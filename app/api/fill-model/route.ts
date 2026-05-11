@@ -9,6 +9,7 @@ type SecFact = {
   fy?: number;
   fp?: string;
   frame?: string;
+  start?: string;
   end?: string;
   filed?: string;
   form?: string;
@@ -51,6 +52,18 @@ type ResolveContext = {
   instant: Map<string, Map<string, FactSource>>;
 };
 
+type SegmentRevenue = {
+  label: string;
+  values: Map<string, number>;
+};
+
+type FilingRef = {
+  accessionNumber: string;
+  filingDate: string;
+  form: string;
+  primaryDocument: string;
+};
+
 const SEC_HEADERS = {
   "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver/0.1 contact@example.com",
   Accept: "application/json"
@@ -58,6 +71,7 @@ const SEC_HEADERS = {
 
 const BLUE = "FF0000FF";
 const MODEL_SHEET = "Model";
+const SEGMENT_SHEET = "Segment Analysis";
 const PERIOD_HEADER_ROWS = [25, 63, 73, 118, 160, 190, 204, 216, 234, 275, 286];
 
 const C = {
@@ -82,7 +96,7 @@ const C = {
   receivables: ["AccountsReceivableNetCurrent"],
   inventory: ["InventoryNet"],
   currentAssets: ["AssetsCurrent"],
-  ppe: ["PropertyPlantAndEquipmentNet"],
+  ppe: ["PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization", "PropertyPlantAndEquipmentNet"],
   intangibles: ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"],
   goodwill: ["Goodwill"],
   assets: ["Assets"],
@@ -90,7 +104,17 @@ const C = {
   accrued: ["AccruedLiabilitiesCurrent", "AccruedIncomeTaxesCurrent", "EmployeeRelatedLiabilitiesCurrent"],
   currentLiabilities: ["LiabilitiesCurrent"],
   currentDebt: ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings"],
-  totalDebt: ["ShortTermBorrowings", "LongTermDebtCurrent", "LongTermDebtNoncurrent", "LongTermDebtAndFinanceLeaseObligationsCurrent", "LongTermDebtAndFinanceLeaseObligationsNoncurrent"],
+  totalDebt: [
+    "ShortTermBorrowings",
+    "LongTermDebtCurrent",
+    "LongTermDebtNoncurrent",
+    "LongTermDebtAndFinanceLeaseObligationsCurrent",
+    "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+    "LongTermDebtAndCapitalLeaseObligationsCurrent",
+    "LongTermDebtAndCapitalLeaseObligations",
+    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+    "LongTermDebt"
+  ],
   deferredTaxLiability: ["DeferredTaxLiabilitiesNoncurrent"],
   liabilities: ["Liabilities"],
   equity: ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
@@ -102,7 +126,6 @@ const C = {
 };
 
 const ROWS: FillRow[] = [
-  row(28, "Revenue", "income", "duration", C.revenue),
   row(29, "Cost of Goods Sold", "income", "duration", C.cogs, -1),
   row(32, "Selling, General & Administration (SG&A)", "income", "duration", C.sga, -1),
   row(33, "Research & Development (R&D)", "income", "duration", C.rd, -1),
@@ -135,7 +158,31 @@ const ROWS: FillRow[] = [
     difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Plug: Current liabilities less AP, accrued liabilities, and current debt.")
   ),
   row(139, "Revolver", "balance", "instant", ["ShortTermBorrowings"]),
-  row(140, "LT Debt (Incl. Current Portion)", "balance", "instant", C.totalDebt, 1, 1_000_000, "Includes current portion of long-term debt and short-term borrowings when reported."),
+  {
+    row: 140,
+    label: "LT Debt (Incl. Current Portion)",
+    statement: "balance",
+    kind: "instant",
+    scale: 1_000_000,
+    comment: "Includes current portion of long-term debt and short-term borrowings when reported.",
+    resolver: (period, ctx) => {
+      const aggregate = first(period, ctx.instant, [
+        "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+        "LongTermDebtAndFinanceLeaseObligations",
+        "LongTermDebtAndCapitalLeaseObligations",
+        "LongTermDebt"
+      ]);
+      if (aggregate) return { value: aggregate.value, sources: [aggregate] };
+      return sum(period, ctx.instant, [
+        "ShortTermBorrowings",
+        "LongTermDebtCurrent",
+        "LongTermDebtNoncurrent",
+        "LongTermDebtAndFinanceLeaseObligationsCurrent",
+        "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+        "LongTermDebtAndCapitalLeaseObligationsCurrent"
+      ]) ?? { value: null, sources: [] };
+    }
+  },
   row(141, "Deferred Income Taxes", "balance", "instant", C.deferredTaxLiability),
   plug(142, "Other Non-Current Liabilities", "balance", "instant", (period, ctx) => {
     const assets = first(period, ctx.instant, C.assets);
@@ -225,11 +272,22 @@ export async function POST(request: NextRequest) {
     const sheet = workbook.getWorksheet(MODEL_SHEET);
     if (!sheet) return jsonError(`Could not find a "${MODEL_SHEET}" worksheet in this workbook.`, 400);
 
-    const columns = blueColumns(sheet);
+    let columns = blueColumns(sheet);
     if (!columns.length) return jsonError("Could not find blue historical input cells in the Model tab.", 400);
 
-    const periods = choosePeriods(ctx, columns.length);
+    let periods = templatePeriods(sheet, columns);
+    if (periods.length === columns.length) {
+      const pairs = periods
+        .map((period, index) => ({ period, col: columns[index] }))
+        .filter(({ period }) => ctx.duration.has(period) || ctx.instant.has(period));
+      periods = pairs.map((pair) => pair.period);
+      columns = pairs.map((pair) => pair.col);
+    } else {
+      periods = choosePeriods(ctx, columns.length);
+      columns = columns.slice(0, periods.length);
+    }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
+    const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
 
     const warnings: string[] = [];
     let filledCells = 0;
@@ -270,9 +328,19 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
+    if (segmentSheet) {
+      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx);
+      filledCells += segmentResult.filledCells;
+      commentsAdded += segmentResult.commentsAdded;
+      warnings.push(...segmentResult.warnings);
+    } else {
+      warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
+    }
+
     commentsAdded += balanceSheetWithModelPlugs(sheet, periods, columns);
     commentsAdded += addWorkbookComment(sheet, company, periods);
-    applyBalanceCheckComments(sheet, periods, columns);
+    addBalanceCheckComments(sheet, periods, columns);
 
     for (const fillRow of ROWS) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
@@ -335,10 +403,175 @@ async function fetchCompanyFacts(cik: string) {
   return response.json();
 }
 
+async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: string[]) {
+  const response = await fetch(`https://data.sec.gov/submissions/CIK${company.cik}.json`, { headers: SEC_HEADERS });
+  if (!response.ok) return [];
+  const submissions = await response.json();
+  const recent = submissions?.filings?.recent;
+  if (!recent) return [];
+
+  const filings: FilingRef[] = recent.form
+    .map((form: string, index: number) => ({
+      form,
+      filingDate: recent.filingDate[index],
+      accessionNumber: recent.accessionNumber[index],
+      primaryDocument: recent.primaryDocument[index]
+    }))
+    .filter((filing: FilingRef) => ["10-Q", "10-K"].includes(filing.form) && filing.primaryDocument?.endsWith(".htm"))
+    .slice(0, 28);
+
+  const annual = new Map<string, Map<string, number>>();
+  const quarterly = new Map<string, Map<string, number>>();
+
+  for (const filing of filings) {
+    try {
+      const accession = filing.accessionNumber.replace(/-/g, "");
+      const cikNoZeros = String(Number(company.cik));
+      const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
+      const html = await fetch(url, { headers: { ...SEC_HEADERS, Accept: "text/html" } }).then((res) => (res.ok ? res.text() : ""));
+      if (!html) continue;
+      const parsed = parseInlineSegmentRevenue(html, filing.form);
+      for (const [period, values] of parsed.entries()) {
+        if (filing.form === "10-K") annual.set(period, values);
+        else quarterly.set(period, values);
+      }
+    } catch {
+      // Segment data is supplemental; model-level company facts still fill the workbook.
+    }
+  }
+
+  deriveSegmentFourthQuarters(quarterly, annual);
+
+  const wanted = new Set(periods);
+  const labels = new Set<string>();
+  quarterly.forEach((values, period) => {
+    if (!wanted.has(period)) return;
+    values.forEach((_, label) => labels.add(label));
+  });
+
+  return Array.from(labels)
+    .sort(segmentSort)
+    .slice(0, 6)
+    .map((label) => ({
+      label,
+      values: new Map(periods.map((period) => [period, quarterly.get(period)?.get(label) ?? 0]))
+    }));
+}
+
+function parseInlineSegmentRevenue(html: string, form: string) {
+  const contexts = new Map<string, { period: string | null; members: string[] }>();
+  for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
+    const body = match[0];
+    const period = contextPeriod(body, form);
+    const members = Array.from(body.matchAll(/<xbrldi:explicitMember\b[^>]*>([^<]+)<\/xbrldi:explicitMember>/g)).map((member) => member[1]);
+    contexts.set(match[1], { period, members });
+  }
+
+  const byPeriod = new Map<string, Map<string, number>>();
+  for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
+    const attrs = match[1];
+    const concept = attrs.match(/\bname="([^"]+)"/)?.[1] ?? "";
+    if (!concept.endsWith(":RevenueFromContractWithCustomerExcludingAssessedTax") && !concept.endsWith(":Revenues")) continue;
+
+    const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
+    if (!contextRef) continue;
+    const context = contexts.get(contextRef);
+    if (!context?.period) continue;
+
+    const label = segmentLabelFromMembers(context.members);
+    if (!label) continue;
+
+    const value = ixNumber(match[2], attrs);
+    if (value === null) continue;
+
+    const periodValues = byPeriod.get(context.period) ?? new Map<string, number>();
+    const existing = periodValues.get(label);
+    if (existing === undefined || preferSegmentFact(context.members, value, existing)) {
+      periodValues.set(label, value);
+    }
+    byPeriod.set(context.period, periodValues);
+  }
+
+  return byPeriod;
+}
+
+function contextPeriod(contextXml: string, form: string) {
+  const start = contextXml.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
+  const end = contextXml.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
+  if (!start || !end) return null;
+  const endDate = new Date(`${end}T00:00:00Z`);
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const days = (endDate.getTime() - startDate.getTime()) / 86_400_000;
+  if (form !== "10-K" && days > 115) return null;
+  const year = endDate.getUTCFullYear();
+  const quarter = Math.floor(endDate.getUTCMonth() / 3) + 1;
+  if (form === "10-K") return `4Q${String(year).slice(-2)}`;
+  return `${quarter}Q${String(year).slice(-2)}`;
+}
+
+function segmentLabelFromMembers(members: string[]) {
+  const product = members.find((member) => member.includes("ProductOrServiceAxis") || /ServiceLine|OtherServiceLine/i.test(member));
+  const joined = members.join(" ");
+  const source = product || joined;
+  if (/CollectionServiceLineMember/i.test(source)) return "Collection";
+  if (/LandfillServiceLineMember/i.test(source)) return "Landfill";
+  if (/EnvironmentalSolutionsServiceLineMember/i.test(source)) return "Environmental Solutions";
+  if (/TransferServiceLineMember/i.test(source)) return "Transfer";
+  if (/OtherServiceLineMember/i.test(source)) return "Other";
+  if (/ProfessionalServices/i.test(source)) return "Professional Services and Other";
+  return null;
+}
+
+function ixNumber(text: string, attrs: string) {
+  const raw = decodeXml(text.replace(/<[^>]+>/g, "").trim()).replace(/,/g, "");
+  if (!raw || raw === "-") return null;
+  const parsed = Number(raw.replace(/[()]/g, ""));
+  if (!Number.isFinite(parsed)) return null;
+  const scale = Number(attrs.match(/\bscale="([^"]+)"/)?.[1] ?? 0);
+  const sign = attrs.includes('sign="-"') || /^\(.+\)$/.test(raw) ? -1 : 1;
+  return parsed * Math.pow(10, scale) * sign;
+}
+
+function decodeXml(value: string) {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, decimal) => String.fromCharCode(Number(decimal)));
+}
+
+function preferSegmentFact(members: string[], value: number, existing: number) {
+  const joined = members.join(" ");
+  if (/IntersegmentEliminationMember/i.test(joined)) return false;
+  if (!/OperatingSegmentsMember/i.test(joined) && value > 0) return true;
+  return Math.abs(value) > Math.abs(existing);
+}
+
+function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, number>>, annual: Map<string, Map<string, number>>) {
+  for (const [period, annualValues] of annual.entries()) {
+    const year = period.slice(2);
+    const q1 = quarterly.get(`1Q${year}`);
+    const q2 = quarterly.get(`2Q${year}`);
+    const q3 = quarterly.get(`3Q${year}`);
+    if (!q1 || !q2 || !q3) continue;
+    const q4 = quarterly.get(period) ?? new Map<string, number>();
+    annualValues.forEach((value, label) => {
+      q4.set(label, value - (q1.get(label) ?? 0) - (q2.get(label) ?? 0) - (q3.get(label) ?? 0));
+    });
+    quarterly.set(period, q4);
+  }
+}
+
+function segmentSort(a: string, b: string) {
+  const order = ["Collection", "Landfill", "Environmental Solutions", "Transfer", "Other", "Professional Services and Other"];
+  return (order.indexOf(a) === -1 ? 99 : order.indexOf(a)) - (order.indexOf(b) === -1 ? 99 : order.indexOf(b));
+}
+
 function buildFactContext(payload: any): ResolveContext {
   const usGaap = payload?.facts?.["us-gaap"] ?? {};
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
+  const cumulativeDuration = new Map<string, Map<string, FactSource>>();
   const annualDuration = new Map<string, Map<string, FactSource>>();
 
   for (const [concept, detail] of Object.entries<any>(usGaap)) {
@@ -353,13 +586,15 @@ function buildFactContext(payload: any): ResolveContext {
       const source = { concept, label, value: fact.val };
       if (!instantFact && fact.fp === "FY") {
         setSource(annualDuration, period, concept, source);
+      } else if (!instantFact && isYearToDateFact(fact)) {
+        setSource(cumulativeDuration, period, concept, source);
       } else {
         setSource(instantFact ? instant : duration, period, concept, source);
       }
     }
   }
 
-  deriveFourthQuarters(duration, annualDuration);
+  deriveQuarterlies(duration, cumulativeDuration, annualDuration);
 
   return { duration, instant };
 }
@@ -370,21 +605,55 @@ function setSource(map: Map<string, Map<string, FactSource>>, period: string, co
   map.set(period, periodFacts);
 }
 
-function deriveFourthQuarters(duration: Map<string, Map<string, FactSource>>, annualDuration: Map<string, Map<string, FactSource>>) {
-  for (const [period, annualFacts] of annualDuration.entries()) {
+function deriveQuarterlies(
+  duration: Map<string, Map<string, FactSource>>,
+  cumulativeDuration: Map<string, Map<string, FactSource>>,
+  annualDuration: Map<string, Map<string, FactSource>>
+) {
+  for (const [period, cumulativeFacts] of cumulativeDuration.entries()) {
+    const quarter = Number(period[0]);
     const year = period.slice(2);
-    for (const [concept, annual] of annualFacts.entries()) {
-      const q1 = duration.get(`1Q${year}`)?.get(concept);
-      const q2 = duration.get(`2Q${year}`)?.get(concept);
-      const q3 = duration.get(`3Q${year}`)?.get(concept);
-      if (!q1 || !q2 || !q3) continue;
-      setSource(duration, period, concept, {
-        concept,
-        label: `${annual.label} (derived Q4)`,
-        value: annual.value - q1.value - q2.value - q3.value
+    if (quarter === 1) {
+      cumulativeFacts.forEach((source, concept) => setSource(duration, period, concept, source));
+    } else if (quarter === 2) {
+      cumulativeFacts.forEach((source, concept) => {
+        const q1 = cumulativeDuration.get(`1Q${year}`)?.get(concept) ?? duration.get(`1Q${year}`)?.get(concept);
+        if (q1 && !duration.get(period)?.get(concept)) {
+          setSource(duration, period, concept, { ...source, label: `${source.label} (derived Q2)`, value: source.value - q1.value });
+        }
+      });
+    } else if (quarter === 3) {
+      cumulativeFacts.forEach((source, concept) => {
+        const q2Cumulative = cumulativeDuration.get(`2Q${year}`)?.get(concept);
+        if (q2Cumulative && !duration.get(period)?.get(concept)) {
+          setSource(duration, period, concept, { ...source, label: `${source.label} (derived Q3)`, value: source.value - q2Cumulative.value });
+        }
       });
     }
   }
+
+  for (const [period, annualFacts] of annualDuration.entries()) {
+    const year = period.slice(2);
+    for (const [concept, annual] of annualFacts.entries()) {
+      const nineMonth = cumulativeDuration.get(`3Q${year}`)?.get(concept);
+      const q1 = duration.get(`1Q${year}`)?.get(concept);
+      const q2 = duration.get(`2Q${year}`)?.get(concept);
+      const q3 = duration.get(`3Q${year}`)?.get(concept);
+      const firstNineMonths = nineMonth?.value ?? (q1 && q2 && q3 ? q1.value + q2.value + q3.value : null);
+      if (firstNineMonths === null) continue;
+      setSource(duration, period, concept, {
+        concept,
+        label: `${annual.label} (derived Q4)`,
+        value: annual.value - firstNineMonths
+      });
+    }
+  }
+}
+
+function isYearToDateFact(fact: SecFact) {
+  if (!fact.start || !fact.end) return false;
+  const days = (new Date(`${fact.end}T00:00:00Z`).getTime() - new Date(`${fact.start}T00:00:00Z`).getTime()) / 86_400_000;
+  return days > 115 && fact.fp !== "FY";
 }
 
 function isUsableFact(fact: SecFact) {
@@ -430,6 +699,21 @@ function blueColumns(sheet: ExcelJS.Worksheet) {
   return [];
 }
 
+function templatePeriods(sheet: ExcelJS.Worksheet, columns: number[]) {
+  const periods = columns.map((col) => cellDisplay(sheet.getCell(25, col)).replace(/e$/i, ""));
+  return periods.every((period) => /^[1-4]Q\d{2}$/.test(period)) ? periods : [];
+}
+
+function cellDisplay(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  if (typeof value === "string") return value;
+  if (typeof value === "number") return String(value);
+  if (value && typeof value === "object" && "result" in value && value.result !== undefined && value.result !== null) {
+    return String(value.result);
+  }
+  return "";
+}
+
 function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
   workbook.worksheets.forEach((sheet) => {
     sheet.eachRow((row) => {
@@ -440,6 +724,58 @@ function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
       });
     });
   });
+}
+
+function fillSegmentAnalysis(
+  sheet: ExcelJS.Worksheet,
+  company: CompanyMatch,
+  periods: string[],
+  columns: number[],
+  segments: SegmentRevenue[],
+  ctx: ResolveContext
+) {
+  const warnings: string[] = [];
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const fallbackRevenue = periods.map((period) => first(period, ctx.duration, C.revenue)?.value ?? 0);
+  const rows = [8, 9, 10, 11, 12, 13];
+  const labelRows = [16, 17, 18, 19, 20, 21];
+
+  const usableSegments = segments.length
+    ? segments
+    : [
+        {
+          label: company.title.replace(/,?\s+INC\.?$/i, ""),
+          values: new Map(periods.map((period, index) => [period, fallbackRevenue[index]]))
+        }
+      ];
+
+  if (!segments.length) {
+    warnings.push("No service-line revenue facts found in recent inline XBRL filings; Segment Analysis uses one total company revenue line.");
+  }
+
+  for (let index = 0; index < rows.length; index += 1) {
+    const segment = usableSegments[index];
+    const label = segment?.label ?? `Segment ${index + 1}`;
+    sheet.getCell(labelRows[index], 3).value = label;
+
+    periods.forEach((period, periodIndex) => {
+      const col = columns[periodIndex];
+      const cell = sheet.getCell(rows[index], col);
+      cell.value = roundModelValue((segment?.values.get(period) ?? 0) / 1_000_000);
+      filledCells += 1;
+    });
+  }
+
+  addComment(
+    sheet.getCell("C16"),
+    segments.length
+      ? `Revenue segment labels and historical revenue values were populated from service-line dimensional facts in recent SEC 10-Q/10-K inline XBRL filings.`
+      : `Revenue is using a one-line fallback because service-line dimensional revenue was not available in recent SEC filings.`
+  );
+  commentsAdded += 1;
+
+  return { filledCells, commentsAdded, warnings };
 }
 
 function isBlue(cell: ExcelJS.Cell) {
@@ -540,13 +876,10 @@ function numericCell(cell: ExcelJS.Cell) {
   return 0;
 }
 
-function applyBalanceCheckComments(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
+function addBalanceCheckComments(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
   periods.forEach((period, index) => {
     const cell = sheet.getCell(158, columns[index]);
-    if (isBlue(cell)) {
-      cell.value = 0;
-      addComment(cell, `Forced balance sheet check to zero for ${period}; row-level plugs reconcile assets to liabilities and equity.`);
-    }
+    addComment(cell, `Balance sheet formulas are preserved for ${period}; historical input plugs reconcile assets to liabilities and equity.`);
   });
 }
 
