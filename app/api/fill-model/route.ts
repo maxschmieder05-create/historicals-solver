@@ -72,7 +72,6 @@ const SEC_HEADERS = {
 const BLUE = "FF0000FF";
 const MODEL_SHEET = "Model";
 const SEGMENT_SHEET = "Segment Analysis";
-const PERIOD_HEADER_ROWS = [25, 63, 73, 118, 160, 190, 204, 216, 234, 275, 286];
 
 const C = {
   revenue: ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"],
@@ -267,7 +266,6 @@ export async function POST(request: NextRequest) {
     workbook.creator = "Historicals Solver";
     workbook.calcProperties.fullCalcOnLoad = true;
     await workbook.xlsx.load(Buffer.from(await file.arrayBuffer()) as unknown as ExcelJS.Buffer);
-    normalizeSharedFormulas(workbook);
 
     const sheet = workbook.getWorksheet(MODEL_SHEET);
     if (!sheet) return jsonError(`Could not find a "${MODEL_SHEET}" worksheet in this workbook.`, 400);
@@ -293,18 +291,12 @@ export async function POST(request: NextRequest) {
     let filledCells = 0;
     let commentsAdded = 0;
 
-    for (const headerRow of PERIOD_HEADER_ROWS) {
-      periods.forEach((period, index) => {
-        const cell = sheet.getCell(headerRow, columns[index]);
-        cell.value = period;
-      });
-    }
-
     for (const fillRow of ROWS) {
       const rowNotes = new Set<string>();
       periods.forEach((period, index) => {
         const col = columns[index];
         const cell = sheet.getCell(fillRow.row, col);
+        if (!isBlue(cell)) return;
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
@@ -322,7 +314,7 @@ export async function POST(request: NextRequest) {
         }
       });
 
-      if (rowNotes.size) {
+      if (rowNotes.size && isBlue(sheet.getCell(fillRow.row, 3))) {
         addComment(sheet.getCell(fillRow.row, 3), Array.from(rowNotes).join(" "));
         commentsAdded += 1;
       }
@@ -339,8 +331,6 @@ export async function POST(request: NextRequest) {
     }
 
     commentsAdded += balanceSheetWithModelPlugs(sheet, periods, columns);
-    commentsAdded += addWorkbookComment(sheet, company, periods);
-    addBalanceCheckComments(sheet, periods, columns);
 
     for (const fillRow of ROWS) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
@@ -714,18 +704,6 @@ function cellDisplay(cell: ExcelJS.Cell) {
   return "";
 }
 
-function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
-  workbook.worksheets.forEach((sheet) => {
-    sheet.eachRow((row) => {
-      row.eachCell((cell) => {
-        const formula = cell.formula;
-        if (!formula) return;
-        cell.value = { formula, result: cell.result };
-      });
-    });
-  });
-}
-
 function fillSegmentAnalysis(
   sheet: ExcelJS.Worksheet,
   company: CompanyMatch,
@@ -757,23 +735,29 @@ function fillSegmentAnalysis(
   for (let index = 0; index < rows.length; index += 1) {
     const segment = usableSegments[index];
     const label = segment?.label ?? `Segment ${index + 1}`;
-    sheet.getCell(labelRows[index], 3).value = label;
+    const labelCell = sheet.getCell(labelRows[index], 3);
+    if (isBlue(labelCell)) {
+      labelCell.value = label;
+    }
 
     periods.forEach((period, periodIndex) => {
       const col = columns[periodIndex];
       const cell = sheet.getCell(rows[index], col);
+      if (!isBlue(cell)) return;
       cell.value = roundModelValue((segment?.values.get(period) ?? 0) / 1_000_000);
       filledCells += 1;
     });
   }
 
-  addComment(
-    sheet.getCell("C16"),
-    segments.length
-      ? `Revenue segment labels and historical revenue values were populated from service-line dimensional facts in recent SEC 10-Q/10-K inline XBRL filings.`
-      : `Revenue is using a one-line fallback because service-line dimensional revenue was not available in recent SEC filings.`
-  );
-  commentsAdded += 1;
+  if (isBlue(sheet.getCell("C16"))) {
+    addComment(
+      sheet.getCell("C16"),
+      segments.length
+        ? `Revenue segment labels and historical revenue values were populated from service-line dimensional facts in recent SEC 10-Q/10-K inline XBRL filings.`
+        : `Revenue is using a one-line fallback because service-line dimensional revenue was not available in recent SEC filings.`
+    );
+    commentsAdded += 1;
+  }
 
   return { filledCells, commentsAdded, warnings };
 }
@@ -847,11 +831,6 @@ function addComment(cell: ExcelJS.Cell, text: string) {
   cell.note = `${existing}Historicals Solver: ${text}`;
 }
 
-function addWorkbookComment(sheet: ExcelJS.Worksheet, company: CompanyMatch, periods: string[]) {
-  addComment(sheet.getCell("C25"), `Filled from SEC company facts for ${company.title} (${company.ticker}) across ${periods.join(", ")}. Dollar values are in millions except per-share data.`);
-  return 1;
-}
-
 function balanceSheetWithModelPlugs(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
   periods.forEach((_, index) => {
     const col = columns[index];
@@ -874,13 +853,6 @@ function numericCell(cell: ExcelJS.Cell) {
   if (typeof value === "number") return value;
   if (value && typeof value === "object" && "result" in value && typeof value.result === "number") return value.result;
   return 0;
-}
-
-function addBalanceCheckComments(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
-  periods.forEach((period, index) => {
-    const cell = sheet.getCell(158, columns[index]);
-    addComment(cell, `Balance sheet formulas are preserved for ${period}; historical input plugs reconcile assets to liabilities and equity.`);
-  });
 }
 
 function roundModelValue(value: number) {
