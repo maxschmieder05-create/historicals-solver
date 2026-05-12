@@ -282,16 +282,12 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("PP&E, Net", "Property Plant and Equipment Net")) {
     return row(rowNumber, label, "balance", "instant", [...C.ppe, "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"]);
   }
-  if (has("Intangible Assets, Net")) return row(rowNumber, label, "balance", "instant", C.intangibles);
+  if (has("Intangible Assets, Net")) return plug(rowNumber, label, "balance", "instant", resolveIntangibleAssets);
   if (has("Goodwill")) return row(rowNumber, label, "balance", "instant", C.goodwill);
   if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investments and Assets of Consolidated Variable Interest Entities")) {
     return row(rowNumber, label, "balance", "instant", INVESTMENT_ASSET_CONCEPTS);
   }
-  if (has("Other Non-Current Assets")) {
-    return plug(rowNumber, label, "balance", "instant", (period, ctx) =>
-      difference(period, ctx.instant, C.assets, [C.currentAssets, C.ppe, C.intangibles, C.goodwill, INVESTMENT_ASSET_CONCEPTS], "Included total assets less separately modeled current assets, PP&E, intangibles, goodwill, and investments.")
-    );
-  }
+  if (has("Other Non-Current Assets")) return row(rowNumber, label, "balance", "instant", ["OtherAssetsNoncurrent", "OtherAssets"]);
   if (has("Accounts Payable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
   if (has("Securities Loaned")) return row(rowNumber, label, "balance", "instant", ["SecuritiesLoaned"]);
   if (has("Accrued Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
@@ -306,7 +302,7 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (includes("LT Debt", "Long Term Debt")) {
     return plug(rowNumber, label, "balance", "instant", resolveTotalDebt);
   }
-  if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", ["DeferredTaxAssetsNet", "DeferredTaxAssetsLiabilitiesNet", ...C.deferredTaxLiability]);
+  if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", C.deferredTaxLiability);
   if (has("Other Non-Current Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentLiabilities);
   if (has("Mezzanine Equity")) return row(rowNumber, label, "balance", "instant", ["RedeemableNoncontrollingInterestEquityCarryingAmount"]);
   if (has("Common Stock & APIC", "Common Stock and APIC")) return plug(rowNumber, label, "balance", "instant", resolveCommonStockAndApic);
@@ -391,6 +387,14 @@ function resolveAccountsPayable(period: string, ctx: ResolveContext): ResolvedVa
   return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
 }
 
+function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedValue {
+  if (first(period, ctx.instant, ["PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"])) {
+    return { value: 0, sources: [zeroSource("IntangibleAssetsNet")], note: "No separate intangible assets line item was reported in the SEC balance sheet for this period." };
+  }
+  const direct = first(period, ctx.instant, C.intangibles);
+  return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
+}
+
 function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
   const brokerDealerLiabilities = sumWithNote(
     period,
@@ -445,9 +449,7 @@ function resolveCommonStockAndApic(period: string, ctx: ResolveContext): Resolve
 
 function resolveTreasuryAndPreferredStock(period: string, ctx: ResolveContext): ResolvedValue {
   const treasury = signed(first(period, ctx.instant, C.treasury), -1);
-  const preferred = signed(first(period, ctx.instant, ["PreferredStockValue"]), -1);
-  const combined = sumResolved([treasury, preferred], "Included treasury stock and preferred stock where reported.");
-  if (combined.value !== null) return combined;
+  if (treasury) return treasury;
   return { value: 0, sources: [zeroSource("TreasuryStockValue")] };
 }
 
@@ -605,21 +607,7 @@ async function fetchCompanyFacts(cik: string) {
 }
 
 async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: string[]) {
-  const response = await fetch(`https://data.sec.gov/submissions/CIK${company.cik}.json`, { headers: SEC_HEADERS });
-  if (!response.ok) return [];
-  const submissions = await response.json();
-  const recent = submissions?.filings?.recent;
-  if (!recent) return [];
-
-  const filings: FilingRef[] = recent.form
-    .map((form: string, index: number) => ({
-      form,
-      filingDate: recent.filingDate[index],
-      accessionNumber: recent.accessionNumber[index],
-      primaryDocument: recent.primaryDocument[index]
-    }))
-    .filter((filing: FilingRef) => (isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm"))
-    .slice(0, 28);
+  const filings = await fetchFilingRefs(company, 40);
 
   const annual = new Map<string, Map<string, SegmentMetrics>>();
   const quarterly = new Map<string, Map<string, SegmentMetrics>>();
@@ -664,22 +652,8 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
 async function fetchInlineFactContext(company: CompanyMatch, periods: string[]): Promise<ResolveContext> {
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
-  const response = await fetch(`https://data.sec.gov/submissions/CIK${company.cik}.json`, { headers: SEC_HEADERS });
-  if (!response.ok) return { duration, instant };
-  const submissions = await response.json();
-  const recent = submissions?.filings?.recent;
-  if (!recent) return { duration, instant };
-
+  const filings = await fetchFilingRefs(company, 60);
   const wanted = new Set(periods);
-  const filings: FilingRef[] = recent.form
-    .map((form: string, index: number) => ({
-      form,
-      filingDate: recent.filingDate[index],
-      accessionNumber: recent.accessionNumber[index],
-      primaryDocument: recent.primaryDocument[index]
-    }))
-    .filter((filing: FilingRef) => (isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm"))
-    .slice(0, 40);
 
   for (const filing of filings) {
     try {
@@ -695,6 +669,41 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[]):
   }
 
   return { duration, instant };
+}
+
+async function fetchFilingRefs(company: CompanyMatch, limit: number) {
+  const response = await fetch(`https://data.sec.gov/submissions/CIK${company.cik}.json`, { headers: SEC_HEADERS });
+  if (!response.ok) return [];
+  const submissions = await response.json();
+  const filings: FilingRef[] = [];
+  collectFilingRefs(submissions?.filings?.recent, filings);
+
+  for (const file of submissions?.filings?.files ?? []) {
+    if (filings.length >= limit) break;
+    try {
+      const older = await fetch(`https://data.sec.gov/submissions/${file.name}`, { headers: SEC_HEADERS }).then((res) => (res.ok ? res.json() : null));
+      collectFilingRefs(older, filings);
+    } catch {
+      // Older filing index fetches are best effort.
+    }
+  }
+
+  return filings.slice(0, limit);
+}
+
+function collectFilingRefs(source: any, filings: FilingRef[]) {
+  if (!source?.form) return;
+  source.form.forEach((form: string, index: number) => {
+    const filing = {
+      form,
+      filingDate: source.filingDate[index],
+      accessionNumber: source.accessionNumber[index],
+      primaryDocument: source.primaryDocument[index]
+    };
+    if ((isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm")) {
+      filings.push(filing);
+    }
+  });
 }
 
 function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext) {
@@ -1281,6 +1290,7 @@ function fillSegmentMetricRows(
     if (segmentIndex === null) continue;
 
     const segment = segments[segmentIndex];
+    if (!segmentHasMetricData(segment, metric, periods)) continue;
     usedSegments.add(segmentIndex);
 
     const labelCell = sheet.getCell(rowNumber, 3);
@@ -1292,12 +1302,16 @@ function fillSegmentMetricRows(
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
       if (!isHardcodedBlueInput(cell)) return;
-      cell.value = roundModelValue((segment[metric].get(period) ?? 0) / 1_000_000);
+      cell.value = (segment[metric].get(period) ?? 0) / 1_000_000;
       filledCells += 1;
     });
   }
 
   return { filledCells };
+}
+
+function segmentHasMetricData(segment: SegmentRevenue, metric: "values" | "operatingIncome" | "depreciationAmortization", periods: string[]) {
+  return periods.some((period) => segment[metric].has(period) && segment[metric].get(period) !== 0);
 }
 
 function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabel: string) {
@@ -1377,6 +1391,10 @@ function isBlue(cell: ExcelJS.Cell) {
 
 function isHardcodedBlueInput(cell: ExcelJS.Cell) {
   return isBlue(cell) && !hasFormula(cell);
+}
+
+function isHardcodedInput(cell: ExcelJS.Cell) {
+  return !hasFormula(cell);
 }
 
 function canAddComment(cell: ExcelJS.Cell) {
