@@ -13,6 +13,7 @@ type SecFact = {
   end?: string;
   filed?: string;
   form?: string;
+  accn?: string;
 };
 
 type CompanyMatch = {
@@ -25,6 +26,12 @@ type FactSource = {
   concept: string;
   label: string;
   value: number;
+  form?: string;
+  fp?: string;
+  filed?: string;
+  accn?: string;
+  start?: string;
+  end?: string;
   derivedTotalValue?: number;
   derivedTotalLabel?: string;
   derivedPriorPeriods?: string[];
@@ -392,7 +399,6 @@ export async function POST(request: NextRequest) {
     let commentsAdded = 0;
 
     for (const fillRow of fillRows) {
-      const rowNotes = new Set<string>();
       let unresolved = 0;
       periods.forEach((period, index) => {
         const col = columns[index];
@@ -408,18 +414,7 @@ export async function POST(request: NextRequest) {
         const result = roundModelValue(resolved.value / (fillRow.scale ?? 1));
         cell.value = result;
         filledCells += 1;
-
-        const sourceLabels = resolved.sources.map((source) => source.label || source.concept);
-        if (resolved.note) rowNotes.add(resolved.note);
-        if (sourceLabels.length > 1 || fillRow.comment) {
-          rowNotes.add(fillRow.comment || `Included SEC concepts: ${unique(sourceLabels).join(", ")}.`);
-        }
       });
-
-      if (rowNotes.size && canAddComment(sheet.getCell(fillRow.row, 3))) {
-        addComment(sheet.getCell(fillRow.row, 3), Array.from(rowNotes).join(" "));
-        commentsAdded += 1;
-      }
 
       if (unresolved) {
         warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
@@ -511,7 +506,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
       accessionNumber: recent.accessionNumber[index],
       primaryDocument: recent.primaryDocument[index]
     }))
-    .filter((filing: FilingRef) => ["10-Q", "10-K"].includes(filing.form) && filing.primaryDocument?.endsWith(".htm"))
+    .filter((filing: FilingRef) => (isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm"))
     .slice(0, 28);
 
   const annual = new Map<string, Map<string, number>>();
@@ -526,7 +521,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
       if (!html) continue;
       const parsed = parseInlineSegmentRevenue(html, filing.form);
       for (const [period, values] of parsed.entries()) {
-        if (filing.form === "10-K") annual.set(period, values);
+        if (isTenK(filing.form)) annual.set(period, values);
         else quarterly.set(period, values);
       }
     } catch {
@@ -596,10 +591,11 @@ function contextPeriod(contextXml: string, form: string) {
   const endDate = new Date(`${end}T00:00:00Z`);
   const startDate = new Date(`${start}T00:00:00Z`);
   const days = (endDate.getTime() - startDate.getTime()) / 86_400_000;
-  if (form !== "10-K" && days > 115) return null;
+  if (isTenK(form) && days < 330) return null;
+  if (!isTenK(form) && days > 115) return null;
   const year = endDate.getUTCFullYear();
   const quarter = Math.floor(endDate.getUTCMonth() / 3) + 1;
-  if (form === "10-K") return `4Q${String(year).slice(-2)}`;
+  if (isTenK(form)) return `4Q${String(year).slice(-2)}`;
   return `${quarter}Q${String(year).slice(-2)}`;
 }
 
@@ -675,14 +671,24 @@ function buildFactContext(payload: any): ResolveContext {
     for (const fact of unitFacts) {
       if (!isUsableFact(fact)) continue;
       const instantFact = isInstantFact(fact);
-      const period = periodKey(fact, instantFact);
+      const period = periodKey(fact);
       if (!period) continue;
-      const source = { concept, label, value: fact.val };
-      if (!instantFact && fact.fp === "FY") {
+      const source = {
+        concept,
+        label,
+        value: fact.val,
+        form: fact.form,
+        fp: fact.fp,
+        filed: fact.filed,
+        accn: fact.accn,
+        start: fact.start,
+        end: fact.end
+      };
+      if (!instantFact && isAnnualDurationFact(fact)) {
         setSource(annualDuration, period, concept, source);
       } else if (!instantFact && isYearToDateFact(fact)) {
         setSource(cumulativeDuration, period, concept, source);
-      } else {
+      } else if (instantFact || isQuarterDurationFact(fact)) {
         setSource(instantFact ? instant : duration, period, concept, source);
       }
     }
@@ -695,6 +701,11 @@ function buildFactContext(payload: any): ResolveContext {
 
 function setSource(map: Map<string, Map<string, FactSource>>, period: string, concept: string, source: FactSource) {
   const periodFacts = map.get(period) ?? new Map<string, FactSource>();
+  const existing = periodFacts.get(concept);
+  if (existing && !preferSource(period, source, existing)) {
+    map.set(period, periodFacts);
+    return;
+  }
   periodFacts.set(concept, source);
   map.set(period, periodFacts);
 }
@@ -770,15 +781,30 @@ function isYearToDateFact(fact: SecFact) {
   return days > 115 && fact.fp !== "FY";
 }
 
+function isAnnualDurationFact(fact: SecFact) {
+  if (!fact.start || !fact.end || fact.fp !== "FY" || !isTenK(fact.form)) return false;
+  return factDurationDays(fact) >= 330;
+}
+
+function isQuarterDurationFact(fact: SecFact) {
+  if (!fact.start || !fact.end || !["Q1", "Q2", "Q3", "Q4"].includes(fact.fp ?? "")) return false;
+  return factDurationDays(fact) <= 115;
+}
+
+function factDurationDays(fact: SecFact) {
+  if (!fact.start || !fact.end) return 0;
+  return (new Date(`${fact.end}T00:00:00Z`).getTime() - new Date(`${fact.start}T00:00:00Z`).getTime()) / 86_400_000;
+}
+
 function isUsableFact(fact: SecFact) {
-  return typeof fact.val === "number" && Boolean(fact.end) && ["10-K", "10-Q", "20-F", "40-F"].includes(fact.form ?? "");
+  return typeof fact.val === "number" && Boolean(fact.end) && (isTenK(fact.form) || isTenQ(fact.form));
 }
 
 function isInstantFact(fact: SecFact) {
   return Boolean(fact.frame?.endsWith("I")) || !["Q1", "Q2", "Q3", "Q4", "FY"].includes(fact.fp ?? "");
 }
 
-function periodKey(fact: SecFact, instantFact: boolean) {
+function periodKey(fact: SecFact) {
   const fy = fact.fy;
   if (!fy) return null;
   const yy = String(fy).slice(-2);
@@ -786,8 +812,36 @@ function periodKey(fact: SecFact, instantFact: boolean) {
   if (fact.fp === "Q2") return `2Q${yy}`;
   if (fact.fp === "Q3") return `3Q${yy}`;
   if (fact.fp === "Q4") return `4Q${yy}`;
-  if (fact.fp === "FY") return instantFact ? `4Q${yy}` : `4Q${yy}`;
+  if (fact.fp === "FY") return `4Q${yy}`;
   return null;
+}
+
+function preferSource(period: string, next: FactSource, current: FactSource) {
+  const nextScore = sourceScore(period, next);
+  const currentScore = sourceScore(period, current);
+  if (nextScore !== currentScore) return nextScore > currentScore;
+  return (next.filed ?? "") > (current.filed ?? "");
+}
+
+function sourceScore(period: string, source: FactSource) {
+  const quarter = period[0];
+  let score = 0;
+  if (quarter === "4") {
+    if (isTenK(source.form)) score += 20;
+    if (source.fp === "FY" || source.fp === "Q4") score += 10;
+  } else {
+    if (isTenQ(source.form)) score += 20;
+    if (source.fp === `Q${quarter}`) score += 10;
+  }
+  return score;
+}
+
+function isTenK(form?: string) {
+  return form === "10-K" || form === "10-K/A";
+}
+
+function isTenQ(form?: string) {
+  return form === "10-Q" || form === "10-Q/A";
 }
 
 function choosePeriods(ctx: ResolveContext, maxColumns: number) {
@@ -861,44 +915,6 @@ function cellDisplay(cell: ExcelJS.Cell) {
   return "";
 }
 
-function derivedQuarterFormula(fillRow: FillRow, resolved: ResolvedValue, period: string, periods: string[], columns: number[], periodIndex: number) {
-  const source = derivedSource(resolved);
-  if (!source?.derivedTotalValue || !source.derivedPriorPeriods?.length) return null;
-  if (!source.derivedPriorPeriods.every((priorPeriod) => periods.includes(priorPeriod))) return null;
-
-  const rowNumber = fillRow.row;
-  const priorIndexes = source.derivedPriorPeriods.map((priorPeriod) => periods.indexOf(priorPeriod));
-  if (!priorIndexes.every((index) => index >= 0 && index < periodIndex)) return null;
-
-  const firstPriorCol = Math.min(...priorIndexes.map((index) => columns[index]));
-  const lastPriorCol = Math.max(...priorIndexes.map((index) => columns[index]));
-  const total = signedDerivedTotal(source.derivedTotalValue, fillRow.sign) / (fillRow.scale ?? 1);
-  return `${formatFormulaNumber(roundModelValue(total))}-SUM(${columnLetter(firstPriorCol)}${rowNumber}:${columnLetter(lastPriorCol)}${rowNumber})`;
-}
-
-function derivedSource(resolved: ResolvedValue) {
-  return resolved.sources.find((source) => source.derivedTotalValue !== undefined && source.derivedPriorPeriods?.length);
-}
-
-function signedDerivedTotal(value: number, sign: FillRow["sign"]) {
-  return sign === -1 ? -Math.abs(value) : value;
-}
-
-function formatFormulaNumber(value: number) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(1);
-}
-
-function columnLetter(col: number) {
-  let value = col;
-  let letters = "";
-  while (value > 0) {
-    const remainder = (value - 1) % 26;
-    letters = String.fromCharCode(65 + remainder) + letters;
-    value = Math.floor((value - 1) / 26);
-  }
-  return letters;
-}
-
 function fillSegmentAnalysis(
   sheet: ExcelJS.Worksheet,
   company: CompanyMatch,
@@ -912,7 +928,6 @@ function fillSegmentAnalysis(
   let commentsAdded = 0;
   const fallbackRevenue = periods.map((period) => first(period, ctx.duration, C.revenue)?.value ?? 0);
   const rows = segmentRevenueRows(sheet).slice(0, 6);
-  const labelRows = segmentMixLabelRows(sheet).slice(0, 6);
 
   const usableSegments = segments.length
     ? segments
@@ -929,17 +944,6 @@ function fillSegmentAnalysis(
 
   for (let index = 0; index < rows.length; index += 1) {
     const segment = usableSegments[index];
-    const label = segment?.label ?? `Segment ${index + 1}`;
-    const revenueLabelCell = sheet.getCell(rows[index], 3);
-    if (isBlue(revenueLabelCell) && !hasFormula(revenueLabelCell)) {
-      revenueLabelCell.value = `${label} Revenue`;
-    }
-
-    const mixLabelCell = labelRows[index] ? sheet.getCell(labelRows[index], 3) : null;
-    if (mixLabelCell && isBlue(mixLabelCell) && !hasFormula(mixLabelCell)) {
-      mixLabelCell.value = label;
-    }
-
     periods.forEach((period, periodIndex) => {
       const col = columns[periodIndex];
       const cell = sheet.getCell(rows[index], col);
@@ -947,17 +951,6 @@ function fillSegmentAnalysis(
       cell.value = roundModelValue((segment?.values.get(period) ?? 0) / 1_000_000);
       filledCells += 1;
     });
-  }
-
-  const noteCell = labelRows[0] ? sheet.getCell(labelRows[0], 3) : sheet.getCell("C16");
-  if (canAddComment(noteCell)) {
-    addComment(
-      noteCell,
-      segments.length
-        ? "Revenue segment labels and historical revenue values were populated from service-line dimensional facts in recent SEC 10-Q/10-K inline XBRL filings."
-        : "Revenue is using a one-line fallback because service-line dimensional revenue was not available in recent SEC filings."
-    );
-    commentsAdded += 1;
   }
 
   return { filledCells, commentsAdded, warnings };
@@ -1006,10 +999,6 @@ function isBlue(cell: ExcelJS.Cell) {
 
 function isHardcodedBlueInput(cell: ExcelJS.Cell) {
   return isBlue(cell) && !hasFormula(cell);
-}
-
-function canAddComment(cell: ExcelJS.Cell) {
-  return !hasFormula(cell);
 }
 
 function hasFormula(cell: ExcelJS.Cell) {
@@ -1075,11 +1064,6 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
     if (!item) return [];
     return "sources" in item ? item.sources : [item];
   });
-}
-
-function addComment(cell: ExcelJS.Cell, text: string) {
-  const existing = typeof cell.note === "string" ? `${cell.note}\n\n` : "";
-  cell.note = `${existing}Historicals Solver: ${text}`;
 }
 
 function roundModelValue(value: number) {
