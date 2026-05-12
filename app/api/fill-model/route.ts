@@ -25,6 +25,9 @@ type FactSource = {
   concept: string;
   label: string;
   value: number;
+  derivedTotalValue?: number;
+  derivedTotalLabel?: string;
+  derivedPriorPeriods?: string[];
 };
 
 type PeriodValues = Record<string, number | null>;
@@ -124,106 +127,39 @@ const C = {
   nci: ["MinorityInterest", "NoncontrollingInterestInConsolidatedEntity"]
 };
 
-const ROWS: FillRow[] = [
-  row(29, "Cost of Goods Sold", "income", "duration", C.cogs, -1),
-  row(32, "Selling, General & Administration (SG&A)", "income", "duration", C.sga, -1),
-  row(33, "Research & Development (R&D)", "income", "duration", C.rd, -1),
-  row(34, "Depreciation & Amortization", "income", "duration", C.da, -1),
-  row(35, "Other Operating Income (Expense)", "income", "duration", ["OtherOperatingIncomeExpenseNet"]),
-  row(38, "Interest Income", "income", "duration", C.interestIncome),
-  row(39, "Interest (Expense)", "income", "duration", C.interestExpense, -1),
-  row(40, "Goodwill Impairment", "income", "duration", C.impairment, -1),
-  row(41, "Other Non-Operating Income (Expense)", "income", "duration", C.otherNonOp),
-  row(44, "Income Tax Benefit (Expense)", "income", "duration", C.taxes, -1),
-  row(47, "Pre-Tax Adjustments", "income", "duration", []),
-  row(48, "Post-Tax Adjustments", "income", "duration", []),
-  row(49, "Discontinued Operations", "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]),
-  row(50, "Income (Loss) due to Non-Controlling Interest", "income", "duration", ["NetIncomeLossAttributableToNoncontrollingInterest"], -1),
-  row(120, "Cash & Cash Equivalents", "balance", "instant", C.cash),
-  row(121, "Accounts Receivable", "balance", "instant", C.receivables),
-  row(122, "Inventory", "balance", "instant", C.inventory),
-  plug(123, "Prepaid & Other Current Assets", "balance", "instant", (period, ctx) =>
-    difference(period, ctx.instant, C.currentAssets, [C.cash, C.receivables, C.inventory], "Plug: AssetsCurrent less cash, receivables, and inventory.")
-  ),
-  row(126, "PP&E, Net", "balance", "instant", C.ppe),
-  row(127, "Intangible Assets, Net", "balance", "instant", C.intangibles),
-  row(128, "Goodwill", "balance", "instant", C.goodwill),
-  plug(129, "Other Non-Current Assets", "balance", "instant", (period, ctx) =>
-    difference(period, ctx.instant, C.assets, [C.currentAssets, C.ppe, C.intangibles, C.goodwill], "Plug: Total assets less current assets, PP&E, intangibles, and goodwill.")
-  ),
-  row(134, "Accounts Payable", "balance", "instant", C.ap),
-  row(135, "Accrued Liabilities", "balance", "instant", C.accrued),
-  plug(136, "Other Current Liabilities", "balance", "instant", (period, ctx) =>
-    difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Plug: Current liabilities less AP, accrued liabilities, and current debt.")
-  ),
-  row(139, "Revolver", "balance", "instant", ["ShortTermBorrowings"]),
-  {
-    row: 140,
-    label: "LT Debt (Incl. Current Portion)",
-    statement: "balance",
-    kind: "instant",
-    scale: 1_000_000,
-    comment: "Includes current portion of long-term debt and short-term borrowings when reported.",
-    resolver: (period, ctx) => {
-      const aggregate = first(period, ctx.instant, [
-        "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
-        "LongTermDebtAndFinanceLeaseObligations",
-        "LongTermDebtAndCapitalLeaseObligations",
-        "LongTermDebt"
-      ]);
-      if (aggregate) return { value: aggregate.value, sources: [aggregate] };
-      return sum(period, ctx.instant, [
-        "ShortTermBorrowings",
-        "LongTermDebtCurrent",
-        "LongTermDebtNoncurrent",
-        "LongTermDebtAndFinanceLeaseObligationsCurrent",
-        "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
-        "LongTermDebtAndCapitalLeaseObligationsCurrent"
-      ]) ?? { value: null, sources: [] };
-    }
-  },
-  row(141, "Deferred Income Taxes", "balance", "instant", C.deferredTaxLiability),
-  plug(142, "Other Non-Current Liabilities", "balance", "instant", (period, ctx) => {
-    const assets = first(period, ctx.instant, C.assets);
-    const currentLiabExDebt = difference(period, ctx.instant, C.currentLiabilities, [C.currentDebt], "");
-    const debt = sum(period, ctx.instant, C.totalDebt);
-    const dtl = first(period, ctx.instant, C.deferredTaxLiability) ?? zeroSource("DeferredTaxLiabilitiesNoncurrent");
-    const equity = first(period, ctx.instant, C.equity);
-    const nci = first(period, ctx.instant, C.nci) ?? zeroSource("NoncontrollingInterestInConsolidatedEntity");
-    if (!assets || !currentLiabExDebt.value || !equity) return { value: null, sources: [], note: "Could not calculate balance-sheet plug because assets, liabilities, or equity were unavailable." };
-    return {
-      value: assets.value - currentLiabExDebt.value - (debt?.value ?? 0) - dtl.value - equity.value - nci.value,
-      sources: compactSources([assets, ...currentLiabExDebt.sources, debt, dtl, equity, nci]),
-      note: "Balance plug: total assets less current liabilities, debt, deferred taxes, shareholder equity, and noncontrolling interests."
-    };
-  }),
-  plug(147, "Common Stock & APIC", "balance", "instant", (period, ctx) => {
-    const direct = first(period, ctx.instant, C.commonApic);
-    if (direct) return { value: direct.value, sources: [direct] };
-    const equity = first(period, ctx.instant, C.equity);
-    const retained = first(period, ctx.instant, C.retained) ?? zeroSource("RetainedEarningsAccumulatedDeficit");
-    const treasury = signed(first(period, ctx.instant, C.treasury), -1) ?? zeroSource("TreasuryStockValue");
-    const aoci = first(period, ctx.instant, C.aoci) ?? zeroSource("AccumulatedOtherComprehensiveIncomeLossNetOfTax");
-    if (!equity) return { value: null, sources: [], note: "Could not derive common stock and APIC because stockholders' equity was unavailable." };
-    return {
-      value: equity.value - retained.value - treasury.value - aoci.value,
-      sources: compactSources([equity, retained, treasury, aoci]),
-      note: "Plug: stockholders' equity less retained earnings, treasury stock, and AOCI."
-    };
-  }),
-  row(148, "Retained Earnings", "balance", "instant", C.retained),
-  plug(149, "Treasury Stock", "balance", "instant", (period, ctx) => signed(first(period, ctx.instant, C.treasury), -1) ?? { value: 0, sources: [zeroSource("TreasuryStockValue")] }),
-  row(150, "Accumulated Other Comprehensive Income (AOCI)", "balance", "instant", C.aoci),
-  row(153, "Noncontrolling Interests", "balance", "instant", C.nci),
-  row(193, "Capital Expenditures", "support", "duration", C.capex),
-  row(194, "Depreciation Expense", "support", "duration", C.da, -1),
-  row(207, "Purchases of Intangibles", "support", "duration", ["PaymentsToAcquireIntangibleAssets"]),
-  row(208, "Amortization Expense", "support", "duration", ["AmortizationOfIntangibleAssets"], -1),
-  row(241, "Shares Repurchased ($ Amount)", "support", "duration", C.repurchases),
-  row(246, "Stock-Based Comp Expense", "support", "duration", C.sbc),
-  row(254, "Dividends", "support", "duration", C.dividends, -1),
-  row(282, "Weighted Average Basic Shares", "support", "duration", C.basicShares, 1, 1_000_000),
-  row(284, "Weighted Average Dilutive Shares", "support", "duration", C.dilutedShares, 1, 1_000_000)
+const COMPENSATION_CONCEPTS = [
+  "CompensationAndBenefitsExpense",
+  "CompensationAndBenefits",
+  "LaborAndRelatedExpense",
+  "SalariesWagesAndBenefits",
+  "SalariesAndWages",
+  "CommissionsExpense",
+  "EmployeeRelatedLiabilitiesCurrent"
+];
+
+const INVESTMENT_ASSET_CONCEPTS = [
+  "Investments",
+  "InvestmentsCurrent",
+  "InvestmentsNoncurrent",
+  "EquityMethodInvestments",
+  "InvestmentsInAffiliatesSubsidiariesAssociatesAndJointVentures",
+  "OtherInvestments",
+  "ConsolidatedVariableInterestEntitiesAssets"
+];
+
+const PURCHASES_OF_INVESTMENTS_CONCEPTS = [
+  "PaymentsToAcquireInvestments",
+  "PaymentsToAcquireAvailableForSaleSecurities",
+  "PaymentsToAcquireHeldToMaturitySecurities",
+  "PaymentsToAcquireEquityMethodInvestments",
+  "PaymentsToAcquireOtherInvestments"
+];
+
+const ACQUISITION_CONCEPTS = [
+  "PaymentsToAcquireBusinessesNetOfCashAcquired",
+  "PaymentsToAcquireBusinessesAndInterestInAffiliates",
+  "BusinessAcquisitionPurchasePrice",
+  "PaymentsForProceedsFromOtherInvestingActivities"
 ];
 
 function row(
@@ -247,6 +183,167 @@ function plug(
   resolver: FillRow["resolver"]
 ): FillRow {
   return { row: rowNumber, label, statement, kind, resolver, scale: 1_000_000 };
+}
+
+function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[]) {
+  const rows: FillRow[] = [];
+  const seen = new Set<number>();
+
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    if (!columns.some((col) => isHardcodedBlueInput(sheet.getCell(rowNumber, col)))) continue;
+    const label = cellDisplay(sheet.getCell(rowNumber, 3)).trim();
+    if (!label || seen.has(rowNumber)) continue;
+    const fillRow = fillRowForLabel(rowNumber, label);
+    if (!fillRow) continue;
+    rows.push(fillRow);
+    seen.add(rowNumber);
+  }
+
+  return rows;
+}
+
+function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
+  const key = normalize(label);
+  const has = (...aliases: string[]) => aliases.some((alias) => key === normalize(alias));
+  const includes = (...aliases: string[]) => aliases.some((alias) => key.includes(normalize(alias)));
+
+  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue")) return row(rowNumber, label, "income", "duration", C.cogs, -1);
+  if (has("Selling, General & Administration (SG&A)", "Selling General & Administrative", "SG&A")) return row(rowNumber, label, "income", "duration", C.sga, -1);
+  if (has("Research & Development (R&D)", "Research and Development")) return row(rowNumber, label, "income", "duration", C.rd, -1);
+  if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits")) {
+    return plug(rowNumber, label, "income", "duration", resolveCompensationExpense);
+  }
+  if (has("Non-Compensation Expenses")) return row(rowNumber, label, "income", "duration", C.sga, -1);
+  if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense")) return row(rowNumber, label, "income", "duration", C.da, -1);
+  if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
+  if (has("Other Operating Income (Expense)")) return row(rowNumber, label, "income", "duration", ["OtherOperatingIncomeExpenseNet"]);
+  if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome);
+  if (has("Interest (Expense)", "Interest Expense")) return row(rowNumber, label, "income", "duration", C.interestExpense, -1);
+  if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
+  if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
+  if (has("Income Tax Benefit (Expense)", "Income Tax Expense")) return row(rowNumber, label, "income", "duration", C.taxes, -1);
+  if (has("Pre-Tax Adjustments", "Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", []);
+  if (has("Discontinued Operations")) return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
+  if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) return row(rowNumber, label, "income", "duration", ["NetIncomeLossAttributableToNoncontrollingInterest"], -1);
+
+  if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents")) return row(rowNumber, label, "balance", "instant", C.cash);
+  if (has("Accounts Receivable", "Fees Receivable")) return row(rowNumber, label, "balance", "instant", C.receivables);
+  if (has("Inventory")) return row(rowNumber, label, "balance", "instant", C.inventory);
+  if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets")) {
+    return plug(rowNumber, label, "balance", "instant", (period, ctx) =>
+      difference(period, ctx.instant, C.currentAssets, [C.cash, C.receivables, C.inventory], "Included current assets less separately modeled cash, receivables, and inventory.")
+    );
+  }
+  if (has("PP&E, Net", "Property Plant and Equipment Net")) return row(rowNumber, label, "balance", "instant", C.ppe);
+  if (has("Intangible Assets, Net")) return row(rowNumber, label, "balance", "instant", C.intangibles);
+  if (has("Goodwill")) return row(rowNumber, label, "balance", "instant", C.goodwill);
+  if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investments and Assets of Consolidated Variable Interest Entities")) {
+    return row(rowNumber, label, "balance", "instant", INVESTMENT_ASSET_CONCEPTS);
+  }
+  if (has("Other Non-Current Assets")) {
+    return plug(rowNumber, label, "balance", "instant", (period, ctx) =>
+      difference(period, ctx.instant, C.assets, [C.currentAssets, C.ppe, C.intangibles, C.goodwill, INVESTMENT_ASSET_CONCEPTS], "Included total assets less separately modeled current assets, PP&E, intangibles, goodwill, and investments.")
+    );
+  }
+  if (has("Accounts Payable")) return row(rowNumber, label, "balance", "instant", C.ap);
+  if (has("Accrued Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
+  if (has("Other Current Liabilities")) {
+    return plug(rowNumber, label, "balance", "instant", (period, ctx) =>
+      difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.")
+    );
+  }
+  if (has("Tax Receivable Agreement Payables")) {
+    return row(rowNumber, label, "balance", "instant", ["TaxReceivableAgreementLiability", "TaxReceivableAgreementLiabilityCurrent", "OtherLiabilitiesCurrent"]);
+  }
+  if (has("Revolver", "Short Term Borrowings")) return row(rowNumber, label, "balance", "instant", ["ShortTermBorrowings"]);
+  if (includes("LT Debt", "Long Term Debt")) {
+    return plug(rowNumber, label, "balance", "instant", resolveTotalDebt);
+  }
+  if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", ["DeferredTaxAssetsNet", "DeferredTaxAssetsLiabilitiesNet", ...C.deferredTaxLiability]);
+  if (has("Other Non-Current Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentLiabilities);
+  if (has("Common Stock & APIC", "Common Stock and APIC")) return plug(rowNumber, label, "balance", "instant", resolveCommonStockAndApic);
+  if (has("Retained Earnings")) return row(rowNumber, label, "balance", "instant", C.retained);
+  if (has("Treasury Stock")) return plug(rowNumber, label, "balance", "instant", (period, ctx) => signed(first(period, ctx.instant, C.treasury), -1) ?? { value: 0, sources: [zeroSource("TreasuryStockValue")] });
+  if (has("Accumulated Other Comprehensive Income (AOCI)", "AOCI")) return row(rowNumber, label, "balance", "instant", C.aoci);
+  if (has("Noncontrolling Interests", "Non-Controlling Interests")) return row(rowNumber, label, "balance", "instant", C.nci);
+
+  if (has("Capital Expenditures", "Capex")) return row(rowNumber, label, "support", "duration", C.capex);
+  if (has("Purchases of Intangibles")) return row(rowNumber, label, "support", "duration", ["PaymentsToAcquireIntangibleAssets"]);
+  if (has("Purchases of Investments")) return row(rowNumber, label, "support", "duration", PURCHASES_OF_INVESTMENTS_CONCEPTS);
+  if (has("Acquisition / (Divestment) of Businesses", "Proceeds From/(Acquisitions of) Businesses", "Proceeds From (Acquisitions of) Businesses")) {
+    return row(rowNumber, label, "support", "duration", ACQUISITION_CONCEPTS);
+  }
+  if (has("Shares Repurchased ($ Amount)", "Share Repurchases ($ Amount)")) return row(rowNumber, label, "support", "duration", C.repurchases);
+  if (has("Stock-Based Comp Expense", "Stock-Based Compensation")) return row(rowNumber, label, "support", "duration", C.sbc);
+  if (has("Dividends")) return row(rowNumber, label, "support", "duration", C.dividends, -1);
+  if (has("Weighted Average Basic Shares", "Basic Shares")) return row(rowNumber, label, "support", "duration", C.basicShares, 1, 1_000_000);
+  if (has("Weighted Average Dilutive Shares", "Weighted Average Diluted Shares", "Diluted Shares")) return row(rowNumber, label, "support", "duration", C.dilutedShares, 1, 1_000_000);
+
+  return null;
+}
+
+function resolveCompensationExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.duration, COMPENSATION_CONCEPTS);
+  if (direct) {
+    return {
+      value: -Math.abs(direct.value),
+      sources: [direct],
+      note: "Mapped to the closest compensation, commissions, benefits, or labor-related SEC concept."
+    };
+  }
+  return { value: null, sources: [], note: "No dedicated compensation and benefits concept was available in SEC company facts." };
+}
+
+function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
+  const aggregate = first(period, ctx.instant, [
+    "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+    "LongTermDebtAndFinanceLeaseObligations",
+    "LongTermDebtAndCapitalLeaseObligations",
+    "LongTermDebt"
+  ]);
+  if (aggregate) return { value: aggregate.value, sources: [aggregate] };
+  return (
+    sum(period, ctx.instant, [
+      "ShortTermBorrowings",
+      "LongTermDebtCurrent",
+      "LongTermDebtNoncurrent",
+      "LongTermDebtAndFinanceLeaseObligationsCurrent",
+      "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
+      "LongTermDebtAndCapitalLeaseObligationsCurrent"
+    ]) ?? { value: null, sources: [] }
+  );
+}
+
+function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const assets = first(period, ctx.instant, C.assets);
+  const currentLiabExDebt = difference(period, ctx.instant, C.currentLiabilities, [C.currentDebt], "");
+  const debt = sum(period, ctx.instant, C.totalDebt);
+  const dtl = first(period, ctx.instant, C.deferredTaxLiability) ?? zeroSource("DeferredTaxLiabilitiesNoncurrent");
+  const equity = first(period, ctx.instant, C.equity);
+  const nci = first(period, ctx.instant, C.nci) ?? zeroSource("NoncontrollingInterestInConsolidatedEntity");
+  if (!assets || currentLiabExDebt.value === null || !equity) {
+    return { value: null, sources: [], note: "Could not calculate other non-current liabilities because assets, liabilities, or equity were unavailable." };
+  }
+  return {
+    value: assets.value - currentLiabExDebt.value - (debt?.value ?? 0) - dtl.value - equity.value - nci.value,
+    sources: compactSources([assets, ...currentLiabExDebt.sources, debt, dtl, equity, nci]),
+    note: "Included total assets less current liabilities, debt, deferred taxes, shareholder equity, and noncontrolling interests."
+  };
+}
+
+function resolveCommonStockAndApic(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.commonApic);
+  if (direct) return { value: direct.value, sources: [direct] };
+  const equity = first(period, ctx.instant, C.equity);
+  const retained = first(period, ctx.instant, C.retained) ?? zeroSource("RetainedEarningsAccumulatedDeficit");
+  const treasury = signed(first(period, ctx.instant, C.treasury), -1) ?? zeroSource("TreasuryStockValue");
+  const aoci = first(period, ctx.instant, C.aoci) ?? zeroSource("AccumulatedOtherComprehensiveIncomeLossNetOfTax");
+  if (!equity) return { value: null, sources: [], note: "Could not derive common stock and APIC because stockholders' equity was unavailable." };
+  return {
+    value: equity.value - retained.value - treasury.value - aoci.value,
+    sources: compactSources([equity, retained, treasury, aoci]),
+    note: "Included stockholders' equity less retained earnings, treasury stock, and AOCI."
+  };
 }
 
 export async function POST(request: NextRequest) {
@@ -273,11 +370,12 @@ export async function POST(request: NextRequest) {
     let columns = blueColumns(sheet);
     if (!columns.length) return jsonError("Could not find blue historical input cells in the Model tab.", 400);
 
-    let periods = templatePeriods(sheet, columns);
-    if (periods.length === columns.length) {
-      const pairs = periods
-        .map((period, index) => ({ period, col: columns[index] }))
-        .filter(({ period }) => ctx.duration.has(period) || ctx.instant.has(period));
+    let periodInfos = templatePeriodInfos(sheet, columns);
+    let periods: string[];
+    if (periodInfos.length === columns.length) {
+      const pairs = periodInfos
+        .map((info, index) => ({ ...info, col: columns[index] }))
+        .filter(({ period, isEstimate }) => /^[1-4]Q\d{2}$/.test(period) && !isEstimate && (ctx.duration.has(period) || ctx.instant.has(period)));
       periods = pairs.map((pair) => pair.period);
       columns = pairs.map((pair) => pair.col);
     } else {
@@ -286,25 +384,29 @@ export async function POST(request: NextRequest) {
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
     const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
+    const fillRows = discoverFillRows(sheet, columns);
+    if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
 
     const warnings: string[] = [];
     let filledCells = 0;
     let commentsAdded = 0;
 
-    for (const fillRow of ROWS) {
+    for (const fillRow of fillRows) {
       const rowNotes = new Set<string>();
+      let unresolved = 0;
       periods.forEach((period, index) => {
         const col = columns[index];
         const cell = sheet.getCell(fillRow.row, col);
-        if (!isBlue(cell)) return;
+        if (!isHardcodedBlueInput(cell)) return;
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
-          cell.value = 0;
+          unresolved += 1;
           return;
         }
 
-        cell.value = roundModelValue(resolved.value / (fillRow.scale ?? 1));
+        const result = roundModelValue(resolved.value / (fillRow.scale ?? 1));
+        cell.value = result;
         filledCells += 1;
 
         const sourceLabels = resolved.sources.map((source) => source.label || source.concept);
@@ -314,9 +416,13 @@ export async function POST(request: NextRequest) {
         }
       });
 
-      if (rowNotes.size && isBlue(sheet.getCell(fillRow.row, 3))) {
+      if (rowNotes.size && canAddComment(sheet.getCell(fillRow.row, 3))) {
         addComment(sheet.getCell(fillRow.row, 3), Array.from(rowNotes).join(" "));
         commentsAdded += 1;
+      }
+
+      if (unresolved) {
+        warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
       }
     }
 
@@ -330,9 +436,7 @@ export async function POST(request: NextRequest) {
       warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
     }
 
-    commentsAdded += balanceSheetWithModelPlugs(sheet, periods, columns);
-
-    for (const fillRow of ROWS) {
+    for (const fillRow of fillRows) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
       if (!hasAny && fillRow.concepts?.length) {
         warnings.push(`${fillRow.label}: no matching SEC concept found.`);
@@ -609,14 +713,31 @@ function deriveQuarterlies(
       cumulativeFacts.forEach((source, concept) => {
         const q1 = cumulativeDuration.get(`1Q${year}`)?.get(concept) ?? duration.get(`1Q${year}`)?.get(concept);
         if (q1 && !duration.get(period)?.get(concept)) {
-          setSource(duration, period, concept, { ...source, label: `${source.label} (derived Q2)`, value: source.value - q1.value });
+          setSource(duration, period, concept, {
+            ...source,
+            label: `${source.label} (derived Q2)`,
+            value: source.value - q1.value,
+            derivedTotalValue: source.value,
+            derivedTotalLabel: source.label,
+            derivedPriorPeriods: [`1Q${year}`]
+          });
         }
       });
     } else if (quarter === 3) {
       cumulativeFacts.forEach((source, concept) => {
         const q2Cumulative = cumulativeDuration.get(`2Q${year}`)?.get(concept);
-        if (q2Cumulative && !duration.get(period)?.get(concept)) {
-          setSource(duration, period, concept, { ...source, label: `${source.label} (derived Q3)`, value: source.value - q2Cumulative.value });
+        const q1 = duration.get(`1Q${year}`)?.get(concept);
+        const q2 = duration.get(`2Q${year}`)?.get(concept);
+        const priorValue = q2Cumulative?.value ?? (q1 && q2 ? q1.value + q2.value : null);
+        if (priorValue !== null && !duration.get(period)?.get(concept)) {
+          setSource(duration, period, concept, {
+            ...source,
+            label: `${source.label} (derived Q3)`,
+            value: source.value - priorValue,
+            derivedTotalValue: source.value,
+            derivedTotalLabel: source.label,
+            derivedPriorPeriods: [`1Q${year}`, `2Q${year}`]
+          });
         }
       });
     }
@@ -634,7 +755,10 @@ function deriveQuarterlies(
       setSource(duration, period, concept, {
         concept,
         label: `${annual.label} (derived Q4)`,
-        value: annual.value - firstNineMonths
+        value: annual.value - firstNineMonths,
+        derivedTotalValue: annual.value,
+        derivedTotalLabel: annual.label,
+        derivedPriorPeriods: [`1Q${year}`, `2Q${year}`, `3Q${year}`]
       });
     }
   }
@@ -678,20 +802,53 @@ function comparePeriods(a: string, b: string) {
 }
 
 function blueColumns(sheet: ExcelJS.Worksheet) {
-  const anchorRows = [29, 120, 134, 140];
-  for (const rowNumber of anchorRows) {
-    const cols: number[] = [];
+  const columnCounts = new Map<number, number>();
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const label = cellDisplay(sheet.getCell(rowNumber, 3));
+    if (!label) continue;
     for (let col = 6; col <= sheet.columnCount; col += 1) {
-      if (isBlue(sheet.getCell(rowNumber, col))) cols.push(col);
+      if (!isHardcodedBlueInput(sheet.getCell(rowNumber, col))) continue;
+      columnCounts.set(col, (columnCounts.get(col) ?? 0) + 1);
     }
-    if (cols.length) return cols;
   }
-  return [];
+
+  const candidates = Array.from(columnCounts.entries())
+    .filter(([, count]) => count >= 3)
+    .map(([col]) => col)
+    .sort((a, b) => a - b);
+
+  if (candidates.length) return candidates;
+
+  return Array.from(columnCounts.keys()).sort((a, b) => a - b);
 }
 
-function templatePeriods(sheet: ExcelJS.Worksheet, columns: number[]) {
-  const periods = columns.map((col) => cellDisplay(sheet.getCell(25, col)).replace(/e$/i, ""));
-  return periods.every((period) => /^[1-4]Q\d{2}$/.test(period)) ? periods : [];
+function templatePeriodInfos(sheet: ExcelJS.Worksheet, columns: number[]) {
+  let best: Array<{ period: string; isEstimate: boolean }> = [];
+  let bestCount = 0;
+  for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 80); rowNumber += 1) {
+    const infos = columns.map((col) => {
+      const label = cellDisplay(sheet.getCell(rowNumber, col));
+      return {
+        period: normalizePeriodLabel(label),
+        isEstimate: /e\s*$/i.test(label.trim())
+      };
+    });
+    const validCount = infos.filter((info) => /^[1-4]Q\d{2}$/.test(info.period)).length;
+    if (validCount > bestCount) {
+      best = infos;
+      bestCount = validCount;
+    }
+  }
+  return bestCount ? best : [];
+}
+
+function normalizePeriodLabel(label: string) {
+  const compact = label.trim().replace(/\s+/g, "").replace(/[’']/g, "").replace(/e$/i, "");
+  const direct = compact.match(/^([1-4])Q(\d{2}|\d{4})$/i);
+  if (direct) return `${direct[1]}Q${direct[2].slice(-2)}`;
+  const qFirst = compact.match(/^Q([1-4])(\d{2}|\d{4})$/i);
+  if (qFirst) return `${qFirst[1]}Q${qFirst[2].slice(-2)}`;
+  return compact;
 }
 
 function cellDisplay(cell: ExcelJS.Cell) {
@@ -702,6 +859,44 @@ function cellDisplay(cell: ExcelJS.Cell) {
     return String(value.result);
   }
   return "";
+}
+
+function derivedQuarterFormula(fillRow: FillRow, resolved: ResolvedValue, period: string, periods: string[], columns: number[], periodIndex: number) {
+  const source = derivedSource(resolved);
+  if (!source?.derivedTotalValue || !source.derivedPriorPeriods?.length) return null;
+  if (!source.derivedPriorPeriods.every((priorPeriod) => periods.includes(priorPeriod))) return null;
+
+  const rowNumber = fillRow.row;
+  const priorIndexes = source.derivedPriorPeriods.map((priorPeriod) => periods.indexOf(priorPeriod));
+  if (!priorIndexes.every((index) => index >= 0 && index < periodIndex)) return null;
+
+  const firstPriorCol = Math.min(...priorIndexes.map((index) => columns[index]));
+  const lastPriorCol = Math.max(...priorIndexes.map((index) => columns[index]));
+  const total = signedDerivedTotal(source.derivedTotalValue, fillRow.sign) / (fillRow.scale ?? 1);
+  return `${formatFormulaNumber(roundModelValue(total))}-SUM(${columnLetter(firstPriorCol)}${rowNumber}:${columnLetter(lastPriorCol)}${rowNumber})`;
+}
+
+function derivedSource(resolved: ResolvedValue) {
+  return resolved.sources.find((source) => source.derivedTotalValue !== undefined && source.derivedPriorPeriods?.length);
+}
+
+function signedDerivedTotal(value: number, sign: FillRow["sign"]) {
+  return sign === -1 ? -Math.abs(value) : value;
+}
+
+function formatFormulaNumber(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function columnLetter(col: number) {
+  let value = col;
+  let letters = "";
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    letters = String.fromCharCode(65 + remainder) + letters;
+    value = Math.floor((value - 1) / 26);
+  }
+  return letters;
 }
 
 function fillSegmentAnalysis(
@@ -716,8 +911,8 @@ function fillSegmentAnalysis(
   let filledCells = 0;
   let commentsAdded = 0;
   const fallbackRevenue = periods.map((period) => first(period, ctx.duration, C.revenue)?.value ?? 0);
-  const rows = [8, 9, 10, 11, 12, 13];
-  const labelRows = [16, 17, 18, 19, 20, 21];
+  const rows = segmentRevenueRows(sheet).slice(0, 6);
+  const labelRows = segmentMixLabelRows(sheet).slice(0, 6);
 
   const usableSegments = segments.length
     ? segments
@@ -735,26 +930,32 @@ function fillSegmentAnalysis(
   for (let index = 0; index < rows.length; index += 1) {
     const segment = usableSegments[index];
     const label = segment?.label ?? `Segment ${index + 1}`;
-    const labelCell = sheet.getCell(labelRows[index], 3);
-    if (isBlue(labelCell)) {
-      labelCell.value = label;
+    const revenueLabelCell = sheet.getCell(rows[index], 3);
+    if (isBlue(revenueLabelCell) && !hasFormula(revenueLabelCell)) {
+      revenueLabelCell.value = `${label} Revenue`;
+    }
+
+    const mixLabelCell = labelRows[index] ? sheet.getCell(labelRows[index], 3) : null;
+    if (mixLabelCell && isBlue(mixLabelCell) && !hasFormula(mixLabelCell)) {
+      mixLabelCell.value = label;
     }
 
     periods.forEach((period, periodIndex) => {
       const col = columns[periodIndex];
       const cell = sheet.getCell(rows[index], col);
-      if (!isBlue(cell)) return;
+      if (!isHardcodedBlueInput(cell)) return;
       cell.value = roundModelValue((segment?.values.get(period) ?? 0) / 1_000_000);
       filledCells += 1;
     });
   }
 
-  if (isBlue(sheet.getCell("C16"))) {
+  const noteCell = labelRows[0] ? sheet.getCell(labelRows[0], 3) : sheet.getCell("C16");
+  if (canAddComment(noteCell)) {
     addComment(
-      sheet.getCell("C16"),
+      noteCell,
       segments.length
-        ? `Revenue segment labels and historical revenue values were populated from service-line dimensional facts in recent SEC 10-Q/10-K inline XBRL filings.`
-        : `Revenue is using a one-line fallback because service-line dimensional revenue was not available in recent SEC filings.`
+        ? "Revenue segment labels and historical revenue values were populated from service-line dimensional facts in recent SEC 10-Q/10-K inline XBRL filings."
+        : "Revenue is using a one-line fallback because service-line dimensional revenue was not available in recent SEC filings."
     );
     commentsAdded += 1;
   }
@@ -762,8 +963,58 @@ function fillSegmentAnalysis(
   return { filledCells, commentsAdded, warnings };
 }
 
+function segmentRevenueRows(sheet: ExcelJS.Worksheet) {
+  const totalRevenueRow = findLabelRow(sheet, "Total Company Revenue");
+  const revenueMixRow = findLabelRow(sheet, "Revenue Mix");
+  if (!totalRevenueRow || !revenueMixRow || revenueMixRow <= totalRevenueRow) return [8, 9, 10, 11, 12, 13];
+  const rows: number[] = [];
+  for (let rowNumber = totalRevenueRow + 1; rowNumber < revenueMixRow; rowNumber += 1) {
+    if (isBlue(sheet.getCell(rowNumber, 3)) || rowHasBlueInputs(sheet, rowNumber)) rows.push(rowNumber);
+  }
+  return rows.length ? rows : [8, 9, 10, 11, 12, 13];
+}
+
+function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
+  const revenueMixRow = findLabelRow(sheet, "Revenue Mix");
+  const operatingIncomeRow = findLabelRow(sheet, "Total Company Operating Income");
+  if (!revenueMixRow || !operatingIncomeRow || operatingIncomeRow <= revenueMixRow) return [16, 17, 18, 19, 20, 21];
+  const rows: number[] = [];
+  for (let rowNumber = revenueMixRow + 1; rowNumber < operatingIncomeRow; rowNumber += 1) {
+    if (cellDisplay(sheet.getCell(rowNumber, 3)).trim()) rows.push(rowNumber);
+  }
+  return rows.length ? rows : [16, 17, 18, 19, 20, 21];
+}
+
+function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
+  const wanted = normalize(label);
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    if (normalize(cellDisplay(sheet.getCell(rowNumber, 3))) === wanted) return rowNumber;
+  }
+  return null;
+}
+
+function rowHasBlueInputs(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  for (let col = 6; col <= sheet.columnCount; col += 1) {
+    if (isHardcodedBlueInput(sheet.getCell(rowNumber, col))) return true;
+  }
+  return false;
+}
+
 function isBlue(cell: ExcelJS.Cell) {
   return cell.font?.color?.argb === BLUE;
+}
+
+function isHardcodedBlueInput(cell: ExcelJS.Cell) {
+  return isBlue(cell) && !hasFormula(cell);
+}
+
+function canAddComment(cell: ExcelJS.Cell) {
+  return !hasFormula(cell);
+}
+
+function hasFormula(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  return Boolean(value && typeof value === "object" && ("formula" in value || "sharedFormula" in value));
 }
 
 function resolveRow(fillRow: FillRow, period: string, ctx: ResolveContext): ResolvedValue {
@@ -829,30 +1080,6 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
 function addComment(cell: ExcelJS.Cell, text: string) {
   const existing = typeof cell.note === "string" ? `${cell.note}\n\n` : "";
   cell.note = `${existing}Historicals Solver: ${text}`;
-}
-
-function balanceSheetWithModelPlugs(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
-  periods.forEach((_, index) => {
-    const col = columns[index];
-    const totalAssets = sumRows(sheet, col, [120, 121, 122, 123, 126, 127, 128, 129]);
-    const currentLiabilitiesExDebt = sumRows(sheet, col, [134, 135, 136]);
-    const debtAndTaxes = sumRows(sheet, col, [139, 140, 141]);
-    const equity = sumRows(sheet, col, [147, 148, 149, 150, 153]);
-    sheet.getCell(142, col).value = roundModelValue(totalAssets - currentLiabilitiesExDebt - debtAndTaxes - equity);
-  });
-  addComment(sheet.getCell("C142"), "Final balance plug recalculated from the model rows so Total Assets equals Total Liabilities & Shareholder's Equity after SEC mappings.");
-  return 1;
-}
-
-function sumRows(sheet: ExcelJS.Worksheet, col: number, rows: number[]) {
-  return rows.reduce((total, rowNumber) => total + numericCell(sheet.getCell(rowNumber, col)), 0);
-}
-
-function numericCell(cell: ExcelJS.Cell) {
-  const value = cell.value;
-  if (typeof value === "number") return value;
-  if (value && typeof value === "object" && "result" in value && typeof value.result === "number") return value.result;
-  return 0;
 }
 
 function roundModelValue(value: number) {
