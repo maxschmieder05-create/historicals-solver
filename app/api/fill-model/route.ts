@@ -151,9 +151,6 @@ const BROKER_DEALER_RECEIVABLES = [
 ];
 
 const BROKER_DEALER_CURRENT_ASSETS = [
-  "CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations",
-  "CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation",
-  "SecuritiesSegregatedUnderOtherRegulations",
   "FinancialInstrumentsOwnedAtFairValue",
   "InvestmentOwnedAtFairValue",
   "InvestmentsInAffiliatesSubsidiariesAssociatesAndJointVentures",
@@ -287,7 +284,7 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investments and Assets of Consolidated Variable Interest Entities")) {
     return row(rowNumber, label, "balance", "instant", INVESTMENT_ASSET_CONCEPTS);
   }
-  if (has("Other Non-Current Assets")) return row(rowNumber, label, "balance", "instant", ["OtherAssetsNoncurrent", "OtherAssets"]);
+  if (has("Other Non-Current Assets")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentAssets);
   if (has("Accounts Payable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
   if (has("Securities Loaned")) return row(rowNumber, label, "balance", "instant", ["SecuritiesLoaned"]);
   if (has("Accrued Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
@@ -370,13 +367,18 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
-  const brokerDealerAssets = sumWithNote(
-    period,
-    ctx.instant,
-    BROKER_DEALER_CURRENT_ASSETS,
-    "Included cash and securities segregated, financial instruments owned, investments and loans, securities borrowed, securities purchased under agreements to resell, and securities received as collateral."
-  );
-  if (brokerDealerAssets.value !== null) return brokerDealerAssets;
+  const segregatedCash =
+    first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation"]) ??
+    first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations"]);
+  const brokerDealerAssets = sum(period, ctx.instant, BROKER_DEALER_CURRENT_ASSETS);
+  if (segregatedCash || brokerDealerAssets) {
+    return {
+      value: (segregatedCash?.value ?? 0) + (brokerDealerAssets?.value ?? 0),
+      sources: compactSources([segregatedCash, brokerDealerAssets]),
+      note:
+        "Included SEC-regulation segregated cash plus financial instruments owned, investments and loans, securities borrowed, securities purchased under agreements to resell, and securities received as collateral."
+    };
+  }
   return difference(period, ctx.instant, C.currentAssets, [C.cash, C.receivables, C.inventory], "Included current assets less separately modeled cash, receivables, and inventory.");
 }
 
@@ -395,13 +397,43 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
   return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
 }
 
-function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
-  const brokerDealerLiabilities = sumWithNote(
+function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
+  const assets = first(period, ctx.instant, C.assets);
+  const currentAssets = first(period, ctx.instant, C.currentAssets);
+  const ppe = first(period, ctx.instant, [...C.ppe, "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"]) ?? zeroSource(C.ppe[0]);
+  const intangibles = resolveIntangibleAssets(period, ctx);
+  const goodwill = first(period, ctx.instant, C.goodwill) ?? zeroSource(C.goodwill[0]);
+  if (assets && currentAssets && intangibles.value !== null) {
+    return {
+      value: assets.value - currentAssets.value - ppe.value - intangibles.value - goodwill.value,
+      sources: compactSources([assets, currentAssets, ppe, intangibles, goodwill]),
+      note: "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill."
+    };
+  }
+  return sumWithNote(
     period,
     ctx.instant,
-    BROKER_DEALER_OTHER_CURRENT_LIABILITIES,
-    "Included financial instruments sold not yet purchased, securities sold under agreements to repurchase, other secured financings, collateral-return obligations, accrued expenses, lease liabilities, and other current liabilities."
+    ["OtherAssetsNoncurrent", "OtherAssets", "AssetsOfDisposalGroupIncludingDiscontinuedOperation"],
+    "Included other assets and assets of disposal groups / discontinued operations reported in the SEC filing."
   );
+}
+
+function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const liabilities = first(period, ctx.instant, C.liabilities);
+  const shortTermBorrowings = first(period, ctx.instant, ["OtherShortTermBorrowings", "ShortTermBorrowings"]) ?? zeroSource("ShortTermBorrowings");
+  const accountsPayable = resolveAccountsPayable(period, ctx);
+  const securitiesLoaned = first(period, ctx.instant, ["SecuritiesLoaned"]) ?? zeroSource("SecuritiesLoaned");
+  const totalDebt = resolveTotalDebt(period, ctx);
+  const deferredTaxes = first(period, ctx.instant, C.deferredTaxLiability) ?? zeroSource("DeferredTaxLiabilitiesNoncurrent");
+  const otherNonCurrent = first(period, ctx.instant, ["OtherLiabilitiesNoncurrent"]) ?? zeroSource("OtherLiabilitiesNoncurrent");
+  if (liabilities && accountsPayable.value !== null && totalDebt.value !== null) {
+    return {
+      value: liabilities.value - shortTermBorrowings.value - accountsPayable.value - securitiesLoaned.value - (totalDebt.value ?? 0) - deferredTaxes.value - otherNonCurrent.value,
+      sources: compactSources([liabilities, shortTermBorrowings, accountsPayable, securitiesLoaned, totalDebt, deferredTaxes, otherNonCurrent]),
+      note: "Calculated from total liabilities less separately modeled borrowings, payables, securities loaned, debt, deferred taxes, and other non-current liabilities."
+    };
+  }
+  const brokerDealerLiabilities = sumWithNote(period, ctx.instant, BROKER_DEALER_OTHER_CURRENT_LIABILITIES, "Included broker-dealer current liability concepts reported in the SEC filing.");
   if (brokerDealerLiabilities.value !== null) return brokerDealerLiabilities;
   return difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.");
 }
