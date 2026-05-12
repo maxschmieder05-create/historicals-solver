@@ -26,6 +26,7 @@ type FactSource = {
   concept: string;
   label: string;
   value: number;
+  note?: string;
   form?: string;
   fp?: string;
   filed?: string;
@@ -62,9 +63,18 @@ type ResolveContext = {
   instant: Map<string, Map<string, FactSource>>;
 };
 
+type InlineContext = {
+  period: string | null;
+  instant: boolean;
+  start?: string;
+  end?: string;
+};
+
 type SegmentRevenue = {
   label: string;
   values: Map<string, number>;
+  operatingIncome: Map<string, number>;
+  depreciationAmortization: Map<string, number>;
 };
 
 type FilingRef = {
@@ -133,6 +143,36 @@ const C = {
   aoci: ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"],
   nci: ["MinorityInterest", "NoncontrollingInterestInConsolidatedEntity"]
 };
+
+const BROKER_DEALER_RECEIVABLES = [
+  "ReceivablesFromBrokersDealersAndClearingOrganizations",
+  "ReceivablesFromCustomers",
+  "FeesInterestAndOther"
+];
+
+const BROKER_DEALER_CURRENT_ASSETS = [
+  "CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations",
+  "CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation",
+  "SecuritiesSegregatedUnderOtherRegulations",
+  "FinancialInstrumentsOwnedAtFairValue",
+  "InvestmentOwnedAtFairValue",
+  "InvestmentsInAffiliatesSubsidiariesAssociatesAndJointVentures",
+  "SecuritiesBorrowed",
+  "SecuritiesPurchasedUnderAgreementsToResell",
+  "SecuritiesReceivedAsCollateral"
+];
+
+const BROKER_DEALER_PAYABLES = ["PayablesToBrokerDealersAndClearingOrganizations", "PayablesToCustomers"];
+
+const BROKER_DEALER_OTHER_CURRENT_LIABILITIES = [
+  "FinancialInstrumentsSoldNotYetPurchasedAtFairValue",
+  "SecuritiesSoldUnderAgreementsToRepurchase",
+  "OtherSecuredFinancings",
+  "ObligationToReturnSecuritiesReceivedAsCollateral",
+  "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent",
+  "OperatingLeaseLiability",
+  "ContractWithCustomerLiabilityCurrent"
+];
 
 const COMPENSATION_CONCEPTS = [
   "CompensationAndBenefitsExpense",
@@ -234,14 +274,14 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) return row(rowNumber, label, "income", "duration", ["NetIncomeLossAttributableToNoncontrollingInterest"], -1);
 
   if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents")) return row(rowNumber, label, "balance", "instant", C.cash);
-  if (has("Accounts Receivable", "Fees Receivable")) return row(rowNumber, label, "balance", "instant", C.receivables);
+  if (has("Accounts Receivable", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
   if (has("Inventory")) return row(rowNumber, label, "balance", "instant", C.inventory);
   if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets")) {
-    return plug(rowNumber, label, "balance", "instant", (period, ctx) =>
-      difference(period, ctx.instant, C.currentAssets, [C.cash, C.receivables, C.inventory], "Included current assets less separately modeled cash, receivables, and inventory.")
-    );
+    return plug(rowNumber, label, "balance", "instant", resolvePrepaidAndOtherCurrentAssets);
   }
-  if (has("PP&E, Net", "Property Plant and Equipment Net")) return row(rowNumber, label, "balance", "instant", C.ppe);
+  if (has("PP&E, Net", "Property Plant and Equipment Net")) {
+    return row(rowNumber, label, "balance", "instant", [...C.ppe, "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"]);
+  }
   if (has("Intangible Assets, Net")) return row(rowNumber, label, "balance", "instant", C.intangibles);
   if (has("Goodwill")) return row(rowNumber, label, "balance", "instant", C.goodwill);
   if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investments and Assets of Consolidated Variable Interest Entities")) {
@@ -252,25 +292,26 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
       difference(period, ctx.instant, C.assets, [C.currentAssets, C.ppe, C.intangibles, C.goodwill, INVESTMENT_ASSET_CONCEPTS], "Included total assets less separately modeled current assets, PP&E, intangibles, goodwill, and investments.")
     );
   }
-  if (has("Accounts Payable")) return row(rowNumber, label, "balance", "instant", C.ap);
+  if (has("Accounts Payable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
+  if (has("Securities Loaned")) return row(rowNumber, label, "balance", "instant", ["SecuritiesLoaned"]);
   if (has("Accrued Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
   if (has("Other Current Liabilities")) {
-    return plug(rowNumber, label, "balance", "instant", (period, ctx) =>
-      difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.")
-    );
+    return plug(rowNumber, label, "balance", "instant", resolveOtherCurrentLiabilities);
   }
   if (has("Tax Receivable Agreement Payables")) {
     return row(rowNumber, label, "balance", "instant", ["TaxReceivableAgreementLiability", "TaxReceivableAgreementLiabilityCurrent", "OtherLiabilitiesCurrent"]);
   }
-  if (has("Revolver", "Short Term Borrowings")) return row(rowNumber, label, "balance", "instant", ["ShortTermBorrowings"]);
+  if (has("Short Term Borrowings")) return row(rowNumber, label, "balance", "instant", ["OtherShortTermBorrowings", "ShortTermBorrowings"]);
+  if (has("Revolver")) return row(rowNumber, label, "balance", "instant", ["RevolvingCreditFacility", "LineOfCreditFacilityCurrentBorrowings"]);
   if (includes("LT Debt", "Long Term Debt")) {
     return plug(rowNumber, label, "balance", "instant", resolveTotalDebt);
   }
   if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", ["DeferredTaxAssetsNet", "DeferredTaxAssetsLiabilitiesNet", ...C.deferredTaxLiability]);
   if (has("Other Non-Current Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentLiabilities);
+  if (has("Mezzanine Equity")) return row(rowNumber, label, "balance", "instant", ["RedeemableNoncontrollingInterestEquityCarryingAmount"]);
   if (has("Common Stock & APIC", "Common Stock and APIC")) return plug(rowNumber, label, "balance", "instant", resolveCommonStockAndApic);
   if (has("Retained Earnings")) return row(rowNumber, label, "balance", "instant", C.retained);
-  if (has("Treasury Stock")) return plug(rowNumber, label, "balance", "instant", (period, ctx) => signed(first(period, ctx.instant, C.treasury), -1) ?? { value: 0, sources: [zeroSource("TreasuryStockValue")] });
+  if (has("Treasury Stock", "Treasury & Preferred Stock")) return plug(rowNumber, label, "balance", "instant", resolveTreasuryAndPreferredStock);
   if (has("Accumulated Other Comprehensive Income (AOCI)", "AOCI")) return row(rowNumber, label, "balance", "instant", C.aoci);
   if (has("Noncontrolling Interests", "Non-Controlling Interests")) return row(rowNumber, label, "balance", "instant", C.nci);
 
@@ -321,6 +362,46 @@ function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
   );
 }
 
+function resolveAccountsReceivable(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.receivables);
+  if (direct) return { value: direct.value, sources: [direct] };
+  return sumWithNote(
+    period,
+    ctx.instant,
+    BROKER_DEALER_RECEIVABLES,
+    "Included broker-dealer receivables, customer receivables, and fees/interest/other receivables from the SEC filing."
+  );
+}
+
+function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
+  const brokerDealerAssets = sumWithNote(
+    period,
+    ctx.instant,
+    BROKER_DEALER_CURRENT_ASSETS,
+    "Included cash and securities segregated, financial instruments owned, investments and loans, securities borrowed, securities purchased under agreements to resell, and securities received as collateral."
+  );
+  if (brokerDealerAssets.value !== null) return brokerDealerAssets;
+  return difference(period, ctx.instant, C.currentAssets, [C.cash, C.receivables, C.inventory], "Included current assets less separately modeled cash, receivables, and inventory.");
+}
+
+function resolveAccountsPayable(period: string, ctx: ResolveContext): ResolvedValue {
+  const brokerDealerPayables = sumWithNote(period, ctx.instant, BROKER_DEALER_PAYABLES, "Included broker-dealer and customer payables from the SEC filing.");
+  if (brokerDealerPayables.value !== null) return brokerDealerPayables;
+  const direct = first(period, ctx.instant, C.ap);
+  return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
+}
+
+function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const brokerDealerLiabilities = sumWithNote(
+    period,
+    ctx.instant,
+    BROKER_DEALER_OTHER_CURRENT_LIABILITIES,
+    "Included financial instruments sold not yet purchased, securities sold under agreements to repurchase, other secured financings, collateral-return obligations, accrued expenses, lease liabilities, and other current liabilities."
+  );
+  if (brokerDealerLiabilities.value !== null) return brokerDealerLiabilities;
+  return difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.");
+}
+
 function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
   const assets = first(period, ctx.instant, C.assets);
   const currentLiabExDebt = difference(period, ctx.instant, C.currentLiabilities, [C.currentDebt], "");
@@ -339,6 +420,15 @@ function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext):
 }
 
 function resolveCommonStockAndApic(period: string, ctx: ResolveContext): ResolvedValue {
+  const common = first(period, ctx.instant, ["CommonStockValue"]) ?? zeroSource("CommonStockValue");
+  const apic = first(period, ctx.instant, C.commonApic);
+  if (apic) {
+    return {
+      value: common.value + apic.value,
+      sources: [common, apic],
+      note: "Included common stock value plus additional paid-in capital."
+    };
+  }
   const direct = first(period, ctx.instant, C.commonApic);
   if (direct) return { value: direct.value, sources: [direct] };
   const equity = first(period, ctx.instant, C.equity);
@@ -351,6 +441,14 @@ function resolveCommonStockAndApic(period: string, ctx: ResolveContext): Resolve
     sources: compactSources([equity, retained, treasury, aoci]),
     note: "Included stockholders' equity less retained earnings, treasury stock, and AOCI."
   };
+}
+
+function resolveTreasuryAndPreferredStock(period: string, ctx: ResolveContext): ResolvedValue {
+  const treasury = signed(first(period, ctx.instant, C.treasury), -1);
+  const preferred = signed(first(period, ctx.instant, ["PreferredStockValue"]), -1);
+  const combined = sumResolved([treasury, preferred], "Included treasury stock and preferred stock where reported.");
+  if (combined.value !== null) return combined;
+  return { value: 0, sources: [zeroSource("TreasuryStockValue")] };
 }
 
 export async function POST(request: NextRequest) {
@@ -390,6 +488,8 @@ export async function POST(request: NextRequest) {
       columns = columns.slice(0, periods.length);
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
+    const inlineCtx = await fetchInlineFactContext(company, periods);
+    mergeContexts(ctx, inlineCtx);
     const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
     const fillRows = discoverFillRows(sheet, columns);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
@@ -399,22 +499,34 @@ export async function POST(request: NextRequest) {
     let commentsAdded = 0;
 
     for (const fillRow of fillRows) {
+      const rowNotes = new Set<string>();
       let unresolved = 0;
       periods.forEach((period, index) => {
         const col = columns[index];
         const cell = sheet.getCell(fillRow.row, col);
-        if (!isHardcodedBlueInput(cell)) return;
+        if (!isHardcodedInput(cell)) return;
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
-          unresolved += 1;
+          cell.value = 0;
+          filledCells += 1;
           return;
         }
 
-        const result = roundModelValue(resolved.value / (fillRow.scale ?? 1));
-        cell.value = result;
+        cell.value = resolved.value / (fillRow.scale ?? 1);
         filledCells += 1;
+
+        const sourceLabels = resolved.sources.map((source) => source.note || source.label || source.concept);
+        if (resolved.note) rowNotes.add(resolved.note);
+        if (sourceLabels.length > 1 || fillRow.comment) {
+          rowNotes.add(fillRow.comment || `Included SEC concepts: ${unique(sourceLabels).join(", ")}.`);
+        }
       });
+
+      if (rowNotes.size && isHardcodedInput(sheet.getCell(fillRow.row, 3))) {
+        addComment(sheet.getCell(fillRow.row, 3), Array.from(rowNotes).join(" "));
+        commentsAdded += 1;
+      }
 
       if (unresolved) {
         warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
@@ -509,8 +621,8 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
     .filter((filing: FilingRef) => (isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm"))
     .slice(0, 28);
 
-  const annual = new Map<string, Map<string, number>>();
-  const quarterly = new Map<string, Map<string, number>>();
+  const annual = new Map<string, Map<string, SegmentMetrics>>();
+  const quarterly = new Map<string, Map<string, SegmentMetrics>>();
 
   for (const filing of filings) {
     try {
@@ -543,9 +655,104 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
     .slice(0, 6)
     .map((label) => ({
       label,
-      values: new Map(periods.map((period) => [period, quarterly.get(period)?.get(label) ?? 0]))
+      values: new Map(periods.map((period) => [period, quarterly.get(period)?.get(label)?.revenue ?? 0])),
+      operatingIncome: new Map(periods.map((period) => [period, quarterly.get(period)?.get(label)?.operatingIncome ?? 0])),
+      depreciationAmortization: new Map(periods.map((period) => [period, quarterly.get(period)?.get(label)?.depreciationAmortization ?? 0]))
     }));
 }
+
+async function fetchInlineFactContext(company: CompanyMatch, periods: string[]): Promise<ResolveContext> {
+  const duration = new Map<string, Map<string, FactSource>>();
+  const instant = new Map<string, Map<string, FactSource>>();
+  const response = await fetch(`https://data.sec.gov/submissions/CIK${company.cik}.json`, { headers: SEC_HEADERS });
+  if (!response.ok) return { duration, instant };
+  const submissions = await response.json();
+  const recent = submissions?.filings?.recent;
+  if (!recent) return { duration, instant };
+
+  const wanted = new Set(periods);
+  const filings: FilingRef[] = recent.form
+    .map((form: string, index: number) => ({
+      form,
+      filingDate: recent.filingDate[index],
+      accessionNumber: recent.accessionNumber[index],
+      primaryDocument: recent.primaryDocument[index]
+    }))
+    .filter((filing: FilingRef) => (isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm"))
+    .slice(0, 40);
+
+  for (const filing of filings) {
+    try {
+      const accession = filing.accessionNumber.replace(/-/g, "");
+      const cikNoZeros = String(Number(company.cik));
+      const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
+      const html = await fetch(url, { headers: { ...SEC_HEADERS, Accept: "text/html" } }).then((res) => (res.ok ? res.text() : ""));
+      if (!html) continue;
+      mergeInlineFacts(html, filing, wanted, { duration, instant });
+    } catch {
+      // Inline facts are a supplement to SEC companyfacts; keep filling with the facts already available.
+    }
+  }
+
+  return { duration, instant };
+}
+
+function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext) {
+  const contexts = parseInlineContexts(html);
+  for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
+    const attrs = match[1];
+    const unitRef = attrs.match(/\bunitRef="([^"]+)"/)?.[1] ?? "";
+    if (!/usd|shares/i.test(unitRef)) continue;
+    const name = attrs.match(/\bname="([^"]+)"/)?.[1] ?? "";
+    const concept = name.includes(":") ? name.split(":").pop() ?? name : name;
+    const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
+    if (!concept || !contextRef) continue;
+    const context = contexts.get(contextRef);
+    if (!context?.period || !wanted.has(context.period)) continue;
+    const value = ixNumber(match[2], attrs);
+    if (value === null) continue;
+    const source = {
+      concept,
+      label: concept,
+      value,
+      form: filing.form,
+      filed: filing.filingDate,
+      accn: filing.accessionNumber,
+      start: context.start,
+      end: context.end
+    };
+    setSource(context.instant ? ctx.instant : ctx.duration, context.period, concept, source);
+  }
+}
+
+function parseInlineContexts(html: string) {
+  const contexts = new Map<string, InlineContext>();
+  for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
+    const body = match[0];
+    const instant = body.match(/<xbrli:instant>([^<]+)<\/xbrli:instant>/)?.[1];
+    if (instant) {
+      contexts.set(match[1], { period: periodKeyFromDate(instant), instant: true, end: instant });
+      continue;
+    }
+    const start = body.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
+    const end = body.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
+    if (start && end) {
+      contexts.set(match[1], { period: periodKeyFromDate(end), instant: false, start, end });
+    }
+  }
+  return contexts;
+}
+
+function mergeContexts(target: ResolveContext, source: ResolveContext) {
+  source.instant.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.instant, period, concept, fact)));
+  source.duration.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.duration, period, concept, fact)));
+}
+
+type SegmentMetrics = {
+  revenue?: number;
+  operatingIncome?: number;
+  depreciationAmortization?: number;
+};
 
 function parseInlineSegmentRevenue(html: string, form: string) {
   const contexts = new Map<string, { period: string | null; members: string[] }>();
@@ -556,11 +763,12 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     contexts.set(match[1], { period, members });
   }
 
-  const byPeriod = new Map<string, Map<string, number>>();
+  const byPeriod = new Map<string, Map<string, SegmentMetrics>>();
   for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
     const attrs = match[1];
     const concept = attrs.match(/\bname="([^"]+)"/)?.[1] ?? "";
-    if (!concept.endsWith(":RevenueFromContractWithCustomerExcludingAssessedTax") && !concept.endsWith(":Revenues")) continue;
+    const metric = segmentMetric(concept);
+    if (!metric) continue;
 
     const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
     if (!contextRef) continue;
@@ -573,15 +781,25 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     const value = ixNumber(match[2], attrs);
     if (value === null) continue;
 
-    const periodValues = byPeriod.get(context.period) ?? new Map<string, number>();
-    const existing = periodValues.get(label);
+    const periodValues = byPeriod.get(context.period) ?? new Map<string, SegmentMetrics>();
+    const metrics = periodValues.get(label) ?? {};
+    const existing = metrics[metric];
     if (existing === undefined || preferSegmentFact(context.members, value, existing)) {
-      periodValues.set(label, value);
+      metrics[metric] = value;
+      periodValues.set(label, metrics);
     }
     byPeriod.set(context.period, periodValues);
   }
 
   return byPeriod;
+}
+
+function segmentMetric(concept: string): keyof SegmentMetrics | null {
+  const local = concept.split(":").pop() ?? concept;
+  if (/^(RevenueFromContractWithCustomerExcludingAssessedTax|Revenues|SalesRevenueNet)$/i.test(local)) return "revenue";
+  if (/(OperatingIncomeLoss|SegmentProfitLoss)/i.test(local)) return "operatingIncome";
+  if (/(DepreciationDepletionAndAmortization|DepreciationAndAmortization|DepreciationExpense)/i.test(local)) return "depreciationAmortization";
+  return null;
 }
 
 function contextPeriod(contextXml: string, form: string) {
@@ -600,16 +818,36 @@ function contextPeriod(contextXml: string, form: string) {
 }
 
 function segmentLabelFromMembers(members: string[]) {
-  const product = members.find((member) => member.includes("ProductOrServiceAxis") || /ServiceLine|OtherServiceLine/i.test(member));
+  const product = members.find(
+    (member) =>
+      member.includes("ProductOrServiceAxis") ||
+      /ServiceLine|OtherServiceLine|BusinessSegment|OperatingSegment|StatementBusinessSegments|SegmentAxis/i.test(member)
+  );
   const joined = members.join(" ");
   const source = product || joined;
   if (/CollectionServiceLineMember/i.test(source)) return "Collection";
   if (/LandfillServiceLineMember/i.test(source)) return "Landfill";
   if (/EnvironmentalSolutionsServiceLineMember/i.test(source)) return "Environmental Solutions";
   if (/TransferServiceLineMember/i.test(source)) return "Transfer";
+  if (/InvestmentBankingAndCapitalMarkets/i.test(source)) return "Investment Banking & Capital Markets";
+  if (/AssetManagementAndOther/i.test(source)) return "Asset Management and Other";
+  if (/AssetManagement/i.test(source)) return "Asset Management and Other";
   if (/OtherServiceLineMember/i.test(source)) return "Other";
   if (/ProfessionalServices/i.test(source)) return "Professional Services and Other";
-  return null;
+  return cleanSegmentMember(source);
+}
+
+function cleanSegmentMember(member: string) {
+  const local = member
+    .split(":")
+    .pop()
+    ?.replace(/(Member|Segment|OperatingSegments|BusinessSegments|ServiceLine)$/gi, "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\bAnd\b/g, "and")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!local || /Consolidated|Corporate|Geographic|North America|Europe|Asia|Other Countries/i.test(local)) return null;
+  return local;
 }
 
 function ixNumber(text: string, attrs: string) {
@@ -637,16 +875,23 @@ function preferSegmentFact(members: string[], value: number, existing: number) {
   return Math.abs(value) > Math.abs(existing);
 }
 
-function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, number>>, annual: Map<string, Map<string, number>>) {
+function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, SegmentMetrics>>, annual: Map<string, Map<string, SegmentMetrics>>) {
   for (const [period, annualValues] of annual.entries()) {
     const year = period.slice(2);
     const q1 = quarterly.get(`1Q${year}`);
     const q2 = quarterly.get(`2Q${year}`);
     const q3 = quarterly.get(`3Q${year}`);
     if (!q1 || !q2 || !q3) continue;
-    const q4 = quarterly.get(period) ?? new Map<string, number>();
-    annualValues.forEach((value, label) => {
-      q4.set(label, value - (q1.get(label) ?? 0) - (q2.get(label) ?? 0) - (q3.get(label) ?? 0));
+    const q4 = quarterly.get(period) ?? new Map<string, SegmentMetrics>();
+    annualValues.forEach((metrics, label) => {
+      const q4Metrics = q4.get(label) ?? {};
+      (["revenue", "operatingIncome", "depreciationAmortization"] as const).forEach((metric) => {
+        const annualValue = metrics[metric];
+        if (annualValue === undefined) return;
+        q4Metrics[metric] =
+          annualValue - (q1.get(label)?.[metric] ?? 0) - (q2.get(label)?.[metric] ?? 0) - (q3.get(label)?.[metric] ?? 0);
+      });
+      q4.set(label, q4Metrics);
     });
     quarterly.set(period, q4);
   }
@@ -658,38 +903,40 @@ function segmentSort(a: string, b: string) {
 }
 
 function buildFactContext(payload: any): ResolveContext {
-  const usGaap = payload?.facts?.["us-gaap"] ?? {};
+  const taxonomies = Object.values(payload?.facts ?? {}) as any[];
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
   const cumulativeDuration = new Map<string, Map<string, FactSource>>();
   const annualDuration = new Map<string, Map<string, FactSource>>();
 
-  for (const [concept, detail] of Object.entries<any>(usGaap)) {
-    const label = detail.label || concept;
-    const units = detail.units ?? {};
-    const unitFacts: SecFact[] = units.USD ?? units.shares ?? units["USD/shares"] ?? Object.values(units)[0] ?? [];
-    for (const fact of unitFacts) {
-      if (!isUsableFact(fact)) continue;
-      const instantFact = isInstantFact(fact);
-      const period = periodKey(fact);
-      if (!period) continue;
-      const source = {
-        concept,
-        label,
-        value: fact.val,
-        form: fact.form,
-        fp: fact.fp,
-        filed: fact.filed,
-        accn: fact.accn,
-        start: fact.start,
-        end: fact.end
-      };
-      if (!instantFact && isAnnualDurationFact(fact)) {
-        setSource(annualDuration, period, concept, source);
-      } else if (!instantFact && isYearToDateFact(fact)) {
-        setSource(cumulativeDuration, period, concept, source);
-      } else if (instantFact || isQuarterDurationFact(fact)) {
-        setSource(instantFact ? instant : duration, period, concept, source);
+  for (const taxonomy of taxonomies) {
+    for (const [concept, detail] of Object.entries<any>(taxonomy)) {
+      const label = detail.label || concept;
+      const units = detail.units ?? {};
+      const unitFacts: SecFact[] = units.USD ?? units.shares ?? units["USD/shares"] ?? Object.values(units)[0] ?? [];
+      for (const fact of unitFacts) {
+        if (!isUsableFact(fact)) continue;
+        const instantFact = isInstantFact(fact);
+        const period = fact.end ? periodKeyFromDate(fact.end) : periodKey(fact);
+        if (!period) continue;
+        const source = {
+          concept,
+          label,
+          value: fact.val,
+          form: fact.form,
+          fp: fact.fp,
+          filed: fact.filed,
+          accn: fact.accn,
+          start: fact.start,
+          end: fact.end
+        };
+        if (!instantFact && isAnnualDurationFact(fact)) {
+          setSource(annualDuration, period, concept, source);
+        } else if (!instantFact && isYearToDateFact(fact)) {
+          setSource(cumulativeDuration, period, concept, source);
+        } else if (instantFact || isQuarterDurationFact(fact)) {
+          setSource(instantFact ? instant : duration, period, concept, source);
+        }
       }
     }
   }
@@ -816,6 +1063,13 @@ function periodKey(fact: SecFact) {
   return null;
 }
 
+function periodKeyFromDate(date: string) {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
+  const quarter = Math.floor(parsed.getUTCMonth() / 3) + 1;
+  return `${quarter}Q${String(parsed.getUTCFullYear()).slice(-2)}`;
+}
+
 function preferSource(period: string, next: FactSource, current: FactSource) {
   const nextScore = sourceScore(period, next);
   const currentScore = sourceScore(period, current);
@@ -915,6 +1169,41 @@ function cellDisplay(cell: ExcelJS.Cell) {
   return "";
 }
 
+function derivedQuarterFormula(fillRow: FillRow, resolved: ResolvedValue, periods: string[], columns: number[], periodIndex: number) {
+  const source = derivedSource(resolved);
+  if (source?.derivedTotalValue === undefined || !source.derivedPriorPeriods?.length) return null;
+
+  const priorIndexes = source.derivedPriorPeriods.map((priorPeriod) => periods.indexOf(priorPeriod));
+  if (!priorIndexes.every((index) => index >= 0 && index < periodIndex)) return null;
+
+  const priorColumns = priorIndexes.map((index) => columns[index]);
+  const total = roundModelValue(signedDerivedTotal(source.derivedTotalValue, fillRow.sign) / (fillRow.scale ?? 1));
+  return `${formatFormulaNumber(total)}-SUM(${columnLetter(Math.min(...priorColumns))}${fillRow.row}:${columnLetter(Math.max(...priorColumns))}${fillRow.row})`;
+}
+
+function derivedSource(resolved: ResolvedValue) {
+  return resolved.sources.find((source) => source.derivedTotalValue !== undefined && source.derivedPriorPeriods?.length);
+}
+
+function signedDerivedTotal(value: number, sign: FillRow["sign"]) {
+  return sign === -1 ? -Math.abs(value) : value;
+}
+
+function formatFormulaNumber(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function columnLetter(col: number) {
+  let value = col;
+  let letters = "";
+  while (value > 0) {
+    const remainder = (value - 1) % 26;
+    letters = String.fromCharCode(65 + remainder) + letters;
+    value = Math.floor((value - 1) / 26);
+  }
+  return letters;
+}
+
 function fillSegmentAnalysis(
   sheet: ExcelJS.Worksheet,
   company: CompanyMatch,
@@ -927,14 +1216,19 @@ function fillSegmentAnalysis(
   let filledCells = 0;
   let commentsAdded = 0;
   const fallbackRevenue = periods.map((period) => first(period, ctx.duration, C.revenue)?.value ?? 0);
-  const rows = segmentRevenueRows(sheet).slice(0, 6);
+  const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix").slice(0, 6);
+  const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check").slice(0, 6);
+  const depreciationRows = segmentMetricRows(sheet, "Total D&A", "D&A Check").slice(0, 6);
+  const labelRows = segmentMixLabelRows(sheet).slice(0, 6);
 
   const usableSegments = segments.length
     ? segments
     : [
         {
           label: company.title.replace(/,?\s+INC\.?$/i, ""),
-          values: new Map(periods.map((period, index) => [period, fallbackRevenue[index]]))
+          values: new Map(periods.map((period, index) => [period, fallbackRevenue[index]])),
+          operatingIncome: new Map(periods.map((period) => [period, 0])),
+          depreciationAmortization: new Map(periods.map((period) => [period, 0]))
         }
       ];
 
@@ -942,29 +1236,79 @@ function fillSegmentAnalysis(
     warnings.push("No service-line revenue facts found in recent inline XBRL filings; Segment Analysis uses one total company revenue line.");
   }
 
-  for (let index = 0; index < rows.length; index += 1) {
+  const revenueResult = fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue");
+  const operatingIncomeResult = fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, usableSegments, "operatingIncome", "Operating Income");
+  const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A");
+  filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
+
+  for (let index = 0; index < labelRows.length; index += 1) {
     const segment = usableSegments[index];
-    periods.forEach((period, periodIndex) => {
-      const col = columns[periodIndex];
-      const cell = sheet.getCell(rows[index], col);
-      if (!isHardcodedBlueInput(cell)) return;
-      cell.value = roundModelValue((segment?.values.get(period) ?? 0) / 1_000_000);
+    const labelCell = sheet.getCell(labelRows[index], 3);
+    if (segment && isHardcodedBlueInput(labelCell)) {
+      labelCell.value = segment.label;
       filledCells += 1;
-    });
+    }
+  }
+
+  const noteCell = firstCommentableCell(sheet, [...rows, ...operatingIncomeRows, ...depreciationRows, ...labelRows]);
+  if (noteCell) {
+    addComment(
+      noteCell,
+      "Segment Analysis historicals were filled only in blue input cells. Visible total/check formulas were preserved; where the template uses helper segment rows, those blue rows drive the revenue mix, operating income mix, D&A mix, and checks."
+    );
+    commentsAdded += 1;
   }
 
   return { filledCells, commentsAdded, warnings };
 }
 
-function segmentRevenueRows(sheet: ExcelJS.Worksheet) {
-  const totalRevenueRow = findLabelRow(sheet, "Total Company Revenue");
-  const revenueMixRow = findLabelRow(sheet, "Revenue Mix");
-  if (!totalRevenueRow || !revenueMixRow || revenueMixRow <= totalRevenueRow) return [8, 9, 10, 11, 12, 13];
+function fillSegmentMetricRows(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  rows: number[],
+  segments: SegmentRevenue[],
+  metric: "values" | "operatingIncome" | "depreciationAmortization",
+  suffix: string
+) {
+  let filledCells = 0;
+  const usedSegments = new Set<number>();
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
+    const rowNumber = rows[rowIndex];
+    const existingLabel = segmentBaseLabel(cellDisplay(sheet.getCell(rowNumber, 3)), suffix);
+    const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments) ?? nextUnusedSegmentIndex(segments, usedSegments);
+    if (segmentIndex === null) continue;
+
+    const segment = segments[segmentIndex];
+    usedSegments.add(segmentIndex);
+
+    const labelCell = sheet.getCell(rowNumber, 3);
+    if (isHardcodedBlueInput(labelCell)) {
+      labelCell.value = suffix === "Revenue" ? `${segment.label} Revenue` : `${segment.label} ${suffix}`;
+      filledCells += 1;
+    }
+
+    periods.forEach((period, periodIndex) => {
+      const cell = sheet.getCell(rowNumber, columns[periodIndex]);
+      if (!isHardcodedBlueInput(cell)) return;
+      cell.value = roundModelValue((segment[metric].get(period) ?? 0) / 1_000_000);
+      filledCells += 1;
+    });
+  }
+
+  return { filledCells };
+}
+
+function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabel: string) {
+  const startRow = findLabelRow(sheet, startLabel);
+  const endRow = findLabelRow(sheet, endLabel);
+  if (!startRow || !endRow || endRow <= startRow) return [];
   const rows: number[] = [];
-  for (let rowNumber = totalRevenueRow + 1; rowNumber < revenueMixRow; rowNumber += 1) {
+  for (let rowNumber = startRow + 1; rowNumber < endRow; rowNumber += 1) {
     if (isBlue(sheet.getCell(rowNumber, 3)) || rowHasBlueInputs(sheet, rowNumber)) rows.push(rowNumber);
   }
-  return rows.length ? rows : [8, 9, 10, 11, 12, 13];
+  return rows;
 }
 
 function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
@@ -976,6 +1320,40 @@ function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
     if (cellDisplay(sheet.getCell(rowNumber, 3)).trim()) rows.push(rowNumber);
   }
   return rows.length ? rows : [16, 17, 18, 19, 20, 21];
+}
+
+function segmentBaseLabel(label: string, suffix: string) {
+  return label
+    .replace(/^"+|"+$/g, "")
+    .replace(new RegExp(`\\s*${suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i"), "")
+    .replace(/\s*Revenue\s*$/i, "")
+    .replace(/\s*Operating Income\s*$/i, "")
+    .replace(/\s*D&A\s*$/i, "")
+    .trim();
+}
+
+function segmentIndexForRow(label: string, segments: SegmentRevenue[], used: Set<number>) {
+  if (!label) return null;
+  const normalizedLabel = normalize(label);
+  const index = segments.findIndex((segment, segmentIndex) => {
+    if (used.has(segmentIndex)) return false;
+    const normalizedSegment = normalize(segment.label);
+    return normalizedSegment === normalizedLabel || normalizedSegment.includes(normalizedLabel) || normalizedLabel.includes(normalizedSegment);
+  });
+  return index === -1 ? null : index;
+}
+
+function nextUnusedSegmentIndex(segments: SegmentRevenue[], used: Set<number>) {
+  const index = segments.findIndex((_, segmentIndex) => !used.has(segmentIndex));
+  return index === -1 ? null : index;
+}
+
+function firstCommentableCell(sheet: ExcelJS.Worksheet, rows: number[]) {
+  for (const rowNumber of rows) {
+    const cell = sheet.getCell(rowNumber, 3);
+    if (canAddComment(cell)) return cell;
+  }
+  return null;
 }
 
 function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
@@ -999,6 +1377,10 @@ function isBlue(cell: ExcelJS.Cell) {
 
 function isHardcodedBlueInput(cell: ExcelJS.Cell) {
   return isBlue(cell) && !hasFormula(cell);
+}
+
+function canAddComment(cell: ExcelJS.Cell) {
+  return !hasFormula(cell);
 }
 
 function hasFormula(cell: ExcelJS.Cell) {
@@ -1035,6 +1417,21 @@ function sum(period: string, map: Map<string, Map<string, FactSource>>, concepts
   };
 }
 
+function sumWithNote(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[], note: string): ResolvedValue {
+  const result = sum(period, map, concepts);
+  return result ? { ...result, note } : { value: null, sources: [], note };
+}
+
+function sumResolved(items: Array<ResolvedValue | null | undefined>, note: string): ResolvedValue {
+  const valid = items.filter((item): item is ResolvedValue => Boolean(item && item.value !== null));
+  if (!valid.length) return { value: null, sources: [], note };
+  return {
+    value: valid.reduce((total, item) => total + (item.value ?? 0), 0),
+    sources: compactSources(valid),
+    note
+  };
+}
+
 function difference(period: string, map: Map<string, Map<string, FactSource>>, totalConcepts: string[], lessConceptGroups: string[][], note: string): ResolvedValue {
   const total = first(period, map, totalConcepts);
   if (!total) return { value: null, sources: [], note };
@@ -1064,6 +1461,11 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
     if (!item) return [];
     return "sources" in item ? item.sources : [item];
   });
+}
+
+function addComment(cell: ExcelJS.Cell, text: string) {
+  const existing = typeof cell.note === "string" ? `${cell.note}\n\n` : "";
+  cell.note = `${existing}Historicals Solver: ${text}`;
 }
 
 function roundModelValue(value: number) {
