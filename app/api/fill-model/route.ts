@@ -94,13 +94,13 @@ const MODEL_SHEET = "Model";
 const SEGMENT_SHEET = "Segment Analysis";
 
 const C = {
-  revenue: ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"],
+  revenue: ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
   cogs: ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"],
   sga: ["SellingGeneralAndAdministrativeExpense", "GeneralAndAdministrativeExpense"],
   rd: ["ResearchAndDevelopmentExpense"],
   da: ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"],
   interestIncome: ["InterestIncomeExpenseNonOperatingNet", "InterestIncomeNonOperating"],
-  interestExpense: ["InterestExpenseNonOperating", "InterestExpense"],
+  interestExpense: ["InterestExpenseOperating", "InterestExpenseNonOperating", "InterestExpense"],
   impairment: ["GoodwillImpairmentLosses", "ImpairmentOfGoodwillAndIntangibleAssets"],
   otherNonOp: ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense"],
   taxes: ["IncomeTaxExpenseBenefit"],
@@ -115,7 +115,11 @@ const C = {
   receivables: ["AccountsReceivableNetCurrent"],
   inventory: ["InventoryNet"],
   currentAssets: ["AssetsCurrent"],
-  ppe: ["PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization", "PropertyPlantAndEquipmentNet"],
+  ppe: [
+    "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization",
+    "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+    "PropertyPlantAndEquipmentNet"
+  ],
   intangibles: ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"],
   goodwill: ["Goodwill"],
   assets: ["Assets"],
@@ -169,6 +173,23 @@ const BROKER_DEALER_OTHER_CURRENT_LIABILITIES = [
   "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent",
   "OperatingLeaseLiability",
   "ContractWithCustomerLiabilityCurrent"
+];
+
+const NON_COMPENSATION_EXPENSE_CONCEPTS = [
+  "FloorBrokerageExchangeAndClearanceFees",
+  "UnderwritingCosts",
+  "CommunicationsAndInformationTechnology",
+  "OccupancyNet",
+  "BusinessDevelopment",
+  "ProfessionalFees"
+];
+
+const OTHER_OPERATING_EXPENSE_CONCEPTS = ["CostOfGoodsAndServicesSold", "OtherExpenses"];
+
+const NONCONTROLLING_INCOME_CONCEPTS = [
+  "NetIncomeLossAttributableToNonredeemableNoncontrollingInterest",
+  "NetIncomeLossAttributableToRedeemableNoncontrollingInterest",
+  "NetIncomeLossAttributableToNoncontrollingInterest"
 ];
 
 const COMPENSATION_CONCEPTS = [
@@ -257,18 +278,22 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits")) {
     return plug(rowNumber, label, "income", "duration", resolveCompensationExpense);
   }
-  if (has("Non-Compensation Expenses")) return row(rowNumber, label, "income", "duration", C.sga, -1);
+  if (has("Non-Compensation Expenses")) return plug(rowNumber, label, "income", "duration", resolveNonCompensationExpense);
   if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense")) return row(rowNumber, label, "income", "duration", C.da, -1);
   if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
-  if (has("Other Operating Income (Expense)")) return row(rowNumber, label, "income", "duration", ["OtherOperatingIncomeExpenseNet"]);
+  if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome);
-  if (has("Interest (Expense)", "Interest Expense")) return row(rowNumber, label, "income", "duration", C.interestExpense, -1);
+  if (has("Interest (Expense)")) return row(rowNumber, label, "income", "duration", []);
+  if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense);
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
   if (has("Income Tax Benefit (Expense)", "Income Tax Expense")) return row(rowNumber, label, "income", "duration", C.taxes, -1);
-  if (has("Pre-Tax Adjustments", "Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", []);
+  if (has("Pre-Tax Adjustments")) return row(rowNumber, label, "income", "duration", []);
+  if (has("Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"], -1);
   if (has("Discontinued Operations")) return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
-  if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) return row(rowNumber, label, "income", "duration", ["NetIncomeLossAttributableToNoncontrollingInterest"], -1);
+  if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) {
+    return plug(rowNumber, label, "income", "duration", resolveNoncontrollingIncome);
+  }
 
   if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents")) return row(rowNumber, label, "balance", "instant", C.cash);
   if (has("Accounts Receivable", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
@@ -277,7 +302,7 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
     return plug(rowNumber, label, "balance", "instant", resolvePrepaidAndOtherCurrentAssets);
   }
   if (has("PP&E, Net", "Property Plant and Equipment Net")) {
-    return row(rowNumber, label, "balance", "instant", [...C.ppe, "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"]);
+    return plug(rowNumber, label, "balance", "instant", resolvePpe);
   }
   if (has("Intangible Assets, Net")) return plug(rowNumber, label, "balance", "instant", resolveIntangibleAssets);
   if (has("Goodwill")) return row(rowNumber, label, "balance", "instant", C.goodwill);
@@ -308,7 +333,7 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Accumulated Other Comprehensive Income (AOCI)", "AOCI")) return row(rowNumber, label, "balance", "instant", C.aoci);
   if (has("Noncontrolling Interests", "Non-Controlling Interests")) return row(rowNumber, label, "balance", "instant", C.nci);
 
-  if (has("Capital Expenditures", "Capex")) return row(rowNumber, label, "support", "duration", C.capex);
+  if (has("Capital Expenditures", "Capex")) return row(rowNumber, label, "support", "duration", C.capex, -1);
   if (has("Purchases of Intangibles")) return row(rowNumber, label, "support", "duration", ["PaymentsToAcquireIntangibleAssets"]);
   if (has("Purchases of Investments")) return row(rowNumber, label, "support", "duration", PURCHASES_OF_INVESTMENTS_CONCEPTS);
   if (has("Acquisition / (Divestment) of Businesses", "Proceeds From/(Acquisitions of) Businesses", "Proceeds From (Acquisitions of) Businesses")) {
@@ -335,6 +360,85 @@ function resolveCompensationExpense(period: string, ctx: ResolveContext): Resolv
   return { value: null, sources: [], note: "No dedicated compensation and benefits concept was available in SEC company facts." };
 }
 
+function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const facts = ctx.duration.get(period);
+  const revenue = first(period, ctx.duration, ["Revenues"]);
+  const netRevenue = first(period, ctx.duration, ["RevenuesNetOfInterestExpense"]);
+  const fallback =
+    revenue && netRevenue
+      ? {
+          value: -Math.abs(revenue.value - netRevenue.value),
+          sources: [revenue, netRevenue],
+          note: "Calculated as SEC revenues less revenues net of interest expense."
+        }
+      : null;
+  if (!facts) return fallback ?? { value: null, sources: [] };
+  for (const concept of C.interestExpense) {
+    const source = facts.get(concept);
+    if (source && source.value !== 0) {
+      return {
+        value: -Math.abs(source.value),
+        sources: [source],
+        note: "Included SEC interest expense, including operating interest expense when that is the company's presentation."
+      };
+    }
+  }
+  const zero = first(period, ctx.duration, C.interestExpense);
+  if (fallback && (!zero || zero.value === 0)) return fallback;
+  return zero ? { value: 0, sources: [zero] } : { value: null, sources: [] };
+}
+
+function resolveNonCompensationExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const detail = sumWithNote(
+    period,
+    ctx.duration,
+    NON_COMPENSATION_EXPENSE_CONCEPTS,
+    "Included floor brokerage and clearing fees, underwriting costs, technology and communications, occupancy and equipment rental, business development, and professional services from the SEC non-interest expense table."
+  );
+  if (detail.value !== null) return signed(detail, -1) ?? detail;
+
+  const noninterestExpense = first(period, ctx.duration, ["NoninterestExpense"]);
+  const compensation = resolveCompensationExpense(period, ctx);
+  const depreciation = first(period, ctx.duration, C.da) ?? zeroSource(C.da[0]);
+  const otherOperating = resolveOtherOperatingIncomeExpense(period, ctx);
+  if (noninterestExpense && compensation.value !== null && otherOperating.value !== null) {
+    return {
+      value: -Math.abs(noninterestExpense.value - Math.abs(compensation.value) - depreciation.value - Math.abs(otherOperating.value)),
+      sources: compactSources([noninterestExpense, compensation, depreciation, otherOperating]),
+      note: "Calculated from SEC non-interest expense less compensation, depreciation and amortization, and other operating expense detail."
+    };
+  }
+  return { value: null, sources: [], note: "No non-compensation expense detail was available in SEC facts." };
+}
+
+function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const detail = sumWithNote(
+    period,
+    ctx.duration,
+    OTHER_OPERATING_EXPENSE_CONCEPTS,
+    "Included cost of sales and other expenses from the SEC non-interest expense table."
+  );
+  if (detail.value !== null) return signed(detail, -1) ?? detail;
+  const direct = first(period, ctx.duration, ["OtherOperatingIncomeExpenseNet"]);
+  return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
+}
+
+function resolveNoncontrollingIncome(period: string, ctx: ResolveContext): ResolvedValue {
+  const detail = sumWithNote(
+    period,
+    ctx.duration,
+    NONCONTROLLING_INCOME_CONCEPTS,
+    "Included nonredeemable and redeemable noncontrolling-interest income/loss attributable to non-controlling interests."
+  );
+  if (detail.value !== null) {
+    return {
+      ...detail,
+      value: -detail.value
+    };
+  }
+  return { value: null, sources: [] };
+}
+
 function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
   const aggregate = first(period, ctx.instant, [
     "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
@@ -353,6 +457,11 @@ function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
       "LongTermDebtAndCapitalLeaseObligationsCurrent"
     ]) ?? { value: null, sources: [] }
   );
+}
+
+function resolvePpe(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.ppe);
+  return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
 }
 
 function resolveAccountsReceivable(period: string, ctx: ResolveContext): ResolvedValue {
@@ -399,13 +508,14 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
   const assets = first(period, ctx.instant, C.assets);
-  const currentAssets = first(period, ctx.instant, C.currentAssets);
-  const ppe = first(period, ctx.instant, [...C.ppe, "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"]) ?? zeroSource(C.ppe[0]);
+  const modeledCurrentAssets = resolveCurrentAssetsFromModeledRows(period, ctx);
+  const currentAssets = modeledCurrentAssets.value !== null ? modeledCurrentAssets : first(period, ctx.instant, C.currentAssets);
+  const ppe = resolvePpe(period, ctx);
   const intangibles = resolveIntangibleAssets(period, ctx);
   const goodwill = first(period, ctx.instant, C.goodwill) ?? zeroSource(C.goodwill[0]);
-  if (assets && currentAssets && intangibles.value !== null) {
+  if (assets && currentAssets && currentAssets.value !== null && ppe.value !== null && intangibles.value !== null) {
     return {
-      value: assets.value - currentAssets.value - ppe.value - intangibles.value - goodwill.value,
+      value: assets.value - currentAssets.value - (ppe.value ?? 0) - intangibles.value - goodwill.value,
       sources: compactSources([assets, currentAssets, ppe, intangibles, goodwill]),
       note: "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill."
     };
@@ -416,6 +526,19 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
     ["OtherAssetsNoncurrent", "OtherAssets", "AssetsOfDisposalGroupIncludingDiscontinuedOperation"],
     "Included other assets and assets of disposal groups / discontinued operations reported in the SEC filing."
   );
+}
+
+function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext): ResolvedValue {
+  const cash = first(period, ctx.instant, C.cash) ?? zeroSource(C.cash[0]);
+  const receivables = resolveAccountsReceivable(period, ctx);
+  const inventory = first(period, ctx.instant, C.inventory) ?? zeroSource(C.inventory[0]);
+  const prepaidAndOther = resolvePrepaidAndOtherCurrentAssets(period, ctx);
+  if (receivables.value === null || prepaidAndOther.value === null) return { value: null, sources: [] };
+  return {
+    value: cash.value + receivables.value + inventory.value + prepaidAndOther.value,
+    sources: compactSources([cash, receivables, inventory, prepaidAndOther]),
+    note: "Calculated from modeled current-asset rows because SEC did not report a separate current assets subtotal."
+  };
 }
 
 function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
@@ -748,6 +871,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
     const concept = name.includes(":") ? name.split(":").pop() ?? name : name;
     const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
     if (!concept || !contextRef) continue;
+    if (["AssetsCurrent", "OtherAssets"].includes(concept)) continue;
     const context = contexts.get(contextRef);
     if (!context?.period || !wanted.has(context.period)) continue;
     const value = ixNumber(match[2], attrs);
@@ -990,6 +1114,15 @@ function buildFactContext(payload: any): ResolveContext {
 function setSource(map: Map<string, Map<string, FactSource>>, period: string, concept: string, source: FactSource) {
   const periodFacts = map.get(period) ?? new Map<string, FactSource>();
   const existing = periodFacts.get(concept);
+  if (existing && existing.value !== 0 && source.value === 0) {
+    map.set(period, periodFacts);
+    return;
+  }
+  if (existing && existing.value === 0 && source.value !== 0) {
+    periodFacts.set(concept, source);
+    map.set(period, periodFacts);
+    return;
+  }
   if (existing && !preferSource(period, source, existing)) {
     map.set(period, periodFacts);
     return;
@@ -1010,6 +1143,7 @@ function deriveQuarterlies(
       cumulativeFacts.forEach((source, concept) => setSource(duration, period, concept, source));
     } else if (quarter === 2) {
       cumulativeFacts.forEach((source, concept) => {
+        if (!canDeriveQuarterlyConcept(concept)) return;
         const q1 = cumulativeDuration.get(`1Q${year}`)?.get(concept) ?? duration.get(`1Q${year}`)?.get(concept);
         if (q1 && !duration.get(period)?.get(concept)) {
           setSource(duration, period, concept, {
@@ -1024,6 +1158,7 @@ function deriveQuarterlies(
       });
     } else if (quarter === 3) {
       cumulativeFacts.forEach((source, concept) => {
+        if (!canDeriveQuarterlyConcept(concept)) return;
         const q2Cumulative = cumulativeDuration.get(`2Q${year}`)?.get(concept);
         const q1 = duration.get(`1Q${year}`)?.get(concept);
         const q2 = duration.get(`2Q${year}`)?.get(concept);
@@ -1045,6 +1180,7 @@ function deriveQuarterlies(
   for (const [period, annualFacts] of annualDuration.entries()) {
     const year = period.slice(2);
     for (const [concept, annual] of annualFacts.entries()) {
+      if (!canDeriveQuarterlyConcept(concept)) continue;
       const nineMonth = cumulativeDuration.get(`3Q${year}`)?.get(concept);
       const q1 = duration.get(`1Q${year}`)?.get(concept);
       const q2 = duration.get(`2Q${year}`)?.get(concept);
@@ -1061,6 +1197,10 @@ function deriveQuarterlies(
       });
     }
   }
+}
+
+function canDeriveQuarterlyConcept(concept: string) {
+  return !/WeightedAverage|EarningsPerShare|SharesOutstanding/i.test(concept);
 }
 
 function isYearToDateFact(fact: SecFact) {
@@ -1121,6 +1261,7 @@ function preferSource(period: string, next: FactSource, current: FactSource) {
 function sourceScore(period: string, source: FactSource) {
   const quarter = period[0];
   let score = 0;
+  const durationDays = source.start && source.end ? factDurationDays({ start: source.start, end: source.end } as SecFact) : 0;
   if (quarter === "4") {
     if (isTenK(source.form)) score += 20;
     if (source.fp === "FY" || source.fp === "Q4") score += 10;
@@ -1128,6 +1269,9 @@ function sourceScore(period: string, source: FactSource) {
     if (isTenQ(source.form)) score += 20;
     if (source.fp === `Q${quarter}`) score += 10;
   }
+  if (durationDays > 115 && source.derivedTotalValue === undefined) score -= 50;
+  if (durationDays > 0 && durationDays <= 115) score += 5;
+  if (source.derivedTotalValue !== undefined) score += 5;
   return score;
 }
 
