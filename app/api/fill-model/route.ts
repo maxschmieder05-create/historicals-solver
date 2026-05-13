@@ -43,6 +43,7 @@ type PeriodValues = Record<string, number | null>;
 type FillRow = {
   row: number;
   label: string;
+  classification: RowClassification;
   statement: "income" | "balance" | "support";
   kind: "duration" | "instant";
   scale?: number;
@@ -50,12 +51,15 @@ type FillRow = {
   concepts?: string[];
   resolver?: (period: string, ctx: ResolveContext) => ResolvedValue;
   comment?: string;
+  noFillComment?: string;
+  modelContext?: ModelRowContext;
 };
 
 type ResolvedValue = {
   value: number | null;
   sources: FactSource[];
   note?: string;
+  classification?: RowClassification;
 };
 
 type ResolveContext = {
@@ -82,6 +86,23 @@ type FilingRef = {
   filingDate: string;
   form: string;
   primaryDocument: string;
+};
+
+type RowClassification = "direct" | "grouped" | "partial" | "formula" | "unused";
+
+type ModelRowContext = {
+  sheetName: string;
+  row: number;
+  label: string;
+  sectionHeader?: string;
+  previousLabel?: string;
+  nextLabel?: string;
+  indentation: number;
+  hasHistoricalFormula: boolean;
+  hasHardcodedInput: boolean;
+  subtotalFormula?: string;
+  projectedColumns: number;
+  signConvention: 1 | -1;
 };
 
 const SEC_HEADERS = {
@@ -308,9 +329,10 @@ function row(
   concepts: string[],
   sign: 1 | -1 = 1,
   scale = 1_000_000,
-  comment?: string
+  comment?: string,
+  classification: RowClassification = concepts.length ? "direct" : "unused"
 ): FillRow {
-  return { row: rowNumber, label, statement, kind, concepts, sign, scale, comment };
+  return { row: rowNumber, label, classification, statement, kind, concepts, sign, scale, comment };
 }
 
 function plug(
@@ -318,21 +340,23 @@ function plug(
   label: string,
   statement: FillRow["statement"],
   kind: FillRow["kind"],
-  resolver: FillRow["resolver"]
+  resolver: FillRow["resolver"],
+  classification: RowClassification = "grouped"
 ): FillRow {
-  return { row: rowNumber, label, statement, kind, resolver, scale: 1_000_000 };
+  return { row: rowNumber, label, classification, statement, kind, resolver, scale: 1_000_000 };
 }
 
-function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[]) {
+function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInfos: Array<{ period: string; isEstimate: boolean }> = []) {
   const rows: FillRow[] = [];
   const seen = new Set<number>();
 
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    if (!columns.some((col) => isHardcodedFinancialInput(sheet.getCell(rowNumber, col)))) continue;
+    const modelContext = modelRowContext(sheet, rowNumber, columns, periodInfos);
+    if (!modelContext.hasHardcodedInput && !modelContext.hasHistoricalFormula) continue;
     const label = rowLabel(sheet, rowNumber);
     if (!label || seen.has(rowNumber)) continue;
-    const fillRow = fillRowForLabel(rowNumber, label);
-    if (!fillRow) continue;
+    const fillRow = fillRowForContext(modelContext) ?? unusedRow(modelContext);
+    fillRow.modelContext = modelContext;
     rows.push(fillRow);
     seen.add(rowNumber);
   }
@@ -341,12 +365,20 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[]) {
 }
 
 function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
+  return fillRowForContext({ sheetName: MODEL_SHEET, row: rowNumber, label, indentation: 0, hasHistoricalFormula: false, hasHardcodedInput: true, projectedColumns: 0, signConvention: 1 });
+}
+
+function fillRowForContext(context: ModelRowContext): FillRow | null {
+  const { row: rowNumber, label } = context;
   const key = normalize(label);
   const has = (...aliases: string[]) => aliases.some((alias) => key === normalize(alias));
   const includes = (...aliases: string[]) => aliases.some((alias) => key.includes(normalize(alias)));
+  const around = normalize([context.sectionHeader, context.previousLabel, context.nextLabel].filter(Boolean).join(" "));
+  const inSection = (...aliases: string[]) => aliases.some((alias) => around.includes(normalize(alias)));
   const hasRevenue = has("Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue");
   const hasNetRevenue = has("Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense");
 
+  if (context.hasHistoricalFormula && !context.hasHardcodedInput) return formulaRow(context);
   if (hasNetRevenue) return row(rowNumber, label, "income", "duration", C.netRevenue, 1, 1_000_000, "Mapped to SEC revenues net of interest expense when reported.");
   if (hasRevenue) return row(rowNumber, label, "income", "duration", C.revenue, 1, 1_000_000, "Mapped to the closest SEC total revenue concept.");
   if (has("Gross Profit", "Gross Margin Dollars")) return row(rowNumber, label, "income", "duration", C.grossProfit, 1, 1_000_000, "Mapped to SEC gross profit.");
@@ -369,16 +401,24 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   }
   if (has("Research & Development (R&D)", "Research and Development")) return row(rowNumber, label, "income", "duration", C.rd, -1);
   if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits", "Employee Compensation & Benefits")) {
-    return plug(rowNumber, label, "income", "duration", resolveCompensationExpense);
+    return plug(rowNumber, label, "income", "duration", resolveCompensationExpense, "direct");
   }
-  if (has("Non-Compensation Expenses")) return plug(rowNumber, label, "income", "duration", resolveNonCompensationExpense);
+  if (has("Non-Compensation Expenses") || (includes("Non Compensation", "Non-Compensation") && inSection("Expense", "Operating"))) {
+    return plug(rowNumber, label, "income", "duration", resolveNonCompensationExpense);
+  }
+  if (
+    has("Other Operating Expenses", "Other Operating Expense") ||
+    (has("Other", "Other Expenses", "Other Expense") && context.indentation > 0 && inSection("Operating Expense", "Operating Expenses", "Noninterest Expense", "Expenses"))
+  ) {
+    return plug(rowNumber, label, "income", "duration", resolveOtherOperatingExpenseGroup);
+  }
   if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense", "Depreciation & Amortization (incl. in SG&A)")) return row(rowNumber, label, "income", "duration", C.da, -1);
   if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
   if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
   if (has("Total Provisions for Credit Losses", "Provision for Credit Losses")) return row(rowNumber, label, "income", "duration", C.creditLossProvision, -1);
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
-  if (has("Interest (Expense)")) return row(rowNumber, label, "income", "duration", []);
-  if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense);
+  if (has("Interest (Expense)")) return reviewRow(context, "Split / partial match: the model row could represent multiple EDGAR interest presentation styles. Needs review.");
+  if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
   if (has("Gain on Sale of Business (Loss)")) return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets"], 1);
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
@@ -386,7 +426,7 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Net Unrealized Debt Securities Gains (Losses)")) return row(rowNumber, label, "income", "duration", C.unrealizedDebtSecurities);
   if (has("FX Adjustments")) return row(rowNumber, label, "income", "duration", C.foreignCurrencyAdjustments);
   if (has("Net Unrealized Pension and Other Benefits")) return row(rowNumber, label, "income", "duration", C.pensionAdjustments);
-  if (has("Pre-Tax Adjustments")) return row(rowNumber, label, "income", "duration", []);
+  if (has("Pre-Tax Adjustments")) return reviewRow(context, "Split / partial match: EDGAR adjustment detail is not consistently available for this model row. Needs review.");
   if (has("Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"], -1);
   if (has("Discontinued Operations")) return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
   if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) {
@@ -451,13 +491,54 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Dividends", "Dividends Issued")) return row(rowNumber, label, "support", "duration", C.dividends, -1);
   if (has("Change in Noncontrolling Interests")) return row(rowNumber, label, "support", "duration", C.noncontrollingInterestChange);
   if (has("Effect of FX Rate Changes on Cash")) return row(rowNumber, label, "support", "duration", C.fxCashEffect);
-  if (has("Beginning Cash Adjustments", "Ending Cash Adjustments")) return row(rowNumber, label, "support", "duration", []);
-  if (has("Beginning Cash Balance")) return plug(rowNumber, label, "support", "instant", resolveBeginningCashBalance);
+  if (has("Beginning Cash Adjustments", "Ending Cash Adjustments")) return reviewRow(context, "Unused / no confident match: cash adjustment rows are model-specific and were not filled from EDGAR.");
+  if (has("Beginning Cash Balance")) return plug(rowNumber, label, "support", "instant", resolveBeginningCashBalance, "direct");
   if (has("Ending Cash Balance")) return row(rowNumber, label, "support", "instant", C.cash);
   if (has("Weighted Average Basic Shares", "Basic Shares")) return row(rowNumber, label, "support", "duration", C.basicShares, 1, 1_000_000);
   if (has("Weighted Average Dilutive Shares", "Weighted Average Diluted Shares", "Diluted Shares")) return row(rowNumber, label, "support", "duration", C.dilutedShares, 1, 1_000_000);
 
   return null;
+}
+
+function formulaRow(context: ModelRowContext): FillRow {
+  return {
+    row: context.row,
+    label: context.label,
+    classification: "formula",
+    statement: statementFromContext(context),
+    kind: "duration",
+    scale: 1_000_000,
+    noFillComment: "Formula row: existing model formula preserved and not overwritten.",
+    modelContext: context
+  };
+}
+
+function reviewRow(context: ModelRowContext, noFillComment: string): FillRow {
+  return {
+    row: context.row,
+    label: context.label,
+    classification: "partial",
+    statement: statementFromContext(context),
+    kind: inBalanceSheetContext(context) ? "instant" : "duration",
+    scale: 1_000_000,
+    noFillComment,
+    modelContext: context
+  };
+}
+
+function unusedRow(context: ModelRowContext): FillRow {
+  return {
+    row: context.row,
+    label: context.label,
+    classification: context.hasHistoricalFormula ? "formula" : "unused",
+    statement: statementFromContext(context),
+    kind: inBalanceSheetContext(context) ? "instant" : "duration",
+    scale: 1_000_000,
+    noFillComment: context.hasHistoricalFormula
+      ? "Formula row: existing model formula preserved and not overwritten."
+      : "Unused / no confident match: no reliable EDGAR line item or logical grouping was identified for this model row.",
+    modelContext: context
+  };
 }
 
 function resolveCompensationExpense(period: string, ctx: ResolveContext): ResolvedValue {
@@ -505,9 +586,9 @@ function resolveNonCompensationExpense(period: string, ctx: ResolveContext): Res
     period,
     ctx.duration,
     NON_COMPENSATION_EXPENSE_CONCEPTS,
-    "Included floor brokerage and clearing fees, underwriting costs, technology and communications, occupancy and equipment rental, business development, and professional services from the SEC non-interest expense table."
+    "These were grouped because the model row is labeled Non-Compensation Expenses and no separate rows exist for these expense categories."
   );
-  if (detail.value !== null) return signed(detail, -1) ?? detail;
+  if (detail.value !== null) return { ...(signed(detail, -1) ?? detail), classification: "grouped" };
 
   const noninterestExpense = first(period, ctx.duration, ["NoninterestExpense"]);
   const compensation = resolveCompensationExpense(period, ctx);
@@ -517,10 +598,22 @@ function resolveNonCompensationExpense(period: string, ctx: ResolveContext): Res
     return {
       value: -Math.abs(noninterestExpense.value - Math.abs(compensation.value) - depreciation.value - Math.abs(otherOperating.value)),
       sources: compactSources([noninterestExpense, compensation, depreciation, otherOperating]),
-      note: "Calculated from SEC non-interest expense less compensation, depreciation and amortization, and other operating expense detail."
+      note: "These were grouped because the model row is broader than the EDGAR non-interest expense detail available for this company.",
+      classification: "grouped"
     };
   }
   return { value: null, sources: [], note: "No non-compensation expense detail was available in SEC facts." };
+}
+
+function resolveOtherOperatingExpenseGroup(period: string, ctx: ResolveContext): ResolvedValue {
+  const detail = sumWithNote(
+    period,
+    ctx.duration,
+    [...NON_COMPENSATION_EXPENSE_CONCEPTS, ...OTHER_OPERATING_EXPENSE_CONCEPTS],
+    "These were grouped because the model row is labeled Other Operating Expenses and the model does not provide separate rows for the included EDGAR expense categories."
+  );
+  if (detail.value !== null) return { ...(signed(detail, -1) ?? detail), classification: "grouped" };
+  return resolveOtherOperatingIncomeExpense(period, ctx);
 }
 
 function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext): ResolvedValue {
@@ -528,9 +621,9 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
     period,
     ctx.duration,
     OTHER_OPERATING_EXPENSE_CONCEPTS,
-    "Included cost of sales and other expenses from the SEC non-interest expense table."
+    "These were grouped because the model row is broader than the EDGAR operating expense detail available for this company."
   );
-  if (detail.value !== null) return signed(detail, -1) ?? detail;
+  if (detail.value !== null) return { ...(signed(detail, -1) ?? detail), classification: "grouped" };
   const direct = first(period, ctx.duration, ["OtherOperatingIncomeExpenseNet"]);
   return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
 }
@@ -797,7 +890,7 @@ export async function POST(request: NextRequest) {
     const inlineCtx = await fetchInlineFactContext(company, periods);
     mergeContexts(ctx, inlineCtx);
     const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
-    const fillRows = discoverFillRows(sheet, columns);
+    const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
 
     const warnings: string[] = [];
@@ -807,10 +900,25 @@ export async function POST(request: NextRequest) {
     for (const fillRow of fillRows) {
       const rowNotes = new Set<string>();
       let unresolved = 0;
+
+      if (fillRow.classification === "formula") {
+        continue;
+      }
+
+      if (fillRow.classification === "unused" || (!fillRow.concepts?.length && !fillRow.resolver)) {
+        const sourceCell = labelCell(sheet, fillRow.row);
+        if (fillRow.noFillComment && canAddComment(sourceCell)) {
+          addComment(sourceCell, fillRow.noFillComment);
+          commentsAdded += 1;
+        }
+        warnings.push(`${fillRow.label}: left unchanged because no confident EDGAR match was found.`);
+        continue;
+      }
+
       periods.forEach((period, index) => {
         const col = columns[index];
         const cell = sheet.getCell(fillRow.row, col);
-        if (!isHardcodedFinancialInput(cell)) return;
+        if (!isModelHistoricalInput(cell)) return;
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
@@ -824,6 +932,12 @@ export async function POST(request: NextRequest) {
         const auditNote = auditNoteForResolvedValue(fillRow, resolved);
         if (auditNote) rowNotes.add(auditNote);
       });
+
+      if (unresolved && fillRow.classification === "partial") {
+        rowNotes.add(fillRow.noFillComment || "Split / partial match: Needs review because EDGAR detail was insufficient for one or more periods.");
+      } else if (unresolved) {
+        rowNotes.add("Needs review: one or more historical periods were left unchanged because no matching EDGAR fact was found.");
+      }
 
       if (rowNotes.size) {
         const sourceCell = labelCell(sheet, fillRow.row);
@@ -850,7 +964,7 @@ export async function POST(request: NextRequest) {
 
     for (const fillRow of fillRows) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
-      if (!hasAny && fillRow.concepts?.length) {
+      if (!hasAny && fillRow.concepts?.length && fillRow.classification !== "unused" && fillRow.classification !== "formula") {
         warnings.push(`${fillRow.label}: no matching SEC concept found.`);
       }
     }
@@ -1536,6 +1650,84 @@ function rowLabel(sheet: ExcelJS.Worksheet, rowNumber: number) {
   return "";
 }
 
+function modelRowContext(
+  sheet: ExcelJS.Worksheet,
+  rowNumber: number,
+  columns: number[],
+  periodInfos: Array<{ period: string; isEstimate: boolean }>
+): ModelRowContext {
+  const label = rowLabel(sheet, rowNumber);
+  const formulaCells = columns.filter((col) => hasFormula(sheet.getCell(rowNumber, col)));
+  const hardcodedCells = columns.filter((col) => isModelHistoricalInput(sheet.getCell(rowNumber, col)));
+  const labelCellForRow = labelCell(sheet, rowNumber);
+  return {
+    sheetName: sheet.name,
+    row: rowNumber,
+    label,
+    sectionHeader: nearestSectionHeader(sheet, rowNumber, columns),
+    previousLabel: nearestLabeledNeighbor(sheet, rowNumber, -1),
+    nextLabel: nearestLabeledNeighbor(sheet, rowNumber, 1),
+    indentation: labelCellForRow.alignment?.indent ?? 0,
+    hasHistoricalFormula: formulaCells.length > 0,
+    hasHardcodedInput: hardcodedCells.length > 0,
+    subtotalFormula: firstFormulaInRow(sheet, rowNumber, columns),
+    projectedColumns: periodInfos.filter((info) => info.isEstimate).length,
+    signConvention: inferSignConvention(label)
+  };
+}
+
+function nearestSectionHeader(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
+  for (let row = rowNumber - 1; row >= Math.max(1, rowNumber - 25); row -= 1) {
+    const label = rowLabel(sheet, row);
+    if (!label) continue;
+    const hasFinancialInput = columns.some((col) => cellDisplay(sheet.getCell(row, col)).trim() || hasFormula(sheet.getCell(row, col)));
+    const labelCellForRow = labelCell(sheet, row);
+    if (!hasFinancialInput || labelCellForRow.font?.bold) return label;
+  }
+  return undefined;
+}
+
+function nearestLabeledNeighbor(sheet: ExcelJS.Worksheet, rowNumber: number, direction: 1 | -1) {
+  const end = direction === 1 ? Math.min(sheet.rowCount, rowNumber + 4) : Math.max(1, rowNumber - 4);
+  for (let row = rowNumber + direction; direction === 1 ? row <= end : row >= end; row += direction) {
+    const label = rowLabel(sheet, row);
+    if (label) return label;
+  }
+  return undefined;
+}
+
+function firstFormulaInRow(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
+  for (const col of columns) {
+    const formula = cellFormula(sheet.getCell(rowNumber, col));
+    if (formula) return formula;
+  }
+  return undefined;
+}
+
+function cellFormula(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  if (!value || typeof value !== "object") return null;
+  if ("formula" in value && typeof value.formula === "string") return value.formula;
+  if ("sharedFormula" in value && typeof value.sharedFormula === "string") return value.sharedFormula;
+  return null;
+}
+
+function inferSignConvention(label: string): 1 | -1 {
+  return /(expense|cost|loss|repayment|repurchase|dividend|tax|depreciation|amortization)/i.test(label) ? -1 : 1;
+}
+
+function statementFromContext(context: ModelRowContext): FillRow["statement"] {
+  if (inBalanceSheetContext(context)) return "balance";
+  if (/cash|capex|debt|equity|share|dividend|working capital/i.test([context.sectionHeader, context.label].filter(Boolean).join(" "))) return "support";
+  return "income";
+}
+
+function inBalanceSheetContext(context: ModelRowContext) {
+  return /balance sheet|assets|liabilities|equity|cash and cash equivalents|receivable|inventory|goodwill|debt/i.test(
+    [context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" ")
+  );
+}
+
 function derivedQuarterFormula(fillRow: FillRow, resolved: ResolvedValue, periods: string[], columns: number[], periodIndex: number) {
   const source = derivedSource(resolved);
   if (source?.derivedTotalValue === undefined || !source.derivedPriorPeriods?.length) return null;
@@ -1744,6 +1936,11 @@ function isHardcodedFinancialInput(cell: ExcelJS.Cell) {
   return value === null || typeof value === "number";
 }
 
+function isModelHistoricalInput(cell: ExcelJS.Cell) {
+  if (hasFormula(cell)) return false;
+  return isBlue(cell) || typeof cell.value === "number";
+}
+
 function canAddComment(cell: ExcelJS.Cell) {
   return !hasFormula(cell);
 }
@@ -1755,27 +1952,46 @@ function hasFormula(cell: ExcelJS.Cell) {
 
 function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue) {
   const derived = derivedSource(resolved);
-  const sourceLabels = unique(resolved.sources.map((source) => source.note || source.label || source.concept).filter(Boolean));
-  const grouped = sourceLabels.length > 1;
+  const sourceLabels = unique(resolved.sources.map(sourceDisplayLabel).filter(Boolean));
+  const classification = resolved.classification ?? fillRow.classification;
+  const grouped = classification === "grouped" || sourceLabels.length > 1 || Boolean((resolved.note || fillRow.comment) && fillRow.classification === "grouped");
   const isDerived = Boolean(derived?.derivedTotalValue !== undefined);
   const hasAnalystNote = Boolean((resolved.note || fillRow.comment) && (grouped || isDerived));
   if (!grouped && !hasAnalystNote && !isDerived) return null;
 
   const parts: string[] = [];
+  if (grouped && sourceLabels.length) parts.push(`Grouped from EDGAR: ${sourceLabels.join(", ")}.`);
   if (resolved.note || fillRow.comment) parts.push(resolved.note || fillRow.comment || "");
-  if (grouped) parts.push(`Included EDGAR line items: ${sourceLabels.join(", ")}.`);
   if (isDerived && derived?.derivedPriorPeriods?.length) {
     parts.push(`Quarterly value was derived from ${derived.derivedTotalLabel || derived.label} less ${derived.derivedPriorPeriods.join(", ")}.`);
   }
   return parts.filter(Boolean).join(" ");
 }
 
+function sourceDisplayLabel(source: FactSource) {
+  const label = source.note || source.label || source.concept;
+  if (!label) return "";
+  if (label !== source.concept && /\s/.test(label)) return label;
+  return label
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\bAnd\b/g, "and")
+    .replace(/\bOf\b/g, "of")
+    .replace(/\bFor\b/g, "for")
+    .replace(/\bNet\b/g, "net")
+    .replace(/\bLoss\b/g, "loss")
+    .replace(/\bExpense\b/g, "expense")
+    .replace(/\bIncome\b/g, "income")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 function resolveRow(fillRow: FillRow, period: string, ctx: ResolveContext): ResolvedValue {
   if (fillRow.resolver) return fillRow.resolver(period, ctx);
-  if (!fillRow.concepts?.length) return { value: 0, sources: [zeroSource(fillRow.label)] };
+  if (!fillRow.concepts?.length) return { value: null, sources: [], note: fillRow.noFillComment, classification: fillRow.classification };
   const source = first(period, fillRow.kind === "instant" ? ctx.instant : ctx.duration, fillRow.concepts);
   if (!source) return { value: null, sources: [] };
-  return signed(source, fillRow.sign ?? 1) ?? { value: null, sources: [] };
+  const resolved = signed(source, fillRow.sign ?? 1) ?? { value: null, sources: [] };
+  return { ...resolved, classification: fillRow.classification };
 }
 
 function first(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[]) {
@@ -1801,7 +2017,7 @@ function sum(period: string, map: Map<string, Map<string, FactSource>>, concepts
 
 function sumWithNote(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[], note: string): ResolvedValue {
   const result = sum(period, map, concepts);
-  return result ? { ...result, note } : { value: null, sources: [], note };
+  return result ? { ...result, note, classification: result.sources.length > 1 ? "grouped" : "direct" } : { value: null, sources: [], note };
 }
 
 function sumResolved(items: Array<ResolvedValue | null | undefined>, note: string): ResolvedValue {
@@ -1810,7 +2026,8 @@ function sumResolved(items: Array<ResolvedValue | null | undefined>, note: strin
   return {
     value: valid.reduce((total, item) => total + (item.value ?? 0), 0),
     sources: compactSources(valid),
-    note
+    note,
+    classification: "grouped"
   };
 }
 
@@ -1821,7 +2038,8 @@ function difference(period: string, map: Map<string, Map<string, FactSource>>, t
   return {
     value: total.value - less.reduce((acc, source) => acc + source.value, 0),
     sources: [total, ...less],
-    note
+    note,
+    classification: "grouped"
   };
 }
 
