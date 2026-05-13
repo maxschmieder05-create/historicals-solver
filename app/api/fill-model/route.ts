@@ -805,6 +805,7 @@ export async function POST(request: NextRequest) {
     let commentsAdded = 0;
 
     for (const fillRow of fillRows) {
+      const rowNotes = new Set<string>();
       let unresolved = 0;
       periods.forEach((period, index) => {
         const col = columns[index];
@@ -819,7 +820,18 @@ export async function POST(request: NextRequest) {
 
         cell.value = resolved.value / (fillRow.scale ?? 1);
         filledCells += 1;
+
+        const auditNote = auditNoteForResolvedValue(fillRow, resolved);
+        if (auditNote) rowNotes.add(auditNote);
       });
+
+      if (rowNotes.size) {
+        const sourceCell = labelCell(sheet, fillRow.row);
+        if (canAddComment(sourceCell)) {
+          addComment(sourceCell, Array.from(rowNotes).join(" "));
+          commentsAdded += 1;
+        }
+      }
 
       if (unresolved) {
         warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
@@ -1696,6 +1708,14 @@ function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
   return null;
 }
 
+function labelCell(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  for (const col of LABEL_COLUMNS) {
+    const cell = sheet.getCell(rowNumber, col);
+    if (cellDisplay(cell).trim()) return cell;
+  }
+  return sheet.getCell(rowNumber, 3);
+}
+
 function rowHasHardcodedFinancialInputs(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
   for (const col of columns) {
     if (isHardcodedFinancialInput(sheet.getCell(rowNumber, col))) return true;
@@ -1724,9 +1744,30 @@ function isHardcodedFinancialInput(cell: ExcelJS.Cell) {
   return value === null || typeof value === "number";
 }
 
+function canAddComment(cell: ExcelJS.Cell) {
+  return !hasFormula(cell);
+}
+
 function hasFormula(cell: ExcelJS.Cell) {
   const value = cell.value;
   return Boolean(value && typeof value === "object" && ("formula" in value || "sharedFormula" in value));
+}
+
+function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue) {
+  const derived = derivedSource(resolved);
+  const sourceLabels = unique(resolved.sources.map((source) => source.note || source.label || source.concept).filter(Boolean));
+  const grouped = sourceLabels.length > 1;
+  const isDerived = Boolean(derived?.derivedTotalValue !== undefined);
+  const hasAnalystNote = Boolean((resolved.note || fillRow.comment) && (grouped || isDerived));
+  if (!grouped && !hasAnalystNote && !isDerived) return null;
+
+  const parts: string[] = [];
+  if (resolved.note || fillRow.comment) parts.push(resolved.note || fillRow.comment || "");
+  if (grouped) parts.push(`Included EDGAR line items: ${sourceLabels.join(", ")}.`);
+  if (isDerived && derived?.derivedPriorPeriods?.length) {
+    parts.push(`Quarterly value was derived from ${derived.derivedTotalLabel || derived.label} less ${derived.derivedPriorPeriods.join(", ")}.`);
+  }
+  return parts.filter(Boolean).join(" ");
 }
 
 function resolveRow(fillRow: FillRow, period: string, ctx: ResolveContext): ResolvedValue {
@@ -1802,6 +1843,11 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
     if (!item) return [];
     return "sources" in item ? item.sources : [item];
   });
+}
+
+function addComment(cell: ExcelJS.Cell, text: string) {
+  const existing = typeof cell.note === "string" ? `${cell.note}\n\n` : "";
+  cell.note = `${existing}Historicals Solver: ${text}`;
 }
 
 function roundModelValue(value: number) {
