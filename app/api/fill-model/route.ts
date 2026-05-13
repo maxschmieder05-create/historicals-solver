@@ -89,7 +89,7 @@ const SEC_HEADERS = {
   Accept: "application/json"
 };
 
-const BLUE = "FF0000FF";
+const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
 const SEGMENT_SHEET = "Segment Analysis";
 const LABEL_COLUMNS = [1, 2, 3, 4, 5];
@@ -100,6 +100,13 @@ const C = {
   grossProfit: ["GrossProfit"],
   operatingIncome: ["OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
   cogs: ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"],
+  healthCareCosts: [
+    "PolicyholderBenefitsAndClaimsIncurredHealthCare",
+    "PolicyholderBenefitsAndClaimsIncurredNet",
+    "MedicalCosts",
+    "BenefitsLossesAndExpenses",
+    "PharmacyAndOtherServiceCosts"
+  ],
   sga: ["SellingGeneralAndAdministrativeExpense", "GeneralAndAdministrativeExpense"],
   rd: ["ResearchAndDevelopmentExpense"],
   da: ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"],
@@ -109,14 +116,75 @@ const C = {
   otherNonOp: ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense"],
   taxes: ["IncomeTaxExpenseBenefit"],
   netIncome: ["NetIncomeLoss"],
+  creditLossProvision: [
+    "ProvisionForLoanLeaseAndOtherLosses",
+    "ProvisionForCreditLosses",
+    "ProvisionForDoubtfulAccounts",
+    "ProvisionForBadDebtExpense",
+    "ProvisionForLoanAndLeaseLosses"
+  ],
+  unrealizedDebtSecurities: [
+    "DebtSecuritiesAvailableForSaleUnrealizedGainLoss",
+    "DebtSecuritiesAvailableForSaleRealizedGainLoss",
+    "GainsLossesOnSalesOfDebtSecuritiesAvailableForSale",
+    "GainsLossesOnSalesOfDebtSecurities"
+  ],
+  foreignCurrencyAdjustments: [
+    "ForeignCurrencyTransactionGainLossBeforeTax",
+    "ForeignCurrencyTransactionGainLossUnrealized",
+    "ForeignCurrencyTransactionGainLoss",
+    "ForeignCurrencyTranslationAdjustment"
+  ],
+  pensionAdjustments: [
+    "DefinedBenefitPlanNetPeriodicBenefitCost",
+    "OtherComprehensiveIncomeLossPensionAndOtherPostretirementBenefitPlansAdjustmentNetOfTax",
+    "PensionAndOtherPostretirementDefinedBenefitPlansLiabilityCurrent"
+  ],
   sbc: ["ShareBasedCompensation"],
   capex: ["PaymentsToAcquirePropertyPlantAndEquipment"],
   dividends: ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
   repurchases: ["PaymentsForRepurchaseOfCommonStock"],
+  workingCapital: ["IncreaseDecreaseInOperatingAssetsAndLiabilities", "IncreaseDecreaseInOperatingCapital", "IncreaseDecreaseInWorkingCapital"],
+  longTermItems: ["OtherOperatingActivitiesCashFlowStatement", "OtherNoncashIncomeExpense", "DeferredIncomeTaxExpenseBenefit"],
+  revolverIssuanceRepayment: [
+    "ProceedsFromRepaymentsOfShortTermDebt",
+    "ProceedsFromRepaymentsOfShortTermDebtMaturingInMoreThanThreeMonths",
+    "ProceedsFromLinesOfCredit",
+    "RepaymentsOfLinesOfCredit"
+  ],
+  debtIssuance: ["ProceedsFromIssuanceOfLongTermDebt", "ProceedsFromLongTermDebt", "ProceedsFromBorrowings", "ProceedsFromDebt"],
+  debtRepayment: ["RepaymentsOfLongTermDebt", "RepaymentsOfDebt", "PaymentsOfLongTermDebt", "RepaymentsOfBorrowings"],
+  equityIssuance: [
+    "ProceedsFromIssuanceOfCommonStock",
+    "ProceedsFromStockOptionsExercised",
+    "ProceedsFromIssuanceOfSharesUnderIncentiveAndShareBasedCompensationPlans"
+  ],
+  noncontrollingInterestChange: [
+    "PaymentsToAcquireAdditionalInterestsInSubsidiaries",
+    "PaymentsToNoncontrollingInterests",
+    "ProceedsFromSaleOfInterestInSubsidiaries",
+    "ProceedsFromNoncontrollingInterests"
+  ],
+  fxCashEffect: [
+    "EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    "EffectOfExchangeRateOnCashAndCashEquivalents"
+  ],
   basicShares: ["WeightedAverageNumberOfSharesOutstandingBasic"],
   dilutedShares: ["WeightedAverageNumberOfDilutedSharesOutstanding"],
   cash: ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
   receivables: ["AccountsReceivableNetCurrent", "AccountsReceivableNet"],
+  cardReceivables: [
+    "FinancingReceivableRecordedInvestmentLineOfCreditAndCreditCardReceivables",
+    "FinanceReceivablesCreditCardNet",
+    "CreditCardReceivables",
+    "CardMemberReceivables"
+  ],
+  loans: [
+    "LoansReceivableHeldForInvestment",
+    "LoansAndLeasesReceivableNetReportedAmount",
+    "FinanceReceivablesNet",
+    "FinancingReceivableRecordedInvestment"
+  ],
   inventory: ["InventoryNet"],
   currentAssets: ["AssetsCurrent"],
   ppe: [
@@ -129,6 +197,7 @@ const C = {
   assets: ["Assets"],
   ap: ["AccountsPayableCurrent", "AccountsPayableAndAccruedLiabilitiesCurrent", "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent"],
   accrued: ["AccruedLiabilitiesCurrent", "AccruedIncomeTaxesCurrent", "EmployeeRelatedLiabilitiesCurrent"],
+  customerDeposits: ["Deposits", "CustomerDeposits", "DepositsLiabilities", "InterestBearingDepositsInDomesticOffices"],
   currentLiabilities: ["LiabilitiesCurrent"],
   currentDebt: ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings"],
   totalDebt: [
@@ -285,21 +354,38 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
     return row(rowNumber, label, "income", "duration", C.operatingIncome, 1, 1_000_000, "Mapped to SEC operating income/loss or nearest pre-tax operating profit concept.");
   }
   if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales")) return row(rowNumber, label, "income", "duration", C.cogs, -1, 1_000_000, "Mapped to SEC cost of revenue / cost of sales.");
-  if (has("Selling, General & Administration (SG&A)", "Selling General & Administrative", "SG&A", "Sales and Marketing", "Selling and Marketing")) return row(rowNumber, label, "income", "duration", C.sga, -1);
+  if (has("Pharmacy and Other Service Costs", "Medical Costs and Other")) return row(rowNumber, label, "income", "duration", C.healthCareCosts, -1, 1_000_000, "Mapped to reported healthcare, claims, pharmacy, or service cost concepts.");
+  if (
+    has(
+      "Selling, General & Administration (SG&A)",
+      "Selling, Geneal & Administrative (SG&A)",
+      "Selling General & Administrative",
+      "SG&A",
+      "Sales and Marketing",
+      "Selling and Marketing"
+    )
+  ) {
+    return row(rowNumber, label, "income", "duration", C.sga, -1);
+  }
   if (has("Research & Development (R&D)", "Research and Development")) return row(rowNumber, label, "income", "duration", C.rd, -1);
-  if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits")) {
+  if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits", "Employee Compensation & Benefits")) {
     return plug(rowNumber, label, "income", "duration", resolveCompensationExpense);
   }
   if (has("Non-Compensation Expenses")) return plug(rowNumber, label, "income", "duration", resolveNonCompensationExpense);
-  if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense")) return row(rowNumber, label, "income", "duration", C.da, -1);
+  if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense", "Depreciation & Amortization (incl. in SG&A)")) return row(rowNumber, label, "income", "duration", C.da, -1);
   if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
   if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
+  if (has("Total Provisions for Credit Losses", "Provision for Credit Losses")) return row(rowNumber, label, "income", "duration", C.creditLossProvision, -1);
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
   if (has("Interest (Expense)")) return row(rowNumber, label, "income", "duration", []);
   if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense);
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
+  if (has("Gain on Sale of Business (Loss)")) return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets"], 1);
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
-  if (has("Income Tax Benefit (Expense)", "Income Tax Expense")) return row(rowNumber, label, "income", "duration", C.taxes, -1);
+  if (has("Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax")) return row(rowNumber, label, "income", "duration", C.taxes, -1);
+  if (has("Net Unrealized Debt Securities Gains (Losses)")) return row(rowNumber, label, "income", "duration", C.unrealizedDebtSecurities);
+  if (has("FX Adjustments")) return row(rowNumber, label, "income", "duration", C.foreignCurrencyAdjustments);
+  if (has("Net Unrealized Pension and Other Benefits")) return row(rowNumber, label, "income", "duration", C.pensionAdjustments);
   if (has("Pre-Tax Adjustments")) return row(rowNumber, label, "income", "duration", []);
   if (has("Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"], -1);
   if (has("Discontinued Operations")) return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
@@ -309,6 +395,7 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
 
   if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash")) return row(rowNumber, label, "balance", "instant", C.cash, 1, 1_000_000, "Mapped to SEC cash and cash equivalents.");
   if (has("Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
+  if (has("Card Member Receivables", "Card Member Recievables")) return row(rowNumber, label, "balance", "instant", C.cardReceivables);
   if (has("Inventory")) return row(rowNumber, label, "balance", "instant", C.inventory);
   if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets")) {
     return plug(rowNumber, label, "balance", "instant", resolvePrepaidAndOtherCurrentAssets);
@@ -318,22 +405,24 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   }
   if (has("Intangible Assets, Net", "Intangibles, Net")) return plug(rowNumber, label, "balance", "instant", resolveIntangibleAssets);
   if (has("Goodwill")) return row(rowNumber, label, "balance", "instant", C.goodwill);
-  if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investments and Assets of Consolidated Variable Interest Entities")) {
+  if (has("Card Member Loans")) return row(rowNumber, label, "balance", "instant", C.loans);
+  if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investment Securities", "Investments and Assets of Consolidated Variable Interest Entities")) {
     return row(rowNumber, label, "balance", "instant", INVESTMENT_ASSET_CONCEPTS);
   }
   if (has("Other Non-Current Assets", "Other Long-Term Assets", "Other LT Assets")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentAssets);
-  if (has("Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
+  if (has("Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities", "Pharmacy Costs Payable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
   if (has("Securities Loaned")) return row(rowNumber, label, "balance", "instant", ["SecuritiesLoaned"]);
   if (has("Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other Current Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
+  if (has("Customer Deposits")) return row(rowNumber, label, "balance", "instant", C.customerDeposits);
   if (has("Other Current Liabilities", "Other Current Liabs")) {
     return plug(rowNumber, label, "balance", "instant", resolveOtherCurrentLiabilities);
   }
   if (has("Tax Receivable Agreement Payables")) {
     return row(rowNumber, label, "balance", "instant", ["TaxReceivableAgreementLiability", "TaxReceivableAgreementLiabilityCurrent", "OtherLiabilitiesCurrent"]);
   }
-  if (has("Short Term Borrowings", "Short-Term Debt", "Short Term Debt", "Current Debt")) return row(rowNumber, label, "balance", "instant", ["OtherShortTermBorrowings", "ShortTermBorrowings", "LongTermDebtCurrent"]);
+  if (has("Short Term Borrowings", "Short-term Borrowings", "Short-Term Debt", "Short Term Debt", "Current Debt")) return row(rowNumber, label, "balance", "instant", ["OtherShortTermBorrowings", "ShortTermBorrowings", "LongTermDebtCurrent"]);
   if (has("Revolver")) return row(rowNumber, label, "balance", "instant", ["RevolvingCreditFacility", "LineOfCreditFacilityCurrentBorrowings"]);
-  if (includes("LT Debt", "Long Term Debt", "Long-Term Debt", "Debt")) {
+  if (has("LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt", "Total Debt") || includes("LT Debt")) {
     return plug(rowNumber, label, "balance", "instant", resolveTotalDebt);
   }
   if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", C.deferredTaxLiability);
@@ -345,15 +434,26 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Accumulated Other Comprehensive Income (AOCI)", "AOCI")) return row(rowNumber, label, "balance", "instant", C.aoci);
   if (has("Noncontrolling Interests", "Non-Controlling Interests")) return row(rowNumber, label, "balance", "instant", C.nci);
 
+  if (has("(Increase)/Decrease in Working Capital", "Increase / (Decrease) in Working Capital")) return row(rowNumber, label, "support", "duration", C.workingCapital);
+  if (has("(Increase)/Decrease in LT Items", "Increase / (Decrease) in LT Items")) return row(rowNumber, label, "support", "duration", C.longTermItems);
   if (has("Capital Expenditures", "Capex")) return row(rowNumber, label, "support", "duration", C.capex, -1);
   if (has("Purchases of Intangibles")) return row(rowNumber, label, "support", "duration", ["PaymentsToAcquireIntangibleAssets"]);
   if (has("Purchases of Investments")) return row(rowNumber, label, "support", "duration", PURCHASES_OF_INVESTMENTS_CONCEPTS);
   if (has("Acquisition / (Divestment) of Businesses", "Proceeds From/(Acquisitions of) Businesses", "Proceeds From (Acquisitions of) Businesses")) {
     return row(rowNumber, label, "support", "duration", ACQUISITION_CONCEPTS);
   }
-  if (has("Shares Repurchased ($ Amount)", "Share Repurchases ($ Amount)")) return row(rowNumber, label, "support", "duration", C.repurchases);
+  if (has("Issuance/(Repayment) of Revolver")) return plug(rowNumber, label, "support", "duration", resolveRevolverIssuanceRepayment);
+  if (has("Issuance of Debt")) return row(rowNumber, label, "support", "duration", C.debtIssuance);
+  if (has("(Repayment of Debt)", "Repayment of Debt")) return row(rowNumber, label, "support", "duration", C.debtRepayment, -1);
+  if (has("Issuance of Equity")) return row(rowNumber, label, "support", "duration", C.equityIssuance);
+  if (has("Shares Repurchased ($ Amount)", "Share Repurchases ($ Amount)", "(Repurchase) of Equity", "Repurchase of Equity")) return row(rowNumber, label, "support", "duration", C.repurchases, -1);
   if (has("Stock-Based Comp Expense", "Stock-Based Compensation")) return row(rowNumber, label, "support", "duration", C.sbc);
-  if (has("Dividends")) return row(rowNumber, label, "support", "duration", C.dividends, -1);
+  if (has("Dividends", "Dividends Issued")) return row(rowNumber, label, "support", "duration", C.dividends, -1);
+  if (has("Change in Noncontrolling Interests")) return row(rowNumber, label, "support", "duration", C.noncontrollingInterestChange);
+  if (has("Effect of FX Rate Changes on Cash")) return row(rowNumber, label, "support", "duration", C.fxCashEffect);
+  if (has("Beginning Cash Adjustments", "Ending Cash Adjustments")) return row(rowNumber, label, "support", "duration", []);
+  if (has("Beginning Cash Balance")) return plug(rowNumber, label, "support", "instant", resolveBeginningCashBalance);
+  if (has("Ending Cash Balance")) return row(rowNumber, label, "support", "instant", C.cash);
   if (has("Weighted Average Basic Shares", "Basic Shares")) return row(rowNumber, label, "support", "duration", C.basicShares, 1, 1_000_000);
   if (has("Weighted Average Dilutive Shares", "Weighted Average Diluted Shares", "Diluted Shares")) return row(rowNumber, label, "support", "duration", C.dilutedShares, 1, 1_000_000);
 
@@ -449,6 +549,43 @@ function resolveNoncontrollingIncome(period: string, ctx: ResolveContext): Resol
     };
   }
   return { value: null, sources: [] };
+}
+
+function resolveRevolverIssuanceRepayment(period: string, ctx: ResolveContext): ResolvedValue {
+  const net = first(period, ctx.duration, [
+    "ProceedsFromRepaymentsOfShortTermDebt",
+    "ProceedsFromRepaymentsOfShortTermDebtMaturingInMoreThanThreeMonths",
+    "NetChangeInShortTermBorrowings"
+  ]);
+  if (net) {
+    return {
+      value: net.value,
+      sources: [net],
+      note: "Mapped to net short-term borrowing or line-of-credit activity when reported."
+    };
+  }
+
+  const proceeds = sum(period, ctx.duration, ["ProceedsFromLinesOfCredit", "ProceedsFromShortTermDebt"]);
+  const repayments = sum(period, ctx.duration, ["RepaymentsOfLinesOfCredit", "RepaymentsOfShortTermDebt"]);
+  if (!proceeds && !repayments) return { value: null, sources: [] };
+  return {
+    value: (proceeds?.value ?? 0) - (repayments?.value ?? 0),
+    sources: compactSources([proceeds, repayments]),
+    note: "Calculated as reported line-of-credit or short-term borrowing proceeds less repayments."
+  };
+}
+
+function resolveBeginningCashBalance(period: string, ctx: ResolveContext): ResolvedValue {
+  const prior = previousPeriod(period);
+  if (!prior) return { value: null, sources: [] };
+  const endingCash = first(prior, ctx.instant, C.cash);
+  return endingCash
+    ? {
+        value: endingCash.value,
+        sources: [endingCash],
+        note: `Calculated from ${prior} ending cash and equivalents.`
+      }
+    : { value: null, sources: [] };
 }
 
 function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
@@ -679,6 +816,7 @@ export async function POST(request: NextRequest) {
         if (resolved.value === null || Number.isNaN(resolved.value)) {
           cell.value = 0;
           filledCells += 1;
+          unresolved += 1;
           return;
         }
 
@@ -1307,6 +1445,14 @@ function comparePeriods(a: string, b: string) {
   return ay === by ? aq - bq : ay - by;
 }
 
+function previousPeriod(period: string) {
+  const quarter = Number(period[0]);
+  const year = Number(`20${period.slice(2)}`);
+  if (!quarter || Number.isNaN(year)) return null;
+  if (quarter === 1) return `4Q${String(year - 1).slice(-2)}`;
+  return `${quarter - 1}Q${String(year).slice(-2)}`;
+}
+
 function blueColumns(sheet: ExcelJS.Worksheet) {
   const columnCounts = new Map<number, number>();
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
@@ -1609,7 +1755,10 @@ function rowHasBlueInputs(sheet: ExcelJS.Worksheet, rowNumber: number) {
 }
 
 function isBlue(cell: ExcelJS.Cell) {
-  return cell.font?.color?.argb === BLUE;
+  const color = cell.font?.color;
+  if (!color) return false;
+  if (color.argb && BLUE_FONT_COLORS.has(color.argb)) return true;
+  return color.theme === 10;
 }
 
 function isHardcodedBlueInput(cell: ExcelJS.Cell) {
