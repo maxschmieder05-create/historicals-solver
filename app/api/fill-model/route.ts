@@ -328,7 +328,7 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[]) {
   const seen = new Set<number>();
 
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    if (!columns.some((col) => isHardcodedInput(sheet.getCell(rowNumber, col)))) continue;
+    if (!columns.some((col) => isHardcodedFinancialInput(sheet.getCell(rowNumber, col)))) continue;
     const label = rowLabel(sheet, rowNumber);
     if (!label || seen.has(rowNumber)) continue;
     const fillRow = fillRowForLabel(rowNumber, label);
@@ -805,36 +805,21 @@ export async function POST(request: NextRequest) {
     let commentsAdded = 0;
 
     for (const fillRow of fillRows) {
-      const rowNotes = new Set<string>();
       let unresolved = 0;
       periods.forEach((period, index) => {
         const col = columns[index];
         const cell = sheet.getCell(fillRow.row, col);
-        if (!isHardcodedInput(cell)) return;
+        if (!isHardcodedFinancialInput(cell)) return;
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
-          cell.value = 0;
-          filledCells += 1;
           unresolved += 1;
           return;
         }
 
         cell.value = resolved.value / (fillRow.scale ?? 1);
         filledCells += 1;
-
-        const sourceLabels = resolved.sources.map((source) => source.note || source.label || source.concept);
-        if (resolved.note) rowNotes.add(resolved.note);
-        if (sourceLabels.length > 1 || fillRow.comment) {
-          rowNotes.add(fillRow.comment || `Included SEC concepts: ${unique(sourceLabels).join(", ")}.`);
-        }
       });
-
-      const sourceCell = labelCell(sheet, fillRow.row);
-      if (rowNotes.size && canAddComment(sourceCell)) {
-        addComment(sourceCell, Array.from(rowNotes).join(" "));
-        commentsAdded += 1;
-      }
 
       if (unresolved) {
         warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
@@ -1584,12 +1569,11 @@ function fillSegmentAnalysis(
 ) {
   const warnings: string[] = [];
   let filledCells = 0;
-  let commentsAdded = 0;
+  const commentsAdded = 0;
   const fallbackRevenue = periods.map((period) => first(period, ctx.duration, C.revenue)?.value ?? 0);
-  const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix").slice(0, 6);
-  const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check").slice(0, 6);
-  const depreciationRows = segmentMetricRows(sheet, "Total D&A", "D&A Check").slice(0, 6);
-  const labelRows = segmentMixLabelRows(sheet).slice(0, 6);
+  const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns).slice(0, 6);
+  const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns).slice(0, 6);
+  const depreciationRows = segmentMetricRows(sheet, "Total D&A", "D&A Check", columns).slice(0, 6);
 
   const usableSegments = segments.length
     ? segments
@@ -1611,24 +1595,6 @@ function fillSegmentAnalysis(
   const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A");
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
 
-  for (let index = 0; index < labelRows.length; index += 1) {
-    const segment = usableSegments[index];
-    const labelCell = sheet.getCell(labelRows[index], 3);
-    if (segment && isHardcodedBlueInput(labelCell)) {
-      labelCell.value = segment.label;
-      filledCells += 1;
-    }
-  }
-
-  const noteCell = firstCommentableCell(sheet, [...rows, ...operatingIncomeRows, ...depreciationRows, ...labelRows]);
-  if (noteCell) {
-    addComment(
-      noteCell,
-      "Segment Analysis historicals were filled only in blue input cells. Visible total/check formulas were preserved; where the template uses helper segment rows, those blue rows drive the revenue mix, operating income mix, D&A mix, and checks."
-    );
-    commentsAdded += 1;
-  }
-
   return { filledCells, commentsAdded, warnings };
 }
 
@@ -1647,6 +1613,7 @@ function fillSegmentMetricRows(
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const rowNumber = rows[rowIndex];
     const existingLabel = segmentBaseLabel(cellDisplay(sheet.getCell(rowNumber, 3)), suffix);
+    if (isGenericSegmentPlaceholder(existingLabel)) continue;
     const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments) ?? nextUnusedSegmentIndex(segments, usedSegments);
     if (segmentIndex === null) continue;
 
@@ -1654,15 +1621,9 @@ function fillSegmentMetricRows(
     if (!segmentHasMetricData(segment, metric, periods)) continue;
     usedSegments.add(segmentIndex);
 
-    const labelCell = sheet.getCell(rowNumber, 3);
-    if (isHardcodedBlueInput(labelCell)) {
-      labelCell.value = suffix === "Revenue" ? `${segment.label} Revenue` : `${segment.label} ${suffix}`;
-      filledCells += 1;
-    }
-
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-      if (!isHardcodedBlueInput(cell)) return;
+      if (!isHardcodedFinancialInput(cell)) return;
       cell.value = (segment[metric].get(period) ?? 0) / 1_000_000;
       filledCells += 1;
     });
@@ -1675,13 +1636,13 @@ function segmentHasMetricData(segment: SegmentRevenue, metric: "values" | "opera
   return periods.some((period) => segment[metric].has(period) && segment[metric].get(period) !== 0);
 }
 
-function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabel: string) {
+function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabel: string, columns: number[]) {
   const startRow = findLabelRow(sheet, startLabel);
   const endRow = findLabelRow(sheet, endLabel);
   if (!startRow || !endRow || endRow <= startRow) return [];
   const rows: number[] = [];
   for (let rowNumber = startRow + 1; rowNumber < endRow; rowNumber += 1) {
-    if (isBlue(sheet.getCell(rowNumber, 3)) || rowHasBlueInputs(sheet, rowNumber)) rows.push(rowNumber);
+    if (rowLabel(sheet, rowNumber) && rowHasHardcodedFinancialInputs(sheet, rowNumber, columns)) rows.push(rowNumber);
   }
   return rows;
 }
@@ -1707,6 +1668,10 @@ function segmentBaseLabel(label: string, suffix: string) {
     .trim();
 }
 
+function isGenericSegmentPlaceholder(label: string) {
+  return !label || /^segment\s*\d+$/i.test(label);
+}
+
 function segmentIndexForRow(label: string, segments: SegmentRevenue[], used: Set<number>) {
   if (!label) return null;
   const normalizedLabel = normalize(label);
@@ -1723,14 +1688,6 @@ function nextUnusedSegmentIndex(segments: SegmentRevenue[], used: Set<number>) {
   return index === -1 ? null : index;
 }
 
-function firstCommentableCell(sheet: ExcelJS.Worksheet, rows: number[]) {
-  for (const rowNumber of rows) {
-    const cell = labelCell(sheet, rowNumber);
-    if (canAddComment(cell)) return cell;
-  }
-  return null;
-}
-
 function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
   const wanted = normalize(label);
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
@@ -1739,17 +1696,9 @@ function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
   return null;
 }
 
-function labelCell(sheet: ExcelJS.Worksheet, rowNumber: number) {
-  for (const col of LABEL_COLUMNS) {
-    const cell = sheet.getCell(rowNumber, col);
-    if (cellDisplay(cell).trim()) return cell;
-  }
-  return sheet.getCell(rowNumber, 3);
-}
-
-function rowHasBlueInputs(sheet: ExcelJS.Worksheet, rowNumber: number) {
-  for (let col = 6; col <= sheet.columnCount; col += 1) {
-    if (isHardcodedBlueInput(sheet.getCell(rowNumber, col))) return true;
+function rowHasHardcodedFinancialInputs(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
+  for (const col of columns) {
+    if (isHardcodedFinancialInput(sheet.getCell(rowNumber, col))) return true;
   }
   return false;
 }
@@ -1769,8 +1718,10 @@ function isHardcodedInput(cell: ExcelJS.Cell) {
   return !hasFormula(cell);
 }
 
-function canAddComment(cell: ExcelJS.Cell) {
-  return !hasFormula(cell);
+function isHardcodedFinancialInput(cell: ExcelJS.Cell) {
+  if (hasFormula(cell)) return false;
+  const value = cell.value;
+  return value === null || typeof value === "number";
 }
 
 function hasFormula(cell: ExcelJS.Cell) {
@@ -1851,11 +1802,6 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
     if (!item) return [];
     return "sources" in item ? item.sources : [item];
   });
-}
-
-function addComment(cell: ExcelJS.Cell, text: string) {
-  const existing = typeof cell.note === "string" ? `${cell.note}\n\n` : "";
-  cell.note = `${existing}Historicals Solver: ${text}`;
 }
 
 function roundModelValue(value: number) {
