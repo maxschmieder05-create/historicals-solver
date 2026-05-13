@@ -92,9 +92,13 @@ const SEC_HEADERS = {
 const BLUE = "FF0000FF";
 const MODEL_SHEET = "Model";
 const SEGMENT_SHEET = "Segment Analysis";
+const LABEL_COLUMNS = [1, 2, 3, 4, 5];
 
 const C = {
   revenue: ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
+  netRevenue: ["RevenuesNetOfInterestExpense"],
+  grossProfit: ["GrossProfit"],
+  operatingIncome: ["OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
   cogs: ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"],
   sga: ["SellingGeneralAndAdministrativeExpense", "GeneralAndAdministrativeExpense"],
   rd: ["ResearchAndDevelopmentExpense"],
@@ -112,7 +116,7 @@ const C = {
   basicShares: ["WeightedAverageNumberOfSharesOutstandingBasic"],
   dilutedShares: ["WeightedAverageNumberOfDilutedSharesOutstanding"],
   cash: ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
-  receivables: ["AccountsReceivableNetCurrent"],
+  receivables: ["AccountsReceivableNetCurrent", "AccountsReceivableNet"],
   inventory: ["InventoryNet"],
   currentAssets: ["AssetsCurrent"],
   ppe: [
@@ -123,7 +127,7 @@ const C = {
   intangibles: ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"],
   goodwill: ["Goodwill"],
   assets: ["Assets"],
-  ap: ["AccountsPayableCurrent", "AccountsPayableAndAccruedLiabilitiesCurrent"],
+  ap: ["AccountsPayableCurrent", "AccountsPayableAndAccruedLiabilitiesCurrent", "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent"],
   accrued: ["AccruedLiabilitiesCurrent", "AccruedIncomeTaxesCurrent", "EmployeeRelatedLiabilitiesCurrent"],
   currentLiabilities: ["LiabilitiesCurrent"],
   currentDebt: ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings"],
@@ -255,8 +259,8 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[]) {
   const seen = new Set<number>();
 
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    if (!columns.some((col) => isHardcodedBlueInput(sheet.getCell(rowNumber, col)))) continue;
-    const label = cellDisplay(sheet.getCell(rowNumber, 3)).trim();
+    if (!columns.some((col) => isHardcodedInput(sheet.getCell(rowNumber, col)))) continue;
+    const label = rowLabel(sheet, rowNumber);
     if (!label || seen.has(rowNumber)) continue;
     const fillRow = fillRowForLabel(rowNumber, label);
     if (!fillRow) continue;
@@ -271,9 +275,17 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   const key = normalize(label);
   const has = (...aliases: string[]) => aliases.some((alias) => key === normalize(alias));
   const includes = (...aliases: string[]) => aliases.some((alias) => key.includes(normalize(alias)));
+  const hasRevenue = has("Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue");
+  const hasNetRevenue = has("Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense");
 
-  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue")) return row(rowNumber, label, "income", "duration", C.cogs, -1);
-  if (has("Selling, General & Administration (SG&A)", "Selling General & Administrative", "SG&A")) return row(rowNumber, label, "income", "duration", C.sga, -1);
+  if (hasNetRevenue) return row(rowNumber, label, "income", "duration", C.netRevenue, 1, 1_000_000, "Mapped to SEC revenues net of interest expense when reported.");
+  if (hasRevenue) return row(rowNumber, label, "income", "duration", C.revenue, 1, 1_000_000, "Mapped to the closest SEC total revenue concept.");
+  if (has("Gross Profit", "Gross Margin Dollars")) return row(rowNumber, label, "income", "duration", C.grossProfit, 1, 1_000_000, "Mapped to SEC gross profit.");
+  if (has("Operating Income", "Operating Income (Loss)", "Income From Operations")) {
+    return row(rowNumber, label, "income", "duration", C.operatingIncome, 1, 1_000_000, "Mapped to SEC operating income/loss or nearest pre-tax operating profit concept.");
+  }
+  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales")) return row(rowNumber, label, "income", "duration", C.cogs, -1, 1_000_000, "Mapped to SEC cost of revenue / cost of sales.");
+  if (has("Selling, General & Administration (SG&A)", "Selling General & Administrative", "SG&A", "Sales and Marketing", "Selling and Marketing")) return row(rowNumber, label, "income", "duration", C.sga, -1);
   if (has("Research & Development (R&D)", "Research and Development")) return row(rowNumber, label, "income", "duration", C.rd, -1);
   if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits")) {
     return plug(rowNumber, label, "income", "duration", resolveCompensationExpense);
@@ -282,11 +294,11 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense")) return row(rowNumber, label, "income", "duration", C.da, -1);
   if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
   if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
-  if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome);
+  if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
   if (has("Interest (Expense)")) return row(rowNumber, label, "income", "duration", []);
   if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense);
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
-  if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
+  if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
   if (has("Income Tax Benefit (Expense)", "Income Tax Expense")) return row(rowNumber, label, "income", "duration", C.taxes, -1);
   if (has("Pre-Tax Adjustments")) return row(rowNumber, label, "income", "duration", []);
   if (has("Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"], -1);
@@ -295,40 +307,40 @@ function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
     return plug(rowNumber, label, "income", "duration", resolveNoncontrollingIncome);
   }
 
-  if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents")) return row(rowNumber, label, "balance", "instant", C.cash);
-  if (has("Accounts Receivable", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
+  if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash")) return row(rowNumber, label, "balance", "instant", C.cash, 1, 1_000_000, "Mapped to SEC cash and cash equivalents.");
+  if (has("Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
   if (has("Inventory")) return row(rowNumber, label, "balance", "instant", C.inventory);
-  if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets")) {
+  if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets")) {
     return plug(rowNumber, label, "balance", "instant", resolvePrepaidAndOtherCurrentAssets);
   }
-  if (has("PP&E, Net", "Property Plant and Equipment Net")) {
+  if (has("PP&E, Net", "Property Plant and Equipment Net", "Property and Equipment, Net", "Property, Plant and Equipment, Net")) {
     return plug(rowNumber, label, "balance", "instant", resolvePpe);
   }
-  if (has("Intangible Assets, Net")) return plug(rowNumber, label, "balance", "instant", resolveIntangibleAssets);
+  if (has("Intangible Assets, Net", "Intangibles, Net")) return plug(rowNumber, label, "balance", "instant", resolveIntangibleAssets);
   if (has("Goodwill")) return row(rowNumber, label, "balance", "instant", C.goodwill);
   if (has("Investments and Assets of Consolidated VIEs", "Investments", "Investments and Assets of Consolidated Variable Interest Entities")) {
     return row(rowNumber, label, "balance", "instant", INVESTMENT_ASSET_CONCEPTS);
   }
-  if (has("Other Non-Current Assets")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentAssets);
-  if (has("Accounts Payable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
+  if (has("Other Non-Current Assets", "Other Long-Term Assets", "Other LT Assets")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentAssets);
+  if (has("Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
   if (has("Securities Loaned")) return row(rowNumber, label, "balance", "instant", ["SecuritiesLoaned"]);
-  if (has("Accrued Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
-  if (has("Other Current Liabilities")) {
+  if (has("Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other Current Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
+  if (has("Other Current Liabilities", "Other Current Liabs")) {
     return plug(rowNumber, label, "balance", "instant", resolveOtherCurrentLiabilities);
   }
   if (has("Tax Receivable Agreement Payables")) {
     return row(rowNumber, label, "balance", "instant", ["TaxReceivableAgreementLiability", "TaxReceivableAgreementLiabilityCurrent", "OtherLiabilitiesCurrent"]);
   }
-  if (has("Short Term Borrowings")) return row(rowNumber, label, "balance", "instant", ["OtherShortTermBorrowings", "ShortTermBorrowings"]);
+  if (has("Short Term Borrowings", "Short-Term Debt", "Short Term Debt", "Current Debt")) return row(rowNumber, label, "balance", "instant", ["OtherShortTermBorrowings", "ShortTermBorrowings", "LongTermDebtCurrent"]);
   if (has("Revolver")) return row(rowNumber, label, "balance", "instant", ["RevolvingCreditFacility", "LineOfCreditFacilityCurrentBorrowings"]);
-  if (includes("LT Debt", "Long Term Debt")) {
+  if (includes("LT Debt", "Long Term Debt", "Long-Term Debt", "Debt")) {
     return plug(rowNumber, label, "balance", "instant", resolveTotalDebt);
   }
   if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", C.deferredTaxLiability);
   if (has("Other Non-Current Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentLiabilities);
   if (has("Mezzanine Equity")) return row(rowNumber, label, "balance", "instant", ["RedeemableNoncontrollingInterestEquityCarryingAmount"]);
-  if (has("Common Stock & APIC", "Common Stock and APIC")) return plug(rowNumber, label, "balance", "instant", resolveCommonStockAndApic);
-  if (has("Retained Earnings")) return row(rowNumber, label, "balance", "instant", C.retained);
+  if (has("Common Stock & APIC", "Common Stock and APIC", "Common Stock and Additional Paid-In Capital", "Common Stock & Additional Paid-In Capital")) return plug(rowNumber, label, "balance", "instant", resolveCommonStockAndApic);
+  if (has("Retained Earnings", "Accumulated Deficit")) return row(rowNumber, label, "balance", "instant", C.retained);
   if (has("Treasury Stock", "Treasury & Preferred Stock")) return plug(rowNumber, label, "balance", "instant", resolveTreasuryAndPreferredStock);
   if (has("Accumulated Other Comprehensive Income (AOCI)", "AOCI")) return row(rowNumber, label, "balance", "instant", C.aoci);
   if (has("Noncontrolling Interests", "Non-Controlling Interests")) return row(rowNumber, label, "balance", "instant", C.nci);
@@ -680,8 +692,9 @@ export async function POST(request: NextRequest) {
         }
       });
 
-      if (rowNotes.size && isHardcodedInput(sheet.getCell(fillRow.row, 3))) {
-        addComment(sheet.getCell(fillRow.row, 3), Array.from(rowNotes).join(" "));
+      const sourceCell = labelCell(sheet, fillRow.row);
+      if (rowNotes.size && canAddComment(sourceCell)) {
+        addComment(sourceCell, Array.from(rowNotes).join(" "));
         commentsAdded += 1;
       }
 
@@ -1297,7 +1310,7 @@ function comparePeriods(a: string, b: string) {
 function blueColumns(sheet: ExcelJS.Worksheet) {
   const columnCounts = new Map<number, number>();
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    const label = cellDisplay(sheet.getCell(rowNumber, 3));
+    const label = rowLabel(sheet, rowNumber);
     if (!label) continue;
     for (let col = 6; col <= sheet.columnCount; col += 1) {
       if (!isHardcodedBlueInput(sheet.getCell(rowNumber, col))) continue;
@@ -1312,7 +1325,25 @@ function blueColumns(sheet: ExcelJS.Worksheet) {
 
   if (candidates.length) return candidates;
 
-  return Array.from(columnCounts.keys()).sort((a, b) => a - b);
+  const blueFallback = Array.from(columnCounts.keys()).sort((a, b) => a - b);
+  if (blueFallback.length) return blueFallback;
+
+  const periodColumns = periodHeaderColumns(sheet);
+  if (periodColumns.length) return periodColumns;
+
+  return [];
+}
+
+function periodHeaderColumns(sheet: ExcelJS.Worksheet) {
+  let best: number[] = [];
+  for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 120); rowNumber += 1) {
+    const cols: number[] = [];
+    for (let col = 4; col <= sheet.columnCount; col += 1) {
+      if (/^[1-4]Q\d{2}$/.test(normalizePeriodLabel(cellDisplay(sheet.getCell(rowNumber, col))))) cols.push(col);
+    }
+    if (cols.length > best.length) best = cols;
+  }
+  return best;
 }
 
 function templatePeriodInfos(sheet: ExcelJS.Worksheet, columns: number[]) {
@@ -1350,6 +1381,14 @@ function cellDisplay(cell: ExcelJS.Cell) {
   if (typeof value === "number") return String(value);
   if (value && typeof value === "object" && "result" in value && value.result !== undefined && value.result !== null) {
     return String(value.result);
+  }
+  return "";
+}
+
+function rowLabel(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  for (const col of LABEL_COLUMNS) {
+    const text = cellDisplay(sheet.getCell(rowNumber, col)).trim();
+    if (text) return text;
   }
   return "";
 }
@@ -1540,7 +1579,7 @@ function nextUnusedSegmentIndex(segments: SegmentRevenue[], used: Set<number>) {
 
 function firstCommentableCell(sheet: ExcelJS.Worksheet, rows: number[]) {
   for (const rowNumber of rows) {
-    const cell = sheet.getCell(rowNumber, 3);
+    const cell = labelCell(sheet, rowNumber);
     if (canAddComment(cell)) return cell;
   }
   return null;
@@ -1549,9 +1588,17 @@ function firstCommentableCell(sheet: ExcelJS.Worksheet, rows: number[]) {
 function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
   const wanted = normalize(label);
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    if (normalize(cellDisplay(sheet.getCell(rowNumber, 3))) === wanted) return rowNumber;
+    if (normalize(rowLabel(sheet, rowNumber)) === wanted) return rowNumber;
   }
   return null;
+}
+
+function labelCell(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  for (const col of LABEL_COLUMNS) {
+    const cell = sheet.getCell(rowNumber, col);
+    if (cellDisplay(cell).trim()) return cell;
+  }
+  return sheet.getCell(rowNumber, 3);
 }
 
 function rowHasBlueInputs(sheet: ExcelJS.Worksheet, rowNumber: number) {
