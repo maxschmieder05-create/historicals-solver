@@ -88,6 +88,22 @@ type FilingRef = {
   primaryDocument: string;
 };
 
+type MappingAuditRow = {
+  sheetName: string;
+  cell: string;
+  modelRowLabel: string;
+  period: string;
+  valueWritten: number;
+  mappingType: RowClassification | "segment" | "calculated";
+  conceptsUsed: string;
+  sourceStatement: string;
+  accession: string;
+  sourceUrl: string;
+  confidence: "high" | "medium" | "low";
+  validationStatus: string;
+  notes: string;
+};
+
 type RowClassification = "direct" | "grouped" | "partial" | "formula" | "unused";
 
 type ModelRowContext = {
@@ -113,7 +129,8 @@ const SEC_HEADERS = {
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
 const SEGMENT_SHEET = "Segment Analysis";
-const LABEL_COLUMNS = [1, 2, 3, 4, 5];
+const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
+const MAPPING_AUDIT_SHEET = "Mapping Audit";
 
 const C = {
   revenue: ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
@@ -417,8 +434,8 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
   if (has("Total Provisions for Credit Losses", "Provision for Credit Losses")) return row(rowNumber, label, "income", "duration", C.creditLossProvision, -1);
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
-  if (has("Interest (Expense)")) return reviewRow(context, "Split / partial match: the model row could represent multiple EDGAR interest presentation styles. Needs review.");
   if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
+  if (/\binterest\s*\(\s*expense\s*\)/i.test(label)) return reviewRow(context, "Split / partial match: the model row could represent multiple EDGAR interest presentation styles. Needs review.");
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
   if (has("Gain on Sale of Business (Loss)")) return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets"], 1);
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
@@ -894,6 +911,7 @@ export async function POST(request: NextRequest) {
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
 
     const warnings: string[] = [];
+    const auditRows: MappingAuditRow[] = [];
     let filledCells = 0;
     let commentsAdded = 0;
 
@@ -931,6 +949,10 @@ export async function POST(request: NextRequest) {
 
         const auditNote = auditNoteForResolvedValue(fillRow, resolved);
         if (auditNote) rowNotes.add(auditNote);
+        const cellComment = mappingComment(fillRow, resolved, period, cell.value as number, "high", auditNote);
+        addComment(cell, cellComment);
+        commentsAdded += 1;
+        auditRows.push(mappingAuditRow(sheet, cell, fillRow, period, cell.value as number, resolved, "high", auditNote));
       });
 
       if (unresolved && fillRow.classification === "partial") {
@@ -954,7 +976,7 @@ export async function POST(request: NextRequest) {
 
     const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
     if (segmentSheet) {
-      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx);
+      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows);
       filledCells += segmentResult.filledCells;
       commentsAdded += segmentResult.commentsAdded;
       warnings.push(...segmentResult.warnings);
@@ -968,6 +990,13 @@ export async function POST(request: NextRequest) {
         warnings.push(`${fillRow.label}: no matching SEC concept found.`);
       }
     }
+
+    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns);
+    if (validationErrors.length) {
+      return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
+    }
+
+    addMappingAuditSheet(workbook, auditRows);
 
     const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
     const outputName = `${company.ticker}_historicals_filled.xlsx`;
@@ -1245,13 +1274,14 @@ function contextPeriod(contextXml: string, form: string) {
 }
 
 function segmentLabelFromMembers(members: string[]) {
+  const reportableSegment = members.find((member) => /BusinessSegment|OperatingSegment|StatementBusinessSegments|SegmentAxis/i.test(member));
   const product = members.find(
     (member) =>
       member.includes("ProductOrServiceAxis") ||
-      /ServiceLine|OtherServiceLine|BusinessSegment|OperatingSegment|StatementBusinessSegments|SegmentAxis/i.test(member)
+      /ServiceLine|OtherServiceLine/i.test(member)
   );
   const joined = members.join(" ");
-  const source = product || joined;
+  const source = reportableSegment || product || joined;
   if (/CollectionServiceLineMember/i.test(source)) return "Collection";
   if (/LandfillServiceLineMember/i.test(source)) return "Landfill";
   if (/EnvironmentalSolutionsServiceLineMember/i.test(source)) return "Environmental Solutions";
@@ -1643,11 +1673,22 @@ function cellDisplay(cell: ExcelJS.Cell) {
 }
 
 function rowLabel(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  const candidates: string[] = [];
   for (const col of LABEL_COLUMNS) {
     const text = cellDisplay(sheet.getCell(rowNumber, col)).trim();
-    if (text) return text;
+    if (!text || /^x$/i.test(text)) continue;
+    candidates.push(text);
   }
-  return "";
+  if (!candidates.length) return "";
+  return candidates.sort((a, b) => scoreLabelCandidate(b) - scoreLabelCandidate(a))[0];
+}
+
+function scoreLabelCandidate(label: string) {
+  let score = Math.min(label.length, 80);
+  if (/[A-Za-z]{3,}/.test(label)) score += 40;
+  if (/statement|revenue|expense|assets|liabilities|equity|cash|income|segment|total/i.test(label)) score += 20;
+  if (/^=/.test(label)) score -= 30;
+  return score;
 }
 
 function modelRowContext(
@@ -1769,11 +1810,12 @@ function fillSegmentAnalysis(
   periods: string[],
   columns: number[],
   segments: SegmentRevenue[],
-  ctx: ResolveContext
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
 ) {
   const warnings: string[] = [];
   let filledCells = 0;
-  const commentsAdded = 0;
+  let commentsAdded = 0;
   const fallbackRevenue = periods.map((period) => first(period, ctx.duration, C.revenue)?.value ?? 0);
   const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns).slice(0, 6);
   const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns).slice(0, 6);
@@ -1794,10 +1836,11 @@ function fillSegmentAnalysis(
     warnings.push("No service-line revenue facts found in recent inline XBRL filings; Segment Analysis uses one total company revenue line.");
   }
 
-  const revenueResult = fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue");
-  const operatingIncomeResult = fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, usableSegments, "operatingIncome", "Operating Income");
-  const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A");
+  const revenueResult = fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows);
+  const operatingIncomeResult = fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, usableSegments, "operatingIncome", "Operating Income", auditRows);
+  const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A", auditRows);
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
+  commentsAdded += revenueResult.commentsAdded + operatingIncomeResult.commentsAdded + depreciationResult.commentsAdded;
 
   return { filledCells, commentsAdded, warnings };
 }
@@ -1809,17 +1852,29 @@ function fillSegmentMetricRows(
   rows: number[],
   segments: SegmentRevenue[],
   metric: "values" | "operatingIncome" | "depreciationAmortization",
-  suffix: string
+  suffix: string,
+  auditRows: MappingAuditRow[]
 ) {
   let filledCells = 0;
+  let commentsAdded = 0;
   const usedSegments = new Set<number>();
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const rowNumber = rows[rowIndex];
-    const existingLabel = segmentBaseLabel(cellDisplay(sheet.getCell(rowNumber, 3)), suffix);
-    if (isGenericSegmentPlaceholder(existingLabel)) continue;
-    const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments) ?? nextUnusedSegmentIndex(segments, usedSegments);
-    if (segmentIndex === null) continue;
+    const existingLabel = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
+    if (isGenericSegmentPlaceholder(existingLabel)) {
+      const cleared = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, existingLabel || suffix, auditRows);
+      filledCells += cleared.filledCells;
+      commentsAdded += cleared.commentsAdded;
+      continue;
+    }
+    const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments);
+    if (segmentIndex === null) {
+      const cleared = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, existingLabel, auditRows);
+      filledCells += cleared.filledCells;
+      commentsAdded += cleared.commentsAdded;
+      continue;
+    }
 
     const segment = segments[segmentIndex];
     if (!segmentHasMetricData(segment, metric, periods)) continue;
@@ -1828,16 +1883,79 @@ function fillSegmentMetricRows(
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
       if (!isHardcodedFinancialInput(cell)) return;
-      cell.value = (segment[metric].get(period) ?? 0) / 1_000_000;
+      const value = (segment[metric].get(period) ?? 0) / 1_000_000;
+      cell.value = value;
       filledCells += 1;
+      const resolved = segmentResolvedValue(segment, metric, period);
+      const comment = mappingCommentForSegment(sheet, cell, existingLabel, segment, period, value, suffix);
+      addComment(cell, comment);
+      commentsAdded += 1;
+      auditRows.push(mappingAuditRowForSegment(sheet, cell, existingLabel, period, value, resolved, suffix));
     });
   }
 
-  return { filledCells };
+  return { filledCells, commentsAdded };
+}
+
+function clearUnmatchedSegmentRow(
+  sheet: ExcelJS.Worksheet,
+  rowNumber: number,
+  periods: string[],
+  columns: number[],
+  modelLabel: string,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  periods.forEach((period, periodIndex) => {
+    const cell = sheet.getCell(rowNumber, columns[periodIndex]);
+    if (!isHardcodedFinancialInput(cell)) return;
+    const existing = typeof cell.value === "number" ? cell.value : null;
+    if (existing === 0 || existing === null) return;
+    cell.value = 0;
+    filledCells += 1;
+    const notes = "Needs review: Segment Analysis row was not filled because the template label is blank, generic, or does not confidently match an EDGAR reportable segment.";
+    addComment(cell, notes);
+    commentsAdded += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: cell.address,
+      modelRowLabel: modelLabel,
+      period,
+      valueWritten: 0,
+      mappingType: "unused",
+      conceptsUsed: "",
+      sourceStatement: "segment",
+      accession: "",
+      sourceUrl: "",
+      confidence: "low",
+      validationStatus: "needs_review",
+      notes
+    });
+  });
+  return { filledCells, commentsAdded };
 }
 
 function segmentHasMetricData(segment: SegmentRevenue, metric: "values" | "operatingIncome" | "depreciationAmortization", periods: string[]) {
   return periods.some((period) => segment[metric].has(period) && segment[metric].get(period) !== 0);
+}
+
+function segmentRowLabel(sheet: ExcelJS.Worksheet, rowNumber: number, suffix: string) {
+  const labelCellForRow = labelCell(sheet, rowNumber);
+  const displayed = cellDisplay(labelCellForRow).trim();
+  if (displayed) return displayed;
+
+  const formula = cellFormula(labelCellForRow);
+  if (!formula) return "";
+
+  const reference = formula.match(/^=?\$?([A-Z]+)\$?(\d+)\s*(?:&|$)/i);
+  if (!reference) return "";
+
+  const referenced = cellDisplay(sheet.getCell(`${reference[1]}${reference[2]}`)).trim();
+  if (!referenced) return "";
+
+  if (/Revenue|Operating Income|D&A/i.test(formula)) return `${referenced} ${suffix}`;
+  return referenced;
 }
 
 function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabel: string, columns: number[]) {
@@ -1865,6 +1983,7 @@ function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
 function segmentBaseLabel(label: string, suffix: string) {
   return label
     .replace(/^"+|"+$/g, "")
+    .replace(/^=/, "")
     .replace(new RegExp(`\\s*${suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`, "i"), "")
     .replace(/\s*Revenue\s*$/i, "")
     .replace(/\s*Operating Income\s*$/i, "")
@@ -1873,7 +1992,7 @@ function segmentBaseLabel(label: string, suffix: string) {
 }
 
 function isGenericSegmentPlaceholder(label: string) {
-  return !label || /^segment\s*\d+$/i.test(label);
+  return !label || /^segment\s*\d+$/i.test(label) || /^(revenue|operating income|d&a|total company)$/i.test(label.trim());
 }
 
 function segmentIndexForRow(label: string, segments: SegmentRevenue[], used: Set<number>) {
@@ -1892,6 +2011,20 @@ function nextUnusedSegmentIndex(segments: SegmentRevenue[], used: Set<number>) {
   return index === -1 ? null : index;
 }
 
+function segmentResolvedValue(
+  segment: SegmentRevenue,
+  metric: "values" | "operatingIncome" | "depreciationAmortization",
+  period: string
+): ResolvedValue {
+  const value = segment[metric].get(period) ?? null;
+  return {
+    value,
+    sources: value === null ? [] : [{ concept: `segment:${metric}`, label: segment.label, value }],
+    note: `Matched reportable segment "${segment.label}" from filing segment tables.`,
+    classification: "direct"
+  };
+}
+
 function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
   const wanted = normalize(label);
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
@@ -1901,11 +2034,19 @@ function findLabelRow(sheet: ExcelJS.Worksheet, label: string) {
 }
 
 function labelCell(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  let best: ExcelJS.Cell | null = null;
+  let bestScore = -Infinity;
   for (const col of LABEL_COLUMNS) {
     const cell = sheet.getCell(rowNumber, col);
-    if (cellDisplay(cell).trim()) return cell;
+    const text = cellDisplay(cell).trim();
+    if (!text || /^x$/i.test(text)) continue;
+    const score = scoreLabelCandidate(text);
+    if (score > bestScore) {
+      best = cell;
+      bestScore = score;
+    }
   }
-  return sheet.getCell(rowNumber, 3);
+  return best ?? sheet.getCell(rowNumber, 3);
 }
 
 function rowHasHardcodedFinancialInputs(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
@@ -2063,9 +2204,200 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
   });
 }
 
+function mappingComment(
+  fillRow: FillRow,
+  resolved: ResolvedValue,
+  period: string,
+  valueWritten: number,
+  confidence: "high" | "medium" | "low",
+  notes?: string | null
+) {
+  const source = resolved.sources[0];
+  const concepts = resolved.sources.length
+    ? resolved.sources.map((item) => `${item.concept} = ${roundModelValue(item.value / (fillRow.scale ?? 1))} mm`).join("; ")
+    : "None";
+  return [
+    "EDGAR mapping:",
+    `Source: ${source?.form || "SEC filing"}${source?.accn ? `, accession #${source.accn}` : ""}${source?.filed ? `, filed ${source.filed}` : ""}`,
+    `Period: ${period}${source?.end ? ` / period ended ${source.end}` : ""}`,
+    `Model row: ${fillRow.modelContext?.sheetName || MODEL_SHEET}!${fillRow.row} ${fillRow.label}`,
+    `Mapping type: ${resolved.classification || fillRow.classification}`,
+    `Concepts used: ${concepts}`,
+    "Unit conversion: raw USD to $mm",
+    `Sign: ${fillRow.sign === -1 ? "inverted because model expects this row as negative" : "copied using model sign convention"}`,
+    `Confidence: ${confidence}`,
+    `Value written: ${valueWritten}`,
+    notes ? `Notes: ${notes}` : resolved.note ? `Notes: ${resolved.note}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function mappingCommentForSegment(
+  sheet: ExcelJS.Worksheet,
+  cell: ExcelJS.Cell,
+  modelLabel: string,
+  segment: SegmentRevenue,
+  period: string,
+  valueWritten: number,
+  suffix: string
+) {
+  return [
+    "EDGAR mapping:",
+    "Source: SEC inline XBRL segment table",
+    `Period: ${period}`,
+    `Model row: ${sheet.name}!${cell.address} ${modelLabel}`,
+    "Mapping type: segment",
+    `Concepts used: reportable segment ${segment.label} ${suffix} = ${valueWritten} mm`,
+    "Unit conversion: raw USD to $mm",
+    "Sign: copied using model sign convention",
+    "Confidence: high",
+    "Notes: Segment Analysis is mapped only to reportable segment rows that match the template labels; generic or blank segment rows are left unchanged."
+  ].join("\n");
+}
+
+function mappingAuditRow(
+  sheet: ExcelJS.Worksheet,
+  cell: ExcelJS.Cell,
+  fillRow: FillRow,
+  period: string,
+  valueWritten: number,
+  resolved: ResolvedValue,
+  confidence: "high" | "medium" | "low",
+  notes?: string | null
+): MappingAuditRow {
+  return {
+    sheetName: sheet.name,
+    cell: cell.address,
+    modelRowLabel: fillRow.label,
+    period,
+    valueWritten,
+    mappingType: resolved.classification || fillRow.classification,
+    conceptsUsed: resolved.sources.map((source) => `${source.concept}=${roundModelValue(source.value / (fillRow.scale ?? 1))}mm`).join("; "),
+    sourceStatement: fillRow.statement,
+    accession: unique(resolved.sources.map((source) => source.accn).filter(Boolean)).join("; "),
+    sourceUrl: "",
+    confidence,
+    validationStatus: "not_run",
+    notes: notes || resolved.note || fillRow.comment || ""
+  };
+}
+
+function mappingAuditRowForSegment(
+  sheet: ExcelJS.Worksheet,
+  cell: ExcelJS.Cell,
+  modelLabel: string,
+  period: string,
+  valueWritten: number,
+  resolved: ResolvedValue,
+  suffix: string
+): MappingAuditRow {
+  return {
+    sheetName: sheet.name,
+    cell: cell.address,
+    modelRowLabel: modelLabel,
+    period,
+    valueWritten,
+    mappingType: "segment",
+    conceptsUsed: resolved.sources.map((source) => `${source.label} ${suffix}=${valueWritten}mm`).join("; "),
+    sourceStatement: "segment",
+    accession: unique(resolved.sources.map((source) => source.accn).filter(Boolean)).join("; "),
+    sourceUrl: "",
+    confidence: "high",
+    validationStatus: "not_run",
+    notes: resolved.note || ""
+  };
+}
+
+function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: string[], columns: number[]) {
+  const errors: string[] = [];
+  const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
+  if (segmentSheet) {
+    errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
+  }
+  const modelSheet = workbook.getWorksheet(MODEL_SHEET);
+  if (modelSheet) {
+    const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
+    if (interestExpenseRow) {
+      const hasPopulatedInterestExpense = columns.some((col) => Math.abs(numericCellValue(modelSheet.getCell(interestExpenseRow, col)) ?? 0) > 0.0001);
+      if (!hasPopulatedInterestExpense) {
+        errors.push("Model Interest Expense row is present but all detected historical cells are zero/blank.");
+      }
+    }
+  }
+  return errors;
+}
+
+function validateSegmentGenericRows(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
+  const errors: string[] = [];
+  const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns);
+  for (const rowNumber of rows) {
+    const label = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, "Revenue"), "Revenue");
+    if (!isGenericSegmentPlaceholder(label)) continue;
+    periods.forEach((period, index) => {
+      const cell = sheet.getCell(rowNumber, columns[index]);
+      if (hasFormula(cell)) return;
+      const value = numericCellValue(cell);
+      if (value !== null && Math.abs(value) > 0.0001) {
+        errors.push(`${sheet.name}!${cell.address} ${period}: generic segment row contains nonzero historical value ${value}.`);
+      }
+    });
+  }
+  return errors;
+}
+
+function numericCellValue(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  if (typeof value === "number") return value;
+  if (value && typeof value === "object" && "result" in value && typeof value.result === "number") return value.result;
+  return null;
+}
+
+function addMappingAuditSheet(workbook: ExcelJS.Workbook, auditRows: MappingAuditRow[]) {
+  const existing = workbook.getWorksheet(MAPPING_AUDIT_SHEET);
+  if (existing) workbook.removeWorksheet(existing.id);
+  const sheet = workbook.addWorksheet(MAPPING_AUDIT_SHEET);
+  sheet.columns = [
+    { header: "workbook sheet", key: "sheetName", width: 24 },
+    { header: "cell/range", key: "cell", width: 12 },
+    { header: "model row label", key: "modelRowLabel", width: 36 },
+    { header: "period", key: "period", width: 12 },
+    { header: "value written", key: "valueWritten", width: 16 },
+    { header: "mapping type", key: "mappingType", width: 16 },
+    { header: "EDGAR concepts used", key: "conceptsUsed", width: 60 },
+    { header: "source statement/table", key: "sourceStatement", width: 24 },
+    { header: "accession", key: "accession", width: 24 },
+    { header: "source URL", key: "sourceUrl", width: 24 },
+    { header: "confidence", key: "confidence", width: 12 },
+    { header: "validation status", key: "validationStatus", width: 18 },
+    { header: "notes", key: "notes", width: 60 }
+  ];
+  auditRows.forEach((row) => sheet.addRow(row));
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+}
+
 function addComment(cell: ExcelJS.Cell, text: string) {
-  const existing = typeof cell.note === "string" ? `${cell.note}\n\n` : "";
-  cell.note = `${existing}Historicals Solver: ${text}`;
+  const existing = commentText(cell.note);
+  const body = `${existing ? `${existing}\n\n` : ""}EDGAR Mapper:\n${text}`;
+  cell.note = {
+    texts: [
+      {
+        font: { bold: true },
+        text: "EDGAR Mapper:\n"
+      },
+      {
+        text: body.replace(/^EDGAR Mapper:\n/, "")
+      }
+    ],
+    editAs: "oneCells"
+  };
+}
+
+function commentText(note: ExcelJS.Cell["note"]) {
+  if (!note) return "";
+  if (typeof note === "string") return note;
+  return note.texts?.map((text) => text.text).join("") ?? "";
 }
 
 function roundModelValue(value: number) {
