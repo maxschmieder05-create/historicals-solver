@@ -368,6 +368,7 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInf
   const seen = new Set<number>();
 
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    if (isCashFlowStatementBlockRow(sheet, rowNumber)) continue;
     const modelContext = modelRowContext(sheet, rowNumber, columns, periodInfos);
     if (!modelContext.hasHardcodedInput && !modelContext.hasHistoricalFormula) continue;
     const label = rowLabel(sheet, rowNumber);
@@ -381,6 +382,16 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInf
   return rows;
 }
 
+function isCashFlowStatementBlockRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  for (let row = rowNumber; row >= Math.max(1, rowNumber - 40); row -= 1) {
+    const label = rowLabel(sheet, row);
+    if (!label) continue;
+    if (normalize(label) === normalize("Cash Flow Statement")) return true;
+    if (/analysis|schedule|statement|drivers|balance sheet/i.test(label)) return false;
+  }
+  return false;
+}
+
 function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
   return fillRowForContext({ sheetName: MODEL_SHEET, row: rowNumber, label, indentation: 0, hasHistoricalFormula: false, hasHardcodedInput: true, projectedColumns: 0, signConvention: 1 });
 }
@@ -391,7 +402,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   const has = (...aliases: string[]) => aliases.some((alias) => key === normalize(alias));
   const includes = (...aliases: string[]) => aliases.some((alias) => key.includes(normalize(alias)));
   const around = normalize([context.sectionHeader, context.previousLabel, context.nextLabel].filter(Boolean).join(" "));
-  const inSection = (...aliases: string[]) => aliases.some((alias) => around.includes(normalize(alias)));
+  const aroundIncludes = (...aliases: string[]) => aliases.some((alias) => around.includes(normalize(alias)));
   const hasRevenue = has("Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue");
   const hasNetRevenue = has("Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense");
 
@@ -420,14 +431,17 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits", "Employee Compensation & Benefits")) {
     return plug(rowNumber, label, "income", "duration", resolveCompensationExpense, "direct");
   }
-  if (has("Non-Compensation Expenses") || (includes("Non Compensation", "Non-Compensation") && inSection("Expense", "Operating"))) {
+  if (has("Non-Compensation Expenses") || (includes("Non Compensation", "Non-Compensation") && aroundIncludes("Expense", "Operating"))) {
     return plug(rowNumber, label, "income", "duration", resolveNonCompensationExpense);
   }
   if (
     has("Other Operating Expenses", "Other Operating Expense") ||
-    (has("Other", "Other Expenses", "Other Expense") && context.indentation > 0 && inSection("Operating Expense", "Operating Expenses", "Noninterest Expense", "Expenses"))
+    (has("Other", "Other Expenses", "Other Expense") && context.indentation > 0 && aroundIncludes("Operating Expense", "Operating Expenses", "Noninterest Expense", "Expenses"))
   ) {
     return plug(rowNumber, label, "income", "duration", resolveOtherOperatingExpenseGroup);
+  }
+  if (has("Depreciation Expense") && inSection(context, "PP&E / Depreciation Schedule", "PPE / Depreciation Schedule", "PP&E", "PPE")) {
+    return reviewRow(context, "Needs review: PP&E depreciation is a roll-forward input and was not overwritten with consolidated depreciation and amortization.");
   }
   if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense", "Depreciation & Amortization (incl. in SG&A)")) return row(rowNumber, label, "income", "duration", C.da, -1);
   if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
@@ -447,7 +461,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"], -1);
   if (has("Discontinued Operations")) return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
   if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) {
-    return plug(rowNumber, label, "income", "duration", resolveNoncontrollingIncome);
+    return plug(rowNumber, label, "income", "duration", resolveCommonIncomePlug);
   }
 
   if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash")) return row(rowNumber, label, "balance", "instant", C.cash, 1, 1_000_000, "Mapped to SEC cash and cash equivalents.");
@@ -493,7 +507,12 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
 
   if (has("(Increase)/Decrease in Working Capital", "Increase / (Decrease) in Working Capital")) return row(rowNumber, label, "support", "duration", C.workingCapital);
   if (has("(Increase)/Decrease in LT Items", "Increase / (Decrease) in LT Items")) return row(rowNumber, label, "support", "duration", C.longTermItems);
-  if (has("Capital Expenditures", "Capex")) return row(rowNumber, label, "support", "duration", C.capex, -1);
+  if (has("Capital Expenditures", "Capex")) {
+    if (inSection(context, "PP&E / Depreciation Schedule", "PPE / Depreciation Schedule", "PP&E", "PPE")) {
+      return reviewRow(context, "Needs review: PP&E schedule capex is a roll-forward input and was not overwritten with generic cash-flow capex.");
+    }
+    return row(rowNumber, label, "support", "duration", C.capex, -1);
+  }
   if (has("Purchases of Intangibles")) return row(rowNumber, label, "support", "duration", ["PaymentsToAcquireIntangibleAssets"]);
   if (has("Purchases of Investments")) return row(rowNumber, label, "support", "duration", PURCHASES_OF_INVESTMENTS_CONCEPTS);
   if (has("Acquisition / (Divestment) of Businesses", "Proceeds From/(Acquisitions of) Businesses", "Proceeds From (Acquisitions of) Businesses")) {
@@ -503,7 +522,22 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Issuance of Debt")) return row(rowNumber, label, "support", "duration", C.debtIssuance);
   if (has("(Repayment of Debt)", "Repayment of Debt")) return row(rowNumber, label, "support", "duration", C.debtRepayment, -1);
   if (has("Issuance of Equity")) return row(rowNumber, label, "support", "duration", C.equityIssuance);
-  if (has("Shares Repurchased ($ Amount)", "Share Repurchases ($ Amount)", "(Repurchase) of Equity", "Repurchase of Equity")) return row(rowNumber, label, "support", "duration", C.repurchases, -1);
+  if (has("Shares Repurchased ($ Amount)", "Share Repurchases ($ Amount)")) {
+    if (inSection(context, "Share Repurchase Assumptions")) {
+      return reviewRow(context, "Needs review: share repurchase assumptions were preserved because EDGAR cash-flow repurchase payments may differ from the model's repurchase-price/share-count schedule.");
+    }
+    return row(
+      rowNumber,
+      label,
+      "support",
+      "duration",
+      C.repurchases,
+      inSection(context, "Shareholder's Equity Schedule", "Shareholders Equity Schedule", "Share Repurchase Assumptions") ? 1 : -1,
+      1_000_000,
+      "Mapped to EDGAR common stock repurchases; sign follows the model row context."
+    );
+  }
+  if (has("(Repurchase) of Equity", "Repurchase of Equity")) return row(rowNumber, label, "support", "duration", C.repurchases, -1);
   if (has("Stock-Based Comp Expense", "Stock-Based Compensation")) return row(rowNumber, label, "support", "duration", C.sbc);
   if (has("Dividends", "Dividends Issued")) return row(rowNumber, label, "support", "duration", C.dividends, -1);
   if (has("Change in Noncontrolling Interests")) return row(rowNumber, label, "support", "duration", C.noncontrollingInterestChange);
@@ -511,8 +545,18 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Beginning Cash Adjustments", "Ending Cash Adjustments")) return reviewRow(context, "Unused / no confident match: cash adjustment rows are model-specific and were not filled from EDGAR.");
   if (has("Beginning Cash Balance")) return plug(rowNumber, label, "support", "instant", resolveBeginningCashBalance, "direct");
   if (has("Ending Cash Balance")) return row(rowNumber, label, "support", "instant", C.cash);
-  if (has("Weighted Average Basic Shares", "Basic Shares")) return row(rowNumber, label, "support", "duration", C.basicShares, 1, 1_000_000);
-  if (has("Weighted Average Dilutive Shares", "Weighted Average Diluted Shares", "Diluted Shares")) return row(rowNumber, label, "support", "duration", C.dilutedShares, 1, 1_000_000);
+  if (has("Weighted Average Basic Shares", "Basic Shares")) {
+    if (inSection(context, "Shares Outstanding Schedule")) {
+      return reviewRow(context, "Needs review: shares outstanding schedule rows use the model's actual share roll-forward and were not overwritten with generic weighted-average share facts.");
+    }
+    return row(rowNumber, label, "support", "duration", C.basicShares, 1, 1_000_000);
+  }
+  if (has("Weighted Average Dilutive Shares", "Weighted Average Diluted Shares", "Diluted Shares")) {
+    if (inSection(context, "Shares Outstanding Schedule")) {
+      return reviewRow(context, "Needs review: shares outstanding schedule rows use the model's actual share roll-forward and were not overwritten with generic weighted-average share facts.");
+    }
+    return row(rowNumber, label, "support", "duration", C.dilutedShares, 1, 1_000_000);
+  }
 
   return null;
 }
@@ -661,6 +705,28 @@ function resolveNoncontrollingIncome(period: string, ctx: ResolveContext): Resol
   return { value: null, sources: [] };
 }
 
+function resolveCommonIncomePlug(period: string, ctx: ResolveContext): ResolvedValue {
+  const common = first(period, ctx.duration, ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLossAvailableToCommonStockholdersDiluted"]);
+  const continuingNet = first(period, ctx.duration, [
+    "IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest",
+    "NetIncomeLoss"
+  ]);
+  const preferredDividends = first(period, ctx.duration, ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"]) ?? zeroSource("PreferredStockDividendsIncomeStatementImpact");
+  const discontinued = first(period, ctx.duration, ["IncomeLossFromDiscontinuedOperationsNetOfTax"]) ?? zeroSource("IncomeLossFromDiscontinuedOperationsNetOfTax");
+
+  if (common && continuingNet) {
+    return {
+      value: common.value - continuingNet.value + preferredDividends.value - discontinued.value,
+      sources: [common, continuingNet, preferredDividends, discontinued],
+      note:
+        "Calculated as EDGAR net income available to common stockholders less continuing net income, plus preferred dividends, less discontinued operations so the model's common-shareholder income formula reconciles to EDGAR.",
+      classification: "grouped"
+    };
+  }
+
+  return resolveNoncontrollingIncome(period, ctx);
+}
+
 function resolveRevolverIssuanceRepayment(period: string, ctx: ResolveContext): ResolvedValue {
   const net = first(period, ctx.duration, [
     "ProceedsFromRepaymentsOfShortTermDebt",
@@ -766,6 +832,15 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
 }
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, ["OtherAssetsNoncurrent", "OtherAssets"]);
+  if (direct) {
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to EDGAR other assets when directly reported, rather than using a residual balance-sheet plug."
+    };
+  }
+
   const assets = first(period, ctx.instant, C.assets);
   const modeledCurrentAssets = resolveCurrentAssetsFromModeledRows(period, ctx);
   const currentAssets = modeledCurrentAssets.value !== null ? modeledCurrentAssets : first(period, ctx.instant, C.currentAssets);
@@ -1723,7 +1798,7 @@ function nearestSectionHeader(sheet: ExcelJS.Worksheet, rowNumber: number, colum
     if (!label) continue;
     const hasFinancialInput = columns.some((col) => cellDisplay(sheet.getCell(row, col)).trim() || hasFormula(sheet.getCell(row, col)));
     const labelCellForRow = labelCell(sheet, row);
-    if (!hasFinancialInput || labelCellForRow.font?.bold) return label;
+    if (!hasFinancialInput || labelCellForRow.font?.bold || /schedule|assumptions|drivers/i.test(label)) return label;
   }
   return undefined;
 }
@@ -1761,6 +1836,11 @@ function statementFromContext(context: ModelRowContext): FillRow["statement"] {
   if (inBalanceSheetContext(context)) return "balance";
   if (/cash|capex|debt|equity|share|dividend|working capital/i.test([context.sectionHeader, context.label].filter(Boolean).join(" "))) return "support";
   return "income";
+}
+
+function inSection(context: ModelRowContext, ...aliases: string[]) {
+  const haystack = normalize([context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" "));
+  return aliases.some((alias) => haystack.includes(normalize(alias)));
 }
 
 function inBalanceSheetContext(context: ModelRowContext) {

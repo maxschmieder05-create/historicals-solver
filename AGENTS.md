@@ -3,10 +3,13 @@
 ## Git Sync
 
 - Use `codex/rsg-segment-historicals` as the shared working branch unless the user explicitly names another branch.
+- Before starting new work, run `git fetch origin` and sync with `origin/codex/rsg-segment-historicals` so every Codex window starts from the latest shared code.
 - When a task is complete, run the relevant checks, commit the completed source changes, and push the branch to `origin`.
 - Do not leave completed source changes only in a local worktree. Other Codex windows should be able to sync by fetching/pulling the shared branch.
 - Do not commit generated artifacts, temporary workbooks, local caches, or build outputs unless the user specifically asks for them.
-- Merge to `main` only through an intentional merge or pull request after the shared branch is verified.
+- If another Codex window has pushed first, integrate the remote branch before pushing, resolving conflicts in favor of the combined verified behavior.
+- Merge to `main` only from the shared branch after all active Codex windows have pushed their completed work and the combined branch is verified.
+- The final output should come from the merged shared branch, not from an individual unsynced local window.
 
 ## Financial Data Source
 
