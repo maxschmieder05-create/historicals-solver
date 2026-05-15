@@ -65,6 +65,8 @@ type ResolvedValue = {
 type ResolveContext = {
   duration: Map<string, Map<string, FactSource>>;
   instant: Map<string, Map<string, FactSource>>;
+  modelSheet?: ExcelJS.Worksheet;
+  currentColumn?: number;
 };
 
 type InlineContext = {
@@ -832,18 +834,12 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
 }
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = first(period, ctx.instant, ["OtherAssetsNoncurrent", "OtherAssets"]);
-  if (direct) {
-    return {
-      value: direct.value,
-      sources: [direct],
-      note: "Mapped to EDGAR other assets when directly reported, rather than using a residual balance-sheet plug."
-    };
-  }
-
   const assets = first(period, ctx.instant, C.assets);
   const modeledCurrentAssets = resolveCurrentAssetsFromModeledRows(period, ctx);
-  const currentAssets = modeledCurrentAssets.value !== null ? modeledCurrentAssets : first(period, ctx.instant, C.currentAssets);
+  const currentAssets =
+    modelSubtotalSource(ctx, ["Total Current Assets"]) ??
+    first(period, ctx.instant, C.currentAssets) ??
+    (modeledCurrentAssets.value !== null ? modeledCurrentAssets : null);
   const ppe = resolvePpe(period, ctx);
   const intangibles = resolveIntangibleAssets(period, ctx);
   const goodwill = first(period, ctx.instant, C.goodwill) ?? zeroSource(C.goodwill[0]);
@@ -860,6 +856,23 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
     ["OtherAssetsNoncurrent", "OtherAssets", "AssetsOfDisposalGroupIncludingDiscontinuedOperation"],
     "Included other assets and assets of disposal groups / discontinued operations reported in the SEC filing."
   );
+}
+
+function modelSubtotalSource(ctx: ResolveContext, labels: string[]): ResolvedValue | null {
+  if (!ctx.modelSheet || !ctx.currentColumn) return null;
+  const normalizedLabels = labels.map(normalize);
+  for (let rowNumber = 1; rowNumber <= ctx.modelSheet.rowCount; rowNumber += 1) {
+    const label = rowLabel(ctx.modelSheet, rowNumber);
+    if (!label || !normalizedLabels.includes(normalize(label))) continue;
+    const value = numericCellValue(ctx.modelSheet.getCell(rowNumber, ctx.currentColumn));
+    if (value === null) return null;
+    return {
+      value: value * 1_000_000,
+      sources: [{ concept: "ModelSubtotal", label, value: value * 1_000_000 }],
+      note: `Used model subtotal "${label}" because this row is a residual in the uploaded workbook.`
+    };
+  }
+  return null;
 }
 
 function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1013,6 +1026,8 @@ export async function POST(request: NextRequest) {
         const cell = sheet.getCell(fillRow.row, col);
         if (!isModelHistoricalInput(cell)) return;
 
+        ctx.modelSheet = sheet;
+        ctx.currentColumn = col;
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
           unresolved += 1;
