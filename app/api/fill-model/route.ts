@@ -1798,8 +1798,7 @@ function nearestSectionHeader(sheet: ExcelJS.Worksheet, rowNumber: number, colum
     if (!label) continue;
     const hasFinancialInput = columns.some((col) => cellDisplay(sheet.getCell(row, col)).trim() || hasFormula(sheet.getCell(row, col)));
     const labelCellForRow = labelCell(sheet, row);
-    if (labelCellForRow.font?.bold || /statement|schedule|assumptions|drivers|analysis/i.test(label)) return label;
-    if (!hasFinancialInput && labelCellForRow.alignment?.indent === 0 && /total|assets|liabilities|equity|cash flow/i.test(label)) return label;
+    if (!hasFinancialInput || labelCellForRow.font?.bold || /schedule|assumptions|drivers/i.test(label)) return label;
   }
   return undefined;
 }
