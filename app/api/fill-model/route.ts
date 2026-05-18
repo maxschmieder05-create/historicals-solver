@@ -477,7 +477,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   ) {
     return plug(rowNumber, label, "income", "duration", resolveOtherOperatingExpenseGroup);
   }
-  if (has("Depreciation Expense") && inSection(context, "PP&E / Depreciation Schedule", "PPE / Depreciation Schedule", "PP&E", "PPE")) {
+  if (has("Depreciation Expense") && inPpeDepreciationScheduleContext(context)) {
     return reviewRow(context, "Needs review: PP&E depreciation is a roll-forward input and was not overwritten with consolidated depreciation and amortization.");
   }
   if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense", "Depreciation & Amortization (incl. in SG&A)")) return row(rowNumber, label, "income", "duration", C.da, -1);
@@ -553,7 +553,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("(Increase)/Decrease in Working Capital", "Increase / (Decrease) in Working Capital")) return row(rowNumber, label, "support", "duration", C.workingCapital);
   if (has("(Increase)/Decrease in LT Items", "Increase / (Decrease) in LT Items")) return row(rowNumber, label, "support", "duration", C.longTermItems);
   if (has("Capital Expenditures", "Capex")) {
-    if (inSection(context, "PP&E / Depreciation Schedule", "PPE / Depreciation Schedule", "PP&E", "PPE")) {
+    if (inPpeDepreciationScheduleContext(context)) {
       return reviewRow(context, "Needs review: PP&E schedule capex is a roll-forward input and was not overwritten with generic cash-flow capex.");
     }
     return row(rowNumber, label, "support", "duration", C.capex, -1);
@@ -561,6 +561,9 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Purchases of Intangibles")) return row(rowNumber, label, "support", "duration", ["PaymentsToAcquireIntangibleAssets"]);
   if (has("Purchases of Investments")) return row(rowNumber, label, "support", "duration", PURCHASES_OF_INVESTMENTS_CONCEPTS);
   if (has("Acquisition / (Divestment) of Businesses", "Proceeds From/(Acquisitions of) Businesses", "Proceeds From (Acquisitions of) Businesses")) {
+    if (inPpeDepreciationScheduleContext(context)) {
+      return reviewRow(context, "Needs review: PP&E schedule acquisition/divestment is a roll-forward input and was not overwritten with generic acquisition cash-flow concepts.");
+    }
     return row(rowNumber, label, "support", "duration", ACQUISITION_CONCEPTS);
   }
   if (has("Issuance/(Repayment) of Revolver")) return plug(rowNumber, label, "support", "duration", resolveRevolverIssuanceRepayment);
@@ -1245,15 +1248,15 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
+    filledCells += cashFlowClearResult.clearedCells;
+    warnings.push(...cashFlowClearResult.warnings);
+
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
     }
-
-    const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
-    filledCells += cashFlowClearResult.clearedCells;
-    warnings.push(...cashFlowClearResult.warnings);
 
     addMappingAuditSheet(workbook, auditRows);
 
@@ -2048,6 +2051,14 @@ function statementFromContext(context: ModelRowContext): FillRow["statement"] {
 function inSection(context: ModelRowContext, ...aliases: string[]) {
   const haystack = normalize([context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" "));
   return aliases.some((alias) => haystack.includes(normalize(alias)));
+}
+
+function inPpeDepreciationScheduleContext(context: ModelRowContext) {
+  const haystack = normalize([context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" "));
+  const hasPpeSchedule = ["PP&E / Depreciation Schedule", "PPE / Depreciation Schedule", "PP&E", "PPE"].some((alias) => haystack.includes(normalize(alias)));
+  const hasScheduleRows = /beginningppe|endingppe|depreciationexpense|acquisitiondivestmentofbusinesses|capex|capitalexpenditures/.test(haystack);
+  const isPpeHeader = normalize(context.sectionHeader ?? "") === normalize("PP&E / Depreciation Schedule") || normalize(context.sectionHeader ?? "") === normalize("PPE / Depreciation Schedule");
+  return isPpeHeader || (hasPpeSchedule && hasScheduleRows);
 }
 
 function inBalanceSheetContext(context: ModelRowContext) {
