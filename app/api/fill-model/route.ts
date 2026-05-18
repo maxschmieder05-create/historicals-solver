@@ -1257,6 +1257,13 @@ export async function POST(request: NextRequest) {
     commentsAdded += ppeScheduleClearResult.commentsAdded;
     warnings.push(...ppeScheduleClearResult.warnings);
 
+    const shareRepurchaseClearResult = clearStaleShareRepurchaseAssumptionAmounts(sheet, periods, columns, auditRows);
+    filledCells += shareRepurchaseClearResult.clearedCells;
+    commentsAdded += shareRepurchaseClearResult.commentsAdded;
+    warnings.push(...shareRepurchaseClearResult.warnings);
+
+    restoreWorkbookLabels(workbook, workbookSnapshot);
+
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
@@ -2722,6 +2729,14 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
   return errors;
 }
 
+function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
+  for (const [address, expected] of snapshot.labels.entries()) {
+    const cell = cellFromSnapshotAddress(workbook, address);
+    if (!cell) continue;
+    if (cellDisplay(cell) !== expected) cell.value = expected;
+  }
+}
+
 function clearCashFlowStatementHistoricalInputs(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
   const cashFlowRows = cashFlowStatementRows(sheet);
   let clearedCells = 0;
@@ -2858,6 +2873,75 @@ function isPpeDepreciationScheduleBoundary(label: string) {
   if (isPpeDepreciationScheduleHeader(label)) return false;
   if (normalize(label) === normalize("Drivers")) return true;
   return /income statement|cash flow statement|cashflow statement|balance sheet|working capital|debt and interest|shareholder|shareholders|analysis|schedule|assumptions/i.test(label);
+}
+
+function clearStaleShareRepurchaseAssumptionAmounts(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
+  let clearedCells = 0;
+  let commentsAdded = 0;
+  const note = "Cannot find in EDGAR, find manually.";
+
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    if (!isShareRepurchaseAssumptionAmountRow(sheet, rowNumber)) continue;
+    const hasNegativeInput = columns.some((col) => {
+      const cell = sheet.getCell(rowNumber, col);
+      if (hasFormula(cell)) return false;
+      const value = numericCellValue(cell);
+      return value !== null && value < -0.0001;
+    });
+    if (!hasNegativeInput) continue;
+
+    let clearedRow = false;
+    columns.forEach((col, index) => {
+      const cell = sheet.getCell(rowNumber, col);
+      if (hasFormula(cell)) return;
+      if (cellDisplay(cell) === "" && numericCellValue(cell) === null) return;
+      cell.value = null;
+      clearedCells += 1;
+      clearedRow = true;
+      auditRows.push({
+        sheetName: sheet.name,
+        cell: cell.address,
+        modelRowLabel: rowLabel(sheet, rowNumber) || "Shares Repurchased ($ Amount)",
+        period: periods[index],
+        valueWritten: 0,
+        mappingType: "unused",
+        conceptsUsed: "",
+        sourceStatement: "support",
+        accession: "",
+        sourceUrl: "",
+        cellWritable: true,
+        formulaPreserved: false,
+        writeBlockedReason: "",
+        signConvention: "not written",
+        confidence: "high",
+        validationStatus: "cleared",
+        notes: note
+      });
+    });
+    if (clearedRow) {
+      const sourceCell = labelCell(sheet, rowNumber);
+      if (canAddComment(sourceCell)) {
+        sourceCell.note = "";
+        addComment(sourceCell, note);
+        commentsAdded += 1;
+      }
+    }
+  }
+
+  return {
+    clearedCells,
+    commentsAdded,
+    warnings: clearedCells ? [`Shares Repurchased ($ Amount): cleared ${clearedCells} stale negative historical input cell(s); ${note}`] : []
+  };
+}
+
+function isShareRepurchaseAssumptionAmountRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  const label = normalize(rowLabel(sheet, rowNumber));
+  if (label !== normalize("Shares Repurchased ($ Amount)") && label !== normalize("Share Repurchases ($ Amount)")) return false;
+  for (let row = rowNumber; row >= Math.max(1, rowNumber - 10); row -= 1) {
+    if (normalize(rowLabel(sheet, row)) === normalize("Share Repurchase Assumptions")) return true;
+  }
+  return false;
 }
 
 function cashFlowStatementRows(sheet: ExcelJS.Worksheet) {
