@@ -2409,8 +2409,85 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
         errors.push("Model Interest Expense row is present but all detected historical cells are zero/blank.");
       }
     }
+    errors.push(...validateBalanceSheetBalances(modelSheet, periods, columns));
   }
   return errors;
+}
+
+function validateBalanceSheetBalances(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
+  const errors: string[] = [];
+  const band = findBalanceSheetBand(sheet);
+  if (!band) return errors;
+  const { balanceStart, balanceEnd } = band;
+  const totalAssetsRow = findRowMatching(sheet, (label) => normalize(label) === normalize("Total Assets"), balanceStart + 1, balanceEnd);
+  const totalLiabEquityRow = findRowMatching(
+    sheet,
+    (label) => /total.*liabilit.*(shareholder|stockholder|equity)|total.*liabilit.*equity/i.test(label),
+    totalAssetsRow ? totalAssetsRow + 1 : balanceStart + 1,
+    balanceEnd
+  );
+
+  if (!totalAssetsRow || !totalLiabEquityRow) return errors;
+
+  columns.forEach((col, index) => {
+    const assetLeafTotal = sumBalanceLeafRows(sheet, col, balanceStart + 1, totalAssetsRow - 1);
+    const liabEquityLeafTotal = sumBalanceLeafRows(sheet, col, totalAssetsRow + 1, totalLiabEquityRow - 1);
+    if (assetLeafTotal === null || liabEquityLeafTotal === null) return;
+
+    const diff = roundModelValue(assetLeafTotal - liabEquityLeafTotal);
+    if (Math.abs(diff) > 1) {
+      errors.push(
+        `${sheet.name} ${periods[index]}: balance sheet leaf rows do not balance; assets ${roundModelValue(assetLeafTotal)} vs liabilities/equity ${roundModelValue(
+          liabEquityLeafTotal
+        )}, difference ${diff}.`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function findBalanceSheetBand(sheet: ExcelJS.Worksheet) {
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (!label || normalize(label) !== normalize("Balance Sheet")) continue;
+    const balanceEnd = findRowMatching(sheet, (candidate) => normalize(candidate) === normalize("Balance Sheet Check"), rowNumber + 1, rowNumber + 120);
+    const totalAssets = findRowMatching(sheet, (candidate) => normalize(candidate) === normalize("Total Assets"), rowNumber + 1, balanceEnd ?? rowNumber + 120);
+    if (balanceEnd && totalAssets) return { balanceStart: rowNumber, balanceEnd };
+  }
+  return null;
+}
+
+function sumBalanceLeafRows(sheet: ExcelJS.Worksheet, col: number, startRow: number, endRow: number) {
+  let total = 0;
+  let found = false;
+  for (let rowNumber = startRow; rowNumber <= endRow; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (!label || isBalanceSubtotalLabel(label)) continue;
+    const value = numericCellValue(sheet.getCell(rowNumber, col));
+    if (value === null) continue;
+    total += value;
+    found = true;
+  }
+  return found ? total : null;
+}
+
+function isBalanceSubtotalLabel(label: string) {
+  const normalized = normalize(label);
+  return (
+    normalized.startsWith("total") ||
+    normalized === normalize("Balance Sheet") ||
+    normalized === normalize("Balance Sheet Check") ||
+    normalized.startsWith("change")
+  );
+}
+
+function findRowMatching(sheet: ExcelJS.Worksheet, predicate: (label: string) => boolean, startRow = 1, endRow = sheet.rowCount) {
+  for (let rowNumber = startRow; rowNumber <= Math.min(sheet.rowCount, endRow); rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (label && predicate(label)) return rowNumber;
+  }
+  return null;
 }
 
 function validateSegmentGenericRows(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
