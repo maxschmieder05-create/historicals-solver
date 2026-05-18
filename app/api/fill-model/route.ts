@@ -399,13 +399,22 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInf
 }
 
 function isCashFlowStatementBlockRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
-  for (let row = rowNumber; row >= Math.max(1, rowNumber - 40); row -= 1) {
+  for (let row = rowNumber; row >= Math.max(1, rowNumber - 80); row -= 1) {
     const label = rowLabel(sheet, row);
     if (!label) continue;
-    if (normalize(label) === normalize("Cash Flow Statement")) return true;
-    if (/analysis|schedule|statement|drivers|balance sheet/i.test(label)) return false;
+    if (isCashFlowStatementHeader(label)) return true;
+    if (isCashFlowStatementBoundary(label)) return false;
   }
   return false;
+}
+
+function isCashFlowStatementHeader(label: string) {
+  return normalize(label) === normalize("Cash Flow Statement") || normalize(label) === normalize("Cashflow Statement");
+}
+
+function isCashFlowStatementBoundary(label: string) {
+  if (isCashFlowStatementHeader(label)) return false;
+  return /income statement|balance sheet|working capital schedule|drivers|analysis|schedule|assumptions|debt and interest|shareholder|shareholders|pp&e|ppe/i.test(label);
 }
 
 function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
