@@ -571,8 +571,8 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("(Repayment of Debt)", "Repayment of Debt")) return row(rowNumber, label, "support", "duration", C.debtRepayment, -1);
   if (has("Issuance of Equity")) return row(rowNumber, label, "support", "duration", C.equityIssuance);
   if (has("Shares Repurchased ($ Amount)", "Share Repurchases ($ Amount)")) {
-    if (inSection(context, "Share Repurchase Assumptions")) {
-      return reviewRow(context, "Needs review: share repurchase assumptions were preserved because EDGAR cash-flow repurchase payments may differ from the model's repurchase-price/share-count schedule.");
+    if (inShareRepurchaseAssumptionsContext(context)) {
+      return reviewRow(context, "Needs review: share repurchase assumptions were preserved because the schedule uses EDGAR issuer-purchase / repurchase-price support, not generic cash-flow repurchase deltas.");
     }
     return row(
       rowNumber,
@@ -2056,6 +2056,13 @@ function statementFromContext(context: ModelRowContext): FillRow["statement"] {
 function inSection(context: ModelRowContext, ...aliases: string[]) {
   const haystack = normalize([context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" "));
   return aliases.some((alias) => haystack.includes(normalize(alias)));
+}
+
+function inShareRepurchaseAssumptionsContext(context: ModelRowContext) {
+  const haystack = normalize([context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" "));
+  const hasRepurchaseRow = /sharesrepurchased|sharerepurchases|averagepricepaid|ttmpe/.test(haystack);
+  const hasScheduleContext = /sharerepurchaseassumptions|shareholdersequityschedule|shareholder/.test(haystack);
+  return hasScheduleContext && hasRepurchaseRow;
 }
 
 function inPpeDepreciationScheduleContext(context: ModelRowContext) {
