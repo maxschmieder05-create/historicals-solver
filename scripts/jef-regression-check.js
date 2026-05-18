@@ -13,6 +13,7 @@ const ticker = process.env.JEF_TICKER || "JEF";
 const checks = [
   { sheet: "Model", name: "Income Statement", start: 28, end: 57 },
   { sheet: "Model", name: "Balance Sheet", start: 118, end: 159 },
+  { sheet: "Model", name: "PP&E / Depreciation Schedule", start: 193, end: 213 },
   { sheet: "Model", name: "Shareholder Equity / Shares", start: 237, end: 287 },
   { sheet: "Model", name: "Debt and Interest Schedule", start: 288, end: 360 },
   { sheet: "Segment Analysis", name: "Segment Revenue", start: 7, end: 17 }
@@ -92,7 +93,6 @@ function compareFormulas(golden, actual, errors) {
         const expected = cellFormula(expectedSheet.getCell(row, col));
         if (!expected) continue;
         const got = cellFormula(actualSheet.getCell(row, col));
-        if (sheetName === "Model" && isPpeScheduleUnsupportedInput(row, col) && !got && isBlank(actualSheet.getCell(row, col))) continue;
         if (expected !== got) {
           errors.push(`${sheetName}!${expectedSheet.getCell(row, col).address}: formula changed from "${expected}" to "${got ?? "[hardcoded/blank]"}".`);
         }
@@ -138,25 +138,6 @@ function isBlank(cell) {
   return got === null || got === undefined || got === "";
 }
 
-function isPpeScheduleUnsupportedInput(row, col) {
-  const quarterCols = new Set([6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19]);
-  return row >= 196 && row <= 198 && quarterCols.has(col);
-}
-
-function comparePpeScheduleBlank(actual, errors) {
-  const sheet = actual.getWorksheet("Model");
-  if (!sheet) return;
-  for (let row = 196; row <= 198; row += 1) {
-    for (const col of [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19]) {
-      const cell = sheet.getCell(row, col);
-      const got = cellValue(cell);
-      if (!isBlank(cell)) {
-        errors.push(`PP&E / Depreciation Schedule Model!${cell.address}: expected blank unsupported historical input, got "${got}".`);
-      }
-    }
-  }
-}
-
 async function main() {
   await fillWorkbook();
   const golden = await readWorkbook(goldenWorkbook);
@@ -166,7 +147,6 @@ async function main() {
   compareFormulas(golden, actual, errors);
   compareRanges(golden, actual, errors);
   compareCashFlowBlank(actual, errors);
-  comparePpeScheduleBlank(actual, errors);
 
   if (errors.length) {
     console.error(errors.slice(0, 40).join("\n"));

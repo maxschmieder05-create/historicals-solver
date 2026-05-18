@@ -1252,11 +1252,6 @@ export async function POST(request: NextRequest) {
     filledCells += cashFlowClearResult.clearedCells;
     warnings.push(...cashFlowClearResult.warnings);
 
-    const ppeScheduleClearResult = clearUnsupportedPpeScheduleHistoricalInputs(sheet, periods, columns, auditRows);
-    filledCells += ppeScheduleClearResult.clearedCells;
-    commentsAdded += ppeScheduleClearResult.commentsAdded;
-    warnings.push(...ppeScheduleClearResult.warnings);
-
     const shareRepurchaseClearResult = clearStaleShareRepurchaseAssumptionAmounts(sheet, periods, columns, auditRows);
     filledCells += shareRepurchaseClearResult.clearedCells;
     commentsAdded += shareRepurchaseClearResult.commentsAdded;
@@ -2121,13 +2116,6 @@ function columnLetter(col: number) {
   return letters;
 }
 
-function columnNumber(letters: string) {
-  return letters
-    .toUpperCase()
-    .split("")
-    .reduce((total, letter) => total * 26 + letter.charCodeAt(0) - 64, 0);
-}
-
 function fillSegmentAnalysis(
   sheet: ExcelJS.Worksheet,
   company: CompanyMatch,
@@ -2722,7 +2710,6 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     if (!cell) continue;
     const actual = cellFormula(cell);
     if (actual !== expected) {
-      if (actual === null && cellDisplay(cell) === "" && isAllowedUnsupportedPpeScheduleClear(workbook, address)) continue;
       errors.push(`${address}: formula changed from "${expected}" to "${actual ?? "[hardcoded/blank]"}".`);
     }
   }
@@ -2776,103 +2763,6 @@ function clearCashFlowStatementHistoricalInputs(sheet: ExcelJS.Worksheet, period
     clearedCells,
     warnings: clearedCells ? [`Cash Flow Statement: cleared ${clearedCells} historical input cell(s); this section is intentionally not filled.`] : []
   };
-}
-
-function clearUnsupportedPpeScheduleHistoricalInputs(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
-  let clearedCells = 0;
-  let commentsAdded = 0;
-  const note =
-    "Left blank: no schedule-specific EDGAR fact was found for this PP&E / Depreciation Schedule bridge row. Generic cash-flow capex, consolidated D&A, and acquisition cash-flow concepts are not used here.";
-
-  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-    if (!isUnsupportedPpeScheduleHistoricalRow(sheet, rowNumber)) continue;
-    let clearedRow = false;
-    columns.forEach((col, index) => {
-      const cell = sheet.getCell(rowNumber, col);
-      if (!hasFormula(cell) && cellDisplay(cell) === "" && numericCellValue(cell) === null) return;
-      cell.value = null;
-      clearedCells += 1;
-      clearedRow = true;
-      auditRows.push({
-        sheetName: sheet.name,
-        cell: cell.address,
-        modelRowLabel: rowLabel(sheet, rowNumber) || "PP&E / Depreciation Schedule",
-        period: periods[index],
-        valueWritten: 0,
-        mappingType: "unused",
-        conceptsUsed: "",
-        sourceStatement: "support",
-        accession: "",
-        sourceUrl: "",
-        cellWritable: true,
-        formulaPreserved: false,
-        writeBlockedReason: "",
-        signConvention: "not written",
-        confidence: "high",
-        validationStatus: "cleared",
-        notes: note
-      });
-    });
-    if (clearedRow) {
-      const sourceCell = labelCell(sheet, rowNumber);
-      if (canAddComment(sourceCell)) {
-        addComment(sourceCell, note);
-        commentsAdded += 1;
-      }
-    }
-  }
-
-  return {
-    clearedCells,
-    commentsAdded,
-    warnings: clearedCells
-      ? [`PP&E / Depreciation Schedule: cleared ${clearedCells} unsupported historical input cell(s); schedule rows are left blank when EDGAR does not provide schedule-specific facts.`]
-      : []
-  };
-}
-
-function isAllowedUnsupportedPpeScheduleClear(workbook: ExcelJS.Workbook, snapshotAddressValue: string) {
-  const coordinates = coordinatesFromSnapshotAddress(snapshotAddressValue);
-  if (!coordinates) return false;
-  const sheet = workbook.getWorksheet(coordinates.sheetName);
-  if (!sheet) return false;
-  const cell = sheet.getCell(coordinates.row, coordinates.col);
-  return isUnsupportedPpeScheduleHistoricalRow(sheet, coordinates.row) && cellDisplay(cell) === "" && !cellFormula(cell);
-}
-
-function isUnsupportedPpeScheduleHistoricalRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
-  if (!isPpeDepreciationScheduleBlockRow(sheet, rowNumber)) return false;
-  return isUnsupportedPpeScheduleLabel(rowLabel(sheet, rowNumber));
-}
-
-function isUnsupportedPpeScheduleLabel(label: string) {
-  const normalized = normalize(label);
-  return (
-    normalized === normalize("Capital Expenditures") ||
-    normalized === normalize("Depreciation Expense") ||
-    normalized === normalize("Acquisition / (Divestment) of Businesses")
-  );
-}
-
-function isPpeDepreciationScheduleBlockRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
-  for (let row = rowNumber; row >= Math.max(1, rowNumber - 80); row -= 1) {
-    const label = rowLabel(sheet, row);
-    if (!label) continue;
-    if (isPpeDepreciationScheduleHeader(label)) return true;
-    if (row !== rowNumber && isPpeDepreciationScheduleBoundary(label)) return false;
-  }
-  return false;
-}
-
-function isPpeDepreciationScheduleHeader(label: string) {
-  const normalized = normalize(label);
-  return normalized === normalize("PP&E / Depreciation Schedule") || normalized === normalize("PPE / Depreciation Schedule");
-}
-
-function isPpeDepreciationScheduleBoundary(label: string) {
-  if (isPpeDepreciationScheduleHeader(label)) return false;
-  if (normalize(label) === normalize("Drivers")) return true;
-  return /income statement|cash flow statement|cashflow statement|balance sheet|working capital|debt and interest|shareholder|shareholders|analysis|schedule|assumptions/i.test(label);
 }
 
 function clearStaleShareRepurchaseAssumptionAmounts(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
@@ -2973,18 +2863,6 @@ function cellFromSnapshotAddress(workbook: ExcelJS.Workbook, address: string) {
   const cellAddress = address.slice(bang + 1);
   const sheet = workbook.getWorksheet(sheetName);
   return sheet?.getCell(cellAddress) ?? null;
-}
-
-function coordinatesFromSnapshotAddress(address: string) {
-  const bang = address.lastIndexOf("!");
-  if (bang < 0) return null;
-  const match = address.slice(bang + 1).match(/^([A-Z]+)(\d+)$/i);
-  if (!match) return null;
-  return {
-    sheetName: address.slice(0, bang),
-    col: columnNumber(match[1]),
-    row: Number(match[2])
-  };
 }
 
 function validateSegmentGenericRows(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
