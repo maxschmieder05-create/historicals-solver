@@ -978,13 +978,36 @@ function resolveBeginningCashBalance(period: string, ctx: ResolveContext): Resol
 function resolveBeginningTotalDebtBalance(period: string, ctx: ResolveContext): ResolvedValue {
   const endingDebt = resolveTotalDebt(period, ctx);
   if (endingDebt.value === null) {
-    return { value: null, sources: [], note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.", classification: "partial" };
+    const prior = previousPeriod(period);
+    const priorDebt = prior ? resolveTotalDebt(prior, ctx) : { value: null, sources: [] };
+    return priorDebt.value === null
+      ? { value: null, sources: [], note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.", classification: "partial" }
+      : {
+          value: priorDebt.value,
+          sources: priorDebt.sources,
+          note: `Mapped to ${prior} EDGAR ending total debt as the opening balance for the debt roll-forward.`,
+          classification: "direct"
+        };
   }
 
   const issuance = sum(period, ctx.duration, C.debtIssuance);
   const repayment = sum(period, ctx.duration, C.debtRepayment) ?? zeroResolved("DebtRepayment");
   if (!issuance) {
-    return { value: null, sources: [...endingDebt.sources, ...repayment.sources], note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.", classification: "partial" };
+    const prior = previousPeriod(period);
+    const priorDebt = prior ? resolveTotalDebt(prior, ctx) : { value: null, sources: [] };
+    return priorDebt.value === null
+      ? {
+          value: null,
+          sources: [...endingDebt.sources, ...repayment.sources],
+          note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.",
+          classification: "partial"
+        }
+      : {
+          value: priorDebt.value,
+          sources: priorDebt.sources,
+          note: `Mapped to ${prior} EDGAR ending total debt as the opening balance because debt issuance detail was unavailable.`,
+          classification: "direct"
+        };
   }
 
   const value = endingDebt.value - issuance.value! + (repayment.value ?? 0);
@@ -997,11 +1020,29 @@ function resolveBeginningTotalDebtBalance(period: string, ctx: ResolveContext): 
 }
 
 function resolveBeginningRetainedEarningsBalance(period: string, ctx: ResolveContext): ResolvedValue {
-  return { value: null, sources: [], note: "Cannot find exact retained-earnings beginning balance plug in EDGAR, find manually.", classification: "partial" };
+  const prior = previousPeriod(period);
+  const priorRetained = prior ? first(prior, ctx.instant, C.retained) : null;
+  return priorRetained
+    ? {
+        value: priorRetained.value,
+        sources: [priorRetained],
+        note: `Mapped to ${prior} EDGAR retained earnings as the opening balance for the retained-earnings roll-forward.`,
+        classification: "direct"
+      }
+    : { value: null, sources: [], note: "Cannot find exact retained-earnings beginning balance plug in EDGAR, find manually.", classification: "partial" };
 }
 
 function resolveBeginningAociBalance(period: string, ctx: ResolveContext): ResolvedValue {
-  return { value: null, sources: [], note: "Cannot find exact AOCI beginning balance plug in EDGAR, find manually.", classification: "partial" };
+  const prior = previousPeriod(period);
+  const priorAoci = prior ? first(prior, ctx.instant, C.aoci) : null;
+  return priorAoci
+    ? {
+        value: priorAoci.value,
+        sources: [priorAoci],
+        note: `Mapped to ${prior} EDGAR accumulated other comprehensive income as the opening balance for the AOCI roll-forward.`,
+        classification: "direct"
+      }
+    : { value: null, sources: [], note: "Cannot find exact AOCI beginning balance plug in EDGAR, find manually.", classification: "partial" };
 }
 
 function zeroResolved(concept: string): ResolvedValue {
@@ -1255,6 +1296,15 @@ export async function POST(request: NextRequest) {
         const cell = sheet.getCell(fillRow.row, col);
         const writeDecision = historicalWriteDecision(fillRow, cell);
         if (!writeDecision.writable) {
+          const formulaUpdate = preservedDividendFormulaUpdate(fillRow, cell, period, periods, columns, index, ctx);
+          if (formulaUpdate) {
+            cell.value = { formula: formulaUpdate.formula, result: formulaUpdate.value };
+            filledCells += 1;
+            addComment(cell, formulaUpdate.comment);
+            commentsAdded += 1;
+            auditRows.push(formulaUpdate.auditRow);
+            return;
+          }
           if (shouldAuditSkippedWrite(writeDecision)) {
             auditRows.push(skippedMappingAuditRow(sheet, cell, fillRow, period, writeDecision));
           }
@@ -1296,6 +1346,8 @@ export async function POST(request: NextRequest) {
         warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
       }
     }
+
+    refreshDividendCachedResults(sheet, periods, columns);
 
     const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
     if (segmentSheet) {
@@ -2107,6 +2159,101 @@ function shouldAuditSkippedWrite(decision: WriteDecision) {
   return decision.reason === "existing formula cell" || decision.reason === "blank inactive/helper cell";
 }
 
+function preservedDividendFormulaUpdate(
+  fillRow: FillRow,
+  cell: ExcelJS.Cell,
+  period: string,
+  periods: string[],
+  columns: number[],
+  periodIndex: number,
+  ctx: ResolveContext
+) {
+  if (!isDividendFormulaBridge(fillRow, period, cell)) return null;
+  const resolved = resolveRow(fillRow, period, ctx);
+  if (resolved.value === null || Number.isNaN(resolved.value)) return null;
+  const value = resolved.value / (fillRow.scale ?? 1);
+  const existingValue = numericCellValue(cell);
+  if (existingValue !== null && Math.abs(existingValue - value) < 0.05) return null;
+  const formula = derivedDividendBridgeFormula(fillRow, resolved, periods, columns, periodIndex);
+  if (!formula) return null;
+  const auditNote = auditNoteForResolvedValue(fillRow, resolved);
+  const comment = mappingComment(fillRow, resolved, period, value, "high", auditNote);
+  return {
+    formula,
+    value,
+    comment,
+    auditRow: {
+      ...mappingAuditRow(cell.worksheet, cell, fillRow, period, value, resolved, "high", auditNote),
+      formulaPreserved: true,
+      writeBlockedReason: "existing formula bridge updated with EDGAR annual total",
+      notes: [auditNote, "Updated the preserved formula's annual bridge constant from EDGAR so the model formula still drives the quarter."].filter(Boolean).join(" ")
+    }
+  };
+}
+
+function isDividendFormulaBridge(fillRow: FillRow, period: string, cell: ExcelJS.Cell) {
+  if (period[0] !== "4" || !hasFormula(cell)) return false;
+  if (normalize(fillRow.label) !== normalize("Dividends")) return false;
+  return Boolean(cellFormula(cell)?.match(/\bSUM\s*\(/i));
+}
+
+function derivedDividendBridgeFormula(fillRow: FillRow, resolved: ResolvedValue, periods: string[], columns: number[], periodIndex: number) {
+  const source = derivedSource(resolved);
+  if (source?.derivedTotalValue === undefined || !source.derivedPriorPeriods?.length) return null;
+  const priorIndexes = source.derivedPriorPeriods.map((priorPeriod) => periods.indexOf(priorPeriod));
+  if (!priorIndexes.every((index) => index >= 0 && index < periodIndex)) return null;
+  const priorColumns = priorIndexes.map((index) => columns[index]);
+  const total = roundModelValue(signedDividendBridgeTotal(source.derivedTotalValue, fillRow.sign) / (fillRow.scale ?? 1));
+  return `${formatDividendFormulaNumber(total)}-SUM(${columnLetter(Math.min(...priorColumns))}${fillRow.row}:${columnLetter(Math.max(...priorColumns))}${fillRow.row})`;
+}
+
+function signedDividendBridgeTotal(value: number, sign: FillRow["sign"]) {
+  return sign === -1 ? -Math.abs(value) : value;
+}
+
+function formatDividendFormulaNumber(value: number) {
+  if (Number.isInteger(value)) return String(value);
+  return value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
+}
+
+function refreshDividendCachedResults(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
+  const dividendRow = findLabelRow(sheet, "Dividends");
+  const dividendsPaidRow = findLabelRow(sheet, "Dividends Paid");
+  if (!dividendRow) return;
+
+  periods.forEach((period, index) => {
+    if (period[0] !== "4") return;
+    const year = period.slice(2);
+    const quarterIndexes = [`1Q${year}`, `2Q${year}`, `3Q${year}`, `4Q${year}`].map((quarter) => periods.indexOf(quarter));
+    if (!quarterIndexes.every((quarterIndex) => quarterIndex >= 0)) return;
+    const quarterCols = quarterIndexes.map((quarterIndex) => columns[quarterIndex]);
+    const annualCol = columns[index] + 1;
+    const dividendAnnual = sumNumericCells(sheet, dividendRow, quarterCols);
+    if (dividendAnnual !== null) setFormulaResult(sheet.getCell(dividendRow, annualCol), dividendAnnual);
+
+    if (!dividendsPaidRow) return;
+    for (const col of [...quarterCols, annualCol]) {
+      const dividendValue = numericCellValue(sheet.getCell(dividendRow, col));
+      if (dividendValue !== null) setFormulaResult(sheet.getCell(dividendsPaidRow, col), -dividendValue);
+    }
+    const paidAnnual = sumNumericCells(sheet, dividendsPaidRow, quarterCols);
+    if (paidAnnual !== null) setFormulaResult(sheet.getCell(dividendsPaidRow, annualCol), paidAnnual);
+  });
+}
+
+function sumNumericCells(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
+  const values = columns.map((col) => numericCellValue(sheet.getCell(rowNumber, col)));
+  if (!values.every((value): value is number => value !== null)) return null;
+  return values.reduce((total, value) => total + value, 0);
+}
+
+function setFormulaResult(cell: ExcelJS.Cell, result: number) {
+  const value = cell.value;
+  if (!value || typeof value !== "object") return;
+  if (!("formula" in value) && !("sharedFormula" in value)) return;
+  cell.value = { ...value, result };
+}
+
 function isInactiveHelperCell(fillRow: FillRow, cell: ExcelJS.Cell) {
   const context = fillRow.modelContext;
   if (!context || cell.value !== null) return false;
@@ -2153,28 +2300,8 @@ function inBalanceSheetContext(context: ModelRowContext) {
   );
 }
 
-function derivedQuarterFormula(fillRow: FillRow, resolved: ResolvedValue, periods: string[], columns: number[], periodIndex: number) {
-  const source = derivedSource(resolved);
-  if (source?.derivedTotalValue === undefined || !source.derivedPriorPeriods?.length) return null;
-
-  const priorIndexes = source.derivedPriorPeriods.map((priorPeriod) => periods.indexOf(priorPeriod));
-  if (!priorIndexes.every((index) => index >= 0 && index < periodIndex)) return null;
-
-  const priorColumns = priorIndexes.map((index) => columns[index]);
-  const total = roundModelValue(signedDerivedTotal(source.derivedTotalValue, fillRow.sign) / (fillRow.scale ?? 1));
-  return `${formatFormulaNumber(total)}-SUM(${columnLetter(Math.min(...priorColumns))}${fillRow.row}:${columnLetter(Math.max(...priorColumns))}${fillRow.row})`;
-}
-
 function derivedSource(resolved: ResolvedValue) {
   return resolved.sources.find((source) => source.derivedTotalValue !== undefined && source.derivedPriorPeriods?.length);
-}
-
-function signedDerivedTotal(value: number, sign: FillRow["sign"]) {
-  return sign === -1 ? -Math.abs(value) : value;
-}
-
-function formatFormulaNumber(value: number) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }
 
 function columnLetter(col: number) {
@@ -2782,10 +2909,19 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     if (!cell) continue;
     const actual = cellFormula(cell);
     if (actual !== expected) {
+      if (isAllowedFormulaPreservationUpdate(cell, expected, actual)) continue;
       errors.push(`${address}: formula changed from "${expected}" to "${actual ?? "[hardcoded/blank]"}".`);
     }
   }
   return errors;
+}
+
+function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
+  if (!actual) return false;
+  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+  if (!rowNumber || normalize(rowLabel(cell.worksheet, rowNumber)) !== normalize("Dividends")) return false;
+  const bridgeFormula = /^[-+]?\d+(?:\.\d+)?-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i;
+  return bridgeFormula.test(expected) && bridgeFormula.test(actual);
 }
 
 function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
