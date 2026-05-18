@@ -53,6 +53,8 @@ type FillRow = {
   comment?: string;
   noFillComment?: string;
   modelContext?: ModelRowContext;
+  allowBlankHistoricalInput?: boolean;
+  onlyBlankHistoricalInput?: boolean;
 };
 
 type ResolvedValue = {
@@ -386,9 +388,10 @@ function plug(
   statement: FillRow["statement"],
   kind: FillRow["kind"],
   resolver: FillRow["resolver"],
-  classification: RowClassification = "grouped"
+  classification: RowClassification = "grouped",
+  options: Pick<FillRow, "allowBlankHistoricalInput" | "onlyBlankHistoricalInput" | "noFillComment"> = {}
 ): FillRow {
-  return { row: rowNumber, label, classification, statement, kind, resolver, scale: 1_000_000 };
+  return { row: rowNumber, label, classification, statement, kind, resolver, scale: 1_000_000, ...options };
 }
 
 function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInfos: Array<{ period: string; isEstimate: boolean }> = []) {
@@ -398,10 +401,10 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInf
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
     if (isCashFlowStatementBlockRow(sheet, rowNumber)) continue;
     const modelContext = modelRowContext(sheet, rowNumber, columns, periodInfos);
-    if (!modelContext.hasHardcodedInput && !modelContext.hasHistoricalFormula) continue;
     const label = rowLabel(sheet, rowNumber);
     if (!label || seen.has(rowNumber)) continue;
     const fillRow = fillRowForContext(modelContext) ?? unusedRow(modelContext);
+    if (!modelContext.hasHardcodedInput && !modelContext.hasHistoricalFormula && !fillRow.allowBlankHistoricalInput) continue;
     fillRow.modelContext = modelContext;
     rows.push(fillRow);
     seen.add(rowNumber);
@@ -442,6 +445,30 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   const aroundIncludes = (...aliases: string[]) => aliases.some((alias) => around.includes(normalize(alias)));
   const hasRevenue = has("Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue");
   const hasNetRevenue = has("Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense");
+
+  if (has("Beginning Balance")) {
+    if (inSection(context, "Total Debt Balance", "Debt and Interest Schedule")) {
+      return plug(rowNumber, label, "support", "instant", resolveBeginningTotalDebtBalance, "partial", {
+        allowBlankHistoricalInput: true,
+        onlyBlankHistoricalInput: true,
+        noFillComment: "Cannot find exact debt beginning balance plug in EDGAR, find manually."
+      });
+    }
+    if (inSection(context, "Retained Earnings")) {
+      return plug(rowNumber, label, "support", "instant", resolveBeginningRetainedEarningsBalance, "partial", {
+        allowBlankHistoricalInput: true,
+        onlyBlankHistoricalInput: true,
+        noFillComment: "Cannot find exact retained-earnings beginning balance plug in EDGAR, find manually."
+      });
+    }
+    if (inSection(context, "AOCI Assumptions", "Accumulated Other Comprehensive Income", "AOCI")) {
+      return plug(rowNumber, label, "support", "instant", resolveBeginningAociBalance, "partial", {
+        allowBlankHistoricalInput: true,
+        onlyBlankHistoricalInput: true,
+        noFillComment: "Cannot find exact AOCI beginning balance plug in EDGAR, find manually."
+      });
+    }
+  }
 
   if (context.hasHistoricalFormula && !context.hasHardcodedInput) return formulaRow(context);
   if (hasNetRevenue) return row(rowNumber, label, "income", "duration", C.netRevenue, 1, 1_000_000, "Mapped to SEC revenues net of interest expense when reported.");
@@ -946,6 +973,39 @@ function resolveBeginningCashBalance(period: string, ctx: ResolveContext): Resol
         note: `Calculated from ${prior} ending cash and equivalents.`
       }
     : { value: null, sources: [] };
+}
+
+function resolveBeginningTotalDebtBalance(period: string, ctx: ResolveContext): ResolvedValue {
+  const endingDebt = resolveTotalDebt(period, ctx);
+  if (endingDebt.value === null) {
+    return { value: null, sources: [], note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.", classification: "partial" };
+  }
+
+  const issuance = sum(period, ctx.duration, C.debtIssuance);
+  const repayment = sum(period, ctx.duration, C.debtRepayment) ?? zeroResolved("DebtRepayment");
+  if (!issuance) {
+    return { value: null, sources: [...endingDebt.sources, ...repayment.sources], note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.", classification: "partial" };
+  }
+
+  const value = endingDebt.value - issuance.value! + (repayment.value ?? 0);
+  return {
+    value,
+    sources: [...endingDebt.sources, ...issuance.sources, ...repayment.sources],
+    note: "Calculated from EDGAR ending total debt less debt issuance plus debt repayment so the debt roll-forward reconciles.",
+    classification: "grouped"
+  };
+}
+
+function resolveBeginningRetainedEarningsBalance(period: string, ctx: ResolveContext): ResolvedValue {
+  return { value: null, sources: [], note: "Cannot find exact retained-earnings beginning balance plug in EDGAR, find manually.", classification: "partial" };
+}
+
+function resolveBeginningAociBalance(period: string, ctx: ResolveContext): ResolvedValue {
+  return { value: null, sources: [], note: "Cannot find exact AOCI beginning balance plug in EDGAR, find manually.", classification: "partial" };
+}
+
+function zeroResolved(concept: string): ResolvedValue {
+  return { value: 0, sources: [zeroSource(concept)] };
 }
 
 function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
@@ -2027,6 +2087,12 @@ function cellFormula(cell: ExcelJS.Cell) {
 function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDecision {
   if (hasFormula(cell)) {
     return { writable: false, reason: "existing formula cell", formulaPreserved: true };
+  }
+  if (fillRow.onlyBlankHistoricalInput && cell.value !== null) {
+    return { writable: false, reason: "existing model hardcode preserved", formulaPreserved: false };
+  }
+  if (fillRow.allowBlankHistoricalInput && cell.value === null) {
+    return { writable: true, formulaPreserved: false };
   }
   if (isInactiveHelperCell(fillRow, cell)) {
     return { writable: false, reason: "blank inactive/helper cell", formulaPreserved: false };
