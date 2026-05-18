@@ -1251,6 +1251,10 @@ export async function POST(request: NextRequest) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
     }
 
+    const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
+    filledCells += cashFlowClearResult.clearedCells;
+    warnings.push(...cashFlowClearResult.warnings);
+
     addMappingAuditSheet(workbook, auditRows);
 
     const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
@@ -2685,6 +2689,65 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     }
   }
   return errors;
+}
+
+function clearCashFlowStatementHistoricalInputs(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
+  const cashFlowRows = cashFlowStatementRows(sheet);
+  let clearedCells = 0;
+  if (!cashFlowRows.length) return { clearedCells, warnings: [] };
+
+  cashFlowRows.forEach((rowNumber) => {
+    columns.forEach((col, index) => {
+      const cell = sheet.getCell(rowNumber, col);
+      if (hasFormula(cell)) return;
+      const existing = numericCellValue(cell);
+      if (existing === null) return;
+      cell.value = null;
+      clearedCells += 1;
+      auditRows.push({
+        sheetName: sheet.name,
+        cell: cell.address,
+        modelRowLabel: rowLabel(sheet, rowNumber) || "Cash Flow Statement",
+        period: periods[index],
+        valueWritten: 0,
+        mappingType: "unused",
+        conceptsUsed: "",
+        sourceStatement: "cash flow",
+        accession: "",
+        sourceUrl: "",
+        cellWritable: true,
+        formulaPreserved: false,
+        writeBlockedReason: "",
+        signConvention: "not written",
+        confidence: "high",
+        validationStatus: "cleared",
+        notes: "Cash Flow Statement historical inputs are intentionally left blank and are not mapped from EDGAR."
+      });
+    });
+  });
+
+  return {
+    clearedCells,
+    warnings: clearedCells ? [`Cash Flow Statement: cleared ${clearedCells} historical input cell(s); this section is intentionally not filled.`] : []
+  };
+}
+
+function cashFlowStatementRows(sheet: ExcelJS.Worksheet) {
+  const rows: number[] = [];
+  let inCashFlow = false;
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (label) {
+      if (isCashFlowStatementHeader(label)) {
+        inCashFlow = true;
+        rows.push(rowNumber);
+        continue;
+      }
+      if (inCashFlow && isCashFlowStatementBoundary(label)) break;
+    }
+    if (inCashFlow) rows.push(rowNumber);
+  }
+  return rows;
 }
 
 function snapshotAddress(sheet: ExcelJS.Worksheet, rowNumber: number, col: number) {

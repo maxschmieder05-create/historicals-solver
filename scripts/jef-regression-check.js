@@ -13,7 +13,6 @@ const ticker = process.env.JEF_TICKER || "JEF";
 const checks = [
   { sheet: "Model", name: "Income Statement", start: 28, end: 57 },
   { sheet: "Model", name: "Balance Sheet", start: 118, end: 159 },
-  { sheet: "Model", name: "Cash Flow Statement", start: 160, end: 181 },
   { sheet: "Model", name: "PP&E / Depreciation Schedule", start: 193, end: 213 },
   { sheet: "Model", name: "Shareholder Equity / Shares", start: 237, end: 287 },
   { sheet: "Model", name: "Debt and Interest Schedule", start: 288, end: 360 },
@@ -119,6 +118,21 @@ function compareRanges(golden, actual, errors) {
   }
 }
 
+function compareCashFlowBlank(actual, errors) {
+  const sheet = actual.getWorksheet("Model");
+  if (!sheet) return;
+  const quarterCols = [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19];
+  for (let row = 73; row <= 104; row += 1) {
+    for (const col of quarterCols) {
+      if (cellFormula(sheet.getCell(row, col))) continue;
+      const got = cellValue(sheet.getCell(row, col));
+      if (got !== null && got !== undefined && got !== "") {
+        errors.push(`Cash Flow Statement Model!${sheet.getCell(row, col).address}: expected blank historical input, got "${got}".`);
+      }
+    }
+  }
+}
+
 async function main() {
   await fillWorkbook();
   const golden = await readWorkbook(goldenWorkbook);
@@ -127,6 +141,7 @@ async function main() {
   compareLabels(golden, actual, errors);
   compareFormulas(golden, actual, errors);
   compareRanges(golden, actual, errors);
+  compareCashFlowBlank(actual, errors);
 
   if (errors.length) {
     console.error(errors.slice(0, 40).join("\n"));
