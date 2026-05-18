@@ -1166,6 +1166,11 @@ export async function POST(request: NextRequest) {
     let filledCells = 0;
     let commentsAdded = 0;
 
+    const cleanupResult = cleanStaleProtectedHistoricalRows(sheet, fillRows, periods, columns, ctx, auditRows);
+    filledCells += cleanupResult.clearedCells;
+    commentsAdded += cleanupResult.commentsAdded;
+    warnings.push(...cleanupResult.warnings);
+
     for (const fillRow of fillRows) {
       const rowNotes = new Set<string>();
       let unresolved = 0;
@@ -1177,6 +1182,7 @@ export async function POST(request: NextRequest) {
       if (fillRow.classification === "unused" || (!fillRow.concepts?.length && !fillRow.resolver)) {
         const sourceCell = labelCell(sheet, fillRow.row);
         if (fillRow.noFillComment && canAddComment(sourceCell)) {
+          if (fillRow.noFillComment.startsWith("Cannot find exact schedule value in EDGAR")) sourceCell.note = "";
           addComment(sourceCell, fillRow.noFillComment);
           commentsAdded += 1;
         }
@@ -2722,6 +2728,113 @@ function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSna
     if (!cell) continue;
     if (cellDisplay(cell) !== expected) cell.value = expected;
   }
+}
+
+function cleanStaleProtectedHistoricalRows(
+  sheet: ExcelJS.Worksheet,
+  fillRows: FillRow[],
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
+) {
+  let clearedCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+
+  for (const fillRow of fillRows) {
+    const staleDetector = staleProtectedRowDetector(fillRow);
+    if (!staleDetector) continue;
+    const staleMatches = periods.flatMap((period, index) => {
+      const col = columns[index];
+      const cell = sheet.getCell(fillRow.row, col);
+      if (hasFormula(cell)) return [];
+      const existing = numericCellValue(cell);
+      if (existing === null) return [];
+      const stale = staleDetector(period, existing, ctx);
+      return stale ? [{ period, col, stale }] : [];
+    });
+    if (!staleMatches.length) continue;
+
+    const clearWholeRow = staleMatches.length >= 2;
+    let clearedRow = false;
+    periods.forEach((period, index) => {
+      const col = columns[index];
+      const cell = sheet.getCell(fillRow.row, col);
+      if (hasFormula(cell)) return;
+      const existing = numericCellValue(cell);
+      if (existing === null) return;
+      const stale = staleMatches.find((match) => match.col === col)?.stale ?? (clearWholeRow ? staleMatches[0].stale : null);
+      if (!stale) return;
+      cell.value = null;
+      clearedCells += 1;
+      clearedRow = true;
+      auditRows.push({
+        sheetName: sheet.name,
+        cell: cell.address,
+        modelRowLabel: fillRow.label,
+        period,
+        valueWritten: 0,
+        mappingType: "unused",
+        conceptsUsed: stale.conceptsUsed,
+        sourceStatement: fillRow.statement,
+        accession: stale.accession,
+        sourceUrl: "",
+        cellWritable: true,
+        formulaPreserved: false,
+        writeBlockedReason: "",
+        signConvention: "not written",
+        confidence: "high",
+        validationStatus: "cleared",
+        notes: stale.note
+      });
+    });
+    if (clearedRow) {
+      fillRow.noFillComment = "Cannot find exact schedule value in EDGAR, find manually.";
+      warnings.push(`${fillRow.label}: cleared stale generic EDGAR values from protected schedule row.`);
+    }
+  }
+
+  return { clearedCells, commentsAdded, warnings };
+}
+
+type StaleProtectedMatch = {
+  note: string;
+  conceptsUsed: string;
+  accession: string;
+};
+
+function staleProtectedRowDetector(fillRow: FillRow): ((period: string, existing: number, ctx: ResolveContext) => StaleProtectedMatch | null) | null {
+  const context = fillRow.modelContext;
+  if (!context || fillRow.classification !== "partial") return null;
+  const normalizedLabel = normalize(fillRow.label);
+
+  if (inPpeDepreciationScheduleContext(context) && normalizedLabel === normalize("Capital Expenditures")) {
+    return staleGenericDetector(C.capex, -1, 1_000_000, "Generic cash-flow capex is not used for PP&E schedule bridge rows.");
+  }
+  if (inPpeDepreciationScheduleContext(context) && normalizedLabel === normalize("Depreciation Expense")) {
+    return staleGenericDetector(C.da, 1, 1_000_000, "Generic consolidated depreciation and amortization is not used for PP&E schedule bridge rows.");
+  }
+  if (inPpeDepreciationScheduleContext(context) && normalizedLabel === normalize("Acquisition / (Divestment) of Businesses")) {
+    return staleGenericDetector(ACQUISITION_CONCEPTS, 1, 1_000_000, "Generic acquisition cash-flow concepts are not used for PP&E schedule bridge rows.");
+  }
+
+  return null;
+}
+
+function staleGenericDetector(concepts: string[], sign: 1 | -1, scale: number, note: string) {
+  return (period: string, existing: number, ctx: ResolveContext): StaleProtectedMatch | null => {
+    const source = first(period, ctx.duration, concepts);
+    if (!source) return null;
+    if (Math.abs(source.value) < 0.0001 || Math.abs(existing) < 0.0001) return null;
+    const expected = (sign === -1 ? -Math.abs(source.value) : Math.abs(source.value)) / scale;
+    if (Math.abs(existing - expected) > 0.05) return null;
+    return {
+      note: `Cannot find exact schedule value in EDGAR, find manually. ${note}`,
+      conceptsUsed: source.concept,
+      accession: source.accn ?? ""
+    };
+  };
 }
 
 function clearCashFlowStatementHistoricalInputs(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
