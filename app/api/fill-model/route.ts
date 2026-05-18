@@ -100,12 +100,27 @@ type MappingAuditRow = {
   sourceStatement: string;
   accession: string;
   sourceUrl: string;
+  cellWritable: boolean;
+  formulaPreserved: boolean;
+  writeBlockedReason: string;
+  signConvention: string;
   confidence: "high" | "medium" | "low";
   validationStatus: string;
   notes: string;
 };
 
 type RowClassification = "direct" | "grouped" | "partial" | "formula" | "unused";
+
+type WorkbookSnapshot = {
+  labels: Map<string, string>;
+  formulas: Map<string, string>;
+};
+
+type WriteDecision = {
+  writable: boolean;
+  reason?: string;
+  formulaPreserved: boolean;
+};
 
 type ModelRowContext = {
   sheetName: string;
@@ -979,6 +994,7 @@ export async function POST(request: NextRequest) {
       columns = columns.slice(0, periods.length);
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
+    const workbookSnapshot = snapshotWorkbook(workbook, [MODEL_SHEET, SEGMENT_SHEET], Math.min(...columns));
     const inlineCtx = await fetchInlineFactContext(company, periods);
     mergeContexts(ctx, inlineCtx);
     const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
@@ -1011,7 +1027,13 @@ export async function POST(request: NextRequest) {
       periods.forEach((period, index) => {
         const col = columns[index];
         const cell = sheet.getCell(fillRow.row, col);
-        if (!isModelHistoricalInput(cell)) return;
+        const writeDecision = historicalWriteDecision(fillRow, cell);
+        if (!writeDecision.writable) {
+          if (shouldAuditSkippedWrite(writeDecision)) {
+            auditRows.push(skippedMappingAuditRow(sheet, cell, fillRow, period, writeDecision));
+          }
+          return;
+        }
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
@@ -1067,6 +1089,7 @@ export async function POST(request: NextRequest) {
     }
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns);
+    validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
     }
@@ -1833,6 +1856,33 @@ function cellFormula(cell: ExcelJS.Cell) {
   return null;
 }
 
+function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDecision {
+  if (hasFormula(cell)) {
+    return { writable: false, reason: "existing formula cell", formulaPreserved: true };
+  }
+  if (isInactiveHelperCell(fillRow, cell)) {
+    return { writable: false, reason: "blank inactive/helper cell", formulaPreserved: false };
+  }
+  if (!isModelHistoricalInput(cell)) {
+    return { writable: false, reason: "not an active historical input cell", formulaPreserved: false };
+  }
+  return { writable: true, formulaPreserved: false };
+}
+
+function shouldAuditSkippedWrite(decision: WriteDecision) {
+  return decision.reason === "existing formula cell" || decision.reason === "blank inactive/helper cell";
+}
+
+function isInactiveHelperCell(fillRow: FillRow, cell: ExcelJS.Cell) {
+  const context = fillRow.modelContext;
+  if (!context || cell.value !== null) return false;
+  const haystack = [context.sectionHeader, context.previousLabel, context.nextLabel, context.label].filter(Boolean).join(" ");
+  if (/cash flow statement/i.test(haystack)) return true;
+  if (/debt and interest schedule/i.test(haystack) && fillRow.statement === "support") return true;
+  if (/drivers|assumptions/i.test(context.sectionHeader ?? "") && !isBlue(cell)) return true;
+  return false;
+}
+
 function inferSignConvention(label: string): 1 | -1 {
   return /(expense|cost|loss|repayment|repurchase|dividend|tax|depreciation|amortization)/i.test(label) ? -1 : 1;
 }
@@ -2013,6 +2063,10 @@ function clearUnmatchedSegmentRow(
       sourceStatement: "segment",
       accession: "",
       sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "not written",
       confidence: "low",
       validationStatus: "needs_review",
       notes
@@ -2362,9 +2416,35 @@ function mappingAuditRow(
     sourceStatement: fillRow.statement,
     accession: unique(resolved.sources.map((source) => source.accn).filter(Boolean)).join("; "),
     sourceUrl: "",
+    cellWritable: true,
+    formulaPreserved: false,
+    writeBlockedReason: "",
+    signConvention: fillRow.sign === -1 ? "inverted to match model sign convention" : "copied",
     confidence,
     validationStatus: "not_run",
     notes: notes || resolved.note || fillRow.comment || ""
+  };
+}
+
+function skippedMappingAuditRow(sheet: ExcelJS.Worksheet, cell: ExcelJS.Cell, fillRow: FillRow, period: string, decision: WriteDecision): MappingAuditRow {
+  return {
+    sheetName: sheet.name,
+    cell: cell.address,
+    modelRowLabel: fillRow.label,
+    period,
+    valueWritten: numericCellValue(cell) ?? 0,
+    mappingType: decision.formulaPreserved ? "formula" : "unused",
+    conceptsUsed: fillRow.concepts?.join("; ") ?? "",
+    sourceStatement: fillRow.statement,
+    accession: "",
+    sourceUrl: "",
+    cellWritable: false,
+    formulaPreserved: decision.formulaPreserved,
+    writeBlockedReason: decision.reason ?? "not writable",
+    signConvention: "not written",
+    confidence: "low",
+    validationStatus: decision.formulaPreserved ? "formula_preserved" : "skipped",
+    notes: decision.formulaPreserved ? "Formula preserved; EDGAR value was not written over an existing model formula." : "Skipped because the cell was not an active model input."
   };
 }
 
@@ -2388,6 +2468,10 @@ function mappingAuditRowForSegment(
     sourceStatement: "segment",
     accession: unique(resolved.sources.map((source) => source.accn).filter(Boolean)).join("; "),
     sourceUrl: "",
+    cellWritable: true,
+    formulaPreserved: false,
+    writeBlockedReason: "",
+    signConvention: "copied",
     confidence: "high",
     validationStatus: "not_run",
     notes: resolved.note || ""
@@ -2411,6 +2495,61 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
     }
   }
   return errors;
+}
+
+function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firstHistoricalCol: number): WorkbookSnapshot {
+  const labels = new Map<string, string>();
+  const formulas = new Map<string, string>();
+  const labelSnapshotEndCol = Math.max(1, firstHistoricalCol - 1);
+  for (const sheetName of sheetNames) {
+    const sheet = workbook.getWorksheet(sheetName);
+    if (!sheet) continue;
+    for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+      for (let col = 1; col <= Math.min(labelSnapshotEndCol, sheet.columnCount); col += 1) {
+        const address = snapshotAddress(sheet, rowNumber, col);
+        labels.set(address, cellDisplay(sheet.getCell(rowNumber, col)));
+      }
+      for (let col = 1; col <= sheet.columnCount; col += 1) {
+        const formula = cellFormula(sheet.getCell(rowNumber, col));
+        if (formula) formulas.set(snapshotAddress(sheet, rowNumber, col), formula);
+      }
+    }
+  }
+  return { labels, formulas };
+}
+
+function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
+  const errors: string[] = [];
+  for (const [address, expected] of snapshot.labels.entries()) {
+    const cell = cellFromSnapshotAddress(workbook, address);
+    if (!cell) continue;
+    const actual = cellDisplay(cell);
+    if (actual !== expected) {
+      errors.push(`${address}: row label changed from "${expected}" to "${actual}".`);
+    }
+  }
+  for (const [address, expected] of snapshot.formulas.entries()) {
+    const cell = cellFromSnapshotAddress(workbook, address);
+    if (!cell) continue;
+    const actual = cellFormula(cell);
+    if (actual !== expected) {
+      errors.push(`${address}: formula changed from "${expected}" to "${actual ?? "[hardcoded/blank]"}".`);
+    }
+  }
+  return errors;
+}
+
+function snapshotAddress(sheet: ExcelJS.Worksheet, rowNumber: number, col: number) {
+  return `${sheet.name}!${columnLetter(col)}${rowNumber}`;
+}
+
+function cellFromSnapshotAddress(workbook: ExcelJS.Workbook, address: string) {
+  const bang = address.lastIndexOf("!");
+  if (bang < 0) return null;
+  const sheetName = address.slice(0, bang);
+  const cellAddress = address.slice(bang + 1);
+  const sheet = workbook.getWorksheet(sheetName);
+  return sheet?.getCell(cellAddress) ?? null;
 }
 
 function validateSegmentGenericRows(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
@@ -2453,6 +2592,10 @@ function addMappingAuditSheet(workbook: ExcelJS.Workbook, auditRows: MappingAudi
     { header: "source statement/table", key: "sourceStatement", width: 24 },
     { header: "accession", key: "accession", width: 24 },
     { header: "source URL", key: "sourceUrl", width: 24 },
+    { header: "cell writable", key: "cellWritable", width: 14 },
+    { header: "formula preserved", key: "formulaPreserved", width: 18 },
+    { header: "write blocked reason", key: "writeBlockedReason", width: 28 },
+    { header: "sign convention", key: "signConvention", width: 28 },
     { header: "confidence", key: "confidence", width: 12 },
     { header: "validation status", key: "validationStatus", width: 18 },
     { header: "notes", key: "notes", width: 60 }
