@@ -65,9 +65,6 @@ type ResolvedValue = {
 type ResolveContext = {
   duration: Map<string, Map<string, FactSource>>;
   instant: Map<string, Map<string, FactSource>>;
-  modelSheet?: ExcelJS.Worksheet;
-  currentColumn?: number;
-  currentRow?: number;
 };
 
 type InlineContext = {
@@ -75,6 +72,7 @@ type InlineContext = {
   instant: boolean;
   start?: string;
   end?: string;
+  hasDimensions?: boolean;
 };
 
 type SegmentRevenue = {
@@ -451,8 +449,8 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
   if (has("Total Provisions for Credit Losses", "Provision for Credit Losses")) return row(rowNumber, label, "income", "duration", C.creditLossProvision, -1);
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
-  if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
   if (/\binterest\s*\(\s*expense\s*\)/i.test(label)) return reviewRow(context, "Split / partial match: the model row could represent multiple EDGAR interest presentation styles. Needs review.");
+  if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
   if (has("Gain on Sale of Business (Loss)")) return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets"], 1);
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
@@ -461,10 +459,18 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("FX Adjustments")) return row(rowNumber, label, "income", "duration", C.foreignCurrencyAdjustments);
   if (has("Net Unrealized Pension and Other Benefits")) return row(rowNumber, label, "income", "duration", C.pensionAdjustments);
   if (has("Pre-Tax Adjustments")) return reviewRow(context, "Split / partial match: EDGAR adjustment detail is not consistently available for this model row. Needs review.");
-  if (has("Post-Tax Adjustments")) return row(rowNumber, label, "income", "duration", ["PreferredStockDividendsIncomeStatementImpact", "ConvertiblePreferredDividendsNetOfTax"], -1);
-  if (has("Discontinued Operations")) return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
+  if (has("Post-Tax Adjustments")) return reviewRow(context, "Split / partial match: post-tax adjustment rows are model-specific and were preserved unless EDGAR detail is explicitly modeled.");
+  if (has("Discontinued Operations")) {
+    if (aroundIncludes("Post-Tax Adjustments", "Income (Loss) due to Non-Controlling Interest", "Net Income Available to Common Shareholders")) {
+      return reviewRow(context, "Split / partial match: this discontinued-operations row is part of a model adjustment bridge and was preserved unless EDGAR detail is explicitly modeled.");
+    }
+    return row(rowNumber, label, "income", "duration", ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
+  }
   if (has("Income (Loss) due to Non-Controlling Interest", "Income Loss Due To Non Controlling Interest")) {
-    return plug(rowNumber, label, "income", "duration", resolveCommonIncomePlug);
+    if (aroundIncludes("Discontinued Operations", "Net Income Available to Common Shareholders", "Post-Tax Adjustments")) {
+      return reviewRow(context, "Split / partial match: this non-controlling-interest row is part of a model-specific net income bridge and was preserved because the common-shareholder income formula already reconciles.");
+    }
+    return plug(rowNumber, label, "income", "duration", resolveNoncontrollingIncome);
   }
 
   if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash")) return row(rowNumber, label, "balance", "instant", C.cash, 1, 1_000_000, "Mapped to SEC cash and cash equivalents.");
@@ -549,13 +555,13 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Beginning Cash Balance")) return plug(rowNumber, label, "support", "instant", resolveBeginningCashBalance, "direct");
   if (has("Ending Cash Balance")) return row(rowNumber, label, "support", "instant", C.cash);
   if (has("Weighted Average Basic Shares", "Basic Shares")) {
-    if (inSection(context, "Shares Outstanding Schedule")) {
+    if (inSection(context, "Shares Outstanding Schedule") || aroundIncludes("Ending Balance - Basic", "Effects of Dilutive Securities", "Weighted Average Dilutive Shares")) {
       return reviewRow(context, "Needs review: shares outstanding schedule rows use the model's actual share roll-forward and were not overwritten with generic weighted-average share facts.");
     }
     return row(rowNumber, label, "support", "duration", C.basicShares, 1, 1_000_000);
   }
   if (has("Weighted Average Dilutive Shares", "Weighted Average Diluted Shares", "Diluted Shares")) {
-    if (inSection(context, "Shares Outstanding Schedule")) {
+    if (inSection(context, "Shares Outstanding Schedule") || aroundIncludes("Weighted Average Basic Shares", "Effects of Dilutive Securities")) {
       return reviewRow(context, "Needs review: shares outstanding schedule rows use the model's actual share roll-forward and were not overwritten with generic weighted-average share facts.");
     }
     return row(rowNumber, label, "support", "duration", C.dilutedShares, 1, 1_000_000);
@@ -804,19 +810,6 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
-  const modelResidual = modelResidualFromSubtotal(ctx, ["Total Current Assets", "Current Assets"], [
-    "Cash & Cash Equivalents",
-    "Cash and Cash Equivalents",
-    "Cash",
-    "Accounts Receivable",
-    "Accounts Receivable, Net",
-    "Trade Receivables",
-    "Fees Receivable",
-    "Inventory",
-    "Inventory, Net"
-  ]);
-  if (modelResidual) return modelResidual;
-
   const segregatedCash =
     first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation"]) ??
     first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations"]);
@@ -848,24 +841,9 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
 }
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
-  const modelResidual = modelResidualFromSubtotal(ctx, ["Total Non-Current Assets", "Total Noncurrent Assets", "Total Long-Term Assets", "Total LT Assets"], [
-    "PP&E, Net",
-    "PPE, Net",
-    "Property Plant and Equipment Net",
-    "Property and Equipment, Net",
-    "Property, Plant and Equipment, Net",
-    "Intangible Assets, Net",
-    "Intangibles, Net",
-    "Goodwill"
-  ]);
-  if (modelResidual) return modelResidual;
-
   const assets = first(period, ctx.instant, C.assets);
   const modeledCurrentAssets = resolveCurrentAssetsFromModeledRows(period, ctx);
-  const currentAssets =
-    modelSubtotalSource(ctx, ["Total Current Assets"]) ??
-    first(period, ctx.instant, C.currentAssets) ??
-    (modeledCurrentAssets.value !== null ? modeledCurrentAssets : null);
+  const currentAssets = modeledCurrentAssets.value !== null ? modeledCurrentAssets : first(period, ctx.instant, C.currentAssets);
   const ppe = resolvePpe(period, ctx);
   const intangibles = resolveIntangibleAssets(period, ctx);
   const goodwill = first(period, ctx.instant, C.goodwill) ?? zeroSource(C.goodwill[0]);
@@ -884,68 +862,6 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
   );
 }
 
-function modelSubtotalSource(ctx: ResolveContext, labels: string[]): ResolvedValue | null {
-  if (!ctx.modelSheet || !ctx.currentColumn) return null;
-  const match = modelRowByLabels(ctx, labels, "nearest");
-  if (!match) return null;
-  const value = numericCellValue(ctx.modelSheet.getCell(match.rowNumber, ctx.currentColumn));
-  if (value === null) return null;
-  return modelValueSource(match.label, value, `Used model subtotal "${match.label}" because this row is a residual in the uploaded workbook.`);
-}
-
-function modelResidualFromSubtotal(ctx: ResolveContext, subtotalLabels: string[], separatelyModeledLabels: string[]): ResolvedValue | null {
-  if (!ctx.modelSheet || !ctx.currentColumn || !ctx.currentRow) return null;
-  const subtotal = modelRowByLabels(ctx, subtotalLabels, "below");
-  if (!subtotal) return null;
-  const subtotalValue = numericCellValue(ctx.modelSheet.getCell(subtotal.rowNumber, ctx.currentColumn));
-  if (subtotalValue === null) return null;
-
-  const sources: FactSource[] = [{ concept: "ModelSubtotal", label: subtotal.label, value: subtotalValue * 1_000_000 }];
-  let residual = subtotalValue;
-  for (let rowNumber = Math.min(ctx.currentRow, subtotal.rowNumber) + 1; rowNumber < Math.max(ctx.currentRow, subtotal.rowNumber); rowNumber += 1) {
-    if (rowNumber === ctx.currentRow) continue;
-    const label = rowLabel(ctx.modelSheet, rowNumber);
-    if (!label || !labelMatchesAny(label, separatelyModeledLabels)) continue;
-    const value = numericCellValue(ctx.modelSheet.getCell(rowNumber, ctx.currentColumn));
-    if (value === null) return null;
-    residual -= value;
-    sources.push({ concept: "ModelModeledRow", label, value: value * 1_000_000 });
-  }
-
-  if (sources.length === 1) return null;
-  return {
-    value: residual * 1_000_000,
-    sources,
-    note: `Calculated as model subtotal "${subtotal.label}" less separately modeled rows in the uploaded workbook.`
-  };
-}
-
-function modelRowByLabels(ctx: ResolveContext, labels: string[], direction: "below" | "nearest") {
-  if (!ctx.modelSheet) return null;
-  const matches: Array<{ rowNumber: number; label: string; distance: number }> = [];
-  for (let rowNumber = 1; rowNumber <= ctx.modelSheet.rowCount; rowNumber += 1) {
-    const label = rowLabel(ctx.modelSheet, rowNumber);
-    if (!label || !labelMatchesAny(label, labels)) continue;
-    if (direction === "below" && ctx.currentRow && rowNumber <= ctx.currentRow) continue;
-    matches.push({ rowNumber, label, distance: ctx.currentRow ? Math.abs(rowNumber - ctx.currentRow) : rowNumber });
-  }
-  matches.sort((a, b) => a.distance - b.distance);
-  return matches[0] ?? null;
-}
-
-function labelMatchesAny(label: string, aliases: string[]) {
-  const normalized = normalize(label);
-  return aliases.some((alias) => normalized === normalize(alias));
-}
-
-function modelValueSource(label: string, value: number, note: string): ResolvedValue {
-  return {
-    value: value * 1_000_000,
-    sources: [{ concept: "ModelSubtotal", label, value: value * 1_000_000 }],
-    note
-  };
-}
-
 function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext): ResolvedValue {
   const cash = first(period, ctx.instant, C.cash) ?? zeroSource(C.cash[0]);
   const receivables = resolveAccountsReceivable(period, ctx);
@@ -960,20 +876,6 @@ function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext
 }
 
 function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
-  const modelResidual = modelResidualFromSubtotal(ctx, ["Total Current Liabilities", "Total Current Liabilities (Excl. Debt)", "Total Current Liabs"], [
-    "Short Term Borrowings",
-    "Short-Term Borrowings",
-    "Accounts Payable",
-    "Accounts Payable and Accrued Liabilities",
-    "Accounts Payable & Accrued Liabilities",
-    "Securities Loaned",
-    "Accrued Liabilities",
-    "Accrued Expenses",
-    "Current Debt",
-    "Current Portion of Debt"
-  ]);
-  if (modelResidual) return modelResidual;
-
   const liabilities = first(period, ctx.instant, C.liabilities);
   const shortTermBorrowings = first(period, ctx.instant, ["OtherShortTermBorrowings", "ShortTermBorrowings"]) ?? zeroSource("ShortTermBorrowings");
   const accountsPayable = resolveAccountsPayable(period, ctx);
@@ -994,16 +896,6 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
 }
 
 function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
-  const modelResidual = modelResidualFromSubtotal(ctx, ["Total Non-Current Liabilities", "Total Noncurrent Liabilities", "Total Long-Term Liabilities", "Total LT Liabilities"], [
-    "Revolver",
-    "LT Debt",
-    "Long-Term Debt",
-    "Long Term Debt",
-    "Deferred Income Taxes",
-    "Deferred Tax Liabilities"
-  ]);
-  if (modelResidual) return modelResidual;
-
   const assets = first(period, ctx.instant, C.assets);
   const currentLiabExDebt = difference(period, ctx.instant, C.currentLiabilities, [C.currentDebt], "");
   const debt = sum(period, ctx.instant, C.totalDebt);
@@ -1121,9 +1013,6 @@ export async function POST(request: NextRequest) {
         const cell = sheet.getCell(fillRow.row, col);
         if (!isModelHistoricalInput(cell)) return;
 
-        ctx.modelSheet = sheet;
-        ctx.currentColumn = col;
-        ctx.currentRow = fillRow.row;
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
           unresolved += 1;
@@ -1351,6 +1240,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
     if (["AssetsCurrent", "OtherAssets"].includes(concept)) continue;
     const context = contexts.get(contextRef);
     if (!context?.period || !wanted.has(context.period)) continue;
+    if (context.hasDimensions) continue;
     const value = ixNumber(match[2], attrs);
     if (value === null) continue;
     const source = {
@@ -1373,16 +1263,20 @@ function parseInlineContexts(html: string) {
     const body = match[0];
     const instant = body.match(/<xbrli:instant>([^<]+)<\/xbrli:instant>/)?.[1];
     if (instant) {
-      contexts.set(match[1], { period: periodKeyFromDate(instant), instant: true, end: instant });
+      contexts.set(match[1], { period: periodKeyFromDate(instant), instant: true, end: instant, hasDimensions: hasInlineDimensions(body) });
       continue;
     }
     const start = body.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
     const end = body.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
     if (start && end) {
-      contexts.set(match[1], { period: periodKeyFromDate(end), instant: false, start, end });
+      contexts.set(match[1], { period: periodKeyFromDate(end), instant: false, start, end, hasDimensions: hasInlineDimensions(body) });
     }
   }
   return contexts;
+}
+
+function hasInlineDimensions(contextBody: string) {
+  return /<xbrldi:(explicitMember|typedMember)\b/i.test(contextBody);
 }
 
 function mergeContexts(target: ResolveContext, source: ResolveContext) {
