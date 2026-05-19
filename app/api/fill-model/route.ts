@@ -1564,8 +1564,13 @@ type SegmentMetrics = {
   depreciationAmortization?: number;
 };
 
+type InlineSegmentContext = {
+  period: string | null;
+  members: string[];
+};
+
 function parseInlineSegmentRevenue(html: string, form: string) {
-  const contexts = new Map<string, { period: string | null; members: string[] }>();
+  const contexts = new Map<string, InlineSegmentContext>();
   for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
     const body = match[0];
     const period = contextPeriod(body, form);
@@ -1574,22 +1579,45 @@ function parseInlineSegmentRevenue(html: string, form: string) {
   }
 
   const byPeriod = new Map<string, Map<string, SegmentMetrics>>();
+  const componentRevenueByPeriod = new Map<string, Map<string, number>>();
+  const totalRevenueByPeriod = new Map<string, { value: number; priority: number }>();
+  const seenComponentFacts = new Set<string>();
+
   for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
     const attrs = match[1];
     const concept = attrs.match(/\bname="([^"]+)"/)?.[1] ?? "";
-    const metric = segmentMetric(concept);
-    if (!metric) continue;
-
     const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
     if (!contextRef) continue;
     const context = contexts.get(contextRef);
     if (!context?.period) continue;
 
-    const label = segmentLabelFromMembers(context.members);
-    if (!label) continue;
-
     const value = ixNumber(match[2], attrs);
     if (value === null) continue;
+
+    const totalPriority = totalRevenuePriority(concept, context.members);
+    if (totalPriority) {
+      const existing = totalRevenueByPeriod.get(context.period);
+      if (!existing || totalPriority > existing.priority || (totalPriority === existing.priority && Math.abs(value) > Math.abs(existing.value))) {
+        totalRevenueByPeriod.set(context.period, { value, priority: totalPriority });
+      }
+    }
+
+    const componentLabel = revenueComponentSegmentLabel(concept, context.members);
+    if (componentLabel) {
+      const factKey = `${context.period}|${componentLabel}|${concept}|${contextRef}|${value}`;
+      if (!seenComponentFacts.has(factKey)) {
+        seenComponentFacts.add(factKey);
+        const periodValues = componentRevenueByPeriod.get(context.period) ?? new Map<string, number>();
+        periodValues.set(componentLabel, (periodValues.get(componentLabel) ?? 0) + value);
+        componentRevenueByPeriod.set(context.period, periodValues);
+      }
+    }
+
+    const metric = segmentMetric(concept);
+    if (!metric) continue;
+
+    const label = segmentLabelFromMembers(context.members);
+    if (!label) continue;
 
     const periodValues = byPeriod.get(context.period) ?? new Map<string, SegmentMetrics>();
     const metrics = periodValues.get(label) ?? {};
@@ -1601,13 +1629,67 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     byPeriod.set(context.period, periodValues);
   }
 
+  applyComponentRevenueRollups(byPeriod, componentRevenueByPeriod, totalRevenueByPeriod);
+
   return byPeriod;
+}
+
+function revenueComponentSegmentLabel(concept: string, members: string[]) {
+  const local = concept.split(":").pop() ?? concept;
+  if (!/^Revenues$/i.test(local)) return null;
+  if (members.some(isReportableSegmentMember)) return null;
+  if (members.some(isNonRevenueComponentMember)) return null;
+
+  const joined = members.join(" ");
+  if (
+    /InvestmentBankingMember|PrincipalTransactionsRevenueMember|CommissionsAndOtherFeesMember|InterestRevenueMember/i.test(joined)
+  ) {
+    return "Investment Banking & Capital Markets";
+  }
+  if (/AssetManagement1Member|ProductAndServiceOtherMember/i.test(joined)) return "Asset Management and Other";
+  return null;
+}
+
+function totalRevenuePriority(concept: string, members: string[]) {
+  const local = concept.split(":").pop() ?? concept;
+  if (!/^(Revenues|RevenueFromContractWithCustomerExcludingAssessedTax|SalesRevenueNet)$/i.test(local)) return 0;
+  if (members.length === 0) return /^Revenues$/i.test(local) ? 100 : 90;
+  if (members.length === 1 && /OperatingSegmentsMember/i.test(members[0])) return /^Revenues$/i.test(local) ? 80 : 70;
+  return 0;
+}
+
+function applyComponentRevenueRollups(
+  byPeriod: Map<string, Map<string, SegmentMetrics>>,
+  componentRevenueByPeriod: Map<string, Map<string, number>>,
+  totalRevenueByPeriod: Map<string, { value: number; priority: number }>
+) {
+  componentRevenueByPeriod.forEach((componentRevenue, period) => {
+    if (!componentRevenue.size) return;
+    const totalRevenue = totalRevenueByPeriod.get(period)?.value;
+    if (totalRevenue === undefined) return;
+
+    const componentTotal = sumNumbers(Array.from(componentRevenue.values()));
+    if (!segmentRevenueTies(componentTotal, totalRevenue)) return;
+
+    const directRevenue = byPeriod.get(period);
+    const directTotal = directRevenue ? sumSegmentRevenue(directRevenue) : 0;
+    const directTies = directRevenue ? segmentRevenueTies(directTotal, totalRevenue) : false;
+    if (directTies && Math.abs(directTotal - componentTotal) <= 100_000) return;
+
+    const periodValues = byPeriod.get(period) ?? new Map<string, SegmentMetrics>();
+    componentRevenue.forEach((revenue, label) => {
+      const metrics = periodValues.get(label) ?? {};
+      metrics.revenue = revenue;
+      periodValues.set(label, metrics);
+    });
+    byPeriod.set(period, periodValues);
+  });
 }
 
 function segmentMetric(concept: string): keyof SegmentMetrics | null {
   const local = concept.split(":").pop() ?? concept;
   if (/^(RevenueFromContractWithCustomerExcludingAssessedTax|Revenues|SalesRevenueNet)$/i.test(local)) return "revenue";
-  if (/(OperatingIncomeLoss|SegmentProfitLoss)/i.test(local)) return "operatingIncome";
+  if (/(OperatingIncomeLoss|SegmentProfitLoss|IncomeLossFromContinuingOperationsBeforeIncomeTaxes)/i.test(local)) return "operatingIncome";
   if (/(DepreciationDepletionAndAmortization|DepreciationAndAmortization|DepreciationExpense)/i.test(local)) return "depreciationAmortization";
   return null;
 }
@@ -1628,24 +1710,32 @@ function contextPeriod(contextXml: string, form: string) {
 }
 
 function segmentLabelFromMembers(members: string[]) {
+  const joined = members.join(" ");
+  if (/InvestmentBankingAndCapitalMarkets/i.test(joined)) return "Investment Banking & Capital Markets";
+  if (/AssetManagementAndOther/i.test(joined)) return "Asset Management and Other";
+  if (/AssetManagementSegmentMember/i.test(joined)) return "Asset Management and Other";
   const reportableSegment = members.find((member) => /BusinessSegment|OperatingSegment|StatementBusinessSegments|SegmentAxis/i.test(member));
   const product = members.find(
     (member) =>
       member.includes("ProductOrServiceAxis") ||
       /ServiceLine|OtherServiceLine/i.test(member)
   );
-  const joined = members.join(" ");
   const source = reportableSegment || product || joined;
   if (/CollectionServiceLineMember/i.test(source)) return "Collection";
   if (/LandfillServiceLineMember/i.test(source)) return "Landfill";
   if (/EnvironmentalSolutionsServiceLineMember/i.test(source)) return "Environmental Solutions";
   if (/TransferServiceLineMember/i.test(source)) return "Transfer";
-  if (/InvestmentBankingAndCapitalMarkets/i.test(source)) return "Investment Banking & Capital Markets";
-  if (/AssetManagementAndOther/i.test(source)) return "Asset Management and Other";
-  if (/AssetManagement/i.test(source)) return "Asset Management and Other";
   if (/OtherServiceLineMember/i.test(source)) return "Other";
   if (/ProfessionalServices/i.test(source)) return "Professional Services and Other";
   return cleanSegmentMember(source);
+}
+
+function isReportableSegmentMember(member: string) {
+  return /BusinessSegment|OperatingSegment|StatementBusinessSegments|SegmentAxis|SegmentMember/i.test(member);
+}
+
+function isNonRevenueComponentMember(member: string) {
+  return /RelatedParty|Reclassification|AccumulatedOtherComprehensiveIncome|Aoci|Geographic|Region|Country|MinimumMember|MaximumMember/i.test(member);
 }
 
 function cleanSegmentMember(member: string) {
@@ -1657,7 +1747,7 @@ function cleanSegmentMember(member: string) {
     .replace(/\bAnd\b/g, "and")
     .replace(/\s+/g, " ")
     .trim();
-  if (!local || /Consolidated|Corporate|Geographic|North America|Europe|Asia|Other Countries/i.test(local)) return null;
+  if (!local || /Consolidated|Corporate|Geographic|North America|Europe|Asia|Other Countries|Operating Segments/i.test(local)) return null;
   return local;
 }
 
@@ -1682,8 +1772,30 @@ function decodeXml(value: string) {
 function preferSegmentFact(members: string[], value: number, existing: number) {
   const joined = members.join(" ");
   if (/IntersegmentEliminationMember/i.test(joined)) return false;
+  if (members.length === 1 && /OperatingSegmentsMember/i.test(members[0])) return false;
   if (!/OperatingSegmentsMember/i.test(joined) && value > 0) return true;
   return Math.abs(value) > Math.abs(existing);
+}
+
+function sumSegmentRevenue(values: Map<string, SegmentMetrics>) {
+  let total = 0;
+  values.forEach((metrics, label) => {
+    if (isAggregateSegmentLabel(label)) return;
+    total += metrics.revenue ?? 0;
+  });
+  return total;
+}
+
+function sumNumbers(values: number[]) {
+  return values.reduce((total, value) => total + value, 0);
+}
+
+function segmentRevenueTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= Math.max(100_000, Math.abs(expected) * 0.0005);
+}
+
+function isAggregateSegmentLabel(label: string) {
+  return /^(Operating Segments|OperatingSegments|Total|Consolidated)$/i.test(label.trim());
 }
 
 function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, SegmentMetrics>>, annual: Map<string, Map<string, SegmentMetrics>>) {
@@ -1709,7 +1821,16 @@ function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, SegmentM
 }
 
 function segmentSort(a: string, b: string) {
-  const order = ["Collection", "Landfill", "Environmental Solutions", "Transfer", "Other", "Professional Services and Other"];
+  const order = [
+    "Investment Banking & Capital Markets",
+    "Asset Management and Other",
+    "Collection",
+    "Landfill",
+    "Environmental Solutions",
+    "Transfer",
+    "Other",
+    "Professional Services and Other"
+  ];
   return (order.indexOf(a) === -1 ? 99 : order.indexOf(a)) - (order.indexOf(b) === -1 ? 99 : order.indexOf(b));
 }
 
@@ -2314,8 +2435,99 @@ function fillSegmentAnalysis(
   const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A", auditRows);
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
   commentsAdded += revenueResult.commentsAdded + operatingIncomeResult.commentsAdded + depreciationResult.commentsAdded;
+  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows);
+  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows);
+  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
+  filledCells += restoreSegmentCheckFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
 
   return { filledCells, commentsAdded, warnings };
+}
+
+function fillSegmentTotalRow(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  segments: SegmentRevenue[],
+  metric: "values" | "operatingIncome" | "depreciationAmortization",
+  label: string,
+  auditRows: MappingAuditRow[]
+) {
+  const rowNumber = findLabelRow(sheet, label);
+  if (!rowNumber) return 0;
+  let filledCells = 0;
+
+  periods.forEach((period, periodIndex) => {
+    const cell = sheet.getCell(rowNumber, columns[periodIndex]);
+    if (!isHardcodedFinancialInput(cell)) return;
+    const value = segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
+    cell.value = value;
+    filledCells += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: cell.address,
+      modelRowLabel: label,
+      period,
+      valueWritten: value,
+      mappingType: "calculated",
+      conceptsUsed: `Sum of EDGAR reportable segment ${metric} rows`,
+      sourceStatement: "segment",
+      accession: "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "copied",
+      confidence: "high",
+      validationStatus: "not_run",
+      notes: `Rebuilt ${label} because the Segment Analysis total cell did not contain a formula.`
+    });
+  });
+
+  return filledCells;
+}
+
+function restoreSegmentCheckFormula(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  totalLabel: string,
+  checkLabel: string,
+  auditRows: MappingAuditRow[]
+) {
+  const totalRow = findLabelRow(sheet, totalLabel);
+  const checkRow = findLabelRow(sheet, checkLabel);
+  if (!totalRow || !checkRow || checkRow <= totalRow + 1) return 0;
+  let filledCells = 0;
+
+  periods.forEach((period, periodIndex) => {
+    const col = columns[periodIndex];
+    const cell = sheet.getCell(checkRow, col);
+    if (hasFormula(cell)) return;
+    const formula = `${columnLetter(col)}${totalRow}-SUM(${columnLetter(col)}${totalRow + 1}:${columnLetter(col)}${checkRow - 1})`;
+    cell.value = { formula, result: 0 };
+    filledCells += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: cell.address,
+      modelRowLabel: checkLabel,
+      period,
+      valueWritten: 0,
+      mappingType: "calculated",
+      conceptsUsed: formula,
+      sourceStatement: "segment",
+      accession: "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "calculated",
+      confidence: "high",
+      validationStatus: "OK!",
+      notes: `Rebuilt ${checkLabel} formula because the Segment Analysis check cell was blank.`
+    });
+  });
+
+  return filledCells;
 }
 
 function fillSegmentMetricRows(
@@ -2475,12 +2687,33 @@ function isGenericSegmentPlaceholder(label: string) {
 function segmentIndexForRow(label: string, segments: SegmentRevenue[], used: Set<number>) {
   if (!label) return null;
   const normalizedLabel = normalize(label);
-  const index = segments.findIndex((segment, segmentIndex) => {
-    if (used.has(segmentIndex)) return false;
+  let bestIndex: number | null = null;
+  let bestScore = 0;
+  segments.forEach((segment, segmentIndex) => {
+    if (used.has(segmentIndex)) return;
     const normalizedSegment = normalize(segment.label);
-    return normalizedSegment === normalizedLabel || normalizedSegment.includes(normalizedLabel) || normalizedLabel.includes(normalizedSegment);
+    const score = segmentLabelMatchScore(normalizedLabel, normalizedSegment);
+    if (!score) return;
+    if (score > bestScore) {
+      bestIndex = segmentIndex;
+      bestScore = score;
+    }
   });
-  return index === -1 ? null : index;
+  return bestIndex;
+}
+
+function segmentLabelMatchScore(normalizedLabel: string, normalizedSegment: string) {
+  if (!normalizedLabel || !normalizedSegment) return 0;
+  if (normalizedSegment === normalizedLabel) return 100;
+  if (normalizedLabel.includes(normalizedSegment)) {
+    const coverage = normalizedSegment.length / normalizedLabel.length;
+    return coverage >= 0.75 ? 70 + coverage : 0;
+  }
+  if (normalizedSegment.includes(normalizedLabel)) {
+    const coverage = normalizedLabel.length / normalizedSegment.length;
+    return coverage >= 0.75 ? 60 + coverage : 0;
+  }
+  return 0;
 }
 
 function nextUnusedSegmentIndex(segments: SegmentRevenue[], used: Set<number>) {
@@ -2820,7 +3053,9 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
   if (segmentSheet) {
+    const segmentEvaluator = new FormulaEvaluator(segmentSheet);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
+    errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
   }
   const modelSheet = workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
@@ -3165,6 +3400,10 @@ function sectionHeaderScore(sheet: ExcelJS.Worksheet, rowNumber: number) {
 
 function valuesTie(actual: number, expected: number) {
   return Math.abs(actual - expected) <= 0.1;
+}
+
+function segmentModelRevenueTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= Math.max(0.1, Math.abs(expected) * 0.0005);
 }
 
 function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firstHistoricalCol: number): WorkbookSnapshot {
@@ -3560,6 +3799,42 @@ function validateSegmentGenericRows(sheet: ExcelJS.Worksheet, periods: string[],
       }
     });
   }
+  return errors;
+}
+
+function validateSegmentRevenueTieOut(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator
+) {
+  const errors: string[] = [];
+  const totalRow = findLabelRow(sheet, "Total Company Revenue");
+  const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns).filter((rowNumber) => {
+    const label = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, "Revenue"), "Revenue");
+    return !isGenericSegmentPlaceholder(label);
+  });
+  if (!totalRow || !rows.length) return errors;
+
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const segmentTotal = rows.reduce((total, rowNumber) => total + (numericCellValue(sheet.getCell(rowNumber, col)) ?? 0), 0);
+    const sheetTotal = evaluator.evaluateCell(sheet.getCell(totalRow, col));
+    const edgarTotal = first(period, ctx.duration, C.revenue)?.value ?? null;
+    const expected = edgarTotal === null ? sheetTotal : edgarTotal / 1_000_000;
+    if (expected !== null && !segmentModelRevenueTies(segmentTotal, expected)) {
+      errors.push(
+        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, not EDGAR total revenue ${roundModelValue(expected)}.`
+      );
+    }
+    if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, segmentTotal)) {
+      errors.push(
+        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`
+      );
+    }
+  });
+
   return errors;
 }
 
