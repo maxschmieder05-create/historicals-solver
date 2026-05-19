@@ -1250,6 +1250,7 @@ export async function POST(request: NextRequest) {
     const modelNonCoreSnapshot = snapshotModelTabOutsideRows(sheet, coreRows);
     const inlineCtx = await fetchInlineFactContext(company, periods);
     mergeContexts(ctx, inlineCtx);
+    const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
     const fillRows = coreStatementFillRows(sheet, discoverFillRows(sheet, columns, periodInfos));
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported income statement or balance sheet labels.", 422);
 
@@ -1336,6 +1337,16 @@ export async function POST(request: NextRequest) {
       if (unresolved) {
         warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
       }
+    }
+
+    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
+    if (segmentSheet) {
+      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows);
+      filledCells += segmentResult.filledCells;
+      commentsAdded += segmentResult.commentsAdded;
+      warnings.push(...segmentResult.warnings);
+    } else {
+      warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
     }
 
     for (const fillRow of fillRows) {
@@ -2827,6 +2838,10 @@ function mappingAuditRowForSegment(
 
 function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: string[], columns: number[], ctx: ResolveContext, warnings: string[]) {
   const errors: string[] = [];
+  const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
+  if (segmentSheet) {
+    errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
+  }
   const modelSheet = workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);

@@ -95,7 +95,7 @@ export default function Home() {
           <h1>Historicals Solver</h1>
           <p>
             Drop the Owl Fund model, enter a ticker or company name, and download a workbook with income statement and
-            balance sheet historical cells populated from SEC company facts.
+            balance sheet historical cells populated from SEC company facts, with Segment Analysis refreshed where needed.
           </p>
         </div>
 

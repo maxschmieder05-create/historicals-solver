@@ -12,15 +12,15 @@ const ticker = process.env.JEF_TICKER || "JEF";
 
 const checks = [
   { sheet: "Model", name: "Income Statement", start: 28, end: 57 },
-  { sheet: "Model", name: "Balance Sheet", start: 118, end: 159 }
+  { sheet: "Model", name: "Balance Sheet", start: 118, end: 159 },
+  { sheet: "Segment Analysis", name: "Segment Revenue", start: 7, end: 17 }
 ];
 
 const preservedChecks = [
   { sheet: "Model", name: "Cash Flow Statement", start: 73, end: 104 },
   { sheet: "Model", name: "PP&E / Depreciation Schedule", start: 193, end: 213 },
   { sheet: "Model", name: "Shareholder Equity / Shares", start: 237, end: 287 },
-  { sheet: "Model", name: "Debt and Interest Schedule", start: 288, end: 360 },
-  { sheet: "Segment Analysis", name: "Segment Revenue", start: 7, end: 17 }
+  { sheet: "Model", name: "Debt and Interest Schedule", start: 288, end: 360 }
 ];
 
 function cellValue(cell) {
