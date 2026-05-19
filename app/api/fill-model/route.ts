@@ -3212,7 +3212,7 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
   const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
-  if (rowNumber && !actual && isProtectedBeginningBalanceRow(cell.worksheet, rowNumber)) return true;
+  if (rowNumber && !actual && isProtectedScheduleClearRow(cell.worksheet, rowNumber)) return true;
   if (!actual) return false;
   if (!rowNumber || normalize(rowLabel(cell.worksheet, rowNumber)) !== normalize("Dividends")) return false;
   const bridgeFormula = /^[-+]?\d+(?:\.\d+)?-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i;
@@ -3242,7 +3242,7 @@ function cleanStaleProtectedHistoricalRows(
   for (const fillRow of fillRows) {
     const staleDetector = staleProtectedRowDetector(fillRow);
     if (!staleDetector) continue;
-    const clearFormulas = Boolean(fillRow.modelContext && isProtectedBeginningBalanceRow(sheet, fillRow.row));
+    const clearFormulas = Boolean(fillRow.modelContext && isProtectedScheduleClearRow(sheet, fillRow.row));
     const staleMatches = periods.flatMap((period, index) => {
       const col = columns[index];
       const cell = sheet.getCell(fillRow.row, col);
@@ -3317,7 +3317,7 @@ function staleProtectedRowDetector(fillRow: FillRow): ((period: string, existing
     return staleGenericDetector(C.capex, -1, 1_000_000, "Generic cash-flow capex is not used for PP&E schedule bridge rows.");
   }
   if (inPpeDepreciationScheduleContext(context) && normalizedLabel === normalize("Depreciation Expense")) {
-    return staleGenericDetector(C.da, 1, 1_000_000, "Generic consolidated depreciation and amortization is not used for PP&E schedule bridge rows.");
+    return staleUnsupportedScheduleDetector("Cannot find exact PP&E schedule depreciation expense in EDGAR, find manually.");
   }
   if (inPpeDepreciationScheduleContext(context) && normalizedLabel === normalize("Acquisition / (Divestment) of Businesses")) {
     return staleGenericDetector(ACQUISITION_CONCEPTS, 1, 1_000_000, "Generic acquisition cash-flow concepts are not used for PP&E schedule bridge rows.");
@@ -3355,7 +3355,31 @@ function isProtectedBeginningBalanceRow(sheet: ExcelJS.Worksheet, rowNumber: num
   return false;
 }
 
+function isProtectedPpeDepreciationRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  if (normalize(rowLabel(sheet, rowNumber)) !== normalize("Depreciation Expense")) return false;
+  for (let row = rowNumber - 1; row >= Math.max(1, rowNumber - 8); row -= 1) {
+    const label = normalize(rowLabel(sheet, row));
+    if (label === normalize("PP&E / Depreciation Schedule") || label === normalize("PPE / Depreciation Schedule")) return true;
+  }
+  return false;
+}
+
+function isProtectedScheduleClearRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  return isProtectedBeginningBalanceRow(sheet, rowNumber) || isProtectedPpeDepreciationRow(sheet, rowNumber);
+}
+
 function staleBeginningBalanceDetector(note: string) {
+  return (_period: string, existing: number | null, _ctx: ResolveContext): StaleProtectedMatch | null => {
+    if (existing !== null && !Number.isFinite(existing)) return null;
+    return {
+      note,
+      conceptsUsed: "",
+      accession: ""
+    };
+  };
+}
+
+function staleUnsupportedScheduleDetector(note: string) {
   return (_period: string, existing: number | null, _ctx: ResolveContext): StaleProtectedMatch | null => {
     if (existing !== null && !Number.isFinite(existing)) return null;
     return {

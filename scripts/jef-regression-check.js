@@ -75,6 +75,19 @@ function isProtectedBeginningBalanceRow(sheet, row) {
   return false;
 }
 
+function isProtectedPpeDepreciationRow(sheet, row) {
+  if (normalize(rowLabel(sheet, row)) !== normalize("Depreciation Expense")) return false;
+  for (let contextRow = row - 1; contextRow >= Math.max(1, row - 8); contextRow -= 1) {
+    const label = normalize(rowLabel(sheet, contextRow));
+    if (label === normalize("PP&E / Depreciation Schedule") || label === normalize("PPE / Depreciation Schedule")) return true;
+  }
+  return false;
+}
+
+function isProtectedScheduleClearRow(sheet, row) {
+  return isProtectedBeginningBalanceRow(sheet, row) || isProtectedPpeDepreciationRow(sheet, row);
+}
+
 async function fillWorkbook() {
   await fs.mkdir(path.dirname(outputWorkbook), { recursive: true });
   const bytes = await fs.readFile(inputWorkbook);
@@ -126,7 +139,7 @@ function compareFormulas(golden, actual, errors) {
         const got = cellFormula(actualSheet.getCell(row, col));
         if (expected !== got) {
           if (isAllowedDividendBridgeUpdate(sheetName, expectedSheet.getCell(row, col), expected, got)) continue;
-          if (sheetName === "Model" && isProtectedBeginningBalanceRow(actualSheet, row) && !got) continue;
+          if (sheetName === "Model" && isProtectedScheduleClearRow(actualSheet, row) && !got) continue;
           errors.push(`${sheetName}!${expectedSheet.getCell(row, col).address}: formula changed from "${expected}" to "${got ?? "[hardcoded/blank]"}".`);
         }
       }
@@ -145,7 +158,7 @@ function compareRanges(golden, actual, errors) {
         const got = cellValue(actualSheet.getCell(row, col));
         if (!valuesMatch(expected, got)) {
           if (isAllowedDividendBridgeUpdate(check.sheet, expectedSheet.getCell(row, col), expected, got)) continue;
-          if (check.sheet === "Model" && isProtectedBeginningBalanceRow(actualSheet, row) && isBlank(actualSheet.getCell(row, col))) continue;
+          if (check.sheet === "Model" && isProtectedScheduleClearRow(actualSheet, row) && isBlank(actualSheet.getCell(row, col))) continue;
           errors.push(`${check.name} ${check.sheet}!${expectedSheet.getCell(row, col).address}: expected "${expected ?? ""}", got "${got ?? ""}".`);
         }
       }
@@ -183,6 +196,21 @@ function compareProtectedBeginningBalancesBlank(actual, errors) {
   }
 }
 
+function compareProtectedScheduleRowsBlank(actual, errors) {
+  const sheet = actual.getWorksheet("Model");
+  if (!sheet) return;
+  const quarterCols = [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19];
+  for (let row = 1; row <= sheet.rowCount; row += 1) {
+    if (!isProtectedScheduleClearRow(sheet, row)) continue;
+    for (const col of quarterCols) {
+      const cell = sheet.getCell(row, col);
+      if (!isBlank(cell)) {
+        errors.push(`Protected Schedule Row Model!${cell.address}: expected blank, got "${cellValue(cell)}".`);
+      }
+    }
+  }
+}
+
 function isBlank(cell) {
   const got = cellValue(cell);
   return got === null || got === undefined || got === "";
@@ -198,6 +226,7 @@ async function main() {
   compareRanges(golden, actual, errors);
   compareCashFlowBlank(actual, errors);
   compareProtectedBeginningBalancesBlank(actual, errors);
+  compareProtectedScheduleRowsBlank(actual, errors);
 
   if (errors.length) {
     console.error(errors.slice(0, 40).join("\n"));
