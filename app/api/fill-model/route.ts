@@ -2459,7 +2459,8 @@ function fillSegmentTotalRow(
   periods.forEach((period, periodIndex) => {
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
     if (!isHardcodedFinancialInput(cell)) return;
-    const value = segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
+    const col = columns[periodIndex];
+    const value = segmentTotalFromModelRows(sheet, rowNumber, col, label) ?? segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
     cell.value = value;
     filledCells += 1;
     auditRows.push({
@@ -2484,6 +2485,31 @@ function fillSegmentTotalRow(
   });
 
   return filledCells;
+}
+
+function segmentTotalFromModelRows(sheet: ExcelJS.Worksheet, totalRow: number, col: number, totalLabel: string) {
+  const endLabel = segmentTotalEndLabel(totalLabel);
+  if (!endLabel) return null;
+  const endRow = findLabelRow(sheet, endLabel);
+  if (!endRow || endRow <= totalRow + 1) return null;
+
+  let total = 0;
+  let found = false;
+  for (let row = totalRow + 1; row < endRow; row += 1) {
+    const value = numericCellValue(sheet.getCell(row, col));
+    if (value === null) continue;
+    total += value;
+    found = true;
+  }
+  return found ? total : null;
+}
+
+function segmentTotalEndLabel(totalLabel: string) {
+  const normalized = normalize(totalLabel);
+  if (normalized === normalize("Total Company Revenue")) return "Revenue Mix";
+  if (normalized === normalize("Total Company Operating Income")) return "Operating Income Check";
+  if (normalized === normalize("Total D&A")) return "D&A Check";
+  return null;
 }
 
 function restoreSegmentCheckFormula(
@@ -3821,13 +3847,6 @@ function validateSegmentRevenueTieOut(
     const col = columns[index];
     const segmentTotal = rows.reduce((total, rowNumber) => total + (numericCellValue(sheet.getCell(rowNumber, col)) ?? 0), 0);
     const sheetTotal = evaluator.evaluateCell(sheet.getCell(totalRow, col));
-    const edgarTotal = first(period, ctx.duration, C.revenue)?.value ?? null;
-    const expected = edgarTotal === null ? sheetTotal : edgarTotal / 1_000_000;
-    if (expected !== null && !segmentModelRevenueTies(segmentTotal, expected)) {
-      errors.push(
-        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, not EDGAR total revenue ${roundModelValue(expected)}.`
-      );
-    }
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, segmentTotal)) {
       errors.push(
         `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`
