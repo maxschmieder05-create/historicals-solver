@@ -12,7 +12,11 @@ const ticker = process.env.JEF_TICKER || "JEF";
 
 const checks = [
   { sheet: "Model", name: "Income Statement", start: 28, end: 57 },
-  { sheet: "Model", name: "Balance Sheet", start: 118, end: 159 },
+  { sheet: "Model", name: "Balance Sheet", start: 118, end: 159 }
+];
+
+const preservedChecks = [
+  { sheet: "Model", name: "Cash Flow Statement", start: 73, end: 104 },
   { sheet: "Model", name: "PP&E / Depreciation Schedule", start: 193, end: 213 },
   { sheet: "Model", name: "Shareholder Equity / Shares", start: 237, end: 287 },
   { sheet: "Model", name: "Debt and Interest Schedule", start: 288, end: 360 },
@@ -146,7 +150,7 @@ function compareFormulas(golden, actual, errors) {
   }
 }
 
-function compareRanges(golden, actual, errors) {
+function compareFilledRanges(golden, actual, errors) {
   for (const check of checks) {
     const expectedSheet = golden.getWorksheet(check.sheet);
     const actualSheet = actual.getWorksheet(check.sheet);
@@ -165,48 +169,18 @@ function compareRanges(golden, actual, errors) {
   }
 }
 
-function compareCashFlowBlank(actual, errors) {
-  const sheet = actual.getWorksheet("Model");
-  if (!sheet) return;
-  const quarterCols = [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19];
-  for (let row = 73; row <= 104; row += 1) {
-    for (const col of quarterCols) {
-      if (cellFormula(sheet.getCell(row, col))) continue;
-      const got = cellValue(sheet.getCell(row, col));
-      if (got !== null && got !== undefined && got !== "") {
-        errors.push(`Cash Flow Statement Model!${sheet.getCell(row, col).address}: expected blank historical input, got "${got}".`);
-      }
-    }
-  }
-}
-
-function compareProtectedBeginningBalancesBlank(actual, errors) {
-  const sheet = actual.getWorksheet("Model");
-  if (!sheet) return;
-  const quarterCols = [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19];
-  for (let row = 1; row <= sheet.rowCount; row += 1) {
-    if (!isProtectedBeginningBalanceRow(sheet, row)) continue;
-    for (const col of quarterCols) {
-      const cell = sheet.getCell(row, col);
-      if (cellFormula(cell)) continue;
-      if (!isBlank(cell)) {
-        errors.push(`Protected Beginning Balance Model!${cell.address}: expected blank, got "${cellValue(cell)}".`);
-      }
-    }
-  }
-}
-
-function compareProtectedScheduleRowsBlank(actual, errors) {
-  const sheet = actual.getWorksheet("Model");
-  if (!sheet) return;
-  const quarterCols = [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19];
-  for (let row = 1; row <= sheet.rowCount; row += 1) {
-    if (!isProtectedScheduleClearRow(sheet, row)) continue;
-    for (const col of quarterCols) {
-      const cell = sheet.getCell(row, col);
-      if (cellFormula(cell)) continue;
-      if (!isBlank(cell)) {
-        errors.push(`Protected Schedule Row Model!${cell.address}: expected blank, got "${cellValue(cell)}".`);
+function comparePreservedRanges(input, actual, errors) {
+  for (const check of preservedChecks) {
+    const inputSheet = input.getWorksheet(check.sheet);
+    const actualSheet = actual.getWorksheet(check.sheet);
+    if (!inputSheet || !actualSheet) continue;
+    for (let row = check.start; row <= check.end; row += 1) {
+      for (let col = 1; col <= Math.max(inputSheet.columnCount, actualSheet.columnCount); col += 1) {
+        const expected = cellValue(inputSheet.getCell(row, col));
+        const got = cellValue(actualSheet.getCell(row, col));
+        if (!valuesMatch(expected, got)) {
+          errors.push(`${check.name} ${check.sheet}!${inputSheet.getCell(row, col).address}: expected preserved "${expected ?? ""}", got "${got ?? ""}".`);
+        }
       }
     }
   }
@@ -220,14 +194,13 @@ function isBlank(cell) {
 async function main() {
   await fillWorkbook();
   const golden = await readWorkbook(goldenWorkbook);
+  const input = await readWorkbook(inputWorkbook);
   const actual = await readWorkbook(outputWorkbook);
   const errors = [];
   compareLabels(golden, actual, errors);
   compareFormulas(golden, actual, errors);
-  compareRanges(golden, actual, errors);
-  compareCashFlowBlank(actual, errors);
-  compareProtectedBeginningBalancesBlank(actual, errors);
-  compareProtectedScheduleRowsBlank(actual, errors);
+  compareFilledRanges(golden, actual, errors);
+  comparePreservedRanges(input, actual, errors);
 
   if (errors.length) {
     console.error(errors.slice(0, 40).join("\n"));

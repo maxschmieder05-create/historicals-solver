@@ -118,6 +118,8 @@ type WorkbookSnapshot = {
   formulas: Map<string, string>;
 };
 
+type CellSnapshot = Map<string, string>;
+
 type WriteDecision = {
   writable: boolean;
   reason?: string;
@@ -411,6 +413,32 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInf
   }
 
   return rows;
+}
+
+function coreStatementRowNumbers(sheet: ExcelJS.Worksheet) {
+  return new Set([
+    ...sectionRows(sheet, "Income Statement", (label) => /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)),
+    ...sectionRows(sheet, "Balance Sheet", (label) => /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label))
+  ]);
+}
+
+function sectionRows(sheet: ExcelJS.Worksheet, sectionLabel: string, isBoundary: (label: string) => boolean) {
+  const sectionStart = findSectionHeaderRow(sheet, sectionLabel);
+  const rows: number[] = [];
+  if (!sectionStart) return rows;
+
+  for (let rowNumber = sectionStart + 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (label && isBoundary(label)) break;
+    rows.push(rowNumber);
+  }
+
+  return rows;
+}
+
+function coreStatementFillRows(sheet: ExcelJS.Worksheet, fillRows: FillRow[]) {
+  const coreRows = coreStatementRowNumbers(sheet);
+  return fillRows.filter((fillRow) => coreRows.has(fillRow.row) && (fillRow.statement === "income" || fillRow.statement === "balance"));
 }
 
 function isCashFlowStatementBlockRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
@@ -1217,12 +1245,13 @@ export async function POST(request: NextRequest) {
       columns = columns.slice(0, periods.length);
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
+    const coreRows = coreStatementRowNumbers(sheet);
     const workbookSnapshot = snapshotWorkbook(workbook, [MODEL_SHEET, SEGMENT_SHEET], Math.min(...columns));
+    const modelNonCoreSnapshot = snapshotModelTabOutsideRows(sheet, coreRows);
     const inlineCtx = await fetchInlineFactContext(company, periods);
     mergeContexts(ctx, inlineCtx);
-    const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
-    const fillRows = discoverFillRows(sheet, columns, periodInfos);
-    if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
+    const fillRows = coreStatementFillRows(sheet, discoverFillRows(sheet, columns, periodInfos));
+    if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported income statement or balance sheet labels.", 422);
 
     const warnings: string[] = [];
     const auditRows: MappingAuditRow[] = [];
@@ -1309,18 +1338,6 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    refreshDividendCachedResults(sheet, periods, columns);
-
-    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
-    if (segmentSheet) {
-      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows);
-      filledCells += segmentResult.filledCells;
-      commentsAdded += segmentResult.commentsAdded;
-      warnings.push(...segmentResult.warnings);
-    } else {
-      warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
-    }
-
     for (const fillRow of fillRows) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
       if (!hasAny && fillRow.concepts?.length && fillRow.classification !== "unused" && fillRow.classification !== "formula") {
@@ -1328,19 +1345,11 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
-    filledCells += cashFlowClearResult.clearedCells;
-    warnings.push(...cashFlowClearResult.warnings);
-
-    const shareRepurchaseClearResult = clearStaleShareRepurchaseAssumptionAmounts(sheet, periods, columns, auditRows);
-    filledCells += shareRepurchaseClearResult.clearedCells;
-    commentsAdded += shareRepurchaseClearResult.commentsAdded;
-    warnings.push(...shareRepurchaseClearResult.warnings);
-
     restoreWorkbookLabels(workbook, workbookSnapshot);
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
+    validationErrors.push(...validateModelTabOutsideRowsPreserved(sheet, coreRows, modelNonCoreSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
     }
@@ -2818,10 +2827,6 @@ function mappingAuditRowForSegment(
 
 function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: string[], columns: number[], ctx: ResolveContext, warnings: string[]) {
   const errors: string[] = [];
-  const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
-  if (segmentSheet) {
-    errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
-  }
   const modelSheet = workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
@@ -2858,7 +2863,6 @@ class FormulaEvaluator {
     } else if (value && typeof value === "object" && ("formula" in value || "sharedFormula" in value)) {
       const formula = formulaForCell(cell);
       result = formula ? this.evaluateFormula(formula, cell, visited) : null;
-      if (result !== null) setFormulaResult(cell, result);
     } else if (value && typeof value === "object" && "result" in value && typeof value.result === "number") {
       result = value.result;
     }
@@ -3224,6 +3228,40 @@ function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSna
     if (!cell) continue;
     if (cellDisplay(cell) !== expected) cell.value = expected;
   }
+}
+
+function snapshotModelTabOutsideRows(sheet: ExcelJS.Worksheet, writableRows: Set<number>): CellSnapshot {
+  const cells: CellSnapshot = new Map();
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    if (writableRows.has(rowNumber)) continue;
+    for (let col = 1; col <= sheet.columnCount; col += 1) {
+      cells.set(snapshotAddress(sheet, rowNumber, col), cellSnapshotValue(sheet.getCell(rowNumber, col)));
+    }
+  }
+  return cells;
+}
+
+function validateModelTabOutsideRowsPreserved(sheet: ExcelJS.Worksheet, writableRows: Set<number>, snapshot: CellSnapshot) {
+  const errors: string[] = [];
+  for (const [address, expected] of snapshot.entries()) {
+    const cell = cellFromSnapshotAddress(sheet.workbook, address);
+    if (!cell) continue;
+    const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+    if (rowNumber && writableRows.has(rowNumber)) continue;
+    const actual = cellSnapshotValue(cell);
+    if (actual !== expected) {
+      errors.push(`${address}: non-income-statement / non-balance-sheet cell changed.`);
+    }
+  }
+  return errors;
+}
+
+function cellSnapshotValue(cell: ExcelJS.Cell) {
+  return JSON.stringify({
+    value: cellDisplay(cell),
+    formula: cellFormula(cell),
+    comment: commentText(cell.note)
+  });
 }
 
 function cleanStaleProtectedHistoricalRows(
