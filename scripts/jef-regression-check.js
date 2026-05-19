@@ -139,7 +139,6 @@ function compareFormulas(golden, actual, errors) {
         const got = cellFormula(actualSheet.getCell(row, col));
         if (expected !== got) {
           if (isAllowedDividendBridgeUpdate(sheetName, expectedSheet.getCell(row, col), expected, got)) continue;
-          if (sheetName === "Model" && isProtectedScheduleClearRow(actualSheet, row) && !got) continue;
           errors.push(`${sheetName}!${expectedSheet.getCell(row, col).address}: formula changed from "${expected}" to "${got ?? "[hardcoded/blank]"}".`);
         }
       }
@@ -158,7 +157,7 @@ function compareRanges(golden, actual, errors) {
         const got = cellValue(actualSheet.getCell(row, col));
         if (!valuesMatch(expected, got)) {
           if (isAllowedDividendBridgeUpdate(check.sheet, expectedSheet.getCell(row, col), expected, got)) continue;
-          if (check.sheet === "Model" && isProtectedScheduleClearRow(actualSheet, row) && isBlank(actualSheet.getCell(row, col))) continue;
+          if (check.sheet === "Model" && isProtectedScheduleClearRow(actualSheet, row) && isBlank(actualSheet.getCell(row, col)) && !cellFormula(expectedSheet.getCell(row, col))) continue;
           errors.push(`${check.name} ${check.sheet}!${expectedSheet.getCell(row, col).address}: expected "${expected ?? ""}", got "${got ?? ""}".`);
         }
       }
@@ -189,6 +188,7 @@ function compareProtectedBeginningBalancesBlank(actual, errors) {
     if (!isProtectedBeginningBalanceRow(sheet, row)) continue;
     for (const col of quarterCols) {
       const cell = sheet.getCell(row, col);
+      if (cellFormula(cell)) continue;
       if (!isBlank(cell)) {
         errors.push(`Protected Beginning Balance Model!${cell.address}: expected blank, got "${cellValue(cell)}".`);
       }
@@ -204,6 +204,7 @@ function compareProtectedScheduleRowsBlank(actual, errors) {
     if (!isProtectedScheduleClearRow(sheet, row)) continue;
     for (const col of quarterCols) {
       const cell = sheet.getCell(row, col);
+      if (cellFormula(cell)) continue;
       if (!isBlank(cell)) {
         errors.push(`Protected Schedule Row Model!${cell.address}: expected blank, got "${cellValue(cell)}".`);
       }

@@ -3212,7 +3212,6 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
   const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
-  if (rowNumber && !actual && isProtectedScheduleClearRow(cell.worksheet, rowNumber)) return true;
   if (!actual) return false;
   if (!rowNumber || normalize(rowLabel(cell.worksheet, rowNumber)) !== normalize("Dividends")) return false;
   const bridgeFormula = /^[-+]?\d+(?:\.\d+)?-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i;
@@ -3242,14 +3241,13 @@ function cleanStaleProtectedHistoricalRows(
   for (const fillRow of fillRows) {
     const staleDetector = staleProtectedRowDetector(fillRow);
     if (!staleDetector) continue;
-    const clearFormulas = Boolean(fillRow.modelContext && isProtectedScheduleClearRow(sheet, fillRow.row));
     const staleMatches = periods.flatMap((period, index) => {
       const col = columns[index];
       const cell = sheet.getCell(fillRow.row, col);
       if (cell.value === null) return [];
-      if (hasFormula(cell) && !clearFormulas) return [];
+      if (hasFormula(cell)) return [];
       const existing = numericCellValue(cell);
-      if (existing === null && !clearFormulas) return [];
+      if (existing === null) return [];
       const stale = staleDetector(period, existing, ctx);
       return stale ? [{ period, col, stale }] : [];
     });
@@ -3261,9 +3259,9 @@ function cleanStaleProtectedHistoricalRows(
       const col = columns[index];
       const cell = sheet.getCell(fillRow.row, col);
       if (cell.value === null) return;
-      if (hasFormula(cell) && !clearFormulas) return;
+      if (hasFormula(cell)) return;
       const existing = numericCellValue(cell);
-      if (existing === null && !clearFormulas) return;
+      if (existing === null) return;
       const stale = staleMatches.find((match) => match.col === col)?.stale ?? (clearWholeRow ? staleMatches[0].stale : null);
       if (!stale) return;
       cell.value = null;
