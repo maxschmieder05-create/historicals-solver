@@ -3086,6 +3086,7 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
   const modelSheet = workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
+    errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings));
     errors.push(...validateIncomeStatementNetIncome(modelSheet, periods, columns, ctx, evaluator, warnings));
     errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
 
@@ -3305,6 +3306,146 @@ function columnIndex(letters: string) {
     .toUpperCase()
     .split("")
     .reduce((total, letter) => total * 26 + letter.charCodeAt(0) - 64, 0);
+}
+
+function validateIncomeStatementKeyMetrics(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  errors.push(
+    ...validateIncomeStatementMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "Revenue",
+      ["Revenue", "Revenues", "Total Revenue", "Total Revenues"],
+      C.revenue
+    )
+  );
+  errors.push(
+    ...validateIncomeStatementMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "EBIT",
+      ["EBIT"],
+      C.operatingIncome
+    )
+  );
+  errors.push(...validateIncomeStatementEbitdaFormula(sheet, periods, columns, evaluator, warnings));
+  return errors;
+}
+
+function validateIncomeStatementMetricAgainstEdgar(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[],
+  metricName: string,
+  labels: string[],
+  concepts: string[]
+) {
+  const errors: string[] = [];
+  const rowNumber = findRowInSection(sheet, "Income Statement", labels, (label) =>
+    /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)
+  );
+  if (!rowNumber) return errors;
+
+  periods.forEach((period, index) => {
+    const edgarValue = first(period, ctx.duration, concepts);
+    if (!edgarValue) {
+      warnings.unshift(`Income Statement ${period}: ${metricName} tie-out skipped because EDGAR ${concepts.join("/")} was unavailable for that period.`);
+      return;
+    }
+
+    const cell = sheet.getCell(rowNumber, columns[index]);
+    const expected = edgarValue.value / 1_000_000;
+    const modelValue = statementMetricCellValue(cell, evaluator, expected);
+    if (modelValue === null) {
+      errors.push(`Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`);
+      return;
+    }
+
+    if (!statementMetricTies(modelValue, expected)) {
+      errors.push(`Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`);
+    }
+  });
+
+  return errors;
+}
+
+function statementMetricCellValue(cell: ExcelJS.Cell, evaluator: FormulaEvaluator, expected: number) {
+  const cached = numericCellValue(cell);
+  if (cached !== null && statementMetricTies(cached, expected)) return cached;
+  return evaluator.evaluateCell(cell);
+}
+
+function statementMetricTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= 0.3;
+}
+
+function validateIncomeStatementEbitdaFormula(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const ebitdaRow = findLabelRow(sheet, "EBITDA");
+  if (!ebitdaRow) return errors;
+  const ebitRow = findPriorLabelRow(sheet, ebitdaRow, "EBIT", 8);
+  const daRow = findPriorLabelRow(sheet, ebitdaRow, "Depreciation & Amortization", 4) ?? findPriorLabelRow(sheet, ebitdaRow, "Depreciation and Amortization", 4);
+  if (!ebitRow || !daRow) {
+    warnings.unshift("Income Statement Analysis: EBITDA tie-out skipped because EBIT or depreciation & amortization row was unavailable.");
+    return errors;
+  }
+
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const ebitdaCell = sheet.getCell(ebitdaRow, col);
+    const ebitCell = sheet.getCell(ebitRow, col);
+    const daCell = sheet.getCell(daRow, col);
+    const cachedEbitda = numericCellValue(ebitdaCell);
+    const cachedEbit = numericCellValue(ebitCell);
+    const cachedDa = numericCellValue(daCell);
+    if (cachedEbitda !== null && cachedEbit !== null && cachedDa !== null && valuesTie(cachedEbitda, cachedEbit + cachedDa)) return;
+
+    const ebitda = evaluator.evaluateCell(ebitdaCell);
+    const ebit = evaluator.evaluateCell(ebitCell);
+    const da = evaluator.evaluateCell(daCell);
+    if (ebitda === null || ebit === null || da === null) {
+      errors.push(`Income Statement ${columnLetter(col)}${ebitdaRow} ${period}: could not evaluate EBITDA, EBIT, or depreciation & amortization.`);
+      return;
+    }
+    const expected = ebit + da;
+    if (!valuesTie(ebitda, expected)) {
+      errors.push(`Income Statement ${columnLetter(col)}${ebitdaRow} ${period}: EBITDA ${roundModelValue(ebitda)} does not equal EBIT plus D&A ${roundModelValue(expected)}.`);
+    }
+  });
+
+  return errors;
+}
+
+function findPriorLabelRow(sheet: ExcelJS.Worksheet, startRow: number, label: string, maxRows: number) {
+  const wanted = normalize(label);
+  for (let rowNumber = startRow - 1; rowNumber >= Math.max(1, startRow - maxRows); rowNumber -= 1) {
+    if (normalize(rowLabel(sheet, rowNumber)) === wanted) return rowNumber;
+  }
+  return null;
 }
 
 function validateIncomeStatementNetIncome(
