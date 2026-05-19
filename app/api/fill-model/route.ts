@@ -1371,6 +1371,8 @@ export async function POST(request: NextRequest) {
       warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
     }
 
+    refreshHistoricalFormulaCachedResults(workbook, columns);
+
     for (const fillRow of fillRows) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
       if (!hasAny && fillRow.concepts?.length && fillRow.classification !== "unused" && fillRow.classification !== "formula") {
@@ -3671,6 +3673,20 @@ function splitFormulaArgs(body: string) {
   }
   args.push(current);
   return args;
+}
+
+function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, columns: number[]) {
+  for (const sheetName of [MODEL_SHEET, SEGMENT_SHEET]) {
+    const sheet = workbook.getWorksheet(sheetName);
+    if (!sheet) continue;
+    const evaluator = new FormulaEvaluator(sheet);
+    for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+      for (const col of columns) {
+        const cell = sheet.getCell(rowNumber, col);
+        if (hasFormula(cell)) evaluator.evaluateCell(cell);
+      }
+    }
+  }
 }
 
 function formulaForCell(cell: ExcelJS.Cell) {
