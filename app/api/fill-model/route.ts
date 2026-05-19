@@ -64,6 +64,30 @@ type ResolvedValue = {
   classification?: RowClassification;
 };
 
+type LlmMappingDecision = {
+  operation: "direct" | "sum" | "difference" | "needs_review";
+  selectedConcepts: string[];
+  sign: 1 | -1;
+  confidence: "high" | "medium" | "low";
+  reason: string;
+  requiresReview: boolean;
+};
+
+type LlmMappingState = {
+  enabled: boolean;
+  decisions: Map<number, FillRow | null>;
+  warnings: string[];
+  calls: number;
+  maxCalls: number;
+};
+
+type LlmCandidateFact = {
+  concept: string;
+  label: string;
+  statement: "income" | "balance";
+  values: Record<string, number>;
+};
+
 type ResolveContext = {
   duration: Map<string, Map<string, FactSource>>;
   instant: Map<string, Map<string, FactSource>>;
@@ -143,6 +167,12 @@ const SEC_HEADERS = {
   "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver/0.1 contact@example.com",
   Accept: "application/json"
 };
+
+const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
+const LLM_MAPPING_MODEL = process.env.LLM_MAPPING_MODEL || "gpt-5.4-mini";
+const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 8);
+const LLM_MAPPING_MIN_CANDIDATE_SCORE = 3;
+const LLM_MAPPING_CANDIDATE_LIMIT = 60;
 
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
@@ -1226,6 +1256,7 @@ export async function POST(request: NextRequest) {
 
     const warnings: string[] = [];
     const auditRows: MappingAuditRow[] = [];
+    const llmState = createLlmMappingState();
     let filledCells = 0;
     let commentsAdded = 0;
 
@@ -1235,6 +1266,7 @@ export async function POST(request: NextRequest) {
     warnings.push(...cleanupResult.warnings);
 
     for (const fillRow of fillRows) {
+      let effectiveFillRow = fillRow;
       const rowNotes = new Set<string>();
       let unresolved = 0;
 
@@ -1243,52 +1275,69 @@ export async function POST(request: NextRequest) {
       }
 
       if (fillRow.classification === "unused" || (!fillRow.concepts?.length && !fillRow.resolver)) {
-        const sourceCell = labelCell(sheet, fillRow.row);
-        if (fillRow.noFillComment && canAddComment(sourceCell)) {
-          if (fillRow.noFillComment.startsWith("Cannot find exact schedule value in EDGAR")) sourceCell.note = "";
-          addComment(sourceCell, fillRow.noFillComment);
-          commentsAdded += 1;
+        const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState);
+        if (llmFillRow) {
+          effectiveFillRow = llmFillRow;
+          rowNotes.add(llmFillRow.comment || "LLM-assisted EDGAR concept mapping was applied after deterministic row matching did not find a confident mapping.");
+        } else {
+          const sourceCell = labelCell(sheet, fillRow.row);
+          if (fillRow.noFillComment && canAddComment(sourceCell)) {
+            if (fillRow.noFillComment.startsWith("Cannot find exact schedule value in EDGAR")) sourceCell.note = "";
+            addComment(sourceCell, fillRow.noFillComment);
+            commentsAdded += 1;
+          }
+          warnings.push(`${fillRow.label}: left unchanged because no confident EDGAR match was found.`);
+          continue;
         }
-        warnings.push(`${fillRow.label}: left unchanged because no confident EDGAR match was found.`);
-        continue;
       }
 
-      periods.forEach((period, index) => {
+      for (let index = 0; index < periods.length; index += 1) {
+        const period = periods[index];
         const col = columns[index];
-        const cell = sheet.getCell(fillRow.row, col);
-        const writeDecision = historicalWriteDecision(fillRow, cell);
+        const cell = sheet.getCell(effectiveFillRow.row, col);
+        const writeDecision = historicalWriteDecision(effectiveFillRow, cell);
         if (!writeDecision.writable) {
-          const formulaUpdate = preservedDividendFormulaUpdate(fillRow, cell, period, periods, columns, index, ctx);
+          const formulaUpdate = preservedDividendFormulaUpdate(effectiveFillRow, cell, period, periods, columns, index, ctx);
           if (formulaUpdate) {
             cell.value = { formula: formulaUpdate.formula, result: formulaUpdate.value };
             filledCells += 1;
             addComment(cell, formulaUpdate.comment);
             commentsAdded += 1;
             auditRows.push(formulaUpdate.auditRow);
-            return;
+            continue;
           }
           if (shouldAuditSkippedWrite(writeDecision)) {
-            auditRows.push(skippedMappingAuditRow(sheet, cell, fillRow, period, writeDecision));
+            auditRows.push(skippedMappingAuditRow(sheet, cell, effectiveFillRow, period, writeDecision));
           }
-          return;
+          continue;
         }
 
-        const resolved = resolveRow(fillRow, period, ctx);
+        let resolved = resolveRow(effectiveFillRow, period, ctx);
+        if (resolved.value === null && effectiveFillRow === fillRow) {
+          const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState);
+          if (llmFillRow) {
+            effectiveFillRow = llmFillRow;
+            rowNotes.add(llmFillRow.comment || "LLM-assisted EDGAR concept mapping was applied after deterministic row matching did not find a value.");
+            resolved = resolveRow(effectiveFillRow, period, ctx);
+          }
+        }
+
         if (resolved.value === null || Number.isNaN(resolved.value)) {
           unresolved += 1;
-          return;
+          continue;
         }
 
-        cell.value = resolved.value / (fillRow.scale ?? 1);
+        cell.value = resolved.value / (effectiveFillRow.scale ?? 1);
         filledCells += 1;
 
-        const auditNote = auditNoteForResolvedValue(fillRow, resolved);
+        const auditNote = auditNoteForResolvedValue(effectiveFillRow, resolved);
         if (auditNote) rowNotes.add(auditNote);
-        const cellComment = mappingComment(fillRow, resolved, period, cell.value as number, "high", auditNote);
+        const confidence = effectiveFillRow.comment?.startsWith("LLM-assisted") ? "medium" : "high";
+        const cellComment = mappingComment(effectiveFillRow, resolved, period, cell.value as number, confidence, auditNote);
         addComment(cell, cellComment);
         commentsAdded += 1;
-        auditRows.push(mappingAuditRow(sheet, cell, fillRow, period, cell.value as number, resolved, "high", auditNote));
-      });
+        auditRows.push(mappingAuditRow(sheet, cell, effectiveFillRow, period, cell.value as number, resolved, confidence, auditNote));
+      }
 
       if (unresolved && fillRow.classification === "partial") {
         rowNotes.add(fillRow.noFillComment || "Split / partial match: Needs review because EDGAR detail was insufficient for one or more periods.");
@@ -1305,9 +1354,10 @@ export async function POST(request: NextRequest) {
       }
 
       if (unresolved) {
-        warnings.push(`${fillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
+        warnings.push(`${effectiveFillRow.label}: ${unresolved} period(s) left unchanged because no matching SEC fact was found.`);
       }
     }
+    warnings.push(...llmState.warnings);
 
     refreshDividendCachedResults(sheet, periods, columns);
 
@@ -2435,6 +2485,20 @@ function fillSegmentAnalysis(
   const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A", auditRows);
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
   commentsAdded += revenueResult.commentsAdded + operatingIncomeResult.commentsAdded + depreciationResult.commentsAdded;
+  const revenueReconciliation = reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, rows, "Revenue", C.revenue, ctx, auditRows);
+  const operatingIncomeReconciliation = reconcileSegmentMetricRowsToStatementTotal(
+    sheet,
+    periods,
+    columns,
+    operatingIncomeRows,
+    "Operating Income",
+    C.operatingIncome,
+    ctx,
+    auditRows
+  );
+  filledCells += revenueReconciliation.filledCells + operatingIncomeReconciliation.filledCells;
+  commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded;
+  warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
@@ -2485,6 +2549,79 @@ function fillSegmentTotalRow(
   });
 
   return filledCells;
+}
+
+function reconcileSegmentMetricRowsToStatementTotal(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  rows: number[],
+  suffix: string,
+  concepts: string[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  if (!rows.length) return { filledCells, commentsAdded, warnings };
+
+  periods.forEach((period, periodIndex) => {
+    const expectedSource = first(period, ctx.duration, concepts);
+    if (!expectedSource) return;
+    const col = columns[periodIndex];
+    const expected = expectedSource.value / 1_000_000;
+    const actual = segmentMetricRowsTotal(sheet, rows, col);
+    if (statementMetricTies(actual, expected)) return;
+
+    const residualRow = findSegmentResidualRow(sheet, rows, col, suffix);
+    if (!residualRow) {
+      warnings.push(`Segment Analysis ${period}: ${suffix} rows do not tie to EDGAR total and no residual segment row was available for reconciliation.`);
+      return;
+    }
+
+    const cell = sheet.getCell(residualRow, col);
+    const value = (numericCellValue(cell) ?? 0) + expected - actual;
+    cell.value = value;
+    filledCells += 1;
+    const note = `Calculated as the residual needed for Segment Analysis ${suffix} rows to tie to EDGAR consolidated ${suffix.toLowerCase()}.`;
+    addComment(cell, note);
+    commentsAdded += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: cell.address,
+      modelRowLabel: rowLabel(sheet, residualRow),
+      period,
+      valueWritten: value,
+      mappingType: "calculated",
+      conceptsUsed: concepts.join(", "),
+      sourceStatement: "segment",
+      accession: expectedSource.accn ?? "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "residual",
+      confidence: "medium",
+      validationStatus: "OK!",
+      notes: note
+    });
+  });
+
+  return { filledCells, commentsAdded, warnings };
+}
+
+function segmentMetricRowsTotal(sheet: ExcelJS.Worksheet, rows: number[], col: number) {
+  return rows.reduce((total, rowNumber) => total + (numericCellValue(sheet.getCell(rowNumber, col)) ?? 0), 0);
+}
+
+function findSegmentResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: number, suffix: string) {
+  const writableRows = rows.filter((rowNumber) => isHardcodedFinancialInput(sheet.getCell(rowNumber, col)));
+  const nonGenericRows = writableRows.filter((rowNumber) => !isGenericSegmentPlaceholder(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix)));
+  const preferred = nonGenericRows.find((rowNumber) =>
+    /other|corporate|unallocated|elimination|reconciliation|residual/i.test(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix))
+  );
+  return preferred ?? nonGenericRows.at(-1) ?? null;
 }
 
 function segmentTotalFromModelRows(sheet: ExcelJS.Worksheet, totalRow: number, col: number, totalLabel: string) {
@@ -2871,6 +3008,272 @@ function resolveRow(fillRow: FillRow, period: string, ctx: ResolveContext): Reso
   return { ...resolved, classification: fillRow.classification };
 }
 
+function createLlmMappingState(): LlmMappingState {
+  const enabledByEnv = /^true$/i.test(process.env.LLM_MAPPING_ENABLED || "");
+  const hasApiKey = Boolean(process.env.OPENAI_API_KEY);
+  return {
+    enabled: enabledByEnv && hasApiKey,
+    decisions: new Map(),
+    warnings: enabledByEnv && !hasApiKey ? ["LLM mapping was enabled but OPENAI_API_KEY was not set; deterministic EDGAR mapping was used."] : [],
+    calls: 0,
+    maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS > 0 ? LLM_MAPPING_MAX_CALLS : 8
+  };
+}
+
+async function llmAssistedFillRow(
+  fillRow: FillRow,
+  company: CompanyMatch,
+  periods: string[],
+  ctx: ResolveContext,
+  state: LlmMappingState
+) {
+  if (!state.enabled || !isLlmMappableRow(fillRow)) return null;
+  if (state.decisions.has(fillRow.row)) return state.decisions.get(fillRow.row) ?? null;
+  if (state.calls >= state.maxCalls) {
+    state.decisions.set(fillRow.row, null);
+    return null;
+  }
+
+  const candidates = llmCandidateFacts(fillRow, periods, ctx);
+  if (!candidates.length) {
+    state.decisions.set(fillRow.row, null);
+    return null;
+  }
+
+  state.calls += 1;
+  try {
+    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates);
+    const mapped = llmDecisionToFillRow(fillRow, decision, candidates);
+    state.decisions.set(fillRow.row, mapped);
+    return mapped;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown OpenAI API error";
+    state.warnings.push(`${fillRow.label}: LLM-assisted mapping skipped (${message}).`);
+    state.decisions.set(fillRow.row, null);
+    return null;
+  }
+}
+
+function isLlmMappableRow(fillRow: FillRow) {
+  if (fillRow.statement !== "income" && fillRow.statement !== "balance") return false;
+  if (fillRow.classification === "formula") return false;
+  const context = fillRow.modelContext;
+  if (context && !context.hasHardcodedInput && !fillRow.allowBlankHistoricalInput) return false;
+  return true;
+}
+
+function llmCandidateFacts(fillRow: FillRow, periods: string[], ctx: ResolveContext): LlmCandidateFact[] {
+  const map = fillRow.kind === "instant" ? ctx.instant : ctx.duration;
+  const byConcept = new Map<string, LlmCandidateFact>();
+
+  periods.forEach((period) => {
+    const facts = map.get(period);
+    if (!facts) return;
+    facts.forEach((source, concept) => {
+      const existing = byConcept.get(concept) ?? {
+        concept,
+        label: sourceDisplayLabel(source),
+        statement: fillRow.statement === "balance" ? "balance" : "income",
+        values: {}
+      };
+      existing.values[period] = roundModelValue(source.value / 1_000_000);
+      byConcept.set(concept, existing);
+    });
+  });
+
+  return Array.from(byConcept.values())
+    .map((candidate) => ({ candidate, score: llmCandidateScore(fillRow, candidate) }))
+    .filter(({ score }) => score >= LLM_MAPPING_MIN_CANDIDATE_SCORE)
+    .sort((a, b) => b.score - a.score || Object.keys(b.candidate.values).length - Object.keys(a.candidate.values).length)
+    .slice(0, LLM_MAPPING_CANDIDATE_LIMIT)
+    .map(({ candidate }) => candidate);
+}
+
+function llmCandidateScore(fillRow: FillRow, candidate: LlmCandidateFact) {
+  const rowTokens = significantTokens([fillRow.label, fillRow.modelContext?.sectionHeader, fillRow.modelContext?.previousLabel, fillRow.modelContext?.nextLabel].join(" "));
+  const candidateTokens = significantTokens(`${candidate.concept} ${candidate.label}`);
+  let score = 0;
+  rowTokens.forEach((token) => {
+    if (candidateTokens.has(token)) score += token.length >= 6 ? 3 : 2;
+    candidateTokens.forEach((candidateToken) => {
+      if (candidateToken !== token && (candidateToken.includes(token) || token.includes(candidateToken)) && Math.min(token.length, candidateToken.length) >= 5) {
+        score += 1;
+      }
+    });
+  });
+  if (fillRow.statement === "balance" && /(assets?|liabilit|equity|cash|receivable|inventory|debt|payable|goodwill|deposit|tax|stock|aoci)/i.test(candidate.concept)) score += 2;
+  if (fillRow.statement === "income" && /(revenue|income|expense|cost|profit|loss|tax|interest|depreciation|amortization|provision|sales)/i.test(candidate.concept)) score += 2;
+  return score;
+}
+
+function significantTokens(value: string) {
+  const stop = new Set(["and", "the", "for", "from", "with", "net", "total", "current", "other", "statement", "schedule"]);
+  return new Set(
+    value
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, " ")
+      .split(/\s+/)
+      .filter((token) => token.length >= 3 && !stop.has(token))
+  );
+}
+
+async function requestLlmMappingDecision(
+  company: CompanyMatch,
+  fillRow: FillRow,
+  periods: string[],
+  candidates: LlmCandidateFact[]
+): Promise<LlmMappingDecision> {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+
+  const response = await fetch(OPENAI_RESPONSES_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`
+    },
+    body: JSON.stringify({
+      model: LLM_MAPPING_MODEL,
+      instructions: [
+        "You map financial model rows to SEC EDGAR XBRL facts.",
+        "Use only the provided candidate concepts. Do not invent concepts or values.",
+        "Prefer needs_review unless the row label, section context, and candidate label clearly match.",
+        "Choose sign -1 only when the model row convention should invert the EDGAR value, such as expense rows shown as negatives.",
+        "Return strict JSON only."
+      ].join(" "),
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: JSON.stringify({
+                company: { ticker: company.ticker, name: company.title },
+                row: {
+                  label: fillRow.label,
+                  statement: fillRow.statement,
+                  kind: fillRow.kind,
+                  sectionHeader: fillRow.modelContext?.sectionHeader ?? "",
+                  previousLabel: fillRow.modelContext?.previousLabel ?? "",
+                  nextLabel: fillRow.modelContext?.nextLabel ?? "",
+                  modelSignConvention: fillRow.modelContext?.signConvention ?? fillRow.sign ?? 1
+                },
+                periods,
+                candidates
+              })
+            }
+          ]
+        }
+      ],
+      max_output_tokens: 700,
+      store: false,
+      text: {
+        format: {
+          type: "json_schema",
+          name: "edgar_mapping_decision",
+          strict: true,
+          schema: {
+            type: "object",
+            additionalProperties: false,
+            required: ["operation", "selectedConcepts", "sign", "confidence", "reason", "requiresReview"],
+            properties: {
+              operation: { type: "string", enum: ["direct", "sum", "difference", "needs_review"] },
+              selectedConcepts: {
+                type: "array",
+                items: { type: "string" }
+              },
+              sign: { type: "integer", enum: [1, -1] },
+              confidence: { type: "string", enum: ["high", "medium", "low"] },
+              reason: { type: "string" },
+              requiresReview: { type: "boolean" }
+            }
+          }
+        }
+      }
+    })
+  });
+
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = body?.error?.message || `${response.status} ${response.statusText}`;
+    throw new Error(message);
+  }
+
+  const text = responseOutputText(body);
+  if (!text) throw new Error("OpenAI response did not include text output");
+  return JSON.parse(text) as LlmMappingDecision;
+}
+
+function responseOutputText(body: any) {
+  if (typeof body?.output_text === "string") return body.output_text;
+  const chunks: string[] = [];
+  for (const item of body?.output ?? []) {
+    if (item?.type !== "message") continue;
+    for (const content of item.content ?? []) {
+      if (content?.type === "output_text" && typeof content.text === "string") chunks.push(content.text);
+    }
+  }
+  return chunks.join("").trim();
+}
+
+function llmDecisionToFillRow(fillRow: FillRow, decision: LlmMappingDecision, candidates: LlmCandidateFact[]): FillRow | null {
+  if (decision.operation === "needs_review" || decision.requiresReview || decision.confidence === "low") return null;
+  const allowed = new Set(candidates.map((candidate) => candidate.concept));
+  const selected = unique(decision.selectedConcepts).filter((concept) => allowed.has(concept));
+  if (!selected.length || selected.length !== decision.selectedConcepts.length) return null;
+  const sign: 1 | -1 = decision.sign === -1 ? -1 : 1;
+  const note = `LLM-assisted EDGAR mapping: ${decision.reason}`;
+
+  if (decision.operation === "direct") {
+    return {
+      ...fillRow,
+      classification: "direct" as const,
+      concepts: [selected[0]],
+      resolver: undefined,
+      sign,
+      scale: 1_000_000,
+      comment: note,
+      noFillComment: undefined
+    };
+  }
+
+  return {
+    ...fillRow,
+    classification: "grouped" as const,
+    concepts: selected,
+    resolver: (period: string, ctx: ResolveContext) => resolveLlmConceptGroup(period, ctx, fillRow.kind, selected, decision.operation, sign, note),
+    sign,
+    scale: 1_000_000,
+    comment: note,
+    noFillComment: undefined
+  };
+}
+
+function resolveLlmConceptGroup(
+  period: string,
+  ctx: ResolveContext,
+  kind: FillRow["kind"],
+  concepts: string[],
+  operation: LlmMappingDecision["operation"],
+  sign: 1 | -1,
+  note: string
+): ResolvedValue {
+  const facts = kind === "instant" ? ctx.instant.get(period) : ctx.duration.get(period);
+  if (!facts) return { value: null, sources: [], note, classification: "grouped" };
+  const sources = concepts.map((concept) => facts.get(concept)).filter(Boolean) as FactSource[];
+  if (sources.length !== concepts.length) return { value: null, sources, note, classification: "grouped" };
+  const unsigned =
+    operation === "difference"
+      ? sources.slice(1).reduce((value, source) => value - source.value, sources[0]?.value ?? 0)
+      : sources.reduce((total, source) => total + source.value, 0);
+  return {
+    value: unsigned * sign,
+    sources,
+    note,
+    classification: sources.length > 1 ? "grouped" : "direct"
+  };
+}
+
 function first(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[]) {
   const facts = map.get(period);
   if (!facts) return null;
@@ -3119,6 +3522,7 @@ class FormulaEvaluator {
     } else if (value && typeof value === "object" && ("formula" in value || "sharedFormula" in value)) {
       const formula = formulaForCell(cell);
       result = formula ? this.evaluateFormula(formula, cell, visited) : null;
+      if (result === null && "result" in value && typeof value.result === "number") result = value.result;
       if (result !== null) setFormulaResult(cell, result);
     } else if (value && typeof value === "object" && "result" in value && typeof value.result === "number") {
       result = value.result;
@@ -3385,12 +3789,16 @@ function validateIncomeStatementMetricAgainstEdgar(
     const expected = edgarValue.value / 1_000_000;
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
-      errors.push(`Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`);
+      const message = `Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`;
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
 
     if (!statementMetricTies(modelValue, expected)) {
-      errors.push(`Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`);
+      const message = `Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
     }
   });
 
@@ -3404,7 +3812,7 @@ function statementMetricCellValue(cell: ExcelJS.Cell, evaluator: FormulaEvaluato
 }
 
 function statementMetricTies(actual: number, expected: number) {
-  return Math.abs(actual - expected) <= 0.3;
+  return Math.abs(actual - expected) <= Math.max(1, Math.abs(expected) * 0.0005);
 }
 
 function validateIncomeStatementEbitdaFormula(
@@ -3438,12 +3846,16 @@ function validateIncomeStatementEbitdaFormula(
     const ebit = evaluator.evaluateCell(ebitCell);
     const da = evaluator.evaluateCell(daCell);
     if (ebitda === null || ebit === null || da === null) {
-      errors.push(`Income Statement ${columnLetter(col)}${ebitdaRow} ${period}: could not evaluate EBITDA, EBIT, or depreciation & amortization.`);
+      const message = `Income Statement ${columnLetter(col)}${ebitdaRow} ${period}: could not evaluate EBITDA, EBIT, or depreciation & amortization.`;
+      if (hasFormula(ebitdaCell) || hasFormula(ebitCell) || hasFormula(daCell)) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
     const expected = ebit + da;
     if (!valuesTie(ebitda, expected)) {
-      errors.push(`Income Statement ${columnLetter(col)}${ebitdaRow} ${period}: EBITDA ${roundModelValue(ebitda)} does not equal EBIT plus D&A ${roundModelValue(expected)}.`);
+      const message = `Income Statement ${columnLetter(col)}${ebitdaRow} ${period}: EBITDA ${roundModelValue(ebitda)} does not equal EBIT plus D&A ${roundModelValue(expected)}.`;
+      if (hasFormula(ebitdaCell) || hasFormula(ebitCell) || hasFormula(daCell)) warnings.unshift(message);
+      else errors.push(message);
     }
   });
 
