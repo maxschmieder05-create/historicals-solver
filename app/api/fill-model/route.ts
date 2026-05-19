@@ -3087,7 +3087,6 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings));
-    errors.push(...validateIncomeStatementNetIncome(modelSheet, periods, columns, ctx, evaluator, warnings));
     errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
 
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
@@ -3343,6 +3342,19 @@ function validateIncomeStatementKeyMetrics(
       C.operatingIncome
     )
   );
+  errors.push(
+    ...validateIncomeStatementMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "net income",
+      ["Net Income (Loss)", "Net Income"],
+      CONTINUING_NET_INCOME_CONCEPTS
+    )
+  );
   errors.push(...validateIncomeStatementEbitdaFormula(sheet, periods, columns, evaluator, warnings));
   return errors;
 }
@@ -3359,9 +3371,7 @@ function validateIncomeStatementMetricAgainstEdgar(
   concepts: string[]
 ) {
   const errors: string[] = [];
-  const rowNumber = findRowInSection(sheet, "Income Statement", labels, (label) =>
-    /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)
-  );
+  const rowNumber = findIncomeStatementMetricRow(sheet, labels);
   if (!rowNumber) return errors;
 
   periods.forEach((period, index) => {
@@ -3405,7 +3415,7 @@ function validateIncomeStatementEbitdaFormula(
   warnings: string[]
 ) {
   const errors: string[] = [];
-  const ebitdaRow = findLabelRow(sheet, "EBITDA");
+  const ebitdaRow = findIncomeStatementMetricRow(sheet, ["EBITDA"]);
   if (!ebitdaRow) return errors;
   const ebitRow = findPriorLabelRow(sheet, ebitdaRow, "EBIT", 8);
   const daRow = findPriorLabelRow(sheet, ebitdaRow, "Depreciation & Amortization", 4) ?? findPriorLabelRow(sheet, ebitdaRow, "Depreciation and Amortization", 4);
@@ -3440,51 +3450,18 @@ function validateIncomeStatementEbitdaFormula(
   return errors;
 }
 
+function findIncomeStatementMetricRow(sheet: ExcelJS.Worksheet, labels: string[]) {
+  return findRowInSection(sheet, "Income Statement", labels, (label) =>
+    /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)
+  );
+}
+
 function findPriorLabelRow(sheet: ExcelJS.Worksheet, startRow: number, label: string, maxRows: number) {
   const wanted = normalize(label);
   for (let rowNumber = startRow - 1; rowNumber >= Math.max(1, startRow - maxRows); rowNumber -= 1) {
     if (normalize(rowLabel(sheet, rowNumber)) === wanted) return rowNumber;
   }
   return null;
-}
-
-function validateIncomeStatementNetIncome(
-  sheet: ExcelJS.Worksheet,
-  periods: string[],
-  columns: number[],
-  ctx: ResolveContext,
-  evaluator: FormulaEvaluator,
-  warnings: string[]
-) {
-  const errors: string[] = [];
-  const netIncomeRow = findRowInSection(sheet, "Income Statement", ["Net Income (Loss)", "Net Income"], (label) =>
-    /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)
-  );
-  if (!netIncomeRow) return errors;
-
-  periods.forEach((period, index) => {
-    const edgarNetIncome = first(period, ctx.duration, C.netIncome);
-    if (!edgarNetIncome) {
-      warnings.unshift(`Income Statement ${period}: net income tie-out skipped because EDGAR NetIncomeLoss was unavailable for that period.`);
-      return;
-    }
-
-    const cell = sheet.getCell(netIncomeRow, columns[index]);
-    const modelNetIncome = evaluator.evaluateCell(cell);
-    if (modelNetIncome === null) {
-      warnings.unshift(`Income Statement ${cell.address} ${period}: could not evaluate model net income for EDGAR tie-out.`);
-      return;
-    }
-
-    const expected = edgarNetIncome.value / 1_000_000;
-    if (!valuesTie(modelNetIncome, expected)) {
-      warnings.unshift(
-        `Income Statement ${cell.address} ${period}: net income ${roundModelValue(modelNetIncome)} does not match EDGAR NetIncomeLoss ${roundModelValue(expected)}.`
-      );
-    }
-  });
-
-  return errors;
 }
 
 function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], evaluator: FormulaEvaluator) {
