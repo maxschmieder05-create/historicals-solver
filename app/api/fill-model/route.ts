@@ -1305,6 +1305,16 @@ export async function POST(request: NextRequest) {
 
         const resolved = resolveRow(fillRow, period, ctx);
         if (resolved.value === null || Number.isNaN(resolved.value)) {
+          if (shouldWriteIncomeStatementZero(fillRow)) {
+            const zeroResolved = zeroIncomeStatementValue(fillRow);
+            cell.value = 0;
+            filledCells += 1;
+            const cellComment = mappingComment(fillRow, zeroResolved, period, 0, "low", zeroResolved.note);
+            addComment(cell, cellComment);
+            commentsAdded += 1;
+            auditRows.push(mappingAuditRow(sheet, cell, fillRow, period, 0, zeroResolved, "low", zeroResolved.note));
+            return;
+          }
           unresolved += 1;
           return;
         }
@@ -2139,6 +2149,19 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDec
 
 function shouldAuditSkippedWrite(decision: WriteDecision) {
   return decision.reason === "existing formula cell" || decision.reason === "blank inactive/helper cell";
+}
+
+function shouldWriteIncomeStatementZero(fillRow: FillRow) {
+  return fillRow.statement === "income" && fillRow.classification !== "partial";
+}
+
+function zeroIncomeStatementValue(fillRow: FillRow): ResolvedValue {
+  return {
+    value: 0,
+    sources: [],
+    note: `No matching EDGAR value was found for this income statement row; wrote 0.0 to preserve the model's historical formatting for ${fillRow.label}.`,
+    classification: fillRow.classification
+  };
 }
 
 function preservedDividendFormulaUpdate(
