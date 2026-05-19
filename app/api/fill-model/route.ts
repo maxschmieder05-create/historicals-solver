@@ -447,6 +447,13 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   const hasNetRevenue = has("Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense");
 
   if (has("Beginning Balance")) {
+    if (inSection(context, "Revolver Balance")) {
+      return plug(rowNumber, label, "support", "instant", resolveBeginningRevolverBalance, "partial", {
+        allowBlankHistoricalInput: true,
+        onlyBlankHistoricalInput: true,
+        noFillComment: "Cannot find exact revolver beginning balance plug in EDGAR, find manually."
+      });
+    }
     if (inSection(context, "Total Debt Balance", "Debt and Interest Schedule")) {
       return plug(rowNumber, label, "support", "instant", resolveBeginningTotalDebtBalance, "partial", {
         allowBlankHistoricalInput: true,
@@ -976,73 +983,28 @@ function resolveBeginningCashBalance(period: string, ctx: ResolveContext): Resol
 }
 
 function resolveBeginningTotalDebtBalance(period: string, ctx: ResolveContext): ResolvedValue {
-  const endingDebt = resolveTotalDebt(period, ctx);
-  if (endingDebt.value === null) {
-    const prior = previousPeriod(period);
-    const priorDebt = prior ? resolveTotalDebt(prior, ctx) : { value: null, sources: [] };
-    return priorDebt.value === null
-      ? { value: null, sources: [], note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.", classification: "partial" }
-      : {
-          value: priorDebt.value,
-          sources: priorDebt.sources,
-          note: `Mapped to ${prior} EDGAR ending total debt as the opening balance for the debt roll-forward.`,
-          classification: "direct"
-        };
-  }
+  return beginningBalanceUnavailable("debt");
+}
 
-  const issuance = sum(period, ctx.duration, C.debtIssuance);
-  const repayment = sum(period, ctx.duration, C.debtRepayment) ?? zeroResolved("DebtRepayment");
-  if (!issuance) {
-    const prior = previousPeriod(period);
-    const priorDebt = prior ? resolveTotalDebt(prior, ctx) : { value: null, sources: [] };
-    return priorDebt.value === null
-      ? {
-          value: null,
-          sources: [...endingDebt.sources, ...repayment.sources],
-          note: "Cannot find exact debt beginning balance plug in EDGAR, find manually.",
-          classification: "partial"
-        }
-      : {
-          value: priorDebt.value,
-          sources: priorDebt.sources,
-          note: `Mapped to ${prior} EDGAR ending total debt as the opening balance because debt issuance detail was unavailable.`,
-          classification: "direct"
-        };
-  }
-
-  const value = endingDebt.value - issuance.value! + (repayment.value ?? 0);
-  return {
-    value,
-    sources: [...endingDebt.sources, ...issuance.sources, ...repayment.sources],
-    note: "Calculated from EDGAR ending total debt less debt issuance plus debt repayment so the debt roll-forward reconciles.",
-    classification: "grouped"
-  };
+function resolveBeginningRevolverBalance(period: string, ctx: ResolveContext): ResolvedValue {
+  return beginningBalanceUnavailable("revolver");
 }
 
 function resolveBeginningRetainedEarningsBalance(period: string, ctx: ResolveContext): ResolvedValue {
-  const prior = previousPeriod(period);
-  const priorRetained = prior ? first(prior, ctx.instant, C.retained) : null;
-  return priorRetained
-    ? {
-        value: priorRetained.value,
-        sources: [priorRetained],
-        note: `Mapped to ${prior} EDGAR retained earnings as the opening balance for the retained-earnings roll-forward.`,
-        classification: "direct"
-      }
-    : { value: null, sources: [], note: "Cannot find exact retained-earnings beginning balance plug in EDGAR, find manually.", classification: "partial" };
+  return beginningBalanceUnavailable("retained-earnings");
 }
 
 function resolveBeginningAociBalance(period: string, ctx: ResolveContext): ResolvedValue {
-  const prior = previousPeriod(period);
-  const priorAoci = prior ? first(prior, ctx.instant, C.aoci) : null;
-  return priorAoci
-    ? {
-        value: priorAoci.value,
-        sources: [priorAoci],
-        note: `Mapped to ${prior} EDGAR accumulated other comprehensive income as the opening balance for the AOCI roll-forward.`,
-        classification: "direct"
-      }
-    : { value: null, sources: [], note: "Cannot find exact AOCI beginning balance plug in EDGAR, find manually.", classification: "partial" };
+  return beginningBalanceUnavailable("AOCI");
+}
+
+function beginningBalanceUnavailable(label: string): ResolvedValue {
+  return {
+    value: null,
+    sources: [],
+    note: `Cannot find exact ${label} beginning balance plug in EDGAR, find manually.`,
+    classification: "partial"
+  };
 }
 
 function zeroResolved(concept: string): ResolvedValue {
@@ -3249,8 +3211,9 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 }
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
-  if (!actual) return false;
   const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+  if (rowNumber && !actual && isProtectedBeginningBalanceRow(cell.worksheet, rowNumber)) return true;
+  if (!actual) return false;
   if (!rowNumber || normalize(rowLabel(cell.worksheet, rowNumber)) !== normalize("Dividends")) return false;
   const bridgeFormula = /^[-+]?\d+(?:\.\d+)?-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i;
   return bridgeFormula.test(expected) && bridgeFormula.test(actual);
@@ -3279,12 +3242,14 @@ function cleanStaleProtectedHistoricalRows(
   for (const fillRow of fillRows) {
     const staleDetector = staleProtectedRowDetector(fillRow);
     if (!staleDetector) continue;
+    const clearFormulas = Boolean(fillRow.modelContext && isProtectedBeginningBalanceRow(sheet, fillRow.row));
     const staleMatches = periods.flatMap((period, index) => {
       const col = columns[index];
       const cell = sheet.getCell(fillRow.row, col);
-      if (hasFormula(cell)) return [];
+      if (cell.value === null) return [];
+      if (hasFormula(cell) && !clearFormulas) return [];
       const existing = numericCellValue(cell);
-      if (existing === null) return [];
+      if (existing === null && !clearFormulas) return [];
       const stale = staleDetector(period, existing, ctx);
       return stale ? [{ period, col, stale }] : [];
     });
@@ -3295,9 +3260,10 @@ function cleanStaleProtectedHistoricalRows(
     periods.forEach((period, index) => {
       const col = columns[index];
       const cell = sheet.getCell(fillRow.row, col);
-      if (hasFormula(cell)) return;
+      if (cell.value === null) return;
+      if (hasFormula(cell) && !clearFormulas) return;
       const existing = numericCellValue(cell);
-      if (existing === null) return;
+      if (existing === null && !clearFormulas) return;
       const stale = staleMatches.find((match) => match.col === col)?.stale ?? (clearWholeRow ? staleMatches[0].stale : null);
       if (!stale) return;
       cell.value = null;
@@ -3324,8 +3290,8 @@ function cleanStaleProtectedHistoricalRows(
       });
     });
     if (clearedRow) {
-      fillRow.noFillComment = "Cannot find exact schedule value in EDGAR, find manually.";
-      warnings.push(`${fillRow.label}: cleared stale generic EDGAR values from protected schedule row.`);
+      fillRow.noFillComment = staleMatches[0].stale.note;
+      warnings.push(`${fillRow.label}: cleared stale or unsupported values from protected schedule row.`);
     }
   }
 
@@ -3338,10 +3304,14 @@ type StaleProtectedMatch = {
   accession: string;
 };
 
-function staleProtectedRowDetector(fillRow: FillRow): ((period: string, existing: number, ctx: ResolveContext) => StaleProtectedMatch | null) | null {
+function staleProtectedRowDetector(fillRow: FillRow): ((period: string, existing: number | null, ctx: ResolveContext) => StaleProtectedMatch | null) | null {
   const context = fillRow.modelContext;
   if (!context || fillRow.classification !== "partial") return null;
   const normalizedLabel = normalize(fillRow.label);
+
+  if (normalizedLabel === normalize("Beginning Balance") && isProtectedScheduleBeginningBalance(context)) {
+    return staleBeginningBalanceDetector(fillRow.noFillComment || "Cannot find exact beginning balance plug in EDGAR, find manually.");
+  }
 
   if (inPpeDepreciationScheduleContext(context) && normalizedLabel === normalize("Capital Expenditures")) {
     return staleGenericDetector(C.capex, -1, 1_000_000, "Generic cash-flow capex is not used for PP&E schedule bridge rows.");
@@ -3356,10 +3326,51 @@ function staleProtectedRowDetector(fillRow: FillRow): ((period: string, existing
   return null;
 }
 
+function isProtectedScheduleBeginningBalance(context: ModelRowContext) {
+  return inSection(
+    context,
+    "Revolver Balance",
+    "Total Debt Balance",
+    "Debt and Interest Schedule",
+    "Retained Earnings",
+    "AOCI Assumptions",
+    "Accumulated Other Comprehensive Income",
+    "AOCI"
+  );
+}
+
+function isProtectedBeginningBalanceRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  if (normalize(rowLabel(sheet, rowNumber)) !== normalize("Beginning Balance")) return false;
+  for (let row = rowNumber - 1; row >= Math.max(1, rowNumber - 12); row -= 1) {
+    const label = normalize(rowLabel(sheet, row));
+    if (
+      label === normalize("Retained Earnings") ||
+      label === normalize("AOCI Assumptions") ||
+      label === normalize("Revolver Balance") ||
+      label === normalize("Total Debt Balance")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function staleBeginningBalanceDetector(note: string) {
+  return (_period: string, existing: number | null, _ctx: ResolveContext): StaleProtectedMatch | null => {
+    if (existing !== null && !Number.isFinite(existing)) return null;
+    return {
+      note,
+      conceptsUsed: "",
+      accession: ""
+    };
+  };
+}
+
 function staleGenericDetector(concepts: string[], sign: 1 | -1, scale: number, note: string) {
-  return (period: string, existing: number, ctx: ResolveContext): StaleProtectedMatch | null => {
+  return (period: string, existing: number | null, ctx: ResolveContext): StaleProtectedMatch | null => {
     const source = first(period, ctx.duration, concepts);
     if (!source) return null;
+    if (existing === null) return null;
     if (Math.abs(source.value) < 0.0001 || Math.abs(existing) < 0.0001) return null;
     const expected = (sign === -1 ? -Math.abs(source.value) : Math.abs(source.value)) / scale;
     if (Math.abs(existing - expected) > 0.05) return null;

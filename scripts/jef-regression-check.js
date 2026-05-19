@@ -51,6 +51,30 @@ function isAllowedDividendBridgeUpdate(sheetName, cell, expected, got) {
   return normalizedExpected === "-169.4-SUM(F257:H257)" && normalizedGot === "-278.6-SUM(F257:H257)";
 }
 
+function normalize(input) {
+  return String(input ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function rowLabel(sheet, row) {
+  return String(cellValue(sheet.getCell(row, 3)) ?? "").trim();
+}
+
+function isProtectedBeginningBalanceRow(sheet, row) {
+  if (normalize(rowLabel(sheet, row)) !== normalize("Beginning Balance")) return false;
+  for (let contextRow = row - 1; contextRow >= Math.max(1, row - 12); contextRow -= 1) {
+    const label = normalize(rowLabel(sheet, contextRow));
+    if (
+      label === normalize("Retained Earnings") ||
+      label === normalize("AOCI Assumptions") ||
+      label === normalize("Revolver Balance") ||
+      label === normalize("Total Debt Balance")
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function fillWorkbook() {
   await fs.mkdir(path.dirname(outputWorkbook), { recursive: true });
   const bytes = await fs.readFile(inputWorkbook);
@@ -102,6 +126,7 @@ function compareFormulas(golden, actual, errors) {
         const got = cellFormula(actualSheet.getCell(row, col));
         if (expected !== got) {
           if (isAllowedDividendBridgeUpdate(sheetName, expectedSheet.getCell(row, col), expected, got)) continue;
+          if (sheetName === "Model" && isProtectedBeginningBalanceRow(actualSheet, row) && !got) continue;
           errors.push(`${sheetName}!${expectedSheet.getCell(row, col).address}: formula changed from "${expected}" to "${got ?? "[hardcoded/blank]"}".`);
         }
       }
@@ -120,6 +145,7 @@ function compareRanges(golden, actual, errors) {
         const got = cellValue(actualSheet.getCell(row, col));
         if (!valuesMatch(expected, got)) {
           if (isAllowedDividendBridgeUpdate(check.sheet, expectedSheet.getCell(row, col), expected, got)) continue;
+          if (check.sheet === "Model" && isProtectedBeginningBalanceRow(actualSheet, row) && isBlank(actualSheet.getCell(row, col))) continue;
           errors.push(`${check.name} ${check.sheet}!${expectedSheet.getCell(row, col).address}: expected "${expected ?? ""}", got "${got ?? ""}".`);
         }
       }
@@ -142,6 +168,21 @@ function compareCashFlowBlank(actual, errors) {
   }
 }
 
+function compareProtectedBeginningBalancesBlank(actual, errors) {
+  const sheet = actual.getWorksheet("Model");
+  if (!sheet) return;
+  const quarterCols = [6, 7, 8, 9, 11, 12, 13, 14, 16, 17, 18, 19];
+  for (let row = 1; row <= sheet.rowCount; row += 1) {
+    if (!isProtectedBeginningBalanceRow(sheet, row)) continue;
+    for (const col of quarterCols) {
+      const cell = sheet.getCell(row, col);
+      if (!isBlank(cell)) {
+        errors.push(`Protected Beginning Balance Model!${cell.address}: expected blank, got "${cellValue(cell)}".`);
+      }
+    }
+  }
+}
+
 function isBlank(cell) {
   const got = cellValue(cell);
   return got === null || got === undefined || got === "";
@@ -156,6 +197,7 @@ async function main() {
   compareFormulas(golden, actual, errors);
   compareRanges(golden, actual, errors);
   compareCashFlowBlank(actual, errors);
+  compareProtectedBeginningBalancesBlank(actual, errors);
 
   if (errors.length) {
     console.error(errors.slice(0, 40).join("\n"));
