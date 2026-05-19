@@ -1371,6 +1371,11 @@ export async function POST(request: NextRequest) {
       warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
     }
 
+    const incomeStatementReconciliation = reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+    filledCells += incomeStatementReconciliation.filledCells;
+    commentsAdded += incomeStatementReconciliation.commentsAdded;
+    warnings.push(...incomeStatementReconciliation.warnings);
+
     refreshHistoricalFormulaCachedResults(workbook, columns);
 
     for (const fillRow of fillRows) {
@@ -2574,7 +2579,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
     const col = columns[periodIndex];
     const expected = expectedSource.value / 1_000_000;
     const actual = segmentMetricRowsTotal(sheet, rows, col);
-    if (statementMetricTies(actual, expected)) return;
+    if (segmentStatementMetricTies(actual, expected)) return;
 
     const residualRow = findSegmentResidualRow(sheet, rows, col, suffix);
     if (!residualRow) {
@@ -2624,6 +2629,10 @@ function findSegmentResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: n
     /other|corporate|unallocated|elimination|reconciliation|residual/i.test(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix))
   );
   return preferred ?? nonGenericRows.at(-1) ?? null;
+}
+
+function segmentStatementMetricTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= 0.05;
 }
 
 function segmentTotalFromModelRows(sheet: ExcelJS.Worksheet, totalRow: number, col: number, totalLabel: string) {
@@ -3008,6 +3017,88 @@ function resolveRow(fillRow: FillRow, period: string, ctx: ResolveContext): Reso
   if (!source) return { value: null, sources: [] };
   const resolved = signed(source, fillRow.sign ?? 1) ?? { value: null, sources: [] };
   return { ...resolved, classification: fillRow.classification };
+}
+
+function reconcileIncomeStatementFormulaRowsToEdgar(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT"]);
+  const residualRow = findIncomeStatementResidualRowBefore(sheet, ebitRow, [
+    "Other Operating Income (Expense)",
+    "Other Operating Expenses",
+    "Other Operating Expense",
+    "Other Operating Income",
+    "Other Operating Income Expense"
+  ]);
+  if (!ebitRow || !residualRow) return { filledCells, commentsAdded, warnings };
+
+  const evaluator = new FormulaEvaluator(sheet);
+  periods.forEach((period, index) => {
+    const source = first(period, ctx.duration, C.operatingIncome);
+    if (!source) return;
+    const col = columns[index];
+    const ebitCell = sheet.getCell(ebitRow, col);
+    if (!hasFormula(ebitCell)) return;
+    const current = evaluator.evaluateCell(ebitCell);
+    if (current === null) return;
+    const expected = source.value / 1_000_000;
+    if (incomeStatementFormulaTies(current, expected)) return;
+
+    const residualCell = sheet.getCell(residualRow, col);
+    if (!isHardcodedFinancialInput(residualCell)) {
+      warnings.push(`Income Statement ${period}: EBIT formula did not tie to EDGAR and no writable operating residual row was available.`);
+      return;
+    }
+
+    const value = (numericCellValue(residualCell) ?? 0) + expected - current;
+    residualCell.value = value;
+    evaluator.clear();
+    filledCells += 1;
+    const note = "Calculated as the residual needed for the Income Statement EBIT formula to tie to EDGAR pre-tax operating income.";
+    addComment(residualCell, note);
+    commentsAdded += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: residualCell.address,
+      modelRowLabel: rowLabel(sheet, residualRow),
+      period,
+      valueWritten: value,
+      mappingType: "calculated",
+      conceptsUsed: C.operatingIncome.join(", "),
+      sourceStatement: "income",
+      accession: source.accn ?? "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "residual",
+      confidence: "medium",
+      validationStatus: "OK!",
+      notes: note
+    });
+  });
+
+  return { filledCells, commentsAdded, warnings };
+}
+
+function findIncomeStatementResidualRowBefore(sheet: ExcelJS.Worksheet, targetRow: number | null, labels: string[]) {
+  if (!targetRow) return null;
+  const wanted = new Set(labels.map(normalize));
+  for (let rowNumber = targetRow - 1; rowNumber >= Math.max(1, targetRow - 12); rowNumber -= 1) {
+    if (wanted.has(normalize(rowLabel(sheet, rowNumber)))) return rowNumber;
+  }
+  return null;
+}
+
+function incomeStatementFormulaTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= 0.12;
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -3510,6 +3601,10 @@ class FormulaEvaluator {
 
   constructor(private readonly sheet: ExcelJS.Worksheet) {}
 
+  clear() {
+    this.cache.clear();
+  }
+
   evaluateCell(cell: ExcelJS.Cell, visited = new Set<string>()): number | null {
     const address = `${cell.worksheet.name}!${cell.address}`;
     if (this.cache.has(address)) return this.cache.get(address) ?? null;
@@ -3547,7 +3642,7 @@ class FormulaEvaluator {
       const target = referencedCell(cell, sheetPrefix, col, row);
       if (!target) return "0";
       const value = this.evaluateCell(target, visited);
-      return value === null ? "0" : String(value);
+      return value === null ? "0" : `(${value})`;
     });
 
     if (!/^[\d+\-*/().,\sNaN]+$/.test(withRefs)) return null;
@@ -3680,8 +3775,10 @@ function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, colum
     const sheet = workbook.getWorksheet(sheetName);
     if (!sheet) continue;
     const evaluator = new FormulaEvaluator(sheet);
+    const firstCol = Math.min(...columns);
+    const lastCol = Math.min(sheet.columnCount, Math.max(...columns) + 1);
     for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-      for (const col of columns) {
+      for (let col = firstCol; col <= lastCol; col += 1) {
         const cell = sheet.getCell(rowNumber, col);
         if (hasFormula(cell)) evaluator.evaluateCell(cell);
       }
