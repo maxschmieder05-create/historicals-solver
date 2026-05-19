@@ -1377,7 +1377,7 @@ export async function POST(request: NextRequest) {
 
     restoreWorkbookLabels(workbook, workbookSnapshot);
 
-    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns);
+    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
@@ -2854,7 +2854,7 @@ function mappingAuditRowForSegment(
   };
 }
 
-function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: string[], columns: number[]) {
+function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: string[], columns: number[], ctx: ResolveContext, warnings: string[]) {
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
   if (segmentSheet) {
@@ -2862,6 +2862,10 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
   }
   const modelSheet = workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
+    const evaluator = new FormulaEvaluator(modelSheet);
+    errors.push(...validateIncomeStatementNetIncome(modelSheet, periods, columns, ctx, evaluator, warnings));
+    errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
+
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
     if (interestExpenseRow) {
       const hasPopulatedInterestExpense = columns.some((col) => Math.abs(numericCellValue(modelSheet.getCell(interestExpenseRow, col)) ?? 0) > 0.0001);
@@ -2871,6 +2875,334 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
     }
   }
   return errors;
+}
+
+class FormulaEvaluator {
+  private readonly cache = new Map<string, number | null>();
+
+  constructor(private readonly sheet: ExcelJS.Worksheet) {}
+
+  evaluateCell(cell: ExcelJS.Cell, visited = new Set<string>()): number | null {
+    const address = `${cell.worksheet.name}!${cell.address}`;
+    if (this.cache.has(address)) return this.cache.get(address) ?? null;
+
+    if (visited.has(address)) return null;
+    visited.add(address);
+
+    const value = cell.value;
+    let result: number | null = null;
+    if (typeof value === "number") {
+      result = value;
+    } else if (value && typeof value === "object" && ("formula" in value || "sharedFormula" in value)) {
+      const formula = formulaForCell(cell);
+      result = formula ? this.evaluateFormula(formula, cell, visited) : null;
+      if (result !== null) setFormulaResult(cell, result);
+    } else if (value && typeof value === "object" && "result" in value && typeof value.result === "number") {
+      result = value.result;
+    }
+
+    visited.delete(address);
+    this.cache.set(address, result);
+    return result;
+  }
+
+  private evaluateFormula(formula: string, cell: ExcelJS.Cell, visited: Set<string>): number | null {
+    const expression = formula.replace(/^=/, "");
+    const ifValue = this.evaluateIfExpression(expression, cell, visited);
+    if (ifValue !== undefined) return ifValue;
+
+    const withoutSums = this.replaceSumCalls(expression, cell, visited);
+    if (withoutSums === null) return null;
+
+    const withRefs = withoutSums.replace(/((?:'[^']+'|[A-Za-z0-9_ ]+)!)?\$?([A-Z]{1,3})\$?(\d+)/g, (reference, sheetPrefix: string, col: string, row: string) => {
+      const target = referencedCell(cell, sheetPrefix, col, row);
+      if (!target) return "0";
+      const value = this.evaluateCell(target, visited);
+      return value === null ? "0" : String(value);
+    });
+
+    if (!/^[\d+\-*/().,\sNaN]+$/.test(withRefs)) return null;
+    try {
+      const value = Function(`"use strict"; return (${withRefs});`)();
+      return typeof value === "number" && Number.isFinite(value) ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private replaceSumCalls(expression: string, cell: ExcelJS.Cell, visited: Set<string>) {
+    let output = expression;
+    const sumPattern = /SUM\(([^()]+)\)/i;
+    while (sumPattern.test(output)) {
+      output = output.replace(sumPattern, (_match, body: string) => {
+        const value = this.evaluateSum(body, cell, visited);
+        return value === null ? "NaN" : String(value);
+      });
+      if (output.includes("NaN")) return null;
+    }
+    return output;
+  }
+
+  private evaluateSum(body: string, cell: ExcelJS.Cell, visited: Set<string>) {
+    let total = 0;
+    for (const part of splitFormulaArgs(body)) {
+      const item = part.trim();
+      const range = item.match(/^((?:'[^']+'|[A-Za-z0-9_ ]+)!)?\$?([A-Z]{1,3})\$?(\d+):\$?([A-Z]{1,3})\$?(\d+)$/i);
+      if (range) {
+        const targetSheet = referencedSheet(cell, range[1]);
+        if (!targetSheet) return null;
+        const startCol = columnIndex(range[2]);
+        const startRow = Number(range[3]);
+        const endCol = columnIndex(range[4]);
+        const endRow = Number(range[5]);
+        for (let row = Math.min(startRow, endRow); row <= Math.max(startRow, endRow); row += 1) {
+          for (let col = Math.min(startCol, endCol); col <= Math.max(startCol, endCol); col += 1) {
+            const value = this.evaluateCell(targetSheet.getCell(row, col), visited);
+            total += value ?? 0;
+          }
+        }
+        continue;
+      }
+
+      const value = this.evaluateFormula(item, cell, visited);
+      if (value === null) return null;
+      total += value;
+    }
+    return total;
+  }
+
+  private evaluateIfExpression(expression: string, cell: ExcelJS.Cell, visited: Set<string>) {
+    const body = functionBody(expression, "IF");
+    if (body === null) return undefined;
+    const [condition, whenTrue, whenFalse] = splitFormulaArgs(body);
+    if (!condition || !whenTrue) return null;
+    const conditionResult = this.evaluateCondition(condition, cell, visited);
+    if (conditionResult === null) return null;
+    return this.evaluateFormula(conditionResult ? whenTrue : whenFalse ?? "0", cell, visited);
+  }
+
+  private evaluateCondition(condition: string, cell: ExcelJS.Cell, visited: Set<string>) {
+    const match = condition.match(/^\s*(\$?[A-Z]{1,3}\$?\d+)\s*(=|<>)\s*"([^"]*)"\s*$/);
+    if (match) {
+      const actual = cellDisplay(cell.worksheet.getCell(match[1].replace(/\$/g, "")));
+      return match[2] === "=" ? actual === match[3] : actual !== match[3];
+    }
+
+    const numericMatch = condition.match(/^\s*(.+?)\s*(=|<>|>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (!numericMatch) return null;
+    const left = this.evaluateFormula(numericMatch[1], cell, visited);
+    const right = Number(numericMatch[3]);
+    if (left === null || Number.isNaN(right)) return null;
+    if (numericMatch[2] === "=") return valuesTie(left, right);
+    if (numericMatch[2] === "<>") return !valuesTie(left, right);
+    if (numericMatch[2] === ">=") return left >= right;
+    if (numericMatch[2] === "<=") return left <= right;
+    if (numericMatch[2] === ">") return left > right;
+    return left < right;
+  }
+}
+
+function referencedCell(cell: ExcelJS.Cell, sheetPrefix: string | undefined, col: string, row: string) {
+  const sheet = referencedSheet(cell, sheetPrefix);
+  return sheet?.getCell(`${col}${row}`.replace(/\$/g, "")) ?? null;
+}
+
+function referencedSheet(cell: ExcelJS.Cell, sheetPrefix?: string) {
+  if (!sheetPrefix) return cell.worksheet;
+  const sheetName = sheetPrefix
+    .slice(0, -1)
+    .replace(/^'/, "")
+    .replace(/'$/, "")
+    .replace(/''/g, "'");
+  return cell.worksheet.workbook.getWorksheet(sheetName) ?? null;
+}
+
+function functionBody(expression: string, name: string) {
+  const trimmed = expression.trim();
+  const prefix = `${name}(`;
+  if (!trimmed.toUpperCase().startsWith(prefix)) return null;
+  if (!trimmed.endsWith(")")) return null;
+  return trimmed.slice(prefix.length, -1);
+}
+
+function splitFormulaArgs(body: string) {
+  const args: string[] = [];
+  let current = "";
+  let depth = 0;
+  let inString = false;
+  for (let index = 0; index < body.length; index += 1) {
+    const char = body[index];
+    if (char === '"') inString = !inString;
+    if (!inString && char === "(") depth += 1;
+    if (!inString && char === ")") depth -= 1;
+    if (!inString && depth === 0 && char === ",") {
+      args.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  args.push(current);
+  return args;
+}
+
+function formulaForCell(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  if (!value || typeof value !== "object") return null;
+  if ("formula" in value && typeof value.formula === "string") return value.formula;
+  if ("sharedFormula" in value && typeof value.sharedFormula === "string") {
+    const master = cell.worksheet.getCell(value.sharedFormula);
+    const masterFormula = cellFormula(master);
+    return masterFormula ? translateSharedFormula(masterFormula, master.address, cell.address) : null;
+  }
+  return null;
+}
+
+function translateSharedFormula(formula: string, sourceAddress: string, targetAddress: string) {
+  const source = parseCellAddress(sourceAddress);
+  const target = parseCellAddress(targetAddress);
+  if (!source || !target) return formula;
+  const colOffset = target.col - source.col;
+  const rowOffset = target.row - source.row;
+  return formula.replace(/(\$?)([A-Z]{1,3})(\$?)(\d+)/g, (_match, colAbs: string, colLetters: string, rowAbs: string, rowDigits: string) => {
+    const nextCol = colAbs ? columnIndex(colLetters) : columnIndex(colLetters) + colOffset;
+    const nextRow = rowAbs ? Number(rowDigits) : Number(rowDigits) + rowOffset;
+    return `${colAbs}${columnLetter(nextCol)}${rowAbs}${nextRow}`;
+  });
+}
+
+function parseCellAddress(address: string) {
+  const match = address.match(/^([A-Z]{1,3})(\d+)$/i);
+  if (!match) return null;
+  return { col: columnIndex(match[1]), row: Number(match[2]) };
+}
+
+function columnIndex(letters: string) {
+  return letters
+    .toUpperCase()
+    .split("")
+    .reduce((total, letter) => total * 26 + letter.charCodeAt(0) - 64, 0);
+}
+
+function validateIncomeStatementNetIncome(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const netIncomeRow = findRowInSection(sheet, "Income Statement", ["Net Income (Loss)", "Net Income"], (label) =>
+    /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)
+  );
+  if (!netIncomeRow) return errors;
+
+  periods.forEach((period, index) => {
+    const edgarNetIncome = first(period, ctx.duration, C.netIncome);
+    if (!edgarNetIncome) {
+      warnings.unshift(`Income Statement ${period}: net income tie-out skipped because EDGAR NetIncomeLoss was unavailable for that period.`);
+      return;
+    }
+
+    const cell = sheet.getCell(netIncomeRow, columns[index]);
+    const modelNetIncome = evaluator.evaluateCell(cell);
+    if (modelNetIncome === null) {
+      warnings.unshift(`Income Statement ${cell.address} ${period}: could not evaluate model net income for EDGAR tie-out.`);
+      return;
+    }
+
+    const expected = edgarNetIncome.value / 1_000_000;
+    if (!valuesTie(modelNetIncome, expected)) {
+      warnings.unshift(
+        `Income Statement ${cell.address} ${period}: net income ${roundModelValue(modelNetIncome)} does not match EDGAR NetIncomeLoss ${roundModelValue(expected)}.`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], evaluator: FormulaEvaluator) {
+  const errors: string[] = [];
+  const checkRow = findRowInSection(sheet, "Balance Sheet", ["Balance Sheet Check"], (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+
+  if (checkRow) {
+    periods.forEach((period, index) => {
+      const cell = sheet.getCell(checkRow, columns[index]);
+      const check = evaluator.evaluateCell(cell);
+      if (check === null) {
+        errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`);
+      } else if (!valuesTie(check, 0)) {
+        errors.push(`Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.`);
+      }
+    });
+    return errors;
+  }
+
+  const assetsRow = findRowInSection(sheet, "Balance Sheet", ["Total Assets"], (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  const liabilitiesAndEquityRow = findRowInSection(sheet, "Balance Sheet", ["Total Liabilities & Shareholder's Equity", "Total Liabilities and Shareholder's Equity"], (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  if (!assetsRow || !liabilitiesAndEquityRow) return errors;
+
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const assets = evaluator.evaluateCell(sheet.getCell(assetsRow, col));
+    const liabilitiesAndEquity = evaluator.evaluateCell(sheet.getCell(liabilitiesAndEquityRow, col));
+    if (assets === null || liabilitiesAndEquity === null) {
+      errors.push(`Balance Sheet ${period}: could not evaluate total assets or total liabilities plus shareholder's equity.`);
+    } else if (!valuesTie(assets, liabilitiesAndEquity)) {
+      errors.push(
+        `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}.`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function findRowInSection(sheet: ExcelJS.Worksheet, sectionLabel: string, labels: string[], isBoundary: (label: string) => boolean) {
+  const sectionStart = findSectionHeaderRow(sheet, sectionLabel);
+  if (!sectionStart) return null;
+  const wanted = labels.map(normalize);
+  for (let rowNumber = sectionStart + 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (!label) continue;
+    if (isBoundary(label)) break;
+    if (wanted.includes(normalize(label))) return rowNumber;
+  }
+  return null;
+}
+
+function findSectionHeaderRow(sheet: ExcelJS.Worksheet, sectionLabel: string) {
+  const wanted = normalize(sectionLabel);
+  let best: { row: number; score: number } | null = null;
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    if (normalize(rowLabel(sheet, rowNumber)) !== wanted) continue;
+    const score = sectionHeaderScore(sheet, rowNumber);
+    if (!best || score > best.score || (score === best.score && rowNumber > best.row)) {
+      best = { row: rowNumber, score };
+    }
+  }
+  return best?.row ?? null;
+}
+
+function sectionHeaderScore(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  let score = 0;
+  if (/^x$/i.test(cellDisplay(sheet.getCell(rowNumber, 1)).trim())) score += 100;
+  for (let col = 6; col <= Math.min(sheet.columnCount, 12); col += 1) {
+    if (cellDisplay(sheet.getCell(rowNumber, col)) || cellFormula(sheet.getCell(rowNumber, col))) score += 10;
+  }
+  return score;
+}
+
+function valuesTie(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= 0.1;
 }
 
 function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firstHistoricalCol: number): WorkbookSnapshot {
