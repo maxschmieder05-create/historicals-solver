@@ -2864,6 +2864,7 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
   if (segmentSheet) {
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
+    errors.push(...validateSegmentOperatingIncomeCheck(segmentSheet, periods, columns));
   }
   const modelSheet = workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
@@ -3636,6 +3637,26 @@ function validateSegmentGenericRows(sheet: ExcelJS.Worksheet, periods: string[],
       }
     });
   }
+  return errors;
+}
+
+function validateSegmentOperatingIncomeCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
+  const errors: string[] = [];
+  const checkRow = findLabelRow(sheet, "Operating Income Check");
+  if (!checkRow) return errors;
+
+  const evaluator = new FormulaEvaluator(sheet);
+  periods.forEach((period, index) => {
+    const cell = sheet.getCell(checkRow, columns[index]);
+    if (!hasFormula(cell)) return;
+    const check = evaluator.evaluateCell(cell);
+    if (check === null) {
+      errors.push(`Segment Analysis ${cell.address} ${period}: could not evaluate the operating income check formula.`);
+    } else if (!valuesTie(check, 0)) {
+      errors.push(`Segment Analysis ${cell.address} ${period}: operating income check is ${roundModelValue(check)}, not OK.`);
+    }
+  });
+
   return errors;
 }
 
