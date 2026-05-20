@@ -94,8 +94,8 @@ export default function Home() {
           <p className="eyebrow">EDGAR to model</p>
           <h1>Historicals Solver</h1>
           <p>
-            Drop the Owl Fund model, enter a ticker or company name, and download a workbook with the blue historical
-            financial cells populated from SEC company facts.
+            Drop a valuation template, enter a ticker or company name, and download a workbook with historical income
+            statement and balance sheet cells populated from SEC company facts.
           </p>
         </div>
 

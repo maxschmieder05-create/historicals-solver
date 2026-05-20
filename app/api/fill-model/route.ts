@@ -168,11 +168,13 @@ const SEC_HEADERS = {
   Accept: "application/json"
 };
 
-const OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses";
-const LLM_MAPPING_MODEL = process.env.LLM_MAPPING_MODEL || "gpt-5.4-mini";
-const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 8);
-const LLM_MAPPING_MIN_CANDIDATE_SCORE = 3;
-const LLM_MAPPING_CANDIDATE_LIMIT = 60;
+const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
+const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
+const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
+const LLM_MAPPING_MODEL = process.env.LLM_MAPPING_MODEL || "google/gemma-4-26b-a4b-it";
+const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 24);
+const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
+const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
@@ -181,11 +183,27 @@ const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
 const MAPPING_AUDIT_SHEET = "Mapping Audit";
 
 const C = {
-  revenue: ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"],
+  revenue: [
+    "Revenues",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "SalesRevenueNet",
+    "NetSales",
+    "SalesRevenueGoodsNet",
+    "SalesRevenueServicesNet",
+    "OperatingLeasesIncomeStatementLeaseRevenue",
+    "RealEstateRevenueNet"
+  ],
   netRevenue: ["RevenuesNetOfInterestExpense"],
   grossProfit: ["GrossProfit"],
   operatingIncome: ["OperatingIncomeLoss", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"],
-  cogs: ["CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"],
+  cogs: [
+    "CostOfRevenue",
+    "CostOfGoodsAndServicesSold",
+    "CostOfGoodsSold",
+    "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
+    "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
+    "DirectCostsOfLeasedAndRentedPropertyOrEquipment"
+  ],
   healthCareCosts: [
     "PolicyholderBenefitsAndClaimsIncurredHealthCare",
     "PolicyholderBenefitsAndClaimsIncurredNet",
@@ -193,15 +211,15 @@ const C = {
     "BenefitsLossesAndExpenses",
     "PharmacyAndOtherServiceCosts"
   ],
-  sga: ["SellingGeneralAndAdministrativeExpense", "GeneralAndAdministrativeExpense"],
-  rd: ["ResearchAndDevelopmentExpense"],
-  da: ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization"],
+  sga: ["SellingGeneralAndAdministrativeExpense", "SellingAndMarketingExpense", "SalesAndMarketingExpense", "GeneralAndAdministrativeExpense"],
+  rd: ["ResearchAndDevelopmentExpense", "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost"],
+  da: ["DepreciationDepletionAndAmortization", "DepreciationAndAmortization", "DepreciationDepletionAndAmortizationExpense", "Depreciation"],
   interestIncome: ["InterestIncomeExpenseNonOperatingNet", "InterestIncomeNonOperating"],
   interestExpense: ["InterestExpenseOperating", "InterestExpenseNonOperating", "InterestExpense"],
-  impairment: ["GoodwillImpairmentLosses", "ImpairmentOfGoodwillAndIntangibleAssets"],
-  otherNonOp: ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense"],
+  impairment: ["GoodwillImpairmentLosses", "ImpairmentOfGoodwillAndIntangibleAssets", "GoodwillAndIntangibleAssetImpairment", "ImpairmentOfRealEstate", "ImpairmentOfLongLivedAssetsToBeDisposedOf"],
+  otherNonOp: ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense", "OtherIncomeExpenseNet", "OtherIncome", "OtherExpense"],
   taxes: ["IncomeTaxExpenseBenefit"],
-  netIncome: ["NetIncomeLoss"],
+  netIncome: ["NetIncomeLoss", "ProfitLoss"],
   creditLossProvision: [
     "ProvisionForLoanLeaseAndOtherLosses",
     "ProvisionForCreditLosses",
@@ -257,8 +275,12 @@ const C = {
   ],
   basicShares: ["WeightedAverageNumberOfSharesOutstandingBasic"],
   dilutedShares: ["WeightedAverageNumberOfDilutedSharesOutstanding"],
-  cash: ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"],
-  receivables: ["AccountsReceivableNetCurrent", "AccountsReceivableNet"],
+  cash: [
+    "CashAndCashEquivalentsAtCarryingValue",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+    "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsIncludingDisposalGroupAndDiscontinuedOperations"
+  ],
+  receivables: ["AccountsReceivableNetCurrent", "AccountsReceivableNet", "TradeAccountsReceivableNetCurrent", "ReceivablesNetCurrent"],
   cardReceivables: [
     "FinancingReceivableRecordedInvestmentLineOfCreditAndCreditCardReceivables",
     "FinanceReceivablesCreditCardNet",
@@ -276,7 +298,10 @@ const C = {
   ppe: [
     "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization",
     "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
-    "PropertyPlantAndEquipmentNet"
+    "PropertyPlantAndEquipmentNet",
+    "PropertyAndEquipmentNet",
+    "RealEstateInvestmentPropertyNet",
+    "RealEstateInvestments"
   ],
   intangibles: ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"],
   goodwill: ["Goodwill"],
@@ -285,7 +310,7 @@ const C = {
   accrued: ["AccruedLiabilitiesCurrent", "AccruedIncomeTaxesCurrent", "EmployeeRelatedLiabilitiesCurrent"],
   customerDeposits: ["Deposits", "CustomerDeposits", "DepositsLiabilities", "InterestBearingDepositsInDomesticOffices"],
   currentLiabilities: ["LiabilitiesCurrent"],
-  currentDebt: ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings"],
+  currentDebt: ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings", "ShortTermBorrowingsCurrent"],
   totalDebt: [
     "ShortTermBorrowings",
     "LongTermDebtCurrent",
@@ -295,7 +320,9 @@ const C = {
     "LongTermDebtAndCapitalLeaseObligationsCurrent",
     "LongTermDebtAndCapitalLeaseObligations",
     "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
-    "LongTermDebt"
+    "LongTermDebt",
+    "DebtAndCapitalLeaseObligations",
+    "DebtInstrumentCarryingAmount"
   ],
   deferredTaxLiability: ["DeferredTaxLiabilitiesNoncurrent"],
   liabilities: ["Liabilities"],
@@ -479,7 +506,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   const includes = (...aliases: string[]) => aliases.some((alias) => key.includes(normalize(alias)));
   const around = normalize([context.sectionHeader, context.previousLabel, context.nextLabel].filter(Boolean).join(" "));
   const aroundIncludes = (...aliases: string[]) => aliases.some((alias) => around.includes(normalize(alias)));
-  const hasRevenue = has("Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue");
+  const hasRevenue = has("Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue", "Total Sales") || has("Rental Revenues", "Rental Revenue");
   const hasNetRevenue = has("Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense");
 
   if (has("Beginning Balance")) {
@@ -520,16 +547,18 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Operating Income", "Operating Income (Loss)", "Income From Operations")) {
     return row(rowNumber, label, "income", "duration", C.operatingIncome, 1, 1_000_000, "Mapped to SEC operating income/loss or nearest pre-tax operating profit concept.");
   }
-  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales")) return row(rowNumber, label, "income", "duration", C.cogs, -1, 1_000_000, "Mapped to SEC cost of revenue / cost of sales.");
+  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales", "Property Taxes and Insurance")) return row(rowNumber, label, "income", "duration", C.cogs, -1, 1_000_000, "Mapped to SEC cost of revenue / cost of sales.");
   if (has("Pharmacy and Other Service Costs", "Medical Costs and Other")) return row(rowNumber, label, "income", "duration", C.healthCareCosts, -1, 1_000_000, "Mapped to reported healthcare, claims, pharmacy, or service cost concepts.");
   if (
     has(
       "Selling, General & Administration (SG&A)",
       "Selling, Geneal & Administrative (SG&A)",
       "Selling General & Administrative",
+      "Selling, General, and Administrative",
       "SG&A",
       "Sales and Marketing",
-      "Selling and Marketing"
+      "Selling and Marketing",
+      "General and Administrative"
     )
   ) {
     return row(rowNumber, label, "income", "duration", C.sga, -1);
@@ -557,15 +586,23 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
   if (/\binterest\s*\(\s*expense\s*\)/i.test(label)) return reviewRow(context, "Split / partial match: the model row could represent multiple EDGAR interest presentation styles. Needs review.");
   if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
-  if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
-  if (has("Gain on Sale of Business (Loss)")) return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets"], 1);
+  if (has("Goodwill Impairment", "Impairment of Investments in Real Estate", "Asset Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
+  if (has("Gain on Sale of Business (Loss)") || includes("Gain on disposition", "Gain (Loss) on disposition", "Gain on sale")) {
+    return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets", "GainLossOnDispositionOfAssets", "GainLossOnDispositionOfAssets1", "GainsLossesOnSalesOfInvestmentRealEstate"], 1);
+  }
+  if (has("Equity in (loss) earnings of unconsolidated entities", "Equity in Earnings of Unconsolidated Entities")) {
+    return row(rowNumber, label, "income", "duration", ["IncomeLossFromEquityMethodInvestments"], 1);
+  }
+  if (has("Loss from early extinguishment of debt", "Loss on Extinguishment of Debt")) {
+    return row(rowNumber, label, "income", "duration", ["GainsLossesOnExtinguishmentOfDebt", "ExtinguishmentOfDebtGainLossNetOfTax"], -1);
+  }
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
   if (has("Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax")) return plug(rowNumber, label, "income", "duration", resolveIncomeTaxExpense, "direct");
   if (has("Net Unrealized Debt Securities Gains (Losses)")) return row(rowNumber, label, "income", "duration", C.unrealizedDebtSecurities);
   if (has("FX Adjustments")) return row(rowNumber, label, "income", "duration", C.foreignCurrencyAdjustments);
   if (has("Net Unrealized Pension and Other Benefits")) return row(rowNumber, label, "income", "duration", C.pensionAdjustments);
   if (has("Pre-Tax Adjustments")) return reviewRow(context, "Split / partial match: EDGAR adjustment detail is not consistently available for this model row. Needs review.");
-  if (has("Post-Tax Adjustments")) return plug(rowNumber, label, "income", "duration", resolvePostTaxAdjustments, "direct");
+  if (has("Post-Tax Adjustments", "Preferred Stock Dividend")) return plug(rowNumber, label, "income", "duration", resolvePostTaxAdjustments, "direct");
   if (has("Discontinued Operations")) {
     if (aroundIncludes("Post-Tax Adjustments", "Income (Loss) due to Non-Controlling Interest", "Net Income Available to Common Shareholders")) {
       return plug(rowNumber, label, "income", "duration", resolveDiscontinuedOperationsBridge, "grouped");
@@ -586,7 +623,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets")) {
     return plug(rowNumber, label, "balance", "instant", resolvePrepaidAndOtherCurrentAssets);
   }
-  if (has("PP&E, Net", "Property Plant and Equipment Net", "Property and Equipment, Net", "Property, Plant and Equipment, Net")) {
+  if (has("PP&E, Net", "Property Plant and Equipment Net", "Property and Equipment, Net", "Property, Plant and Equipment, Net", "Real Estate Investments", "Real Estate Investment Property, Net")) {
     return plug(rowNumber, label, "balance", "instant", resolvePpe);
   }
   if (has("Intangible Assets, Net", "Intangibles, Net")) return plug(rowNumber, label, "balance", "instant", resolveIntangibleAssets);
@@ -768,7 +805,7 @@ function resolveNonCompensationExpense(period: string, ctx: ResolveContext): Res
     "These were grouped because the model row is labeled Non-Compensation Expenses and no separate rows exist for these expense categories."
   );
   if (detail.value !== null) {
-    if (period[0] === "4") {
+    if (isFourthQuarterPeriod(period)) {
       const derived = resolveFourthQuarterFromAnnualDetail(period, detail, (priorPeriod) => resolveNonCompensationExpense(priorPeriod, ctx));
       if (derived.value !== null) return derived;
     }
@@ -791,7 +828,7 @@ function resolveNonCompensationExpense(period: string, ctx: ResolveContext): Res
 }
 
 function resolveFourthQuarterFromAnnualDetail(period: string, annualDetail: ResolvedValue, priorResolver: (period: string) => ResolvedValue): ResolvedValue {
-  const year = period.slice(2);
+  const year = periodYearSuffix(period);
   const annualValue = annualDetail.sources.reduce((total, source) => total + Math.abs(source.derivedTotalValue ?? source.value), 0);
   const priorPeriods = [`1Q${year}`, `2Q${year}`, `3Q${year}`];
   const priorValues = priorPeriods.map((priorPeriod) => priorResolver(priorPeriod).value);
@@ -940,7 +977,7 @@ function normalizedDiscontinuedOperationsBridgeValue(period: string, value: numb
 }
 
 function resolveCommonShareholderNciBridge(period: string, ctx: ResolveContext): ResolvedValue {
-  if (isLatestFactYear(period, ctx) || Number(`20${period.slice(2)}`) < latestCompletedFiscalYear(ctx) - 1) {
+  if (isLatestFactYear(period, ctx) || periodYear(period) < latestCompletedFiscalYear(ctx) - 1) {
     return resolveDirectNoncontrollingIncome(period, ctx);
   }
 
@@ -983,7 +1020,7 @@ function resolveCommonIncomePlug(period: string, ctx: ResolveContext): ResolvedV
 
 function bridgeSource(period: string, concept: string, label: string, value: number, inputs: Array<FactSource | ResolvedValue | null | undefined>): FactSource {
   const source: FactSource = { concept, label, value, note: label };
-  if (period[0] !== "4") return source;
+  if (!isFourthQuarterPeriod(period)) return source;
 
   const annualValues = inputs.map(modelAnnualValue);
   if (!annualValues.every((item): item is number => item !== null)) return source;
@@ -991,7 +1028,7 @@ function bridgeSource(period: string, concept: string, label: string, value: num
 
   source.derivedTotalValue = annualValue;
   source.derivedTotalLabel = label;
-  source.derivedPriorPeriods = [`1Q${period.slice(2)}`, `2Q${period.slice(2)}`, `3Q${period.slice(2)}`];
+  source.derivedPriorPeriods = [`1Q${periodYearSuffix(period)}`, `2Q${periodYearSuffix(period)}`, `3Q${periodYearSuffix(period)}`];
   return source;
 }
 
@@ -1003,13 +1040,13 @@ function modelAnnualValue(item: FactSource | ResolvedValue | null | undefined) {
 }
 
 function isLatestFactYear(period: string, ctx: ResolveContext) {
-  return Number(`20${period.slice(2)}`) === latestCompletedFiscalYear(ctx);
+  return periodYear(period) === latestCompletedFiscalYear(ctx);
 }
 
 function latestCompletedFiscalYear(ctx: ResolveContext) {
   const completedFiscalYears = unique([...ctx.duration.keys(), ...ctx.instant.keys()])
-    .filter((key) => key[0] === "4")
-    .map((key) => Number(`20${key.slice(2)}`))
+    .filter((key) => isFourthQuarterPeriod(key) || isAnnualPeriod(key))
+    .map(periodYear)
     .filter(Number.isFinite);
   return Math.max(...completedFiscalYears);
 }
@@ -1249,6 +1286,34 @@ function resolveTreasuryAndPreferredStock(period: string, ctx: ResolveContext): 
   return { value: 0, sources: [zeroSource("TreasuryStockValue")] };
 }
 
+function primaryFinancialWorksheet(workbook: ExcelJS.Workbook) {
+  const explicit = workbook.getWorksheet(MODEL_SHEET);
+  if (explicit && blueColumns(explicit).length) return explicit;
+
+  const candidates = workbook.worksheets
+    .map((sheet) => ({ sheet, score: financialWorksheetScore(sheet) }))
+    .filter(({ score }) => score >= 20)
+    .sort((a, b) => b.score - a.score);
+  return candidates[0]?.sheet ?? explicit ?? null;
+}
+
+function financialWorksheetScore(sheet: ExcelJS.Worksheet) {
+  const columns = blueColumns(sheet);
+  if (!columns.length) return 0;
+  let score = Math.min(columns.length, 30);
+  for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (!label) continue;
+    if (/income statement|balance sheet|historical spread|financials|ffo calc/i.test(label)) score += 20;
+    if (/revenue|net sales|rental revenues|cost of goods|gross profit|operating income|net income|income tax/i.test(label)) score += 5;
+    if (/cash|accounts receivable|inventory|assets|liabilities|equity|debt|goodwill|pp&e|real estate investments/i.test(label)) score += 5;
+  }
+  if (/model/i.test(sheet.name)) score += 40;
+  if (/income statement|balance sheet|historical spread|financial/i.test(sheet.name)) score += 30;
+  if (/cover|chart|benchmark|comparables|valuation|pre-earnings|post-earnings/i.test(sheet.name)) score -= 50;
+  return score;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -1267,18 +1332,22 @@ export async function POST(request: NextRequest) {
     workbook.calcProperties.fullCalcOnLoad = true;
     await workbook.xlsx.load(Buffer.from(await file.arrayBuffer()) as unknown as ExcelJS.Buffer);
 
-    const sheet = workbook.getWorksheet(MODEL_SHEET);
-    if (!sheet) return jsonError(`Could not find a "${MODEL_SHEET}" worksheet in this workbook.`, 400);
+    const sheet = primaryFinancialWorksheet(workbook);
+    if (!sheet) return jsonError(`Could not find a worksheet with historical income statement or balance sheet input rows in this workbook.`, 400);
+    const isStandardModelSheet = sheet.name === MODEL_SHEET;
 
     let columns = blueColumns(sheet);
-    if (!columns.length) return jsonError("Could not find blue historical input cells in the Model tab.", 400);
+    if (!columns.length) return jsonError(`Could not find blue historical input cells in the "${sheet.name}" worksheet.`, 400);
 
     let periodInfos = templatePeriodInfos(sheet, columns);
     let periods: string[];
     if (periodInfos.length === columns.length) {
-      const pairs = periodInfos
+      const supportedPairs = periodInfos
         .map((info, index) => ({ ...info, col: columns[index] }))
-        .filter(({ period, isEstimate }) => /^[1-4]Q\d{2}$/.test(period) && !isEstimate && (ctx.duration.has(period) || ctx.instant.has(period)));
+        .filter(({ period, isEstimate }) => isSupportedPeriodKey(period) && !isEstimate && (ctx.duration.has(period) || ctx.instant.has(period)));
+      const quarterlyPairs = supportedPairs.filter(({ period }) => isQuarterPeriod(period));
+      const annualPairs = supportedPairs.filter(({ period }) => isAnnualPeriod(period));
+      const pairs = quarterlyPairs.length ? quarterlyPairs : annualPairs;
       periods = pairs.map((pair) => pair.period);
       columns = pairs.map((pair) => pair.col);
     } else {
@@ -1286,10 +1355,13 @@ export async function POST(request: NextRequest) {
       columns = columns.slice(0, periods.length);
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
-    const workbookSnapshot = snapshotWorkbook(workbook, [MODEL_SHEET, SEGMENT_SHEET], Math.min(...columns));
-    const inlineCtx = await fetchInlineFactContext(company, periods);
-    mergeContexts(ctx, inlineCtx);
-    const segmentRevenue = await fetchSegmentRevenueByPeriod(company, periods);
+    const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
+    if (isStandardModelSheet && periods.some(isQuarterPeriod)) {
+      const inlineCtx = await fetchInlineFactContext(company, periods);
+      mergeContexts(ctx, inlineCtx);
+    }
+    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
+    const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods) : [];
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
 
@@ -1398,34 +1470,35 @@ export async function POST(request: NextRequest) {
     }
     warnings.push(...llmState.warnings);
 
-    refreshDividendCachedResults(sheet, periods, columns);
+    if (isStandardModelSheet) refreshDividendCachedResults(sheet, periods, columns);
 
-    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
     if (segmentSheet) {
       const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows);
       filledCells += segmentResult.filledCells;
       commentsAdded += segmentResult.commentsAdded;
       warnings.push(...segmentResult.warnings);
     } else {
-      warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; Model revenue formulas were left untouched.`);
+      warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; segment revenue formulas were left untouched.`);
     }
 
-    const incomeStatementReconciliation = reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
-    filledCells += incomeStatementReconciliation.filledCells;
-    commentsAdded += incomeStatementReconciliation.commentsAdded;
-    warnings.push(...incomeStatementReconciliation.warnings);
+    if (isStandardModelSheet) {
+      const incomeStatementReconciliation = reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      filledCells += incomeStatementReconciliation.filledCells;
+      commentsAdded += incomeStatementReconciliation.commentsAdded;
+      warnings.push(...incomeStatementReconciliation.warnings);
 
-    const netIncomeReconciliation = reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
-    filledCells += netIncomeReconciliation.filledCells;
-    commentsAdded += netIncomeReconciliation.commentsAdded;
-    warnings.push(...netIncomeReconciliation.warnings);
+      const netIncomeReconciliation = reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      filledCells += netIncomeReconciliation.filledCells;
+      commentsAdded += netIncomeReconciliation.commentsAdded;
+      warnings.push(...netIncomeReconciliation.warnings);
 
-    const balanceSheetReconciliation = reconcileBalanceSheetCheck(sheet, periods, columns, auditRows);
-    filledCells += balanceSheetReconciliation.filledCells;
-    commentsAdded += balanceSheetReconciliation.commentsAdded;
-    warnings.push(...balanceSheetReconciliation.warnings);
+      const balanceSheetReconciliation = reconcileBalanceSheetCheck(sheet, periods, columns, auditRows);
+      filledCells += balanceSheetReconciliation.filledCells;
+      commentsAdded += balanceSheetReconciliation.commentsAdded;
+      warnings.push(...balanceSheetReconciliation.warnings);
 
-    refreshHistoricalFormulaCachedResults(workbook, columns);
+      refreshHistoricalFormulaCachedResults(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
+    }
 
     for (const fillRow of fillRows) {
       const hasAny = periods.some((_, index) => sheet.getCell(fillRow.row, columns[index]).value !== null);
@@ -1434,18 +1507,20 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
-    filledCells += cashFlowClearResult.clearedCells;
-    warnings.push(...cashFlowClearResult.warnings);
+    if (isStandardModelSheet) {
+      const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
+      filledCells += cashFlowClearResult.clearedCells;
+      warnings.push(...cashFlowClearResult.warnings);
 
-    const shareRepurchaseClearResult = clearStaleShareRepurchaseAssumptionAmounts(sheet, periods, columns, auditRows);
-    filledCells += shareRepurchaseClearResult.clearedCells;
-    commentsAdded += shareRepurchaseClearResult.commentsAdded;
-    warnings.push(...shareRepurchaseClearResult.warnings);
+      const shareRepurchaseClearResult = clearStaleShareRepurchaseAssumptionAmounts(sheet, periods, columns, auditRows);
+      filledCells += shareRepurchaseClearResult.clearedCells;
+      commentsAdded += shareRepurchaseClearResult.commentsAdded;
+      warnings.push(...shareRepurchaseClearResult.warnings);
+    }
 
     restoreWorkbookLabels(workbook, workbookSnapshot);
 
-    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings);
+    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
@@ -1970,10 +2045,16 @@ function buildFactContext(payload: any): ResolveContext {
         };
         if (!instantFact && isAnnualDurationFact(fact)) {
           setSource(annualDuration, period, concept, source);
+          const annualPeriod = annualPeriodKey(fact);
+          if (annualPeriod) setSource(duration, annualPeriod, concept, source);
         } else if (!instantFact && isYearToDateFact(fact)) {
           setSource(cumulativeDuration, period, concept, source);
         } else if (instantFact || isQuarterDurationFact(fact)) {
           setSource(instantFact ? instant : duration, period, concept, source);
+          if (instantFact && isAnnualInstantFact(fact)) {
+            const annualPeriod = annualPeriodKey(fact);
+            if (annualPeriod) setSource(instant, annualPeriod, concept, source);
+          }
         }
       }
     }
@@ -2078,6 +2159,16 @@ function isAnnualDurationFact(fact: SecFact) {
   return factDurationDays(fact) >= 330;
 }
 
+function isAnnualInstantFact(fact: SecFact) {
+  return Boolean(fact.end && fact.fp === "FY" && isTenK(fact.form));
+}
+
+function annualPeriodKey(fact: SecFact) {
+  const fiscalYear = fact.fy ?? (fact.end ? new Date(`${fact.end}T00:00:00Z`).getUTCFullYear() : null);
+  if (!fiscalYear) return null;
+  return `FY${String(fiscalYear).slice(-2)}`;
+}
+
 function isQuarterDurationFact(fact: SecFact) {
   if (!fact.start || !fact.end || !["Q1", "Q2", "Q3", "Q4"].includes(fact.fp ?? "")) return false;
   return factDurationDays(fact) <= 115;
@@ -2123,10 +2214,13 @@ function preferSource(period: string, next: FactSource, current: FactSource) {
 }
 
 function sourceScore(period: string, source: FactSource) {
-  const quarter = period[0];
+  const quarter = String(periodQuarter(period));
   let score = 0;
   const durationDays = source.start && source.end ? factDurationDays({ start: source.start, end: source.end } as SecFact) : 0;
-  if (quarter === "4") {
+  if (isAnnualPeriod(period)) {
+    if (isTenK(source.form)) score += 35;
+    if (source.fp === "FY") score += 15;
+  } else if (quarter === "4") {
     if (isTenK(source.form)) score += 20;
     if (source.fp === "FY" || source.fp === "Q4") score += 10;
   } else {
@@ -2149,29 +2243,61 @@ function isTenQ(form?: string) {
 
 function choosePeriods(ctx: ResolveContext, maxColumns: number) {
   const periods = unique([...ctx.duration.keys(), ...ctx.instant.keys()]).sort(comparePeriods);
-  return periods.slice(-maxColumns);
+  return periods.filter((period) => !isAnnualPeriod(period)).slice(-maxColumns);
 }
 
 function comparePeriods(a: string, b: string) {
-  const [aq, ay] = [Number(a[0]), Number(`20${a.slice(2)}`)];
-  const [bq, by] = [Number(b[0]), Number(`20${b.slice(2)}`)];
+  const [aq, ay] = [periodQuarter(a), periodYear(a)];
+  const [bq, by] = [periodQuarter(b), periodYear(b)];
   return ay === by ? aq - bq : ay - by;
 }
 
 function previousPeriod(period: string) {
-  const quarter = Number(period[0]);
-  const year = Number(`20${period.slice(2)}`);
+  if (isAnnualPeriod(period)) return `FY${String(periodYear(period) - 1).slice(-2)}`;
+  const quarter = periodQuarter(period);
+  const year = periodYear(period);
   if (!quarter || Number.isNaN(year)) return null;
   if (quarter === 1) return `4Q${String(year - 1).slice(-2)}`;
   return `${quarter - 1}Q${String(year).slice(-2)}`;
 }
 
+function isSupportedPeriodKey(period: string) {
+  return /^[1-4]Q\d{2}$/.test(period) || isAnnualPeriod(period);
+}
+
+function isAnnualPeriod(period: string) {
+  return /^FY\d{2}$/.test(period);
+}
+
+function isQuarterPeriod(period: string) {
+  return /^[1-4]Q\d{2}$/.test(period);
+}
+
+function isFourthQuarterPeriod(period: string) {
+  return /^4Q\d{2}$/.test(period);
+}
+
+function periodYear(period: string) {
+  const match = period.match(/^(?:[1-4]Q|FY)(\d{2})$/);
+  return match ? Number(`20${match[1]}`) : NaN;
+}
+
+function periodYearSuffix(period: string) {
+  return String(periodYear(period)).slice(-2);
+}
+
+function periodQuarter(period: string) {
+  if (isAnnualPeriod(period)) return 4;
+  return Number(period[0]);
+}
+
 function blueColumns(sheet: ExcelJS.Worksheet) {
   const columnCounts = new Map<number, number>();
+  const maxScanColumn = Math.min(sheet.columnCount, 120);
   for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
     const label = rowLabel(sheet, rowNumber);
     if (!label) continue;
-    for (let col = 6; col <= sheet.columnCount; col += 1) {
+    for (let col = 6; col <= maxScanColumn; col += 1) {
       if (!isHardcodedBlueInput(sheet.getCell(rowNumber, col))) continue;
       columnCounts.set(col, (columnCounts.get(col) ?? 0) + 1);
     }
@@ -2197,8 +2323,8 @@ function periodHeaderColumns(sheet: ExcelJS.Worksheet) {
   let best: number[] = [];
   for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 120); rowNumber += 1) {
     const cols: number[] = [];
-    for (let col = 4; col <= sheet.columnCount; col += 1) {
-      if (/^[1-4]Q\d{2}$/.test(normalizePeriodLabel(cellDisplay(sheet.getCell(rowNumber, col))))) cols.push(col);
+    for (let col = 4; col <= Math.min(sheet.columnCount, 120); col += 1) {
+      if (isSupportedPeriodKey(normalizePeriodLabel(cellDisplay(sheet.getCell(rowNumber, col))))) cols.push(col);
     }
     if (cols.length > best.length) best = cols;
   }
@@ -2208,6 +2334,7 @@ function periodHeaderColumns(sheet: ExcelJS.Worksheet) {
 function templatePeriodInfos(sheet: ExcelJS.Worksheet, columns: number[]) {
   let best: Array<{ period: string; isEstimate: boolean }> = [];
   let bestCount = 0;
+  let bestQuarterCount = 0;
   for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 80); rowNumber += 1) {
     const infos = columns.map((col) => {
       const label = cellDisplay(sheet.getCell(rowNumber, col));
@@ -2216,10 +2343,12 @@ function templatePeriodInfos(sheet: ExcelJS.Worksheet, columns: number[]) {
         isEstimate: /e\s*$/i.test(label.trim())
       };
     });
-    const validCount = infos.filter((info) => /^[1-4]Q\d{2}$/.test(info.period)).length;
-    if (validCount > bestCount) {
+    const validCount = infos.filter((info) => isSupportedPeriodKey(info.period)).length;
+    const quarterCount = infos.filter((info) => isQuarterPeriod(info.period)).length;
+    if (validCount > bestCount || (validCount === bestCount && quarterCount > bestQuarterCount)) {
       best = infos;
       bestCount = validCount;
+      bestQuarterCount = quarterCount;
     }
   }
   return bestCount ? best : [];
@@ -2231,6 +2360,8 @@ function normalizePeriodLabel(label: string) {
   if (direct) return `${direct[1]}Q${direct[2].slice(-2)}`;
   const qFirst = compact.match(/^Q([1-4])(\d{2}|\d{4})$/i);
   if (qFirst) return `${qFirst[1]}Q${qFirst[2].slice(-2)}`;
+  const fiscalYear = compact.match(/^(?:FY(\d{2}|\d{4})|(\d{4}))A?$/i);
+  if (fiscalYear) return `FY${(fiscalYear[1] ?? fiscalYear[2]).slice(-2)}`;
   return compact;
 }
 
@@ -2238,6 +2369,7 @@ function cellDisplay(cell: ExcelJS.Cell) {
   const value = cell.value;
   if (typeof value === "string") return value;
   if (typeof value === "number") return String(value);
+  if (value instanceof Date) return periodKeyFromDate(value.toISOString().slice(0, 10)) ?? "";
   if (value && typeof value === "object" && "result" in value && value.result !== undefined && value.result !== null) {
     return String(value.result);
   }
@@ -2381,7 +2513,7 @@ function preservedDividendFormulaUpdate(
 }
 
 function isDividendFormulaBridge(fillRow: FillRow, period: string, cell: ExcelJS.Cell) {
-  if (period[0] !== "4" || !hasFormula(cell)) return false;
+  if (!isFourthQuarterPeriod(period) || !hasFormula(cell)) return false;
   if (normalize(fillRow.label) !== normalize("Dividends")) return false;
   return Boolean(cellFormula(cell)?.match(/\bSUM\s*\(/i));
 }
@@ -2411,8 +2543,8 @@ function refreshDividendCachedResults(sheet: ExcelJS.Worksheet, periods: string[
   if (!dividendRow) return;
 
   periods.forEach((period, index) => {
-    if (period[0] !== "4") return;
-    const year = period.slice(2);
+    if (!isFourthQuarterPeriod(period)) return;
+    const year = periodYearSuffix(period);
     const quarterIndexes = [`1Q${year}`, `2Q${year}`, `3Q${year}`, `4Q${year}`].map((quarter) => periods.indexOf(quarter));
     if (!quarterIndexes.every((quarterIndex) => quarterIndex >= 0)) return;
     const quarterCols = quarterIndexes.map((quarterIndex) => columns[quarterIndex]);
@@ -3332,15 +3464,25 @@ function findWritableBalanceSheetResidualRow(sheet: ExcelJS.Worksheet, rows: num
 }
 
 function createLlmMappingState(): LlmMappingState {
-  const enabledByEnv = /^true$/i.test(process.env.LLM_MAPPING_ENABLED || "");
-  const hasApiKey = Boolean(process.env.OPENAI_API_KEY);
+  const enabledByEnv = llmMappingEnabledByEnv();
+  const hasApiKey = Boolean(llmApiKey());
   return {
     enabled: enabledByEnv && hasApiKey,
     decisions: new Map(),
-    warnings: enabledByEnv && !hasApiKey ? ["LLM mapping was enabled but OPENAI_API_KEY was not set; deterministic EDGAR mapping was used."] : [],
+    warnings: enabledByEnv && !hasApiKey ? ["LLM mapping was enabled but OPENROUTER_API_KEY was not set; deterministic EDGAR mapping was used."] : [],
     calls: 0,
-    maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS > 0 ? LLM_MAPPING_MAX_CALLS : 8
+    maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS > 0 ? LLM_MAPPING_MAX_CALLS : 24
   };
+}
+
+function llmMappingEnabledByEnv() {
+  const raw = process.env.LLM_MAPPING_ENABLED;
+  if (raw === undefined || raw === "") return Boolean(llmApiKey());
+  return /^(true|1|yes)$/i.test(raw);
+}
+
+function llmApiKey() {
+  return process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "";
 }
 
 async function llmAssistedFillRow(
@@ -3370,7 +3512,7 @@ async function llmAssistedFillRow(
     state.decisions.set(fillRow.row, mapped);
     return mapped;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown OpenAI API error";
+    const message = error instanceof Error ? error.message : "unknown OpenRouter API error";
     state.warnings.push(`${fillRow.label}: LLM-assisted mapping skipped (${message}).`);
     state.decisions.set(fillRow.row, null);
     return null;
@@ -3406,10 +3548,18 @@ function llmCandidateFacts(fillRow: FillRow, periods: string[], ctx: ResolveCont
 
   return Array.from(byConcept.values())
     .map((candidate) => ({ candidate, score: llmCandidateScore(fillRow, candidate) }))
-    .filter(({ score }) => score >= LLM_MAPPING_MIN_CANDIDATE_SCORE)
+    .filter(({ score }) => score >= llmMinCandidateScore())
     .sort((a, b) => b.score - a.score || Object.keys(b.candidate.values).length - Object.keys(a.candidate.values).length)
-    .slice(0, LLM_MAPPING_CANDIDATE_LIMIT)
+    .slice(0, llmCandidateLimit())
     .map(({ candidate }) => candidate);
+}
+
+function llmMinCandidateScore() {
+  return Number.isFinite(LLM_MAPPING_MIN_CANDIDATE_SCORE) ? LLM_MAPPING_MIN_CANDIDATE_SCORE : 2;
+}
+
+function llmCandidateLimit() {
+  return Number.isFinite(LLM_MAPPING_CANDIDATE_LIMIT) && LLM_MAPPING_CANDIDATE_LIMIT > 0 ? LLM_MAPPING_CANDIDATE_LIMIT : 80;
 }
 
 function llmCandidateScore(fillRow: FillRow, candidate: LlmCandidateFact) {
@@ -3446,72 +3596,37 @@ async function requestLlmMappingDecision(
   periods: string[],
   candidates: LlmCandidateFact[]
 ): Promise<LlmMappingDecision> {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+  const apiKey = llmApiKey();
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
 
-  const response = await fetch(OPENAI_RESPONSES_URL, {
+  const system = [
+    "You map financial model rows to SEC EDGAR XBRL facts.",
+    "Use only the provided candidate concepts. Do not invent concepts or values.",
+    "Prefer needs_review unless the row label, section context, and candidate label clearly match.",
+    "Choose sign -1 only when the model row convention should invert the EDGAR value, such as expense rows shown as negatives.",
+    "Return strict JSON only."
+  ].join(" ");
+
+  const response = await fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${apiKey}`
+      Authorization: `Bearer ${apiKey}`,
+      "HTTP-Referer": OPENROUTER_SITE_URL,
+      "X-Title": OPENROUTER_APP_TITLE
     },
     body: JSON.stringify({
       model: LLM_MAPPING_MODEL,
-      instructions: [
-        "You map financial model rows to SEC EDGAR XBRL facts.",
-        "Use only the provided candidate concepts. Do not invent concepts or values.",
-        "Prefer needs_review unless the row label, section context, and candidate label clearly match.",
-        "Choose sign -1 only when the model row convention should invert the EDGAR value, such as expense rows shown as negatives.",
-        "Return strict JSON only."
-      ].join(" "),
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: JSON.stringify({
-                company: { ticker: company.ticker, name: company.title },
-                row: {
-                  label: fillRow.label,
-                  statement: fillRow.statement,
-                  kind: fillRow.kind,
-                  sectionHeader: fillRow.modelContext?.sectionHeader ?? "",
-                  previousLabel: fillRow.modelContext?.previousLabel ?? "",
-                  nextLabel: fillRow.modelContext?.nextLabel ?? "",
-                  modelSignConvention: fillRow.modelContext?.signConvention ?? fillRow.sign ?? 1
-                },
-                periods,
-                candidates
-              })
-            }
-          ]
-        }
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: JSON.stringify(llmMappingPayload(company, fillRow, periods, candidates)) }
       ],
-      max_output_tokens: 700,
-      store: false,
-      text: {
-        format: {
-          type: "json_schema",
-          name: "edgar_mapping_decision",
-          strict: true,
-          schema: {
-            type: "object",
-            additionalProperties: false,
-            required: ["operation", "selectedConcepts", "sign", "confidence", "reason", "requiresReview"],
-            properties: {
-              operation: { type: "string", enum: ["direct", "sum", "difference", "needs_review"] },
-              selectedConcepts: {
-                type: "array",
-                items: { type: "string" }
-              },
-              sign: { type: "integer", enum: [1, -1] },
-              confidence: { type: "string", enum: ["high", "medium", "low"] },
-              reason: { type: "string" },
-              requiresReview: { type: "boolean" }
-            }
-          }
-        }
+      temperature: 0,
+      max_tokens: 700,
+      provider: { require_parameters: true },
+      response_format: {
+        type: "json_schema",
+        json_schema: llmMappingJsonSchema()
       }
     })
   });
@@ -3523,12 +3638,61 @@ async function requestLlmMappingDecision(
   }
 
   const text = responseOutputText(body);
-  if (!text) throw new Error("OpenAI response did not include text output");
+  if (!text) throw new Error("OpenRouter response did not include text output");
   return JSON.parse(text) as LlmMappingDecision;
+}
+
+function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: string[], candidates: LlmCandidateFact[]) {
+  return {
+    company: { ticker: company.ticker, name: company.title },
+    row: {
+      label: fillRow.label,
+      statement: fillRow.statement,
+      kind: fillRow.kind,
+      sectionHeader: fillRow.modelContext?.sectionHeader ?? "",
+      previousLabel: fillRow.modelContext?.previousLabel ?? "",
+      nextLabel: fillRow.modelContext?.nextLabel ?? "",
+      modelSignConvention: fillRow.modelContext?.signConvention ?? fillRow.sign ?? 1
+    },
+    periods,
+    candidates
+  };
+}
+
+function llmMappingJsonSchema() {
+  return {
+    name: "edgar_mapping_decision",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["operation", "selectedConcepts", "sign", "confidence", "reason", "requiresReview"],
+      properties: {
+        operation: { type: "string", enum: ["direct", "sum", "difference", "needs_review"] },
+        selectedConcepts: {
+          type: "array",
+          items: { type: "string" }
+        },
+        sign: { type: "integer", enum: [1, -1] },
+        confidence: { type: "string", enum: ["high", "medium", "low"] },
+        reason: { type: "string" },
+        requiresReview: { type: "boolean" }
+      }
+    }
+  };
 }
 
 function responseOutputText(body: any) {
   if (typeof body?.output_text === "string") return body.output_text;
+  const content = body?.choices?.[0]?.message?.content;
+  if (typeof content === "string") return content.trim();
+  if (content && typeof content === "object" && !Array.isArray(content)) return JSON.stringify(content);
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => (typeof item?.text === "string" ? item.text : typeof item?.content === "string" ? item.content : ""))
+      .join("")
+      .trim();
+  }
   const chunks: string[] = [];
   for (const item of body?.output ?? []) {
     if (item?.type !== "message") continue;
@@ -3801,7 +3965,14 @@ function mappingAuditRowForSegment(
   };
 }
 
-function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: string[], columns: number[], ctx: ResolveContext, warnings: string[]) {
+function validateWorkbookBeforeReturn(
+  workbook: ExcelJS.Workbook,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  warnings: string[],
+  modelSheetName = MODEL_SHEET
+) {
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
   if (segmentSheet) {
@@ -3809,7 +3980,9 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
     errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
   }
-  const modelSheet = workbook.getWorksheet(MODEL_SHEET);
+  if (modelSheetName !== MODEL_SHEET) return errors;
+
+  const modelSheet = workbook.getWorksheet(modelSheetName) ?? workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings));
@@ -4000,8 +4173,8 @@ function splitFormulaArgs(body: string) {
   return args;
 }
 
-function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, columns: number[]) {
-  for (const sheetName of [MODEL_SHEET, SEGMENT_SHEET]) {
+function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, columns: number[], sheetNames = [MODEL_SHEET, SEGMENT_SHEET]) {
+  for (const sheetName of sheetNames) {
     const sheet = workbook.getWorksheet(sheetName);
     if (!sheet) continue;
     const evaluator = new FormulaEvaluator(sheet);
@@ -4308,6 +4481,7 @@ function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firs
   const labels = new Map<string, string>();
   const formulas = new Map<string, string>();
   const labelSnapshotEndCol = Math.max(1, firstHistoricalCol - 1);
+  const formulaSnapshotEndCol = 120;
   for (const sheetName of sheetNames) {
     const sheet = workbook.getWorksheet(sheetName);
     if (!sheet) continue;
@@ -4316,7 +4490,7 @@ function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firs
         const address = snapshotAddress(sheet, rowNumber, col);
         labels.set(address, cellDisplay(sheet.getCell(rowNumber, col)));
       }
-      for (let col = 1; col <= sheet.columnCount; col += 1) {
+      for (let col = 1; col <= Math.min(formulaSnapshotEndCol, sheet.columnCount); col += 1) {
         const formula = cellFormula(sheet.getCell(rowNumber, col));
         if (formula) formulas.set(snapshotAddress(sheet, rowNumber, col), formula);
       }
