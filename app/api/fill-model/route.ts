@@ -27,6 +27,7 @@ type FactSource = {
   label: string;
   value: number;
   note?: string;
+  sourceUrl?: string;
   form?: string;
   fp?: string;
   filed?: string;
@@ -99,6 +100,69 @@ type ResolveContext = {
   instant: Map<string, Map<string, FactSource>>;
 };
 
+type PipelineLayer =
+  | "edgar_extraction"
+  | "concept_normalization"
+  | "template_profile_detection"
+  | "row_classification"
+  | "cell_write_policy"
+  | "formula_evaluation"
+  | "validation_tie_out";
+
+type TemplateProfileKind = "owl_standard" | "financial_company" | "generic";
+
+type TemplateProfile = {
+  kind: TemplateProfileKind;
+  confidence: "high" | "medium" | "low";
+  rationale: string[];
+  sheetName: string;
+  hasSegmentAnalysis: boolean;
+};
+
+type NormalizedMetricKey =
+  | "revenue"
+  | "net_revenue"
+  | "cogs"
+  | "gross_profit"
+  | "sga"
+  | "rd"
+  | "da"
+  | "ebit"
+  | "interest_income"
+  | "interest_expense"
+  | "taxes"
+  | "net_income"
+  | "net_income_common"
+  | "assets"
+  | "liabilities"
+  | "equity"
+  | "debt"
+  | "dividends"
+  | "share_repurchases"
+  | "basic_shares"
+  | "diluted_shares";
+
+type NormalizedHistoricalValue = {
+  metric: NormalizedMetricKey | string;
+  period: string;
+  value: number | null;
+  sources: FactSource[];
+  statement: "income" | "balance" | "cash_flow" | "segment" | "support";
+  periodType: "duration" | "instant";
+  mappingType: "direct" | "derived" | "grouped" | "residual" | "missing";
+  confidence: "high" | "medium" | "low";
+  rationale: string;
+};
+
+type NormalizedHistoricalsPackage = {
+  company: CompanyMatch;
+  profile: TemplateProfile;
+  periods: string[];
+  metrics: Map<string, Map<string, NormalizedHistoricalValue>>;
+  segments: SegmentRevenue[];
+  diagnostics: Array<{ layer: PipelineLayer; severity: "info" | "warning" | "error"; message: string }>;
+};
+
 type InlineContext = {
   period: string | null;
   instant: boolean;
@@ -125,15 +189,22 @@ type MappingAuditRow = {
   sheetName: string;
   cell: string;
   modelRowLabel: string;
+  section?: string;
   period: string;
   valueWritten: number;
-  mappingType: RowClassification | "segment" | "calculated";
+  mappingType: RowClassification | "segment" | "calculated" | "derived" | "residual" | "skipped" | "formula preserved" | "formula updated" | "validation only";
   conceptsUsed: string;
+  secLabels?: string;
   sourceStatement: string;
   accession: string;
   sourceUrl: string;
+  filingForm?: string;
+  filedDate?: string;
+  startDate?: string;
+  endDate?: string;
   cellWritable: boolean;
   formulaPreserved: boolean;
+  formulaStatus?: string;
   writeBlockedReason: string;
   signConvention: string;
   confidence: "high" | "medium" | "low";
@@ -1503,6 +1574,196 @@ function findCoverRow(sheet: ExcelJS.Worksheet, label: string) {
   return null;
 }
 
+function detectTemplateProfile(workbook: ExcelJS.Workbook, sheet: ExcelJS.Worksheet, ctx: ResolveContext): TemplateProfile {
+  const sheetNames = workbook.worksheets.map((item) => normalize(item.name));
+  const labels: string[] = [];
+  for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 420); rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (label) labels.push(label);
+  }
+  const labelText = normalize(labels.join(" "));
+  const hasSegmentAnalysis = Boolean(workbook.getWorksheet(SEGMENT_SHEET));
+  const rationale: string[] = [];
+  let owlScore = 0;
+  let financialScore = 0;
+
+  if (normalize(sheet.name) === normalize(MODEL_SHEET)) {
+    owlScore += 2;
+    rationale.push("Primary worksheet is named Model.");
+  }
+  if (hasSegmentAnalysis) {
+    owlScore += 2;
+    rationale.push("Workbook includes Segment Analysis.");
+  }
+  for (const label of ["Income Statement", "Income Statement Analysis", "Cash Flow Statement", "Balance Sheet", "Working Capital", "PP&E / Depreciation Schedule", "Shareholder's Equity Schedule", "Shares Outstanding Schedule", "Debt and Interest Schedule"]) {
+    if (labelText.includes(normalize(label))) owlScore += 1;
+  }
+  if (sheetNames.some((name) => /valuation|fig|financial/.test(name))) financialScore += 1;
+  if (/netrevenues|revenuenetofinterestexpense|noninterestexpense|investmentbanking|assetmanagement|capitalmarkets|tradingrevenue|compensationandbenefits|bookvalue|tangiblebookvalue|financialinstruments|securitiesborrowed|brokerdealers|customerdeposits/.test(labelText)) {
+    financialScore += 4;
+    rationale.push("Workbook labels indicate a financial-company presentation.");
+  }
+  if (hasAnyConcept(ctx, "duration", [...C.netRevenue, "NoninterestExpense", ...COMPENSATION_CONCEPTS, "InvestmentBankingRevenue", "PrincipalTransactionsRevenue"])) {
+    financialScore += 2;
+    rationale.push("SEC facts include financial-company revenue/expense concepts.");
+  }
+  if (hasAnyConcept(ctx, "instant", [...BROKER_DEALER_RECEIVABLES, ...BROKER_DEALER_CURRENT_ASSETS, ...BROKER_DEALER_PAYABLES, ...BROKER_DEALER_OTHER_CURRENT_LIABILITIES, ...C.customerDeposits])) {
+    financialScore += 2;
+    rationale.push("SEC facts include broker/dealer or financial asset/liability concepts.");
+  }
+
+  if (financialScore >= 4 && financialScore >= owlScore) {
+    return { kind: "financial_company", confidence: financialScore >= 6 ? "high" : "medium", rationale, sheetName: sheet.name, hasSegmentAnalysis };
+  }
+  if (owlScore >= 5) {
+    return { kind: "owl_standard", confidence: owlScore >= 8 ? "high" : "medium", rationale, sheetName: sheet.name, hasSegmentAnalysis };
+  }
+  return {
+    kind: "generic",
+    confidence: "low",
+    rationale: rationale.length ? rationale : ["Workbook did not strongly match the Owl or financial-company profiles."],
+    sheetName: sheet.name,
+    hasSegmentAnalysis
+  };
+}
+
+function hasAnyConcept(ctx: ResolveContext, kind: "duration" | "instant", concepts: string[]) {
+  const source = kind === "duration" ? ctx.duration : ctx.instant;
+  return Array.from(source.values()).some((facts) => concepts.some((concept) => facts.has(concept)));
+}
+
+function buildNormalizedHistoricalsPackage(
+  company: CompanyMatch,
+  profile: TemplateProfile,
+  periods: string[],
+  ctx: ResolveContext,
+  segments: SegmentRevenue[]
+): NormalizedHistoricalsPackage {
+  const metrics = new Map<string, Map<string, NormalizedHistoricalValue>>();
+  const diagnostics: NormalizedHistoricalsPackage["diagnostics"] = [
+    {
+      layer: "template_profile_detection",
+      severity: profile.kind === "generic" ? "warning" : "info",
+      message: `${profile.kind} profile selected with ${profile.confidence} confidence: ${profile.rationale.join(" ")}`
+    }
+  ];
+
+  const rules: Array<{
+    key: NormalizedMetricKey;
+    statement: NormalizedHistoricalValue["statement"];
+    periodType: NormalizedHistoricalValue["periodType"];
+    concepts?: string[];
+    resolver?: (period: string, ctx: ResolveContext) => ResolvedValue;
+    rationale: string;
+  }> = [
+    { key: "revenue", statement: "income", periodType: "duration", concepts: C.revenue, rationale: "Total company revenue normalized from EDGAR revenue concepts." },
+    { key: "net_revenue", statement: "income", periodType: "duration", concepts: C.netRevenue, rationale: "Financial-company net revenue normalized from EDGAR revenues net of interest expense." },
+    { key: "cogs", statement: "income", periodType: "duration", concepts: C.cogs, rationale: "Cost of revenue normalized from EDGAR cost concepts." },
+    { key: "gross_profit", statement: "income", periodType: "duration", concepts: C.grossProfit, rationale: "Gross profit normalized from EDGAR gross profit." },
+    { key: "sga", statement: "income", periodType: "duration", resolver: resolveSellingGeneralAdministrativeExpense, rationale: "SG&A normalized directly or from EDGAR operating-income bridge inputs." },
+    { key: "rd", statement: "income", periodType: "duration", concepts: C.rd, rationale: "R&D normalized from EDGAR research and development concepts." },
+    { key: "da", statement: "income", periodType: "duration", concepts: C.da, rationale: "D&A normalized from EDGAR depreciation and amortization concepts." },
+    { key: "ebit", statement: "income", periodType: "duration", concepts: C.operatingIncome, rationale: "EBIT / operating income normalized from EDGAR operating income or pre-tax operating profit concepts." },
+    { key: "interest_income", statement: "income", periodType: "duration", concepts: C.interestIncome, rationale: "Interest income normalized from EDGAR interest income concepts." },
+    { key: "interest_expense", statement: "income", periodType: "duration", resolver: resolveInterestExpense, rationale: "Interest expense normalized directly or from EDGAR revenue net of interest expense bridge." },
+    { key: "taxes", statement: "income", periodType: "duration", resolver: resolveIncomeTaxExpense, rationale: "Income tax normalized directly or derived from EDGAR pre-tax and net income." },
+    { key: "net_income", statement: "income", periodType: "duration", concepts: CONTINUING_NET_INCOME_CONCEPTS, rationale: "Net income normalized from EDGAR net income / continuing net income." },
+    { key: "net_income_common", statement: "income", periodType: "duration", concepts: COMMON_SHAREHOLDER_INCOME_CONCEPTS, rationale: "Common shareholder net income normalized from EDGAR common-stockholder income concepts." },
+    { key: "assets", statement: "balance", periodType: "instant", concepts: C.assets, rationale: "Total assets normalized from EDGAR balance sheet facts." },
+    { key: "liabilities", statement: "balance", periodType: "instant", concepts: C.liabilities, rationale: "Total liabilities normalized from EDGAR balance sheet facts." },
+    { key: "equity", statement: "balance", periodType: "instant", concepts: C.equity, rationale: "Equity normalized from EDGAR stockholders' equity concepts." },
+    { key: "debt", statement: "balance", periodType: "instant", resolver: resolveTotalDebt, rationale: "Debt normalized from aggregate or component EDGAR debt concepts." },
+    { key: "dividends", statement: "cash_flow", periodType: "duration", concepts: C.dividends, rationale: "Dividends normalized from EDGAR cash dividends paid concepts." },
+    { key: "share_repurchases", statement: "cash_flow", periodType: "duration", concepts: C.repurchases, rationale: "Share repurchases normalized from EDGAR common stock repurchase payments." },
+    { key: "basic_shares", statement: "support", periodType: "duration", concepts: C.basicShares, rationale: "Basic shares normalized from EDGAR weighted-average basic shares." },
+    { key: "diluted_shares", statement: "support", periodType: "duration", concepts: C.dilutedShares, rationale: "Diluted shares normalized from EDGAR weighted-average diluted shares." }
+  ];
+
+  for (const rule of rules) {
+    const values = new Map<string, NormalizedHistoricalValue>();
+    for (const period of periods) {
+      const resolved = rule.resolver
+        ? rule.resolver(period, ctx)
+        : rule.concepts
+          ? resolveConceptsAsNormalized(rule.periodType === "instant" ? ctx.instant : ctx.duration, period, rule.concepts)
+          : { value: null, sources: [] };
+      const derived = Boolean(derivedSource(resolved));
+      values.set(period, {
+        metric: rule.key,
+        period,
+        value: resolved.value,
+        sources: resolved.sources,
+        statement: rule.statement,
+        periodType: rule.periodType,
+        mappingType: resolved.value === null ? "missing" : derived ? "derived" : resolved.classification === "grouped" ? "grouped" : "direct",
+        confidence: resolved.value === null ? "low" : resolved.classification === "grouped" || derived ? "medium" : "high",
+        rationale: resolved.note || rule.rationale
+      });
+    }
+    metrics.set(rule.key, values);
+  }
+
+  for (const key of ["revenue", "net_revenue", "ebit", "net_income", "assets", "liabilities", "equity"] as NormalizedMetricKey[]) {
+    const missing = periods.filter((period) => metrics.get(key)?.get(period)?.value === null);
+    if (missing.length) {
+      diagnostics.push({
+        layer: "concept_normalization",
+        severity: "warning",
+        message: `${key} missing for ${missing.join(", ")} after EDGAR normalization.`
+      });
+    }
+  }
+
+  return { company, profile, periods, metrics, segments, diagnostics };
+}
+
+function resolveConceptsAsNormalized(map: Map<string, Map<string, FactSource>>, period: string, concepts: string[]): ResolvedValue {
+  const source = first(period, map, concepts);
+  return source ? { value: source.value, sources: [source], classification: "direct" } : { value: null, sources: [] };
+}
+
+function resolveRowFromPackage(fillRow: FillRow, period: string, normalized: NormalizedHistoricalsPackage): ResolvedValue | null {
+  if (fillRow.resolver) return null;
+  const key = normalizedMetricKeyForFillRow(fillRow, normalized.profile);
+  if (!key) return null;
+  const value = normalized.metrics.get(key)?.get(period);
+  if (!value || value.value === null) return null;
+  const signedValue = fillRow.sign === -1 ? -Math.abs(value.value) : value.value;
+  return {
+    value: signedValue,
+    sources: value.sources,
+    note: value.rationale,
+    classification: value.mappingType === "grouped" || value.mappingType === "derived" ? "grouped" : "direct"
+  };
+}
+
+function normalizedMetricKeyForFillRow(fillRow: FillRow, profile: TemplateProfile): NormalizedMetricKey | null {
+  const label = normalize(fillRow.label);
+  const concepts = new Set(fillRow.concepts ?? []);
+  const hasAny = (items: string[]) => items.some((concept) => concepts.has(concept));
+  if (hasAny(C.netRevenue) || label === normalize("Net Revenue") || label === normalize("Revenue Net of Interest Expense")) return "net_revenue";
+  if (hasAny(C.revenue) || /^(total)?revenues?$|^sales$|^netsales$/.test(label)) return profile.kind === "financial_company" && hasAny(C.netRevenue) ? "net_revenue" : "revenue";
+  if (hasAny(C.cogs)) return "cogs";
+  if (hasAny(C.grossProfit)) return "gross_profit";
+  if (hasAny(C.rd)) return "rd";
+  if (hasAny(C.da)) return "da";
+  if (hasAny(C.operatingIncome) || label === normalize("EBIT") || label === normalize("Operating Income")) return "ebit";
+  if (hasAny(C.interestIncome)) return "interest_income";
+  if (hasAny(C.interestExpense) || /interestexpense/.test(label)) return "interest_expense";
+  if (hasAny(C.taxes) || /incometax/.test(label)) return "taxes";
+  if (hasAny(COMMON_SHAREHOLDER_INCOME_CONCEPTS) || /netincomeavailabletocommon/.test(label)) return "net_income_common";
+  if (hasAny(C.netIncome) || hasAny(CONTINUING_NET_INCOME_CONCEPTS) || label === normalize("Net Income") || label === normalize("Net Income (Loss)")) return "net_income";
+  if (hasAny(C.assets) || label === normalize("Total Assets")) return "assets";
+  if (hasAny(C.liabilities) || label === normalize("Total Liabilities")) return "liabilities";
+  if (hasAny(C.equity) || /totalequity|totalshareholdersequity|totalstockholdersequity/.test(label)) return "equity";
+  if (label === normalize("Total Debt")) return "debt";
+  if (hasAny(C.dividends) || label === normalize("Dividends")) return "dividends";
+  if (hasAny(C.repurchases) || /repurchases/.test(label)) return "share_repurchases";
+  if (hasAny(C.basicShares)) return "basic_shares";
+  if (hasAny(C.dilutedShares)) return "diluted_shares";
+  return null;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -1514,7 +1775,7 @@ export async function POST(request: NextRequest) {
 
     const company = await findCompany(query);
     const facts = await fetchCompanyFacts(company.cik);
-    const ctx = buildFactContext(facts);
+    const ctx = buildFactContext(facts, company);
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Historicals Solver";
@@ -1556,6 +1817,8 @@ export async function POST(request: NextRequest) {
     }
     const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
     const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods) : [];
+    const profile = detectTemplateProfile(workbook, sheet, ctx);
+    const normalizedPackage = buildNormalizedHistoricalsPackage(company, profile, periods, ctx, segmentRevenue);
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
 
@@ -1564,6 +1827,7 @@ export async function POST(request: NextRequest) {
     const llmState = createLlmMappingState();
     let filledCells = 0;
     let commentsAdded = 0;
+    warnings.push(...normalizedPackage.diagnostics.filter((item) => item.severity !== "info").map((item) => `${item.layer}: ${item.message}`));
 
     const cleanupResult = cleanStaleProtectedHistoricalRows(sheet, fillRows, periods, columns, ctx, auditRows);
     filledCells += cleanupResult.clearedCells;
@@ -1602,19 +1866,28 @@ export async function POST(request: NextRequest) {
         const cell = sheet.getCell(effectiveFillRow.row, col);
         const writeDecision = historicalWriteDecision(effectiveFillRow, cell);
         if (!writeDecision.writable) {
+          const formulaUpdate = preservedHistoricalFormulaUpdate(effectiveFillRow, cell, period, periods, columns, index, ctx);
+          if (formulaUpdate) {
+            cell.value = { formula: formulaUpdate.formula, result: formulaUpdate.value };
+            filledCells += 1;
+            addComment(cell, formulaUpdate.comment);
+            commentsAdded += 1;
+            auditRows.push(formulaUpdate.auditRow);
+            continue;
+          }
           if (shouldAuditSkippedWrite(writeDecision)) {
             auditRows.push(skippedMappingAuditRow(sheet, cell, effectiveFillRow, period, writeDecision));
           }
           continue;
         }
 
-        let resolved = resolveRow(effectiveFillRow, period, ctx);
+        let resolved = resolveRowFromPackage(effectiveFillRow, period, normalizedPackage) ?? resolveRow(effectiveFillRow, period, ctx);
         if (resolved.value === null && effectiveFillRow === fillRow && fillRow.classification === "unused") {
           const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState);
           if (llmFillRow) {
             effectiveFillRow = llmFillRow;
             rowNotes.add(llmFillRow.comment || "LLM-assisted EDGAR concept mapping was applied after deterministic row matching did not find a value.");
-            resolved = resolveRow(effectiveFillRow, period, ctx);
+            resolved = resolveRowFromPackage(effectiveFillRow, period, normalizedPackage) ?? resolveRow(effectiveFillRow, period, ctx);
           }
         }
 
@@ -1707,7 +1980,7 @@ export async function POST(request: NextRequest) {
     restoreWorkbookLabels(workbook, workbookSnapshot);
     clearStaleFormulaErrorResults(workbook);
 
-    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name);
+    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
@@ -1721,6 +1994,8 @@ export async function POST(request: NextRequest) {
       JSON.stringify({
         companyName: company.title,
         ticker: company.ticker,
+        templateProfile: profile.kind,
+        templateProfileConfidence: profile.confidence,
         periods,
         filledCells,
         commentsAdded,
@@ -1825,7 +2100,7 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[]):
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
       const html = await fetch(url, { headers: { ...SEC_HEADERS, Accept: "text/html" } }).then((res) => (res.ok ? res.text() : ""));
       if (!html) continue;
-      mergeInlineFacts(html, filing, wanted, { duration, instant });
+      mergeInlineFacts(html, filing, wanted, { duration, instant }, url);
     } catch {
       // Inline facts are a supplement to SEC companyfacts; keep filling with the facts already available.
     }
@@ -1869,7 +2144,7 @@ function collectFilingRefs(source: any, filings: FilingRef[]) {
   });
 }
 
-function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext) {
+function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext, sourceUrl = "") {
   const contexts = parseInlineContexts(html);
   for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
     const attrs = match[1];
@@ -1889,6 +2164,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
       concept,
       label: concept,
       value,
+      sourceUrl,
       form: filing.form,
       filed: filing.filingDate,
       accn: filing.accessionNumber,
@@ -2208,7 +2484,7 @@ function segmentSort(a: string, b: string) {
   return (order.indexOf(a) === -1 ? 99 : order.indexOf(a)) - (order.indexOf(b) === -1 ? 99 : order.indexOf(b));
 }
 
-function buildFactContext(payload: any): ResolveContext {
+function buildFactContext(payload: any, company?: CompanyMatch): ResolveContext {
   const taxonomies = Object.values(payload?.facts ?? {}) as any[];
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
@@ -2229,6 +2505,7 @@ function buildFactContext(payload: any): ResolveContext {
           concept,
           label,
           value: fact.val,
+          sourceUrl: sourceUrlForAccession(company?.cik ?? payload?.cik, fact.accn),
           form: fact.form,
           fp: fact.fp,
           filed: fact.filed,
@@ -2256,6 +2533,11 @@ function buildFactContext(payload: any): ResolveContext {
   deriveQuarterlies(duration, cumulativeDuration, annualDuration);
 
   return { duration, instant };
+}
+
+function sourceUrlForAccession(cik: string | number | undefined, accn?: string) {
+  if (!cik || !accn) return "";
+  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accn.replace(/-/g, "")}/`;
 }
 
 function setSource(map: Map<string, Map<string, FactSource>>, period: string, concept: string, source: FactSource) {
@@ -2319,6 +2601,8 @@ function deriveQuarterlies(
     const year = period.slice(2);
     for (const [concept, annual] of annualFacts.entries()) {
       if (!canDeriveQuarterlyConcept(concept)) continue;
+      const existingQuarter = duration.get(period)?.get(concept);
+      if (existingQuarter && existingQuarter.derivedTotalValue === undefined && isQuarterDurationSource(existingQuarter)) continue;
       const nineMonth = cumulativeDuration.get(`3Q${year}`)?.get(concept);
       const q1 = duration.get(`1Q${year}`)?.get(concept);
       const q2 = duration.get(`2Q${year}`)?.get(concept);
@@ -2326,6 +2610,7 @@ function deriveQuarterlies(
       const firstNineMonths = nineMonth?.value ?? (q1 && q2 && q3 ? q1.value + q2.value + q3.value : null);
       if (firstNineMonths === null) continue;
       setSource(duration, period, concept, {
+        ...annual,
         concept,
         label: `${annual.label} (derived Q4)`,
         value: annual.value - firstNineMonths,
@@ -2335,6 +2620,11 @@ function deriveQuarterlies(
       });
     }
   }
+}
+
+function isQuarterDurationSource(source: FactSource) {
+  if (!source.start || !source.end || !["Q1", "Q2", "Q3", "Q4"].includes(source.fp ?? "")) return false;
+  return factDurationDays({ start: source.start, end: source.end } as SecFact) <= 115;
 }
 
 function canDeriveQuarterlyConcept(concept: string) {
@@ -2741,19 +3031,32 @@ function preservedHistoricalFormulaUpdate(
   if (existingValue !== null && Math.abs(existingValue - value) < 0.05) return null;
   const formula = derivedHistoricalBridgeFormula(fillRow, resolved, periods, columns, periodIndex);
   if (!formula) return null;
+  const styledFormula = preserveBridgeFormulaStyle(cellFormula(cell) ?? "", formula);
   const auditNote = auditNoteForResolvedValue(fillRow, resolved);
   const comment = mappingComment(fillRow, resolved, period, value, "high", auditNote);
   return {
-    formula,
+    formula: styledFormula,
     value,
     comment,
     auditRow: {
       ...mappingAuditRow(cell.worksheet, cell, fillRow, period, value, resolved, "high", auditNote),
       formulaPreserved: true,
+      formulaStatus: "formula bridge updated",
       writeBlockedReason: "existing formula bridge updated with EDGAR annual total",
       notes: [auditNote, "Updated the preserved formula's annual bridge constant from EDGAR so the model formula still drives the quarter."].filter(Boolean).join(" ")
     }
   };
+}
+
+function preserveBridgeFormulaStyle(originalFormula: string, updatedFormula: string) {
+  const original = originalFormula.replace(/^=/, "").trim();
+  let output = updatedFormula;
+  if (/^\+-/.test(original) && /^-/.test(output)) output = `+${output}`;
+  else if (/^\+/.test(original) && !/^\+/.test(output)) output = `+${output}`;
+  if (/^\(.+-SUM\([A-Z]+\d+:[A-Z]+\d+\)\)$/i.test(original) && !/^\(.+\)$/.test(output)) {
+    output = `(${output})`;
+  }
+  return output;
 }
 
 function isHistoricalFormulaBridge(period: string, cell: ExcelJS.Cell) {
@@ -2767,7 +3070,7 @@ function derivedHistoricalBridgeFormula(fillRow: FillRow, resolved: ResolvedValu
   const priorIndexes = source.derivedPriorPeriods.map((priorPeriod) => periods.indexOf(priorPeriod));
   if (!priorIndexes.every((index) => index >= 0 && index < periodIndex)) return null;
   const priorColumns = priorIndexes.map((index) => columns[index]);
-  const total = roundModelValue(signedAnnualBridgeTotal(source.derivedTotalValue, fillRow, resolved) / (fillRow.scale ?? 1));
+  const total = signedAnnualBridgeTotal(source.derivedTotalValue, fillRow, resolved) / (fillRow.scale ?? 1);
   return `${formatDividendFormulaNumber(total)}-SUM(${columnLetter(Math.min(...priorColumns))}${fillRow.row}:${columnLetter(Math.max(...priorColumns))}${fillRow.row})`;
 }
 
@@ -3632,7 +3935,7 @@ function formulaBridgeForTargetValue(cell: ExcelJS.Cell, targetValue: number) {
   for (let col = Math.min(startCol, endCol); col <= Math.max(startCol, endCol); col += 1) {
     priorSum += numericCellValue(cell.worksheet.getCell(startRow, col)) ?? 0;
   }
-  const bridgeTotal = roundModelValue(targetValue + priorSum);
+  const bridgeTotal = targetValue + priorSum;
   return `${formatDividendFormulaNumber(bridgeTotal)}-SUM(${columnLetter(Math.min(startCol, endCol))}${startRow}:${columnLetter(Math.max(startCol, endCol))}${endRow})`;
 }
 
@@ -4382,15 +4685,22 @@ function mappingAuditRow(
     sheetName: sheet.name,
     cell: cell.address,
     modelRowLabel: fillRow.label,
+    section: fillRow.modelContext?.sectionHeader ?? "",
     period,
     valueWritten,
     mappingType: resolved.classification || fillRow.classification,
     conceptsUsed: resolved.sources.map((source) => `${source.concept}=${roundModelValue(source.value / (fillRow.scale ?? 1))}mm`).join("; "),
+    secLabels: unique(resolved.sources.map((source) => source.label).filter(Boolean)).join("; "),
     sourceStatement: fillRow.statement,
     accession: unique(resolved.sources.map((source) => source.accn).filter(Boolean)).join("; "),
-    sourceUrl: "",
+    sourceUrl: unique(resolved.sources.map((source) => source.sourceUrl).filter(Boolean)).join("; "),
+    filingForm: unique(resolved.sources.map((source) => source.form).filter(Boolean)).join("; "),
+    filedDate: unique(resolved.sources.map((source) => source.filed).filter(Boolean)).join("; "),
+    startDate: unique(resolved.sources.map((source) => source.start).filter(Boolean)).join("; "),
+    endDate: unique(resolved.sources.map((source) => source.end).filter(Boolean)).join("; "),
     cellWritable: true,
     formulaPreserved: false,
+    formulaStatus: "not a formula cell",
     writeBlockedReason: "",
     signConvention: fillRow.sign === -1 ? "inverted to match model sign convention" : "copied",
     confidence,
@@ -4404,15 +4714,22 @@ function skippedMappingAuditRow(sheet: ExcelJS.Worksheet, cell: ExcelJS.Cell, fi
     sheetName: sheet.name,
     cell: cell.address,
     modelRowLabel: fillRow.label,
+    section: fillRow.modelContext?.sectionHeader ?? "",
     period,
     valueWritten: numericCellValue(cell) ?? 0,
-    mappingType: decision.formulaPreserved ? "formula" : "unused",
+    mappingType: decision.formulaPreserved ? "formula preserved" : "skipped",
     conceptsUsed: fillRow.concepts?.join("; ") ?? "",
+    secLabels: "",
     sourceStatement: fillRow.statement,
     accession: "",
     sourceUrl: "",
+    filingForm: "",
+    filedDate: "",
+    startDate: "",
+    endDate: "",
     cellWritable: false,
     formulaPreserved: decision.formulaPreserved,
+    formulaStatus: decision.formulaPreserved ? "preserved" : "not written",
     writeBlockedReason: decision.reason ?? "not writable",
     signConvention: "not written",
     confidence: "low",
@@ -4434,15 +4751,22 @@ function mappingAuditRowForSegment(
     sheetName: sheet.name,
     cell: cell.address,
     modelRowLabel: modelLabel,
+    section: "Segment Analysis",
     period,
     valueWritten,
     mappingType: "segment",
     conceptsUsed: resolved.sources.map((source) => `${source.label} ${suffix}=${valueWritten}mm`).join("; "),
+    secLabels: unique(resolved.sources.map((source) => source.label).filter(Boolean)).join("; "),
     sourceStatement: "segment",
     accession: unique(resolved.sources.map((source) => source.accn).filter(Boolean)).join("; "),
-    sourceUrl: "",
+    sourceUrl: unique(resolved.sources.map((source) => source.sourceUrl).filter(Boolean)).join("; "),
+    filingForm: unique(resolved.sources.map((source) => source.form).filter(Boolean)).join("; "),
+    filedDate: unique(resolved.sources.map((source) => source.filed).filter(Boolean)).join("; "),
+    startDate: unique(resolved.sources.map((source) => source.start).filter(Boolean)).join("; "),
+    endDate: unique(resolved.sources.map((source) => source.end).filter(Boolean)).join("; "),
     cellWritable: true,
     formulaPreserved: false,
+    formulaStatus: "not a formula cell",
     writeBlockedReason: "",
     signConvention: "copied",
     confidence: "high",
@@ -4457,7 +4781,8 @@ function validateWorkbookBeforeReturn(
   columns: number[],
   ctx: ResolveContext,
   warnings: string[],
-  modelSheetName = MODEL_SHEET
+  modelSheetName = MODEL_SHEET,
+  profile: TemplateProfile = { kind: "generic", confidence: "low", rationale: [], sheetName: modelSheetName, hasSegmentAnalysis: Boolean(workbook.getWorksheet(SEGMENT_SHEET)) }
 ) {
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
@@ -4465,13 +4790,31 @@ function validateWorkbookBeforeReturn(
     const segmentEvaluator = new FormulaEvaluator(segmentSheet);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
     errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings));
+    errors.push(
+      ...validateSegmentStatementTieOut(
+        segmentSheet,
+        periods,
+        columns,
+        ctx,
+        segmentEvaluator,
+        warnings,
+        "operating income",
+        "Total Company Operating Income",
+        "Operating Income Check",
+        "Operating Income",
+        C.operatingIncome
+      )
+    );
+    errors.push(
+      ...validateSegmentStatementTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings, "D&A", "Total D&A", "D&A Check", "D&A", C.da)
+    );
   }
   if (modelSheetName !== MODEL_SHEET) return errors;
 
   const modelSheet = workbook.getWorksheet(modelSheetName) ?? workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
-    errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings));
+    errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings, profile));
     errors.push(...validateBalanceSheetStatementTotals(modelSheet, periods, columns, ctx, evaluator, warnings));
     errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
 
@@ -4739,22 +5082,39 @@ function validateIncomeStatementKeyMetrics(
   columns: number[],
   ctx: ResolveContext,
   evaluator: FormulaEvaluator,
-  warnings: string[]
+  warnings: string[],
+  profile: TemplateProfile
 ) {
   const errors: string[] = [];
-  errors.push(
-    ...validateIncomeStatementMetricAgainstEdgar(
-      sheet,
-      periods,
-      columns,
-      ctx,
-      evaluator,
-      warnings,
-      "Revenue",
-      ["Revenue", "Revenues", "Total Revenue", "Total Revenues"],
-      C.revenue
-    )
-  );
+  if (profile.kind === "financial_company" && hasAnyConcept(ctx, "duration", C.netRevenue)) {
+    errors.push(
+      ...validateIncomeStatementMetricAgainstEdgar(
+        sheet,
+        periods,
+        columns,
+        ctx,
+        evaluator,
+        warnings,
+        "net revenue",
+        ["Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense", "Total Net Revenue"],
+        C.netRevenue
+      )
+    );
+  } else {
+    errors.push(
+      ...validateIncomeStatementMetricAgainstEdgar(
+        sheet,
+        periods,
+        columns,
+        ctx,
+        evaluator,
+        warnings,
+        "Revenue",
+        ["Revenue", "Revenues", "Total Revenue", "Total Revenues"],
+        C.revenue
+      )
+    );
+  }
   errors.push(
     ...validateIncomeStatementMetricAgainstEdgar(
       sheet,
@@ -5125,8 +5485,7 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
   void cell;
-  void expected;
-  void actual;
+  if (actual && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
   return false;
 }
 
@@ -5534,6 +5893,60 @@ function validateSegmentRevenueTieOut(
   return errors;
 }
 
+function validateSegmentStatementTieOut(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[],
+  metricName: string,
+  totalLabel: string,
+  endLabel: string,
+  suffix: string,
+  concepts: string[]
+) {
+  const errors: string[] = [];
+  const totalRow = findLabelRow(sheet, totalLabel);
+  const rows = segmentMetricRows(sheet, totalLabel, endLabel, columns).filter((rowNumber) => {
+    const label = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
+    return !isGenericSegmentPlaceholder(label);
+  });
+  if (!totalRow || !rows.length) return errors;
+
+  periods.forEach((period, index) => {
+    const edgarValue = first(period, ctx.duration, concepts);
+    if (!edgarValue) {
+      warnings.unshift(`${sheet.name} ${period}: ${metricName} tie-out skipped because EDGAR ${concepts.join("/")} was unavailable.`);
+      return;
+    }
+    const col = columns[index];
+    const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
+    const totalCell = sheet.getCell(totalRow, col);
+    const sheetTotal = evaluator.evaluateCell(totalCell);
+    const expected = edgarValue.value / 1_000_000;
+
+    if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, segmentTotal)) {
+      const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but detail rows sum to ${roundModelValue(segmentTotal)}.`;
+      if (hasFormula(totalCell)) warnings.unshift(message);
+      else errors.push(message);
+    }
+    if (!segmentStatementMetricTies(segmentTotal, expected)) {
+      const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} rows sum to ${roundModelValue(segmentTotal)}, but EDGAR is ${roundModelValue(expected)}.`;
+      if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
+      else errors.push(message);
+    }
+    if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, expected)) {
+      const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but EDGAR is ${roundModelValue(expected)}.`;
+      if (hasFormula(totalCell)) warnings.unshift(message);
+      else errors.push(message);
+    }
+  });
+
+  return errors;
+}
+
 function numericCellValue(cell: ExcelJS.Cell) {
   const value = cell.value;
   if (typeof value === "number") return value;
@@ -5549,15 +5962,22 @@ function addMappingAuditSheet(workbook: ExcelJS.Workbook, auditRows: MappingAudi
     { header: "workbook sheet", key: "sheetName", width: 24 },
     { header: "cell/range", key: "cell", width: 12 },
     { header: "model row label", key: "modelRowLabel", width: 36 },
+    { header: "section", key: "section", width: 28 },
     { header: "period", key: "period", width: 12 },
     { header: "value written", key: "valueWritten", width: 16 },
     { header: "mapping type", key: "mappingType", width: 16 },
     { header: "EDGAR concepts used", key: "conceptsUsed", width: 60 },
+    { header: "SEC label(s)", key: "secLabels", width: 44 },
     { header: "source statement/table", key: "sourceStatement", width: 24 },
     { header: "accession", key: "accession", width: 24 },
     { header: "source URL", key: "sourceUrl", width: 24 },
+    { header: "filing form", key: "filingForm", width: 14 },
+    { header: "filed date", key: "filedDate", width: 14 },
+    { header: "start date", key: "startDate", width: 14 },
+    { header: "end date", key: "endDate", width: 14 },
     { header: "cell writable", key: "cellWritable", width: 14 },
     { header: "formula preserved", key: "formulaPreserved", width: 18 },
+    { header: "formula status", key: "formulaStatus", width: 22 },
     { header: "write blocked reason", key: "writeBlockedReason", width: 28 },
     { header: "sign convention", key: "signConvention", width: 28 },
     { header: "confidence", key: "confidence", width: 12 },

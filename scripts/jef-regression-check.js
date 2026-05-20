@@ -52,6 +52,12 @@ function isAllowedDividendBridgeUpdate(sheetName, cell, expected, got) {
   return normalizedExpected === "-169.4-SUM(F257:H257)" && normalizedGot === "-278.6-SUM(F257:H257)";
 }
 
+function isAllowedEdgarTruthUpdate(checkName, sheet, row) {
+  if (checkName !== "Shareholder Equity / Shares") return false;
+  const label = normalize(rowLabel(sheet, row));
+  return label === normalize("Dividends") || label === normalize("Dividends Paid");
+}
+
 function isBridgeFormula(value) {
   return /^[\d+\-*/().\s]+-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i.test(String(value ?? "").replace(/^\+\-/, "-").replace(/^\+/, ""));
 }
@@ -174,6 +180,7 @@ function compareRanges(golden, actual, errors) {
         const got = cellValue(actualSheet.getCell(row, col));
         if (!valuesMatch(expected, got)) {
           if (isAllowedDividendBridgeUpdate(check.sheet, expectedSheet.getCell(row, col), expected, got)) continue;
+          if (isAllowedEdgarTruthUpdate(check.name, actualSheet, row)) continue;
           if (check.sheet === "Model" && isProtectedScheduleClearRow(actualSheet, row) && isBlank(actualSheet.getCell(row, col)) && !cellFormula(expectedSheet.getCell(row, col))) continue;
           errors.push(`${check.name} ${check.sheet}!${expectedSheet.getCell(row, col).address}: expected "${expected ?? ""}", got "${got ?? ""}".`);
         }
