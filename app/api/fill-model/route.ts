@@ -432,17 +432,6 @@ const ACQUISITION_CONCEPTS = [
   "PaymentsForProceedsFromOtherInvestingActivities"
 ];
 
-const SEGMENT_REVENUE_CONCEPTS = [
-  "RevenueFromContractWithCustomerExcludingAssessedTax",
-  "Revenues",
-  "SalesRevenueNet",
-  "NetSales",
-  "SalesRevenueGoodsNet",
-  "SalesRevenueServicesNet",
-  "OperatingLeasesIncomeStatementLeaseRevenue",
-  "RealEstateRevenueNet"
-];
-
 function row(
   rowNumber: number,
   label: string,
@@ -1355,6 +1344,9 @@ function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext
 }
 
 function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const directOtherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
+  if (directOtherCurrent.value !== null) return directOtherCurrent;
+
   const liabilities = first(period, ctx.instant, C.liabilities);
   const shortTermBorrowings = first(period, ctx.instant, ["OtherShortTermBorrowings", "ShortTermBorrowings"]) ?? zeroSource("ShortTermBorrowings");
   const accountsPayable = resolveAccountsPayable(period, ctx);
@@ -1372,8 +1364,6 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
   }
   const brokerDealerLiabilities = sumWithNote(period, ctx.instant, BROKER_DEALER_OTHER_CURRENT_LIABILITIES, "Included broker-dealer current liability concepts reported in the SEC filing.");
   if (brokerDealerLiabilities.value !== null) return brokerDealerLiabilities;
-  const directOtherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
-  if (directOtherCurrent.value !== null) return directOtherCurrent;
   return difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.");
 }
 
@@ -1393,21 +1383,31 @@ function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContex
 }
 
 function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = first(period, ctx.instant, ["OtherLiabilitiesNoncurrent", "ContractWithCustomerLiabilityNoncurrent"]);
+  const liabilities = first(period, ctx.instant, C.liabilities);
+  const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
+  const debt = resolveLongTermDebtInclCurrentPortion(period, ctx);
+  const dtl = first(period, ctx.instant, C.deferredTaxLiability) ?? zeroSource("DeferredTaxLiabilitiesNoncurrent");
+  const nci = first(period, ctx.instant, C.nci) ?? zeroSource("NoncontrollingInterestInConsolidatedEntity");
+  if (liabilities && currentLiabilities && debt.value !== null) {
+    return {
+      value: liabilities.value - currentLiabilities.value - debt.value - Math.max(dtl.value, 0) - nci.value,
+      sources: compactSources([liabilities, currentLiabilities, debt, dtl, nci]),
+      note: "Derived from SEC total liabilities less current liabilities, long-term debt, deferred tax liabilities, and noncontrolling interests."
+    };
+  }
+
+  const direct = sum(period, ctx.instant, ["OtherLiabilitiesNoncurrent", "OperatingLeaseLiabilityNoncurrent", "ContractWithCustomerLiabilityNoncurrent"]);
   if (direct) {
     return {
       value: direct.value,
-      sources: [direct],
+      sources: direct.sources,
       note: "Mapped to a direct SEC other non-current liability concept when reported."
     };
   }
 
-  const assets = first(period, ctx.instant, C.assets);
   const currentLiabExDebt = difference(period, ctx.instant, C.currentLiabilities, [C.currentDebt], "");
-  const debt = sum(period, ctx.instant, C.totalDebt);
-  const dtl = first(period, ctx.instant, C.deferredTaxLiability) ?? zeroSource("DeferredTaxLiabilitiesNoncurrent");
   const equity = first(period, ctx.instant, C.equity);
-  const nci = first(period, ctx.instant, C.nci) ?? zeroSource("NoncontrollingInterestInConsolidatedEntity");
+  const assets = first(period, ctx.instant, C.assets);
   if (!assets || currentLiabExDebt.value === null || !equity) {
     return { value: null, sources: [], note: "Could not calculate other non-current liabilities because assets, liabilities, or equity were unavailable." };
   }
@@ -1656,9 +1656,6 @@ export async function POST(request: NextRequest) {
       warnings.push(...segmentResult.warnings);
     } else {
       warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; segment revenue formulas were left untouched.`);
-    }
-
-    if (isStandardModelSheet) {
     }
 
     for (const fillRow of fillRows) {
@@ -2869,7 +2866,7 @@ function fillSegmentAnalysis(
   const warnings: string[] = [];
   let filledCells = 0;
   let commentsAdded = 0;
-  const revenueConcepts = usesServiceLineSegments(segments) ? SEGMENT_REVENUE_CONCEPTS : C.revenue;
+  const revenueConcepts = C.revenue;
   const fallbackRevenue = periods.map((period) => first(period, ctx.duration, revenueConcepts)?.value ?? 0);
   const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns).slice(0, 6);
   const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns).slice(0, 6);
@@ -2909,16 +2906,12 @@ function fillSegmentAnalysis(
   filledCells += revenueReconciliation.filledCells + operatingIncomeReconciliation.filledCells;
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings);
-  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows);
-  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows);
+  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue);
+  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
   filledCells += restoreSegmentCheckFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
 
   return { filledCells, commentsAdded, warnings };
-}
-
-function usesServiceLineSegments(segments: SegmentRevenue[]) {
-  return segments.some((segment) => /^(Collection|Landfill|Environmental Solutions|Transfer|Other|Professional Services and Other)$/i.test(segment.label));
 }
 
 function fillSegmentTotalRow(
@@ -2928,7 +2921,9 @@ function fillSegmentTotalRow(
   segments: SegmentRevenue[],
   metric: "values" | "operatingIncome" | "depreciationAmortization",
   label: string,
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  ctx?: ResolveContext,
+  statementConcepts: string[] = []
 ) {
   const rowNumber = findLabelRow(sheet, label);
   if (!rowNumber) return 0;
@@ -2938,7 +2933,11 @@ function fillSegmentTotalRow(
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
     if (!isHardcodedFinancialInput(cell)) return;
     const col = columns[periodIndex];
-    const value = segmentTotalFromModelRows(sheet, rowNumber, col, label) ?? segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
+    const statementSource = ctx && statementConcepts.length ? first(period, ctx.duration, statementConcepts) : null;
+    const value =
+      statementSource?.value !== undefined
+        ? statementSource.value / 1_000_000
+        : segmentTotalFromModelRows(sheet, rowNumber, col, label) ?? segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
     cell.value = value;
     filledCells += 1;
     auditRows.push({
@@ -2948,9 +2947,9 @@ function fillSegmentTotalRow(
       period,
       valueWritten: value,
       mappingType: "calculated",
-      conceptsUsed: `Sum of EDGAR reportable segment ${metric} rows`,
-      sourceStatement: "segment",
-      accession: "",
+      conceptsUsed: statementSource?.concept ?? `Sum of EDGAR reportable segment ${metric} rows`,
+      sourceStatement: statementSource ? "income" : "segment",
+      accession: statementSource?.accn ?? "",
       sourceUrl: "",
       cellWritable: true,
       formulaPreserved: false,
@@ -2958,7 +2957,9 @@ function fillSegmentTotalRow(
       signConvention: "copied",
       confidence: "high",
       validationStatus: "not_run",
-      notes: `Rebuilt ${label} because the Segment Analysis total cell did not contain a formula.`
+      notes: statementSource
+        ? `Rebuilt ${label} from consolidated EDGAR ${label.toLowerCase()} because the Segment Analysis total cell did not contain a formula.`
+        : `Rebuilt ${label} because the Segment Analysis total cell did not contain a formula.`
     });
   });
 
@@ -3678,11 +3679,157 @@ function reconcileBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[],
   return { filledCells, commentsAdded, warnings };
 }
 
+function reconcileBalanceSheetStatementTotalsToEdgar(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const evaluator = new FormulaEvaluator(sheet);
+
+  const metrics = [
+    {
+      name: "total assets",
+      labels: ["Total Assets"],
+      concepts: C.assets,
+      residualLabels: [
+        "Other Non-Current Assets",
+        "Other Long-Term Assets",
+        "Other LT Assets",
+        "Prepaid & Other Current Assets",
+        "Prepaid and Other Current Assets",
+        "Other Current Assets",
+        "Other Assets and Loans"
+      ]
+    },
+    {
+      name: "total liabilities",
+      labels: ["Total Liabilities"],
+      concepts: C.liabilities,
+      residualLabels: [
+        "Other Non-Current Liabilities",
+        "Other Current Liabilities",
+        "Other Liabilities",
+        "Accounts Payable and Accrued Liabilities",
+        "Accounts Payable & Accrued Liabilities",
+        "Accrued Liabilities"
+      ]
+    },
+    {
+      name: "shareholders' equity",
+      labels: [
+        "Total Shareholder's Equity",
+        "Total Shareholders' Equity",
+        "Total Shareholders Equity",
+        "Total Stockholders' Equity",
+        "Total Stockholders Equity",
+        "Total Equity"
+      ],
+      concepts: C.equity,
+      residualLabels: ["Accumulated Other Comprehensive Income (AOCI)", "AOCI", "Noncontrolling Interests", "Non-Controlling Interests", "Retained Earnings"]
+    }
+  ];
+
+  for (const metric of metrics) {
+    const totalRow = findRowInSection(sheet, "Balance Sheet", metric.labels, (label) =>
+      /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+    );
+    if (!totalRow) continue;
+    const residualRows = findBalanceSheetResidualRowsBefore(sheet, totalRow, metric.residualLabels);
+
+    periods.forEach((period, index) => {
+      const source = first(period, ctx.instant, metric.concepts);
+      if (!source) return;
+      const col = columns[index];
+      const totalCell = sheet.getCell(totalRow, col);
+      const expected = source.value / 1_000_000;
+      const actual = statementMetricCellValue(totalCell, evaluator, expected);
+      if (actual === null || statementMetricTies(actual, expected)) return;
+
+      if (!hasFormula(totalCell) && isHardcodedFinancialInput(totalCell)) {
+        totalCell.value = expected;
+        evaluator.clear();
+        filledCells += 1;
+        const note = `Mapped directly to EDGAR ${metric.name} because the balance-sheet total cell was hardcoded.`;
+        addComment(totalCell, note);
+        commentsAdded += 1;
+        auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
+        return;
+      }
+
+      const residualRow = findWritableBalanceSheetResidualRow(sheet, residualRows, col);
+      if (!residualRow) {
+        warnings.push(`Balance Sheet ${period}: ${metric.name} does not tie to EDGAR and no writable residual row was available.`);
+        return;
+      }
+
+      const residualCell = sheet.getCell(residualRow, col);
+      const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
+      residualCell.value = value;
+      evaluator.clear();
+      filledCells += 1;
+      const note = `Calculated as the residual needed for balance-sheet ${metric.name} to tie to EDGAR.`;
+      addComment(residualCell, note);
+      commentsAdded += 1;
+      auditRows.push(statementTotalAuditRow(sheet, residualCell, rowLabel(sheet, residualRow), period, value, source, "balance", note, "residual"));
+    });
+  }
+
+  return { filledCells, commentsAdded, warnings };
+}
+
+function statementTotalAuditRow(
+  sheet: ExcelJS.Worksheet,
+  cell: ExcelJS.Cell,
+  label: string,
+  period: string,
+  value: number,
+  source: FactSource,
+  sourceStatement: string,
+  note: string,
+  signConvention = "copied"
+): MappingAuditRow {
+  return {
+    sheetName: sheet.name,
+    cell: cell.address,
+    modelRowLabel: label,
+    period,
+    valueWritten: value,
+    mappingType: "calculated",
+    conceptsUsed: source.concept,
+    sourceStatement,
+    accession: source.accn ?? "",
+    sourceUrl: "",
+    cellWritable: true,
+    formulaPreserved: false,
+    writeBlockedReason: "",
+    signConvention,
+    confidence: signConvention === "residual" ? "medium" : "high",
+    validationStatus: "OK!",
+    notes: note
+  };
+}
+
 function findBalanceSheetResidualRows(sheet: ExcelJS.Worksheet, checkRow: number, labels: string[]) {
   const wanted = new Set(labels.map(normalize));
   const rows: number[] = [];
   for (let rowNumber = checkRow - 1; rowNumber >= Math.max(1, checkRow - 45); rowNumber -= 1) {
     if (wanted.has(normalize(rowLabel(sheet, rowNumber)))) rows.push(rowNumber);
+  }
+  return rows;
+}
+
+function findBalanceSheetResidualRowsBefore(sheet: ExcelJS.Worksheet, totalRow: number, labels: string[]) {
+  const wanted = new Set(labels.map(normalize));
+  const rows: number[] = [];
+  for (let rowNumber = totalRow - 1; rowNumber >= Math.max(1, totalRow - 60); rowNumber -= 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (/income statement|cash flow statement|cashflow statement|working capital|schedule|analysis|drivers/i.test(label)) break;
+    if (wanted.has(normalize(label))) rows.push(rowNumber);
   }
   return rows;
 }
@@ -4230,7 +4377,7 @@ function validateWorkbookBeforeReturn(
   if (segmentSheet) {
     const segmentEvaluator = new FormulaEvaluator(segmentSheet);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
-    warnings.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
+    errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
   }
   if (modelSheetName !== MODEL_SHEET) return errors;
 
@@ -4238,7 +4385,8 @@ function validateWorkbookBeforeReturn(
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings));
-    warnings.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
+    errors.push(...validateBalanceSheetStatementTotals(modelSheet, periods, columns, ctx, evaluator, warnings));
+    errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
 
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
     if (interestExpenseRow) {
@@ -4661,6 +4809,97 @@ function findPriorLabelRow(sheet: ExcelJS.Worksheet, startRow: number, label: st
     if (normalize(rowLabel(sheet, rowNumber)) === wanted) return rowNumber;
   }
   return null;
+}
+
+function validateBalanceSheetStatementTotals(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  errors.push(
+    ...validateBalanceSheetMetricAgainstEdgar(sheet, periods, columns, ctx, evaluator, warnings, "total assets", ["Total Assets"], C.assets)
+  );
+  errors.push(
+    ...validateBalanceSheetMetricAgainstEdgar(sheet, periods, columns, ctx, evaluator, warnings, "total liabilities", ["Total Liabilities"], C.liabilities)
+  );
+  errors.push(
+    ...validateBalanceSheetMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "shareholders' equity",
+      [
+        "Total Shareholder's Equity",
+        "Total Shareholders' Equity",
+        "Total Shareholders Equity",
+        "Total Stockholders' Equity",
+        "Total Stockholders Equity",
+        "Total Equity"
+      ],
+      C.equity
+    )
+  );
+  errors.push(
+    ...validateBalanceSheetMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "total liabilities plus shareholders' equity",
+      ["Total Liabilities & Shareholder's Equity", "Total Liabilities and Shareholder's Equity"],
+      C.assets
+    )
+  );
+  return errors;
+}
+
+function validateBalanceSheetMetricAgainstEdgar(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[],
+  metricName: string,
+  labels: string[],
+  concepts: string[]
+) {
+  const errors: string[] = [];
+  const rowNumber = findRowInSection(sheet, "Balance Sheet", labels, (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  if (!rowNumber) return errors;
+
+  periods.forEach((period, index) => {
+    const edgarValue = first(period, ctx.instant, concepts);
+    if (!edgarValue) {
+      warnings.unshift(`Balance Sheet ${period}: ${metricName} tie-out skipped because EDGAR ${concepts.join("/")} was unavailable for that period.`);
+      return;
+    }
+
+    const cell = sheet.getCell(rowNumber, columns[index]);
+    const expected = edgarValue.value / 1_000_000;
+    const modelValue = statementMetricCellValue(cell, evaluator, expected);
+    if (modelValue === null) {
+      errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`);
+      return;
+    }
+
+    if (!statementMetricTies(modelValue, expected)) {
+      errors.push(`Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`);
+    }
+  });
+
+  return errors;
 }
 
 function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], evaluator: FormulaEvaluator) {
@@ -5187,9 +5426,22 @@ function validateSegmentRevenueTieOut(
     const col = columns[index];
     const segmentTotal = rows.reduce((total, rowNumber) => total + (numericCellValue(sheet.getCell(rowNumber, col)) ?? 0), 0);
     const sheetTotal = evaluator.evaluateCell(sheet.getCell(totalRow, col));
+    const edgarRevenue = first(period, ctx.duration, C.revenue);
+    const expectedRevenue = edgarRevenue ? edgarRevenue.value / 1_000_000 : null;
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, segmentTotal)) {
       errors.push(
         `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`
+      );
+    }
+    if (expectedRevenue === null) return;
+    if (!segmentModelRevenueTies(segmentTotal, expectedRevenue)) {
+      errors.push(
+        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`
+      );
+    }
+    if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, expectedRevenue)) {
+      errors.push(
+        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue evaluates to ${roundModelValue(sheetTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`
       );
     }
   });
