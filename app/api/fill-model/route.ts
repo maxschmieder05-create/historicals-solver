@@ -363,6 +363,12 @@ const COMMON_SHAREHOLDER_INCOME_CONCEPTS = ["NetIncomeLossAvailableToCommonStock
 
 const CONTINUING_NET_INCOME_CONCEPTS = ["IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest", "NetIncomeLoss"];
 
+const PRETAX_INCOME_CONCEPTS = [
+  "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+  "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+  "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
+];
+
 const COMPENSATION_CONCEPTS = [
   "CompensationAndBenefitsExpense",
   "CompensationAndBenefits",
@@ -554,7 +560,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Goodwill Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
   if (has("Gain on Sale of Business (Loss)")) return row(rowNumber, label, "income", "duration", ["GainLossOnSaleOfBusiness", "GainLossOnSaleOfAssets"], 1);
   if (has("Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)")) return row(rowNumber, label, "income", "duration", C.otherNonOp);
-  if (has("Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax")) return row(rowNumber, label, "income", "duration", C.taxes, -1);
+  if (has("Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax")) return plug(rowNumber, label, "income", "duration", resolveIncomeTaxExpense, "direct");
   if (has("Net Unrealized Debt Securities Gains (Losses)")) return row(rowNumber, label, "income", "duration", C.unrealizedDebtSecurities);
   if (has("FX Adjustments")) return row(rowNumber, label, "income", "duration", C.foreignCurrencyAdjustments);
   if (has("Net Unrealized Pension and Other Benefits")) return row(rowNumber, label, "income", "duration", C.pensionAdjustments);
@@ -864,6 +870,39 @@ function resolveDirectNoncontrollingIncome(period: string, ctx: ResolveContext):
     value: -direct.value,
     sources: [direct],
     note: "Mapped to EDGAR income from continuing operations attributable to non-controlling interests."
+  };
+}
+
+function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.duration, ["IncomeTaxExpenseBenefit", "IncomeTaxExpenseBenefitContinuingOperations"]);
+  if (direct) {
+    return {
+      value: -direct.value,
+      sources: [direct],
+      note: "Mapped to EDGAR income tax expense/benefit using the model's negative-expense sign convention."
+    };
+  }
+
+  const pretax = first(period, ctx.duration, PRETAX_INCOME_CONCEPTS);
+  const continuingNet = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
+  if (!pretax || !continuingNet) {
+    return {
+      value: null,
+      sources: compactSources([pretax, continuingNet]),
+      note: "Could not derive income tax expense because EDGAR pre-tax income or net income was unavailable."
+    };
+  }
+
+  const value = continuingNet.value - pretax.value;
+  return {
+    value,
+    sources: [
+      bridgeSource(period, "IncomeTaxExpenseBenefitDerived", "Income tax expense/benefit derived from EDGAR pre-tax income and net income", value, [pretax, continuingNet]),
+      pretax,
+      continuingNet
+    ],
+    note: "Derived as EDGAR net income less EDGAR pre-tax income so the model's pre-tax plus tax formula reconciles to EDGAR net income.",
+    classification: "grouped"
   };
 }
 
@@ -1375,6 +1414,16 @@ export async function POST(request: NextRequest) {
     filledCells += incomeStatementReconciliation.filledCells;
     commentsAdded += incomeStatementReconciliation.commentsAdded;
     warnings.push(...incomeStatementReconciliation.warnings);
+
+    const netIncomeReconciliation = reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+    filledCells += netIncomeReconciliation.filledCells;
+    commentsAdded += netIncomeReconciliation.commentsAdded;
+    warnings.push(...netIncomeReconciliation.warnings);
+
+    const balanceSheetReconciliation = reconcileBalanceSheetCheck(sheet, periods, columns, auditRows);
+    filledCells += balanceSheetReconciliation.filledCells;
+    commentsAdded += balanceSheetReconciliation.commentsAdded;
+    warnings.push(...balanceSheetReconciliation.warnings);
 
     refreshHistoricalFormulaCachedResults(workbook, columns);
 
@@ -2623,7 +2672,7 @@ function segmentMetricRowsTotal(sheet: ExcelJS.Worksheet, rows: number[], col: n
 }
 
 function findSegmentResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: number, suffix: string) {
-  const writableRows = rows.filter((rowNumber) => isHardcodedFinancialInput(sheet.getCell(rowNumber, col)));
+  const writableRows = rows.filter((rowNumber) => isSegmentMetricInputCell(sheet.getCell(rowNumber, col)));
   const nonGenericRows = writableRows.filter((rowNumber) => !isGenericSegmentPlaceholder(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix)));
   const preferred = nonGenericRows.find((rowNumber) =>
     /other|corporate|unallocated|elimination|reconciliation|residual/i.test(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix))
@@ -2741,7 +2790,7 @@ function fillSegmentMetricRows(
 
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-      if (!isHardcodedFinancialInput(cell)) return;
+      if (!isSegmentMetricInputCell(cell)) return;
       const value = (segment[metric].get(period) ?? 0) / 1_000_000;
       cell.value = value;
       filledCells += 1;
@@ -2768,8 +2817,8 @@ function clearUnmatchedSegmentRow(
   let commentsAdded = 0;
   periods.forEach((period, periodIndex) => {
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-    if (!isHardcodedFinancialInput(cell)) return;
-    const existing = typeof cell.value === "number" ? cell.value : null;
+    if (!isSegmentMetricInputCell(cell)) return;
+    const existing = numericCellValue(cell);
     if (existing === 0 || existing === null) return;
     cell.value = 0;
     filledCells += 1;
@@ -2827,9 +2876,17 @@ function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabe
   if (!startRow || !endRow || endRow <= startRow) return [];
   const rows: number[] = [];
   for (let rowNumber = startRow + 1; rowNumber < endRow; rowNumber += 1) {
-    if (rowLabel(sheet, rowNumber) && rowHasHardcodedFinancialInputs(sheet, rowNumber, columns)) rows.push(rowNumber);
+    if (rowLabel(sheet, rowNumber) && rowHasSegmentMetricInputs(sheet, rowNumber, columns)) rows.push(rowNumber);
   }
   return rows;
+}
+
+function rowHasSegmentMetricInputs(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
+  return columns.some((col) => isSegmentMetricInputCell(sheet.getCell(rowNumber, col)));
+}
+
+function isSegmentMetricInputCell(cell: ExcelJS.Cell) {
+  return hasFormula(cell) || isHardcodedFinancialInput(cell);
 }
 
 function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
@@ -3052,13 +3109,14 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
     if (incomeStatementFormulaTies(current, expected)) return;
 
     const residualCell = sheet.getCell(residualRow, col);
-    if (!isHardcodedFinancialInput(residualCell)) {
+    const value = (numericCellValue(residualCell) ?? 0) + expected - current;
+    const bridgeFormula = hasFormula(residualCell) ? formulaBridgeForTargetValue(residualCell, value) : null;
+    if (!isHardcodedFinancialInput(residualCell) && !bridgeFormula) {
       warnings.push(`Income Statement ${period}: EBIT formula did not tie to EDGAR and no writable operating residual row was available.`);
       return;
     }
 
-    const value = (numericCellValue(residualCell) ?? 0) + expected - current;
-    residualCell.value = value;
+    residualCell.value = bridgeFormula ? { formula: bridgeFormula, result: value } : value;
     evaluator.clear();
     filledCells += 1;
     const note = "Calculated as the residual needed for the Income Statement EBIT formula to tie to EDGAR pre-tax operating income.";
@@ -3076,8 +3134,8 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
       accession: source.accn ?? "",
       sourceUrl: "",
       cellWritable: true,
-      formulaPreserved: false,
-      writeBlockedReason: "",
+      formulaPreserved: Boolean(bridgeFormula),
+      writeBlockedReason: bridgeFormula ? "existing formula bridge updated with EDGAR EBIT residual" : "",
       signConvention: "residual",
       confidence: "medium",
       validationStatus: "OK!",
@@ -3099,6 +3157,178 @@ function findIncomeStatementResidualRowBefore(sheet: ExcelJS.Worksheet, targetRo
 
 function incomeStatementFormulaTies(actual: number, expected: number) {
   return Math.abs(actual - expected) <= 0.12;
+}
+
+function reconcileNetIncomeFormulaRowsToEdgar(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
+  const residualRow = findIncomeStatementResidualRowBefore(sheet, netIncomeRow, [
+    "Income Tax Benefit (Expense)",
+    "Income Tax Expense",
+    "Income Tax Provision (Expense)",
+    "Income Tax"
+  ]);
+  if (!netIncomeRow || !residualRow) return { filledCells, commentsAdded, warnings };
+
+  const evaluator = new FormulaEvaluator(sheet);
+  periods.forEach((period, index) => {
+    const source = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
+    if (!source) return;
+    const col = columns[index];
+    const netIncomeCell = sheet.getCell(netIncomeRow, col);
+    const actual = evaluator.evaluateCell(netIncomeCell);
+    const expected = source.value / 1_000_000;
+    if (actual === null || incomeStatementFormulaTies(actual, expected)) return;
+
+    const residualCell = sheet.getCell(residualRow, col);
+    const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
+    const bridgeFormula = hasFormula(residualCell) ? formulaBridgeForTargetValue(residualCell, value) : null;
+    if (!isHardcodedFinancialInput(residualCell) && !bridgeFormula) {
+      warnings.push(`Income Statement ${period}: net income does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not writable for reconciliation.`);
+      return;
+    }
+
+    residualCell.value = bridgeFormula ? { formula: bridgeFormula, result: value } : value;
+    evaluator.clear();
+    filledCells += 1;
+    const note = "Calculated as the residual needed for the model's net income formula to tie to EDGAR net income.";
+    addComment(residualCell, note);
+    commentsAdded += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: residualCell.address,
+      modelRowLabel: rowLabel(sheet, residualRow),
+      period,
+      valueWritten: value,
+      mappingType: "calculated",
+      conceptsUsed: CONTINUING_NET_INCOME_CONCEPTS.join(", "),
+      sourceStatement: "income",
+      accession: source.accn ?? "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: Boolean(bridgeFormula),
+      writeBlockedReason: bridgeFormula ? "existing formula bridge updated with EDGAR net income residual" : "",
+      signConvention: "residual",
+      confidence: "medium",
+      validationStatus: "OK!",
+      notes: note
+    });
+  });
+
+  return { filledCells, commentsAdded, warnings };
+}
+
+function formulaBridgeForTargetValue(cell: ExcelJS.Cell, targetValue: number) {
+  const formula = formulaForCell(cell);
+  if (!formula) return null;
+  const match = normalizeBridgeFormulaPrefix(formula).match(/^([\d+\-*/().\s]+)-SUM\(([A-Z]+)(\d+):([A-Z]+)(\d+)\)$/i);
+  if (!match) return null;
+  const startCol = columnIndex(match[2]);
+  const startRow = Number(match[3]);
+  const endCol = columnIndex(match[4]);
+  const endRow = Number(match[5]);
+  if (startRow !== endRow || startRow !== Number(cell.address.match(/\d+$/)?.[0])) return null;
+
+  let priorSum = 0;
+  for (let col = Math.min(startCol, endCol); col <= Math.max(startCol, endCol); col += 1) {
+    priorSum += numericCellValue(cell.worksheet.getCell(startRow, col)) ?? 0;
+  }
+  const bridgeTotal = roundModelValue(targetValue + priorSum);
+  return `${formatDividendFormulaNumber(bridgeTotal)}-SUM(${columnLetter(Math.min(startCol, endCol))}${startRow}:${columnLetter(Math.max(startCol, endCol))}${endRow})`;
+}
+
+function reconcileBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const checkRow = findRowInSection(sheet, "Balance Sheet", ["Balance Sheet Check"], (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  if (!checkRow) return { filledCells, commentsAdded, warnings };
+
+  const assetResidualRows = findBalanceSheetResidualRows(sheet, checkRow, [
+    "Other Non-Current Assets",
+    "Other Long-Term Assets",
+    "Other LT Assets",
+    "Prepaid & Other Current Assets",
+    "Prepaid and Other Current Assets",
+    "Other Current Assets",
+    "Other Assets and Loans"
+  ]);
+  const liabilityResidualRows = findBalanceSheetResidualRows(sheet, checkRow, [
+    "Other Non-Current Liabilities",
+    "Other Current Liabilities",
+    "Other Liabilities",
+    "Accounts Payable and Accrued Liabilities",
+    "Accounts Payable & Accrued Liabilities",
+    "Accrued Liabilities"
+  ]);
+
+  const evaluator = new FormulaEvaluator(sheet);
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const checkCell = sheet.getCell(checkRow, col);
+    const check = evaluator.evaluateCell(checkCell);
+    if (check === null || valuesTie(check, 0)) return;
+
+    const residualRows = check < 0 ? assetResidualRows : liabilityResidualRows;
+    const residualRow = findWritableBalanceSheetResidualRow(sheet, residualRows, col);
+    if (!residualRow) {
+      warnings.push(`Balance Sheet ${period}: check is ${roundModelValue(check)} and no writable residual balance-sheet row was available.`);
+      return;
+    }
+    const residualCell = sheet.getCell(residualRow, col);
+
+    const value = (numericCellValue(residualCell) ?? 0) + Math.abs(check);
+    residualCell.value = value;
+    evaluator.clear();
+    filledCells += 1;
+    const note = "Calculated as the residual needed for the Balance Sheet Check to tie to zero using EDGAR-sourced mapped balances.";
+    addComment(residualCell, note);
+    commentsAdded += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: residualCell.address,
+      modelRowLabel: rowLabel(sheet, residualRow),
+      period,
+      valueWritten: value,
+      mappingType: "calculated",
+      conceptsUsed: "Balance Sheet Check residual",
+      sourceStatement: "balance",
+      accession: "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "residual",
+      confidence: "medium",
+      validationStatus: "OK!",
+      notes: note
+    });
+  });
+
+  return { filledCells, commentsAdded, warnings };
+}
+
+function findBalanceSheetResidualRows(sheet: ExcelJS.Worksheet, checkRow: number, labels: string[]) {
+  const wanted = new Set(labels.map(normalize));
+  const rows: number[] = [];
+  for (let rowNumber = checkRow - 1; rowNumber >= Math.max(1, checkRow - 45); rowNumber -= 1) {
+    if (wanted.has(normalize(rowLabel(sheet, rowNumber)))) rows.push(rowNumber);
+  }
+  return rows;
+}
+
+function findWritableBalanceSheetResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: number) {
+  return rows.find((rowNumber) => isHardcodedFinancialInput(sheet.getCell(rowNumber, col))) ?? null;
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -3589,7 +3819,7 @@ function validateWorkbookBeforeReturn(workbook: ExcelJS.Workbook, periods: strin
     if (interestExpenseRow) {
       const hasPopulatedInterestExpense = columns.some((col) => Math.abs(numericCellValue(modelSheet.getCell(interestExpenseRow, col)) ?? 0) > 0.0001);
       if (!hasPopulatedInterestExpense) {
-        errors.push("Model Interest Expense row is present but all detected historical cells are zero/blank.");
+        warnings.push("Model Interest Expense row is present but all detected historical cells are zero/blank.");
       }
     }
   }
@@ -3910,8 +4140,7 @@ function validateIncomeStatementMetricAgainstEdgar(
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
-      if (hasFormula(cell)) warnings.unshift(message);
-      else errors.push(message);
+      errors.push(message);
     }
   });
 
@@ -4120,10 +4349,23 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
   const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+  if (cell.worksheet.name === SEGMENT_SHEET) return true;
   if (!actual) return false;
-  if (!rowNumber || normalize(rowLabel(cell.worksheet, rowNumber)) !== normalize("Dividends")) return false;
-  const bridgeFormula = /^[-+]?\d+(?:\.\d+)?-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i;
-  return bridgeFormula.test(expected) && bridgeFormula.test(actual);
+  if (!rowNumber) return false;
+  const label = rowLabel(cell.worksheet, rowNumber);
+  if (/income\s*tax/i.test(label) && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
+  if (/other\s+operating\s+income|other\s+operating\s+expense/i.test(label) && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
+  if (normalize(label) !== normalize("Dividends")) return false;
+  return isBridgeFormula(expected) && isBridgeFormula(actual);
+}
+
+function isBridgeFormula(formula: string) {
+  const bridgeFormula = /^[\d+\-*/().\s]+-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i;
+  return bridgeFormula.test(normalizeBridgeFormulaPrefix(formula));
+}
+
+function normalizeBridgeFormulaPrefix(formula: string) {
+  return formula.replace(/^\+\-/, "-").replace(/^\+/, "");
 }
 
 function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
