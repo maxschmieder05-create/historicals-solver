@@ -81,6 +81,12 @@ type LlmMappingState = {
   maxCalls: number;
 };
 
+type LlmMappingModelChoice = {
+  model: string;
+  tier: "fast" | "complex";
+  reason: string;
+};
+
 type LlmCandidateFact = {
   concept: string;
   label: string;
@@ -172,10 +178,13 @@ const SEC_HEADERS = {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-const LLM_MAPPING_MODEL = process.env.LLM_MAPPING_MODEL || "google/gemma-4-26b-a4b-it";
+const LLM_MAPPING_FAST_MODEL = process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || "google/gemma-4-26b-a4b-it";
+const LLM_MAPPING_COMPLEX_MODEL =
+  process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || process.env.LLM_MAPPING_MODEL || "openai/gpt-4o-mini";
 const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 24);
 const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
+const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
 
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
@@ -1344,9 +1353,6 @@ function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext
 }
 
 function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
-  const directOtherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
-  if (directOtherCurrent.value !== null) return directOtherCurrent;
-
   const liabilities = first(period, ctx.instant, C.liabilities);
   const shortTermBorrowings = first(period, ctx.instant, ["OtherShortTermBorrowings", "ShortTermBorrowings"]) ?? zeroSource("ShortTermBorrowings");
   const accountsPayable = resolveAccountsPayable(period, ctx);
@@ -1364,6 +1370,8 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
   }
   const brokerDealerLiabilities = sumWithNote(period, ctx.instant, BROKER_DEALER_OTHER_CURRENT_LIABILITIES, "Included broker-dealer current liability concepts reported in the SEC filing.");
   if (brokerDealerLiabilities.value !== null) return brokerDealerLiabilities;
+  const directOtherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
+  if (directOtherCurrent.value !== null) return directOtherCurrent;
   return difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.");
 }
 
@@ -3886,8 +3894,9 @@ async function llmAssistedFillRow(
 
   state.calls += 1;
   try {
-    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates);
-    const mapped = llmDecisionToFillRow(fillRow, decision, candidates);
+    const modelChoice = chooseLlmMappingModel(fillRow, candidates);
+    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model);
+    const mapped = llmDecisionToFillRow(fillRow, decision, candidates, modelChoice);
     state.decisions.set(fillRow.row, mapped);
     return mapped;
   } catch (error) {
@@ -3958,6 +3967,43 @@ function llmCandidateScore(fillRow: FillRow, candidate: LlmCandidateFact) {
   return score;
 }
 
+function chooseLlmMappingModel(fillRow: FillRow, candidates: LlmCandidateFact[]): LlmMappingModelChoice {
+  const score = llmMappingComplexityScore(fillRow, candidates);
+  const complexThreshold = Number.isFinite(LLM_MAPPING_COMPLEX_SCORE) ? LLM_MAPPING_COMPLEX_SCORE : 4;
+  if (score >= complexThreshold && LLM_MAPPING_COMPLEX_MODEL) {
+    return {
+      model: LLM_MAPPING_COMPLEX_MODEL,
+      tier: "complex",
+      reason: `complex mapping score ${score}`
+    };
+  }
+  return {
+    model: LLM_MAPPING_FAST_MODEL,
+    tier: "fast",
+    reason: `simple mapping score ${score}`
+  };
+}
+
+function llmMappingComplexityScore(fillRow: FillRow, candidates: LlmCandidateFact[]) {
+  const label = [fillRow.label, fillRow.modelContext?.sectionHeader, fillRow.modelContext?.previousLabel, fillRow.modelContext?.nextLabel].join(" ");
+  const scoredCandidates = candidates.map((candidate) => llmCandidateScore(fillRow, candidate)).sort((a, b) => b - a);
+  const topScore = scoredCandidates[0] ?? 0;
+  const secondScore = scoredCandidates[1] ?? 0;
+  let score = 0;
+
+  if (candidates.length > 50) score += 3;
+  else if (candidates.length > 25) score += 2;
+  else if (candidates.length > 12) score += 1;
+  if (topScore < 6) score += 1;
+  if (secondScore && topScore - secondScore <= 2) score += 1;
+  if (/other|misc|adjust|reclass|non[-\s]?operating|non[-\s]?current|unallocated|elimination|residual/i.test(label)) score += 2;
+  if (/interest|credit|loan|securit|broker|dealer|deposit|receivable|payable|investment|noninterest|trading|fair value/i.test(label)) score += 2;
+  if (/\b(and|incl\.?|including|excluding|less|net of|total)\b/i.test(fillRow.label)) score += 1;
+  if (fillRow.statement === "balance" && /liabilit|equity|asset/i.test(fillRow.label)) score += 1;
+
+  return score;
+}
+
 function significantTokens(value: string) {
   const stop = new Set(["and", "the", "for", "from", "with", "net", "total", "current", "other", "statement", "schedule"]);
   return new Set(
@@ -3973,7 +4019,8 @@ async function requestLlmMappingDecision(
   company: CompanyMatch,
   fillRow: FillRow,
   periods: string[],
-  candidates: LlmCandidateFact[]
+  candidates: LlmCandidateFact[],
+  model: string
 ): Promise<LlmMappingDecision> {
   const apiKey = llmApiKey();
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
@@ -3996,7 +4043,7 @@ async function requestLlmMappingDecision(
       "X-Title": OPENROUTER_APP_TITLE
     },
     body: JSON.stringify({
-      model: LLM_MAPPING_MODEL,
+      model,
       messages: [
         { role: "system", content: system },
         { role: "user", content: JSON.stringify(llmMappingPayload(company, fillRow, periods, candidates)) }
@@ -4083,13 +4130,13 @@ function responseOutputText(body: any) {
   return chunks.join("").trim();
 }
 
-function llmDecisionToFillRow(fillRow: FillRow, decision: LlmMappingDecision, candidates: LlmCandidateFact[]): FillRow | null {
+function llmDecisionToFillRow(fillRow: FillRow, decision: LlmMappingDecision, candidates: LlmCandidateFact[], modelChoice: LlmMappingModelChoice): FillRow | null {
   if (decision.operation === "needs_review" || decision.requiresReview || decision.confidence === "low") return null;
   const allowed = new Set(candidates.map((candidate) => candidate.concept));
   const selected = unique(decision.selectedConcepts).filter((concept) => allowed.has(concept));
   if (!selected.length || selected.length !== decision.selectedConcepts.length) return null;
   const sign: 1 | -1 = decision.sign === -1 ? -1 : 1;
-  const note = `LLM-assisted EDGAR mapping: ${decision.reason}`;
+  const note = `LLM-assisted EDGAR mapping (${modelChoice.tier} model, ${modelChoice.reason}): ${decision.reason}`;
 
   if (decision.operation === "direct") {
     return {
