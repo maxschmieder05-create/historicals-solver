@@ -1682,6 +1682,26 @@ export async function POST(request: NextRequest) {
       filledCells += shareRepurchaseClearResult.clearedCells;
       commentsAdded += shareRepurchaseClearResult.commentsAdded;
       warnings.push(...shareRepurchaseClearResult.warnings);
+
+      const incomeFormulaResult = reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      filledCells += incomeFormulaResult.filledCells;
+      commentsAdded += incomeFormulaResult.commentsAdded;
+      warnings.push(...incomeFormulaResult.warnings);
+
+      const netIncomeFormulaResult = reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      filledCells += netIncomeFormulaResult.filledCells;
+      commentsAdded += netIncomeFormulaResult.commentsAdded;
+      warnings.push(...netIncomeFormulaResult.warnings);
+
+      const balanceSheetTotalResult = reconcileBalanceSheetStatementTotalsToEdgar(sheet, periods, columns, ctx, auditRows);
+      filledCells += balanceSheetTotalResult.filledCells;
+      commentsAdded += balanceSheetTotalResult.commentsAdded;
+      warnings.push(...balanceSheetTotalResult.warnings);
+
+      const balanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, periods, columns, auditRows);
+      filledCells += balanceSheetCheckResult.filledCells;
+      commentsAdded += balanceSheetCheckResult.commentsAdded;
+      warnings.push(...balanceSheetCheckResult.warnings);
     }
 
     restoreWorkbookLabels(workbook, workbookSnapshot);
@@ -2994,7 +3014,8 @@ function reconcileSegmentMetricRowsToStatementTotal(
     if (!expectedSource) return;
     const col = columns[periodIndex];
     const expected = expectedSource.value / 1_000_000;
-    const actual = segmentMetricRowsTotal(sheet, rows, col);
+    const evaluator = new FormulaEvaluator(sheet);
+    const actual = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     if (segmentStatementMetricTies(actual, expected)) return;
 
     const residualRow = findSegmentResidualRow(sheet, rows, col, suffix);
@@ -3034,8 +3055,11 @@ function reconcileSegmentMetricRowsToStatementTotal(
   return { filledCells, commentsAdded, warnings };
 }
 
-function segmentMetricRowsTotal(sheet: ExcelJS.Worksheet, rows: number[], col: number) {
-  return rows.reduce((total, rowNumber) => total + (numericCellValue(sheet.getCell(rowNumber, col)) ?? 0), 0);
+function segmentMetricRowsTotal(sheet: ExcelJS.Worksheet, rows: number[], col: number, evaluator?: FormulaEvaluator) {
+  return rows.reduce((total, rowNumber) => {
+    const cell = sheet.getCell(rowNumber, col);
+    return total + (evaluator?.evaluateCell(cell) ?? numericCellValue(cell) ?? 0);
+  }, 0);
 }
 
 function findSegmentResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: number, suffix: string) {
@@ -3253,7 +3277,7 @@ function rowHasSegmentMetricInputs(sheet: ExcelJS.Worksheet, rowNumber: number, 
 }
 
 function isSegmentMetricInputCell(cell: ExcelJS.Cell) {
-  return isHardcodedFinancialInput(cell);
+  return isHardcodedFinancialInput(cell) || hasFormula(cell);
 }
 
 function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
@@ -3739,6 +3763,24 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       ],
       concepts: C.equity,
       residualLabels: ["Accumulated Other Comprehensive Income (AOCI)", "AOCI", "Noncontrolling Interests", "Non-Controlling Interests", "Retained Earnings"]
+    },
+    {
+      name: "total liabilities plus shareholders' equity",
+      labels: ["Total Liabilities & Shareholder's Equity", "Total Liabilities and Shareholder's Equity"],
+      concepts: C.assets,
+      residualLabels: [
+        "Other Non-Current Liabilities",
+        "Other Current Liabilities",
+        "Other Liabilities",
+        "Accounts Payable and Accrued Liabilities",
+        "Accounts Payable & Accrued Liabilities",
+        "Accrued Liabilities",
+        "Accumulated Other Comprehensive Income (AOCI)",
+        "AOCI",
+        "Noncontrolling Interests",
+        "Non-Controlling Interests",
+        "Retained Earnings"
+      ]
     }
   ];
 
@@ -3771,6 +3813,16 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
 
       const residualRow = findWritableBalanceSheetResidualRow(sheet, residualRows, col);
       if (!residualRow) {
+        if (isBalanceSheetTotalFormulaReplacementAllowed(totalCell)) {
+          totalCell.value = expected;
+          evaluator.clear();
+          filledCells += 1;
+          const note = `Mapped directly to EDGAR ${metric.name} because no writable residual balance-sheet row was available.`;
+          addComment(totalCell, note);
+          commentsAdded += 1;
+          auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
+          return;
+        }
         warnings.push(`Balance Sheet ${period}: ${metric.name} does not tie to EDGAR and no writable residual row was available.`);
         return;
       }
@@ -3779,6 +3831,17 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
       residualCell.value = value;
       evaluator.clear();
+      const reconciled = statementMetricCellValue(totalCell, evaluator, expected);
+      if (reconciled !== null && !statementMetricTies(reconciled, expected) && isBalanceSheetTotalFormulaReplacementAllowed(totalCell)) {
+        totalCell.value = expected;
+        evaluator.clear();
+        filledCells += 1;
+        const note = `Mapped directly to EDGAR ${metric.name} because the template formula did not respond to residual reconciliation.`;
+        addComment(totalCell, note);
+        commentsAdded += 1;
+        auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
+        return;
+      }
       filledCells += 1;
       const note = `Calculated as the residual needed for balance-sheet ${metric.name} to tie to EDGAR.`;
       addComment(residualCell, note);
@@ -3847,7 +3910,19 @@ function findWritableBalanceSheetResidualRow(sheet: ExcelJS.Worksheet, rows: num
 }
 
 function isReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
-  return isHardcodedFinancialInput(cell);
+  if (isHardcodedFinancialInput(cell)) return true;
+  if (!hasFormula(cell)) return false;
+  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+  if (!rowNumber) return false;
+  return isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, rowNumber));
+}
+
+function isBalanceSheetTotalFormulaReplacementAllowed(cell: ExcelJS.Cell) {
+  if (!hasFormula(cell)) return false;
+  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+  if (!rowNumber) return false;
+  const label = rowLabel(cell.worksheet, rowNumber);
+  return isFormulaReplacementAllowedForReconciliation(label);
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -5095,7 +5170,7 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
 }
 
 function isFormulaReplacementAllowedForReconciliation(label: string) {
-  return /other\s+operating\s+income|other\s+operating\s+expense|income\s*tax|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities/i.test(label);
+  return /other\s+operating\s+income|other\s+operating\s+expense|income\s*tax|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities|total\s+assets|total\s+liabilities|total\s+(?:shareholder|shareholders|stockholder|stockholders)'?\s+equity|total\s+equity|total\s+liabilities\s+(?:&|and)\s+(?:shareholder|shareholders)'?\s+equity/i.test(label);
 }
 
 function isBridgeFormula(formula: string) {
@@ -5471,7 +5546,7 @@ function validateSegmentRevenueTieOut(
 
   periods.forEach((period, index) => {
     const col = columns[index];
-    const segmentTotal = rows.reduce((total, rowNumber) => total + (numericCellValue(sheet.getCell(rowNumber, col)) ?? 0), 0);
+    const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     const sheetTotal = evaluator.evaluateCell(sheet.getCell(totalRow, col));
     const edgarRevenue = first(period, ctx.duration, C.revenue);
     const expectedRevenue = edgarRevenue ? edgarRevenue.value / 1_000_000 : null;
