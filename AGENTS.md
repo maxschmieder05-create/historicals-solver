@@ -18,6 +18,13 @@
 - Do not use third-party finance websites, scraped summaries, analyst estimates, or manually invented figures as source data for workbook outputs.
 - If EDGAR does not provide a requested number directly, derive it only from EDGAR-sourced values and leave a note explaining the derivation.
 
+## System Learning From Fixes
+
+- When fixing a workbook, mapping, validation, or calculation error, turn the fix into a reusable system rule whenever possible.
+- Prefer general rules based on template structure, row labels, section context, statement type, period type, and SEC concept semantics.
+- Do not solve errors with company-specific, ticker-specific, workbook-specific, or single-period overrides unless the user explicitly asks for a one-off emergency patch.
+- Any learned rule should apply to new uploaded templates and different companies that expose the same pattern through EDGAR-sourced data.
+
 ## Local Server
 
 - After source changes, make sure the dev server is running and verify `http://localhost:3000` responds successfully.

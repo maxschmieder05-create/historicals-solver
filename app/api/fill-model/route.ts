@@ -964,6 +964,16 @@ function resolveDiscontinuedOperationsBridge(period: string, ctx: ResolveContext
     };
   }
 
+  const direct = first(period, ctx.duration, ["IncomeLossFromDiscontinuedOperationsNetOfTax"]);
+  if (direct) {
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to EDGAR discontinued operations when directly reported; this reusable rule avoids company- or period-specific bridge overrides.",
+      classification: "grouped"
+    };
+  }
+
   const common = first(period, ctx.duration, COMMON_SHAREHOLDER_INCOME_CONCEPTS);
   const continuingNet = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
   const postTax = resolvePostTaxAdjustments(period, ctx);
@@ -972,7 +982,7 @@ function resolveDiscontinuedOperationsBridge(period: string, ctx: ResolveContext
     return { value: null, sources: compactSources([common, continuingNet, postTax, nci]), note: "Could not calculate the discontinued-operations bridge because one or more EDGAR bridge inputs were unavailable." };
   }
 
-  const value = normalizedDiscontinuedOperationsBridgeValue(period, common.value - continuingNet.value - postTax.value - nci.value);
+  const value = common.value - continuingNet.value - postTax.value - nci.value;
   const source = bridgeSource(period, "DiscontinuedOperationsBridge", "Discontinued operations common-shareholder bridge", value, [common, continuingNet, postTax, nci]);
   return {
     value,
@@ -980,11 +990,6 @@ function resolveDiscontinuedOperationsBridge(period: string, ctx: ResolveContext
     note: "Calculated from EDGAR common-shareholder income less continuing net income, post-tax adjustments, and NCI so the model bridge reconciles.",
     classification: "grouped"
   };
-}
-
-function normalizedDiscontinuedOperationsBridgeValue(period: string, value: number) {
-  if (period === "4Q25" && Math.abs(value - -4_374_000) < 1) return -4_734_000;
-  return value;
 }
 
 function resolveCommonShareholderNciBridge(period: string, ctx: ResolveContext): ResolvedValue {
@@ -3664,6 +3669,7 @@ async function requestLlmMappingDecision(
   const system = [
     "You map financial model rows to SEC EDGAR XBRL facts.",
     "Use only the provided candidate concepts. Do not invent concepts or values.",
+    "Treat every mapping correction as a reusable template rule: rely on row labels, section context, statement type, period kind, and SEC concept semantics, never ticker-specific or single-period exceptions.",
     "Prefer needs_review unless the row label, section context, and candidate label clearly match.",
     "Choose sign -1 only when the model row convention should invert the EDGAR value, such as expense rows shown as negatives.",
     "Return strict JSON only."
