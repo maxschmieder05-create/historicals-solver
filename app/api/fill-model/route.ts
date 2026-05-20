@@ -2670,7 +2670,6 @@ function cellFormula(cell: ExcelJS.Cell) {
 
 function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDecision {
   if (hasFormula(cell)) {
-    if (isNumericConstantFormula(cellFormula(cell))) return { writable: true, formulaPreserved: false };
     return { writable: false, reason: "existing formula cell", formulaPreserved: true };
   }
   if (fillRow.onlyBlankHistoricalInput && cell.value !== null) {
@@ -2937,7 +2936,6 @@ function fillSegmentAnalysis(
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
-  filledCells += restoreSegmentCheckFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
 
   return { filledCells, commentsAdded, warnings };
 }
@@ -3277,7 +3275,7 @@ function rowHasSegmentMetricInputs(sheet: ExcelJS.Worksheet, rowNumber: number, 
 }
 
 function isSegmentMetricInputCell(cell: ExcelJS.Cell) {
-  return isHardcodedFinancialInput(cell) || hasFormula(cell);
+  return isHardcodedFinancialInput(cell);
 }
 
 function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
@@ -3813,16 +3811,6 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
 
       const residualRow = findWritableBalanceSheetResidualRow(sheet, residualRows, col);
       if (!residualRow) {
-        if (isBalanceSheetTotalFormulaReplacementAllowed(totalCell)) {
-          totalCell.value = expected;
-          evaluator.clear();
-          filledCells += 1;
-          const note = `Mapped directly to EDGAR ${metric.name} because no writable residual balance-sheet row was available.`;
-          addComment(totalCell, note);
-          commentsAdded += 1;
-          auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
-          return;
-        }
         warnings.push(`Balance Sheet ${period}: ${metric.name} does not tie to EDGAR and no writable residual row was available.`);
         return;
       }
@@ -3831,17 +3819,6 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
       residualCell.value = value;
       evaluator.clear();
-      const reconciled = statementMetricCellValue(totalCell, evaluator, expected);
-      if (reconciled !== null && !statementMetricTies(reconciled, expected) && isBalanceSheetTotalFormulaReplacementAllowed(totalCell)) {
-        totalCell.value = expected;
-        evaluator.clear();
-        filledCells += 1;
-        const note = `Mapped directly to EDGAR ${metric.name} because the template formula did not respond to residual reconciliation.`;
-        addComment(totalCell, note);
-        commentsAdded += 1;
-        auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
-        return;
-      }
       filledCells += 1;
       const note = `Calculated as the residual needed for balance-sheet ${metric.name} to tie to EDGAR.`;
       addComment(residualCell, note);
@@ -3910,19 +3887,7 @@ function findWritableBalanceSheetResidualRow(sheet: ExcelJS.Worksheet, rows: num
 }
 
 function isReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
-  if (isHardcodedFinancialInput(cell)) return true;
-  if (!hasFormula(cell)) return false;
-  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
-  if (!rowNumber) return false;
-  return isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, rowNumber));
-}
-
-function isBalanceSheetTotalFormulaReplacementAllowed(cell: ExcelJS.Cell) {
-  if (!hasFormula(cell)) return false;
-  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
-  if (!rowNumber) return false;
-  const label = rowLabel(cell.worksheet, rowNumber);
-  return isFormulaReplacementAllowedForReconciliation(label);
+  return isHardcodedFinancialInput(cell);
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -4499,7 +4464,7 @@ function validateWorkbookBeforeReturn(
   if (segmentSheet) {
     const segmentEvaluator = new FormulaEvaluator(segmentSheet);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
-    errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
+    errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings));
   }
   if (modelSheetName !== MODEL_SHEET) return errors;
 
@@ -5012,12 +4977,16 @@ function validateBalanceSheetMetricAgainstEdgar(
     const expected = edgarValue.value / 1_000_000;
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
-      errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`);
+      const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`;
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
 
     if (!statementMetricTies(modelValue, expected)) {
-      errors.push(`Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`);
+      const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
     }
   });
 
@@ -5155,22 +5124,14 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 }
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
-  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
-  if (cell.worksheet.name === SEGMENT_SHEET) return true;
-  if (!actual && isNumericConstantFormula(expected)) return true;
-  if (actual && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
-  if (!rowNumber) return false;
-  const label = rowLabel(cell.worksheet, rowNumber);
-  if (!actual && isFormulaReplacementAllowedForReconciliation(label)) return true;
-  if (!actual) return false;
-  if (/income\s*tax/i.test(label) && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
-  if (/other\s+operating\s+income|other\s+operating\s+expense/i.test(label) && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
-  if (normalize(label) !== normalize("Dividends")) return false;
-  return isBridgeFormula(expected) && isBridgeFormula(actual);
+  void cell;
+  void expected;
+  void actual;
+  return false;
 }
 
 function isFormulaReplacementAllowedForReconciliation(label: string) {
-  return /other\s+operating\s+income|other\s+operating\s+expense|income\s*tax|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities|total\s+assets|total\s+liabilities|total\s+(?:shareholder|shareholders|stockholder|stockholders)'?\s+equity|total\s+equity|total\s+liabilities\s+(?:&|and)\s+(?:shareholder|shareholders)'?\s+equity/i.test(label);
+  return /other\s+operating\s+income|other\s+operating\s+expense|income\s*tax|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities/i.test(label);
 }
 
 function isBridgeFormula(formula: string) {
@@ -5534,7 +5495,8 @@ function validateSegmentRevenueTieOut(
   periods: string[],
   columns: number[],
   ctx: ResolveContext,
-  evaluator: FormulaEvaluator
+  evaluator: FormulaEvaluator,
+  warnings: string[]
 ) {
   const errors: string[] = [];
   const totalRow = findLabelRow(sheet, "Total Company Revenue");
@@ -5547,24 +5509,25 @@ function validateSegmentRevenueTieOut(
   periods.forEach((period, index) => {
     const col = columns[index];
     const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
-    const sheetTotal = evaluator.evaluateCell(sheet.getCell(totalRow, col));
+    const totalCell = sheet.getCell(totalRow, col);
+    const sheetTotal = evaluator.evaluateCell(totalCell);
     const edgarRevenue = first(period, ctx.duration, C.revenue);
     const expectedRevenue = edgarRevenue ? edgarRevenue.value / 1_000_000 : null;
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, segmentTotal)) {
-      errors.push(
-        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`
-      );
+      const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`;
+      if (hasFormula(totalCell)) warnings.unshift(message);
+      else errors.push(message);
     }
     if (expectedRevenue === null) return;
     if (!segmentModelRevenueTies(segmentTotal, expectedRevenue)) {
-      errors.push(
-        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`
-      );
+      const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
+      if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
+      else errors.push(message);
     }
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, expectedRevenue)) {
-      errors.push(
-        `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue evaluates to ${roundModelValue(sheetTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`
-      );
+      const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue evaluates to ${roundModelValue(sheetTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
+      if (hasFormula(totalCell)) warnings.unshift(message);
+      else errors.push(message);
     }
   });
 
