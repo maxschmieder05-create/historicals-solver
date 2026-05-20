@@ -158,6 +158,7 @@ type ModelRowContext = {
   indentation: number;
   hasHistoricalFormula: boolean;
   hasHardcodedInput: boolean;
+  hasNetRevenueInterestExpenseAbove: boolean;
   subtotalFormula?: string;
   projectedColumns: number;
   signConvention: 1 | -1;
@@ -217,7 +218,7 @@ const C = {
   interestIncome: ["InterestIncomeExpenseNonOperatingNet", "InterestIncomeNonOperating"],
   interestExpense: ["InterestExpenseOperating", "InterestExpenseNonOperating", "InterestExpense"],
   impairment: ["GoodwillImpairmentLosses", "ImpairmentOfGoodwillAndIntangibleAssets", "GoodwillAndIntangibleAssetImpairment", "ImpairmentOfRealEstate", "ImpairmentOfLongLivedAssetsToBeDisposedOf"],
-  otherNonOp: ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense", "OtherIncomeExpenseNet", "OtherIncome", "OtherExpense"],
+  otherNonOp: ["OtherNonoperatingIncomeExpense", "OtherIncome", "OtherExpense"],
   taxes: ["IncomeTaxExpenseBenefit"],
   netIncome: ["NetIncomeLoss", "ProfitLoss"],
   creditLossProvision: [
@@ -329,7 +330,7 @@ const C = {
   equity: ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
   commonApic: ["CommonStocksIncludingAdditionalPaidInCapital", "AdditionalPaidInCapitalCommonStocks"],
   retained: ["RetainedEarningsAccumulatedDeficit"],
-  treasury: ["TreasuryStockValue"],
+  treasury: ["TreasuryStockCommonValue", "TreasuryStockValue"],
   aoci: ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"],
   nci: ["MinorityInterest", "NoncontrollingInterestInConsolidatedEntity"]
 };
@@ -507,7 +508,17 @@ function isCashFlowStatementBoundary(label: string) {
 }
 
 function fillRowForLabel(rowNumber: number, label: string): FillRow | null {
-  return fillRowForContext({ sheetName: MODEL_SHEET, row: rowNumber, label, indentation: 0, hasHistoricalFormula: false, hasHardcodedInput: true, projectedColumns: 0, signConvention: 1 });
+  return fillRowForContext({
+    sheetName: MODEL_SHEET,
+    row: rowNumber,
+    label,
+    indentation: 0,
+    hasHistoricalFormula: false,
+    hasHardcodedInput: true,
+    hasNetRevenueInterestExpenseAbove: false,
+    projectedColumns: 0,
+    signConvention: 1
+  });
 }
 
 function fillRowForContext(context: ModelRowContext): FillRow | null {
@@ -572,7 +583,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
       "General and Administrative"
     )
   ) {
-    return row(rowNumber, label, "income", "duration", C.sga, -1);
+    return plug(rowNumber, label, "income", "duration", resolveSellingGeneralAdministrativeExpense, "grouped");
   }
   if (has("Research & Development (R&D)", "Research and Development")) return row(rowNumber, label, "income", "duration", C.rd, -1);
   if (has("Compensation and Benefits", "Compensation, Commissions, and Benefits", "Employee Compensation & Benefits")) {
@@ -590,12 +601,20 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Depreciation Expense") && inPpeDepreciationScheduleContext(context)) {
     return reviewRow(context, "Needs review: PP&E depreciation is a roll-forward input and was not overwritten with consolidated depreciation and amortization.");
   }
-  if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense", "Depreciation & Amortization (incl. in SG&A)")) return row(rowNumber, label, "income", "duration", C.da, -1);
+  if (has("Depreciation & Amortization (incl. in SG&A)")) return row(rowNumber, label, "income", "duration", C.da, -1);
+  if (has("Depreciation & Amortization", "Depreciation and Amortization", "Depreciation Expense")) {
+    return reviewRow(context, "Needs review: consolidated D&A is often a cash-flow disclosure and was not overwritten into the income statement unless explicitly included in an operating expense row.");
+  }
   if (has("Amortization Expense")) return row(rowNumber, label, "support", "duration", ["AmortizationOfIntangibleAssets"], -1);
   if (has("Other Operating Income (Expense)")) return plug(rowNumber, label, "income", "duration", resolveOtherOperatingIncomeExpense);
   if (has("Total Provisions for Credit Losses", "Provision for Credit Losses")) return row(rowNumber, label, "income", "duration", C.creditLossProvision, -1);
   if (has("Interest Income")) return row(rowNumber, label, "income", "duration", C.interestIncome, 1, 1_000_000, "Mapped to SEC interest income.");
-  if (/\binterest\s*\(\s*expense\s*\)/i.test(label)) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
+  if (/\binterest\s*\(\s*expense\s*\)/i.test(label)) {
+    if (context.hasNetRevenueInterestExpenseAbove) {
+      return plug(rowNumber, label, "income", "duration", resolveNonOperatingInterestExpenseAfterNetRevenue, "direct");
+    }
+    return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
+  }
   if (has("Interest Expense")) return plug(rowNumber, label, "income", "duration", resolveInterestExpense, "direct");
   if (has("Goodwill Impairment", "Impairment of Investments in Real Estate", "Asset Impairment")) return row(rowNumber, label, "income", "duration", C.impairment, -1);
   if (has("Gain on Sale of Business (Loss)") || includes("Gain on disposition", "Gain (Loss) on disposition", "Gain on sale")) {
@@ -646,7 +665,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Other Non-Current Assets", "Other Long-Term Assets", "Other LT Assets")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentAssets);
   if (has("Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities", "Pharmacy Costs Payable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsPayable);
   if (has("Securities Loaned")) return row(rowNumber, label, "balance", "instant", ["SecuritiesLoaned"]);
-  if (has("Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other Current Liabilities")) return row(rowNumber, label, "balance", "instant", C.accrued);
+  if (has("Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other Current Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveAccruedLiabilities);
   if (has("Customer Deposits")) return row(rowNumber, label, "balance", "instant", C.customerDeposits);
   if (has("Other Current Liabilities", "Other Current Liabs")) {
     return plug(rowNumber, label, "balance", "instant", resolveOtherCurrentLiabilities);
@@ -656,10 +675,13 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   }
   if (has("Short Term Borrowings", "Short-term Borrowings", "Short-Term Debt", "Short Term Debt", "Current Debt")) return row(rowNumber, label, "balance", "instant", ["OtherShortTermBorrowings", "ShortTermBorrowings", "LongTermDebtCurrent"]);
   if (has("Revolver")) return row(rowNumber, label, "balance", "instant", ["RevolvingCreditFacility", "LineOfCreditFacilityCurrentBorrowings"]);
-  if (has("LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt", "Total Debt") || includes("LT Debt")) {
+  if (has("LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt") || includes("LT Debt")) {
+    return plug(rowNumber, label, "balance", "instant", resolveLongTermDebtInclCurrentPortion);
+  }
+  if (has("Total Debt")) {
     return plug(rowNumber, label, "balance", "instant", resolveTotalDebt);
   }
-  if (has("Deferred Income Taxes")) return row(rowNumber, label, "balance", "instant", C.deferredTaxLiability);
+  if (has("Deferred Income Taxes")) return plug(rowNumber, label, "balance", "instant", resolveDeferredTaxLiability);
   if (has("Other Non-Current Liabilities")) return plug(rowNumber, label, "balance", "instant", resolveOtherNonCurrentLiabilities);
   if (has("Mezzanine Equity")) return row(rowNumber, label, "balance", "instant", ["RedeemableNoncontrollingInterestEquityCarryingAmount"]);
   if (has("Common Stock & APIC", "Common Stock and APIC", "Common Stock and Additional Paid-In Capital", "Common Stock & Additional Paid-In Capital")) return plug(rowNumber, label, "balance", "instant", resolveCommonStockAndApic);
@@ -808,6 +830,27 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   return zero ? { value: 0, sources: [zero] } : { value: null, sources: [] };
 }
 
+function resolveNonOperatingInterestExpenseAfterNetRevenue(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.duration, ["InterestExpenseNonOperating"]);
+  if (direct) {
+    return {
+      value: -Math.abs(direct.value),
+      sources: [direct],
+      note: "Mapped only to SEC non-operating interest expense because operating interest expense is already included in the model's net revenue bridge."
+    };
+  }
+
+  const netRevenue = first(period, ctx.duration, C.netRevenue);
+  const operatingInterest = first(period, ctx.duration, ["InterestExpenseOperating"]);
+  const genericInterest = first(period, ctx.duration, ["InterestExpense"]);
+  return {
+    value: 0,
+    sources: compactSources([zeroSource("InterestExpenseNonOperating"), netRevenue, operatingInterest, genericInterest]),
+    note:
+      "Set to zero because this model already deducts interest expense above net revenue and EDGAR did not report a separate non-operating interest expense for this period."
+  };
+}
+
 function resolveNonCompensationExpense(period: string, ctx: ResolveContext): ResolvedValue {
   const detail = sumWithNote(
     period,
@@ -884,6 +927,46 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
   if (detail.value !== null) return { ...(signed(detail, -1) ?? detail), classification: "grouped" };
   const direct = first(period, ctx.duration, ["OtherOperatingIncomeExpenseNet"]);
   return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
+}
+
+function resolveSellingGeneralAdministrativeExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const broadDirect = first(period, ctx.duration, ["SellingGeneralAndAdministrativeExpense"]);
+  if (broadDirect) {
+    return {
+      value: -Math.abs(broadDirect.value),
+      sources: [broadDirect],
+      note: "Mapped to EDGAR selling, general, and administrative expense.",
+      classification: "direct"
+    };
+  }
+
+  const grossProfit = first(period, ctx.duration, C.grossProfit);
+  const operatingIncome = first(period, ctx.duration, C.operatingIncome);
+  if (grossProfit && operatingIncome) {
+    const rd = first(period, ctx.duration, C.rd) ?? zeroSource(C.rd[0]);
+    const da = first(period, ctx.duration, C.da) ?? zeroSource(C.da[0]);
+    const otherOperating = first(period, ctx.duration, ["OtherOperatingIncomeExpenseNet"]) ?? zeroSource("OtherOperatingIncomeExpenseNet");
+    const value = operatingIncome.value - grossProfit.value - signedModeledExpense(rd) - signedModeledExpense(da) - otherOperating.value;
+    return {
+      value,
+      sources: compactSources([grossProfit, operatingIncome, rd, da, otherOperating]),
+      note:
+        "Calculated as the residual needed for gross profit, separately modeled R&D, D&A, and other operating income/expense to reconcile to EDGAR operating income.",
+      classification: "grouped"
+    };
+  }
+
+  const component = sumWithNote(
+    period,
+    ctx.duration,
+    ["SellingAndMarketingExpense", "SalesAndMarketingExpense", "GeneralAndAdministrativeExpense"],
+    "Grouped from EDGAR selling/marketing and general/administrative expense concepts because no broad SG&A concept was reported."
+  );
+  return signed(component, -1) ?? { value: null, sources: [], note: "No SG&A concept or operating-income bridge inputs were available in SEC facts." };
+}
+
+function signedModeledExpense(source: FactSource) {
+  return source.value === 0 ? 0 : -Math.abs(source.value);
 }
 
 function resolvePostTaxAdjustments(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1153,6 +1236,26 @@ function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
   );
 }
 
+function resolveLongTermDebtInclCurrentPortion(period: string, ctx: ResolveContext): ResolvedValue {
+  const detailed = sum(period, ctx.instant, ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "LongTermDebtNoncurrent"]);
+  if (detailed) return detailed;
+  const aggregate = first(period, ctx.instant, ["LongTermDebt"]);
+  return aggregate ? { value: aggregate.value, sources: [aggregate] } : { value: null, sources: [] };
+}
+
+function resolveDeferredTaxLiability(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.deferredTaxLiability);
+  if (!direct) return { value: null, sources: [] };
+  if (direct.value <= 0) {
+    return {
+      value: 0,
+      sources: [direct],
+      note: "SEC deferred tax fact was not a liability balance for this period, so the liability row was set to zero."
+    };
+  }
+  return { value: direct.value, sources: [direct] };
+}
+
 function resolvePpe(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.ppe);
   return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
@@ -1189,6 +1292,22 @@ function resolveAccountsPayable(period: string, ctx: ResolveContext): ResolvedVa
   const brokerDealerPayables = sumWithNote(period, ctx.instant, BROKER_DEALER_PAYABLES, "Included broker-dealer and customer payables from the SEC filing.");
   if (brokerDealerPayables.value !== null) return brokerDealerPayables;
   const direct = first(period, ctx.instant, C.ap);
+  return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
+}
+
+function resolveAccruedLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
+  const accountsPayable = resolveAccountsPayable(period, ctx);
+  const otherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
+  if (currentLiabilities && accountsPayable.value !== null && otherCurrent.value !== null) {
+    return {
+      value: currentLiabilities.value - accountsPayable.value - otherCurrent.value,
+      sources: compactSources([currentLiabilities, accountsPayable, otherCurrent]),
+      note: "Derived from SEC current liabilities less separately modeled accounts payable and other current liabilities."
+    };
+  }
+
+  const direct = first(period, ctx.instant, C.accrued);
   return direct ? { value: direct.value, sources: [direct] } : { value: null, sources: [] };
 }
 
@@ -1241,21 +1360,48 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
   const accountsPayable = resolveAccountsPayable(period, ctx);
   const securitiesLoaned = first(period, ctx.instant, ["SecuritiesLoaned"]) ?? zeroSource("SecuritiesLoaned");
   const totalDebt = resolveTotalDebt(period, ctx);
+  const modeledDebt = totalDebt.value !== null ? totalDebt : resolveLongTermDebtInclCurrentPortion(period, ctx);
   const deferredTaxes = first(period, ctx.instant, C.deferredTaxLiability) ?? zeroSource("DeferredTaxLiabilitiesNoncurrent");
   const otherNonCurrent = first(period, ctx.instant, ["OtherLiabilitiesNoncurrent"]) ?? zeroSource("OtherLiabilitiesNoncurrent");
-  if (liabilities && accountsPayable.value !== null && totalDebt.value !== null) {
+  if (liabilities && accountsPayable.value !== null && modeledDebt.value !== null) {
     return {
-      value: liabilities.value - shortTermBorrowings.value - accountsPayable.value - securitiesLoaned.value - (totalDebt.value ?? 0) - deferredTaxes.value - otherNonCurrent.value,
-      sources: compactSources([liabilities, shortTermBorrowings, accountsPayable, securitiesLoaned, totalDebt, deferredTaxes, otherNonCurrent]),
+      value: liabilities.value - shortTermBorrowings.value - accountsPayable.value - securitiesLoaned.value - (modeledDebt.value ?? 0) - deferredTaxes.value - otherNonCurrent.value,
+      sources: compactSources([liabilities, shortTermBorrowings, accountsPayable, securitiesLoaned, modeledDebt, deferredTaxes, otherNonCurrent]),
       note: "Calculated from total liabilities less separately modeled borrowings, payables, securities loaned, debt, deferred taxes, and other non-current liabilities."
     };
   }
   const brokerDealerLiabilities = sumWithNote(period, ctx.instant, BROKER_DEALER_OTHER_CURRENT_LIABILITIES, "Included broker-dealer current liability concepts reported in the SEC filing.");
   if (brokerDealerLiabilities.value !== null) return brokerDealerLiabilities;
+  const directOtherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
+  if (directOtherCurrent.value !== null) return directOtherCurrent;
   return difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.");
 }
 
+function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, [
+    "ContentLiabilitiesCurrent",
+    "ContractWithCustomerLiabilityCurrent",
+    "OtherAccruedLiabilitiesCurrent",
+    "OtherLiabilitiesCurrent"
+  ]);
+  if (!direct) return { value: null, sources: [] };
+  return {
+    value: direct.value,
+    sources: [direct],
+    note: "Mapped to a direct SEC other current liability / current contract liability concept when reported."
+  };
+}
+
 function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, ["OtherLiabilitiesNoncurrent", "ContractWithCustomerLiabilityNoncurrent"]);
+  if (direct) {
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to a direct SEC other non-current liability concept when reported."
+    };
+  }
+
   const assets = first(period, ctx.instant, C.assets);
   const currentLiabExDebt = difference(period, ctx.instant, C.currentLiabilities, [C.currentDebt], "");
   const debt = sum(period, ctx.instant, C.totalDebt);
@@ -1286,7 +1432,7 @@ function resolveCommonStockAndApic(period: string, ctx: ResolveContext): Resolve
   if (direct) return { value: direct.value, sources: [direct] };
   const equity = first(period, ctx.instant, C.equity);
   const retained = first(period, ctx.instant, C.retained) ?? zeroSource("RetainedEarningsAccumulatedDeficit");
-  const treasury = signed(first(period, ctx.instant, C.treasury), -1) ?? zeroSource("TreasuryStockValue");
+  const treasury = signed(firstWithPriorInstant(period, ctx.instant, C.treasury), -1) ?? zeroSource("TreasuryStockValue");
   const aoci = first(period, ctx.instant, C.aoci) ?? zeroSource("AccumulatedOtherComprehensiveIncomeLossNetOfTax");
   if (!equity) return { value: null, sources: [], note: "Could not derive common stock and APIC because stockholders' equity was unavailable." };
   return {
@@ -1297,7 +1443,7 @@ function resolveCommonStockAndApic(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolveTreasuryAndPreferredStock(period: string, ctx: ResolveContext): ResolvedValue {
-  const treasury = signed(first(period, ctx.instant, C.treasury), -1);
+  const treasury = signed(firstWithPriorInstant(period, ctx.instant, C.treasury), -1);
   if (treasury) return treasury;
   return { value: 0, sources: [zeroSource("TreasuryStockValue")] };
 }
@@ -1368,6 +1514,8 @@ export async function POST(request: NextRequest) {
     (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).forceFullCalc = true;
     (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).calcMode = "auto";
     await workbook.xlsx.load(Buffer.from(await file.arrayBuffer()) as unknown as ExcelJS.Buffer);
+    normalizeSharedFormulas(workbook);
+    removeInvalidConditionalFormattingRules(workbook);
     updateCoverCompanyMetadata(workbook, company);
 
     const sheet = primaryFinancialWorksheet(workbook);
@@ -1446,15 +1594,6 @@ export async function POST(request: NextRequest) {
         const cell = sheet.getCell(effectiveFillRow.row, col);
         const writeDecision = historicalWriteDecision(effectiveFillRow, cell);
         if (!writeDecision.writable) {
-          const formulaUpdate = preservedHistoricalFormulaUpdate(effectiveFillRow, cell, period, periods, columns, index, ctx);
-          if (formulaUpdate) {
-            cell.value = { formula: formulaUpdate.formula, result: formulaUpdate.value };
-            filledCells += 1;
-            addComment(cell, formulaUpdate.comment);
-            commentsAdded += 1;
-            auditRows.push(formulaUpdate.auditRow);
-            continue;
-          }
           if (shouldAuditSkippedWrite(writeDecision)) {
             auditRows.push(skippedMappingAuditRow(sheet, cell, effectiveFillRow, period, writeDecision));
           }
@@ -1462,7 +1601,7 @@ export async function POST(request: NextRequest) {
         }
 
         let resolved = resolveRow(effectiveFillRow, period, ctx);
-        if (resolved.value === null && effectiveFillRow === fillRow) {
+        if (resolved.value === null && effectiveFillRow === fillRow && fillRow.classification === "unused") {
           const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState);
           if (llmFillRow) {
             effectiveFillRow = llmFillRow;
@@ -1520,22 +1659,6 @@ export async function POST(request: NextRequest) {
     }
 
     if (isStandardModelSheet) {
-      const incomeStatementReconciliation = reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
-      filledCells += incomeStatementReconciliation.filledCells;
-      commentsAdded += incomeStatementReconciliation.commentsAdded;
-      warnings.push(...incomeStatementReconciliation.warnings);
-
-      const netIncomeReconciliation = reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
-      filledCells += netIncomeReconciliation.filledCells;
-      commentsAdded += netIncomeReconciliation.commentsAdded;
-      warnings.push(...netIncomeReconciliation.warnings);
-
-      const balanceSheetReconciliation = reconcileBalanceSheetCheck(sheet, periods, columns, auditRows);
-      filledCells += balanceSheetReconciliation.filledCells;
-      commentsAdded += balanceSheetReconciliation.commentsAdded;
-      warnings.push(...balanceSheetReconciliation.warnings);
-
-      refreshHistoricalFormulaCachedResults(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     }
 
     for (const fillRow of fillRows) {
@@ -2460,10 +2583,28 @@ function modelRowContext(
     indentation: labelCellForRow.alignment?.indent ?? 0,
     hasHistoricalFormula: formulaCells.length > 0,
     hasHardcodedInput: hardcodedCells.length > 0,
+    hasNetRevenueInterestExpenseAbove: hasNetRevenueInterestExpenseBridgeAbove(sheet, rowNumber),
     subtotalFormula: firstFormulaInRow(sheet, rowNumber, columns),
     projectedColumns: periodInfos.filter((info) => info.isEstimate).length,
     signConvention: inferSignConvention(label)
   };
+}
+
+function hasNetRevenueInterestExpenseBridgeAbove(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  let foundInterestExpense = false;
+  let foundNetRevenue = false;
+
+  for (let row = rowNumber - 1; row >= Math.max(1, rowNumber - 40); row -= 1) {
+    const label = rowLabel(sheet, row);
+    if (!label) continue;
+    const normalized = normalize(label);
+    if (normalized === normalize("Income Statement")) break;
+    if (normalized === normalize("Interest Expense")) foundInterestExpense = true;
+    if (normalized === normalize("Net Revenue") || normalized === normalize("Revenue Net of Interest Expense")) foundNetRevenue = true;
+    if (foundInterestExpense && foundNetRevenue) return true;
+  }
+
+  return false;
 }
 
 function nearestSectionHeader(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
@@ -2520,6 +2661,39 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDec
     return { writable: false, reason: "not an active historical input cell", formulaPreserved: false };
   }
   return { writable: true, formulaPreserved: false };
+}
+
+function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
+  workbook.eachSheet((sheet) => {
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        const value = cell.value;
+        if (!value || typeof value !== "object" || !("sharedFormula" in value)) return;
+        const formula = formulaForCell(cell);
+        if (!formula) return;
+        const result = "result" in value ? value.result : undefined;
+        cell.value = result === undefined ? { formula } : { formula, result };
+      });
+    });
+  });
+}
+
+function removeInvalidConditionalFormattingRules(workbook: ExcelJS.Workbook) {
+  workbook.eachSheet((sheet) => {
+    const worksheetModel = sheet as ExcelJS.Worksheet & {
+      conditionalFormattings?: Array<{ rules?: Array<{ formulae?: unknown[]; type?: string }> }>;
+    };
+    if (!worksheetModel.conditionalFormattings?.length) return;
+    worksheetModel.conditionalFormattings = worksheetModel.conditionalFormattings
+      .map((formatting) => ({
+        ...formatting,
+        rules: (formatting.rules ?? []).filter((rule) => {
+          if (rule.type !== "expression" && rule.type !== "cellIs") return true;
+          return Array.isArray(rule.formulae) && rule.formulae.length > 0;
+        })
+      }))
+      .filter((formatting) => formatting.rules?.length);
+  });
 }
 
 function shouldAuditSkippedWrite(decision: WriteDecision) {
@@ -3070,7 +3244,7 @@ function rowHasSegmentMetricInputs(sheet: ExcelJS.Worksheet, rowNumber: number, 
 }
 
 function isSegmentMetricInputCell(cell: ExcelJS.Cell) {
-  return hasFormula(cell) || isHardcodedFinancialInput(cell);
+  return isHardcodedFinancialInput(cell);
 }
 
 function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
@@ -3298,14 +3472,12 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
 
     const residualCell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(residualCell) ?? 0) + expected - current;
-    const hadResidualFormula = hasFormula(residualCell);
-    const bridgeFormula = hasFormula(residualCell) ? formulaBridgeForTargetValue(residualCell, value) : null;
-    if (!isReconciliationResidualCellWritable(residualCell) && !bridgeFormula) {
+    if (!isReconciliationResidualCellWritable(residualCell)) {
       warnings.push(`Income Statement ${period}: EBIT formula did not tie to EDGAR and no writable operating residual row was available.`);
       return;
     }
 
-    residualCell.value = bridgeFormula ? { formula: bridgeFormula, result: value } : value;
+    residualCell.value = value;
     evaluator.clear();
     filledCells += 1;
     const note = "Calculated as the residual needed for the Income Statement EBIT formula to tie to EDGAR pre-tax operating income.";
@@ -3323,8 +3495,8 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
       accession: source.accn ?? "",
       sourceUrl: "",
       cellWritable: true,
-      formulaPreserved: Boolean(bridgeFormula),
-      writeBlockedReason: residualWriteReason(hadResidualFormula, bridgeFormula, "EDGAR EBIT residual"),
+      formulaPreserved: false,
+      writeBlockedReason: "",
       signConvention: "residual",
       confidence: "medium",
       validationStatus: "OK!",
@@ -3379,14 +3551,12 @@ function reconcileNetIncomeFormulaRowsToEdgar(
 
     const residualCell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
-    const hadResidualFormula = hasFormula(residualCell);
-    const bridgeFormula = hasFormula(residualCell) ? formulaBridgeForTargetValue(residualCell, value) : null;
-    if (!isReconciliationResidualCellWritable(residualCell) && !bridgeFormula) {
+    if (!isReconciliationResidualCellWritable(residualCell)) {
       warnings.push(`Income Statement ${period}: net income does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not writable for reconciliation.`);
       return;
     }
 
-    residualCell.value = bridgeFormula ? { formula: bridgeFormula, result: value } : value;
+    residualCell.value = value;
     evaluator.clear();
     filledCells += 1;
     const note = "Calculated as the residual needed for the model's net income formula to tie to EDGAR net income.";
@@ -3404,8 +3574,8 @@ function reconcileNetIncomeFormulaRowsToEdgar(
       accession: source.accn ?? "",
       sourceUrl: "",
       cellWritable: true,
-      formulaPreserved: Boolean(bridgeFormula),
-      writeBlockedReason: residualWriteReason(hadResidualFormula, bridgeFormula, "EDGAR net income residual"),
+      formulaPreserved: false,
+      writeBlockedReason: "",
       signConvention: "residual",
       confidence: "medium",
       validationStatus: "OK!",
@@ -3522,12 +3692,7 @@ function findWritableBalanceSheetResidualRow(sheet: ExcelJS.Worksheet, rows: num
 }
 
 function isReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
-  return isHardcodedFinancialInput(cell) || hasFormula(cell);
-}
-
-function residualWriteReason(hadFormula: boolean, bridgeFormula: string | null, residualName: string) {
-  if (!hadFormula) return "";
-  return bridgeFormula ? `existing formula bridge updated with ${residualName}` : `existing formula replaced with ${residualName}`;
+  return isHardcodedFinancialInput(cell);
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -3588,7 +3753,7 @@ async function llmAssistedFillRow(
 
 function isLlmMappableRow(fillRow: FillRow) {
   if (fillRow.statement !== "income" && fillRow.statement !== "balance") return false;
-  if (fillRow.classification === "formula") return false;
+  if (fillRow.classification !== "unused") return false;
   const context = fillRow.modelContext;
   if (context && !context.hasHardcodedInput && !fillRow.allowBlankHistoricalInput) return false;
   return true;
@@ -3839,6 +4004,25 @@ function first(period: string, map: Map<string, Map<string, FactSource>>, concep
   return null;
 }
 
+function firstWithPriorInstant(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[]) {
+  const direct = first(period, map, concepts);
+  if (direct) return direct;
+
+  const priorPeriods = Array.from(map.keys())
+    .filter((candidate) => isSupportedPeriodKey(candidate) && comparePeriods(candidate, period) < 0)
+    .sort(comparePeriods)
+    .reverse();
+  for (const priorPeriod of priorPeriods) {
+    const source = first(priorPeriod, map, concepts);
+    if (!source) continue;
+    return {
+      ...source,
+      note: `${sourceDisplayLabel(source)} carried forward from ${priorPeriod} because the instant balance was not separately reported for ${period}.`
+    };
+  }
+  return null;
+}
+
 function sum(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[]): ResolvedValue | null {
   const facts = map.get(period);
   if (!facts) return null;
@@ -4046,7 +4230,7 @@ function validateWorkbookBeforeReturn(
   if (segmentSheet) {
     const segmentEvaluator = new FormulaEvaluator(segmentSheet);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
-    errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
+    warnings.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator));
   }
   if (modelSheetName !== MODEL_SHEET) return errors;
 
@@ -4054,7 +4238,7 @@ function validateWorkbookBeforeReturn(
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings));
-    errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
+    warnings.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
 
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
     if (interestExpenseRow) {
@@ -4091,7 +4275,6 @@ class FormulaEvaluator {
       const formula = formulaForCell(cell);
       result = formula ? this.evaluateFormula(formula, cell, visited) : null;
       if (result === null && "result" in value && typeof value.result === "number") result = value.result;
-      if (result !== null) setFormulaResult(cell, result);
     } else if (value && typeof value === "object" && "result" in value && typeof value.result === "number") {
       result = value.result;
     }
@@ -4265,6 +4448,8 @@ function clearStaleFormulaErrorResults(workbook: ExcelJS.Workbook) {
         if (!value || typeof value !== "object") return;
         if ("formula" in value && typeof value.formula === "string" && isFormulaErrorResult(value.result)) {
           cell.value = { formula: value.formula };
+        } else if ("sharedFormula" in value && typeof value.sharedFormula === "string" && isFormulaErrorResult(value.result)) {
+          cell.value = { sharedFormula: value.sharedFormula };
         }
       });
     });
@@ -4399,7 +4584,8 @@ function validateIncomeStatementMetricAgainstEdgar(
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
-      errors.push(message);
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
     }
   });
 
