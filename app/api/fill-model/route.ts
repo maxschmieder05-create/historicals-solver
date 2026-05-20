@@ -4632,7 +4632,9 @@ function isBridgeFormula(formula: string) {
 }
 
 function normalizeBridgeFormulaPrefix(formula: string) {
-  return formula.replace(/^\+\-/, "-").replace(/^\+/, "");
+  const normalized = formula.replace(/^\+\-/, "-").replace(/^\+/, "");
+  const wrapped = normalized.match(/^\((.+-SUM\([A-Z]+\d+:[A-Z]+\d+\))\)$/i);
+  return wrapped ? wrapped[1] : normalized;
 }
 
 function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {

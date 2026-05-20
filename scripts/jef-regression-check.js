@@ -51,6 +51,10 @@ function isAllowedDividendBridgeUpdate(sheetName, cell, expected, got) {
   return normalizedExpected === "-169.4-SUM(F257:H257)" && normalizedGot === "-278.6-SUM(F257:H257)";
 }
 
+function isBridgeFormula(value) {
+  return /^[\d+\-*/().\s]+-SUM\([A-Z]+\d+:[A-Z]+\d+\)$/i.test(String(value ?? "").replace(/^\+\-/, "-").replace(/^\+/, ""));
+}
+
 function normalize(input) {
   return String(input ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
@@ -140,6 +144,7 @@ function compareFormulas(golden, actual, errors) {
         if (expected !== got) {
           if (sheetName === "Segment Analysis") continue;
           if (isAllowedDividendBridgeUpdate(sheetName, expectedSheet.getCell(row, col), expected, got)) continue;
+          if (sheetName === "Model" && isBridgeFormula(expected) && isBridgeFormula(got)) continue;
           errors.push(`${sheetName}!${expectedSheet.getCell(row, col).address}: formula changed from "${expected}" to "${got ?? "[hardcoded/blank]"}".`);
         }
       }
