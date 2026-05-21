@@ -6056,6 +6056,7 @@ function validateIncomeStatementKeyMetrics(
       resolveModeledOperatingProfit
     )
   );
+  errors.push(...validateIncomeStatementOperatingExpenseBridge(sheet, periods, columns, evaluator, warnings));
   errors.push(
     ...validateIncomeStatementMetricAgainstEdgar(
       sheet,
@@ -6099,6 +6100,89 @@ function validateIncomeStatementKeyMetrics(
   errors.push(...validateIncomeStatementEbitdaFormula(sheet, periods, columns, evaluator, warnings));
   errors.push(...validateIncomeStatementAdjustedNetIncomeFormula(sheet, periods, columns, evaluator, warnings));
   return errors;
+}
+
+function validateIncomeStatementOperatingExpenseBridge(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const netRevenueRow = findIncomeStatementMetricRow(sheet, ["Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense", "Total Net Revenue"]);
+  const revenueRow = findIncomeStatementMetricRow(sheet, ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales"]);
+  const baseRow = netRevenueRow ?? revenueRow;
+  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]);
+  if (!baseRow || !ebitRow || ebitRow <= baseRow) return errors;
+
+  const operatingExpenseRows = incomeStatementOperatingExpenseRows(sheet, baseRow, ebitRow);
+  if (!operatingExpenseRows.length) {
+    warnings.unshift("Income Statement Analysis: operating expense bridge skipped because no operating expense rows were found between revenue and EBIT.");
+    return errors;
+  }
+
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const base = evaluator.evaluateCell(sheet.getCell(baseRow, col));
+    const ebit = evaluator.evaluateCell(sheet.getCell(ebitRow, col));
+    const expenseValues = operatingExpenseRows.map((rowNumber) => evaluator.evaluateCell(sheet.getCell(rowNumber, col)));
+    if (base === null || ebit === null || expenseValues.some((value) => value === null)) {
+      warnings.unshift(`Income Statement ${period}: operating expense bridge could not be evaluated from revenue/net revenue, operating expense rows, and EBIT.`);
+      return;
+    }
+
+    const operatingExpenses = (expenseValues as number[]).reduce((total, value) => total + value, 0);
+    const expectedEbit = base + operatingExpenses;
+    if (!statementMetricTies(expectedEbit, ebit)) {
+      const labels = operatingExpenseRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ");
+      errors.push(
+        `Income Statement ${period}: revenue/net revenue plus operating expenses equals ${roundModelValue(expectedEbit)}, but EBIT / operating income is ${roundModelValue(ebit)}. Operating expense rows checked: ${labels}.`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function incomeStatementOperatingExpenseRows(sheet: ExcelJS.Worksheet, baseRow: number, ebitRow: number) {
+  const totalRow = findOperatingExpenseTotalRowBetween(sheet, baseRow, ebitRow);
+  if (totalRow) return [totalRow];
+
+  const rows: number[] = [];
+  for (let rowNumber = baseRow + 1; rowNumber < ebitRow; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (isOperatingExpenseBridgeRowLabel(label)) rows.push(rowNumber);
+  }
+  return rows;
+}
+
+function findOperatingExpenseTotalRowBetween(sheet: ExcelJS.Worksheet, baseRow: number, ebitRow: number) {
+  for (let rowNumber = baseRow + 1; rowNumber < ebitRow; rowNumber += 1) {
+    const normalized = normalize(rowLabel(sheet, rowNumber));
+    if (/^(total)?(operating|noninterest)(costs|expenses|costsandexpenses)$/.test(normalized)) return rowNumber;
+    if (/^totaloperating(costs|expenses|costsandexpenses)$/.test(normalized)) return rowNumber;
+    if (/^totalnoninterestexpenses?$/.test(normalized)) return rowNumber;
+  }
+  return null;
+}
+
+function isOperatingExpenseBridgeRowLabel(label: string) {
+  const normalized = normalize(label);
+  if (!normalized) return false;
+  if (/otheroperating(income|expense)|otheroperatingincomeexpense/.test(normalized)) return true;
+  if (/provision.*creditloss|creditloss.*provision|customerengagement|variablecustomerengagement|^vce$/.test(normalized)) return true;
+  if (
+    /grossprofit|grossmargin|netrevenue|revenue|ebit|ebitda|operatingincome|incomefromoperations|pretax|tax|netincome|earnings|subtotal|total/.test(
+      normalized
+    )
+  ) {
+    return false;
+  }
+  if (/interestincome|interestexpense|othernonoperating|nonoperating/.test(normalized)) return false;
+  return /cost|cogs|cor|fulfillment|technology|content|research|development|salesmarketing|marketing|selling|generaladministrative|administrative|compensation|benefits|provision|creditloss|depreciation|amortization|restructuring|impairment|otheroperating|operatingexpense|noninterestexpense|expense/.test(
+    normalized
+  );
 }
 
 function validateIncomeStatementMetricAgainstEdgar(
