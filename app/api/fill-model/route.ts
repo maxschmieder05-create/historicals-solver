@@ -1,5 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import ExcelJS from "exceljs";
+import {
+  COMBINED_NONCURRENT_DEBT_AND_LEASE_CONCEPTS,
+  NONCURRENT_DEBT_CONCEPTS,
+  NONCURRENT_LEASE_LIABILITY_CONCEPTS,
+  PENSION_LIABILITY_CONCEPTS,
+  TemplateMappingContext,
+  buildLiabilityTemplateMappingContext,
+  currentDebtBelongsInAccruedLiabilities
+} from "./liability-classification";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -99,12 +108,6 @@ type ResolveContext = {
   duration: Map<string, Map<string, FactSource>>;
   instant: Map<string, Map<string, FactSource>>;
   template?: TemplateMappingContext;
-};
-
-type TemplateMappingContext = {
-  hasCurrentDebtRow: boolean;
-  hasNonCurrentLeaseLiabilityRow: boolean;
-  hasPensionLiabilityRow: boolean;
 };
 
 type PipelineLayer =
@@ -448,28 +451,6 @@ const BROKER_DEALER_OTHER_CURRENT_LIABILITIES = [
   "ObligationToReturnSecuritiesReceivedAsCollateral",
   "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent",
   "ContractWithCustomerLiabilityCurrent"
-];
-
-const NONCURRENT_DEBT_CONCEPTS = [
-  "LongTermDebtNoncurrent",
-  "LongTermDebt"
-];
-
-const COMBINED_NONCURRENT_DEBT_AND_LEASE_CONCEPTS = [
-  "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
-  "LongTermDebtAndCapitalLeaseObligationsNoncurrent"
-];
-
-const NONCURRENT_LEASE_LIABILITY_CONCEPTS = [
-  "OperatingLeaseLiabilityNoncurrent",
-  "FinanceLeaseLiabilityNoncurrent",
-  "LesseeOperatingLeaseLiabilityNoncurrent"
-];
-
-const PENSION_LIABILITY_CONCEPTS = [
-  "PensionAndOtherPostretirementDefinedBenefitPlansLiabilityNoncurrent",
-  "DefinedBenefitPensionPlanLiabilitiesNoncurrent",
-  "OtherPostretirementDefinedBenefitPlanLiabilitiesNoncurrent"
 ];
 
 const NON_COMPENSATION_EXPENSE_CONCEPTS = [
@@ -1656,12 +1637,12 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
   const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
   const accountsPayable = resolveAccountsPayable(period, ctx);
   const otherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
-  const currentDebt = ctx.template?.hasCurrentDebtRow ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
+  const currentDebt = ctx.template && !currentDebtBelongsInAccruedLiabilities(ctx.template) ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
   if (currentLiabilities && accountsPayable.value !== null && otherCurrent.value !== null && currentDebt.value !== null) {
     return {
       value: currentLiabilities.value - accountsPayable.value - otherCurrent.value - currentDebt.value,
       sources: compactSources([currentLiabilities, accountsPayable, otherCurrent, currentDebt]),
-      note: ctx.template?.hasCurrentDebtRow
+      note: ctx.template && !currentDebtBelongsInAccruedLiabilities(ctx.template)
         ? "Derived from SEC current liabilities less separately modeled accounts payable, other current liabilities, and current debt."
         : "Derived from SEC current liabilities less separately modeled accounts payable and other current liabilities. Current debt remains in accrued liabilities when the template does not expose a separate current debt row."
     };
@@ -2183,7 +2164,7 @@ export async function POST(request: NextRequest) {
     const normalizedPackage = buildNormalizedHistoricalsPackage(company, profile, periods, ctx, segmentRevenue);
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
-    ctx.template = templateMappingContext(fillRows);
+    ctx.template = buildLiabilityTemplateMappingContext(fillRows);
 
     const warnings: string[] = [];
     const auditRows: MappingAuditRow[] = [];
@@ -6963,31 +6944,6 @@ function roundModelValue(value: number) {
 
 function normalize(input: string) {
   return input.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-function templateMappingContext(fillRows: FillRow[]): TemplateMappingContext {
-  const balanceRows = fillRows.filter((row) => row.statement === "balance");
-  const hasLabel = (patterns: RegExp[]) => balanceRows.some((row) => patterns.some((pattern) => pattern.test(normalize(row.label))));
-  const hasConcept = (concepts: string[]) =>
-    balanceRows.some((row) => row.concepts?.some((concept) => concepts.includes(concept)));
-
-  return {
-    hasCurrentDebtRow:
-      hasConcept(C.currentDebt) ||
-      hasLabel([
-        /^currentdebt$/,
-        /^shorttermdebt$/,
-        /^shorttermborrowings$/,
-        /^currentportionoflongtermdebt$/,
-        /^currentmaturitiesoflongtermdebt$/
-      ]),
-    hasNonCurrentLeaseLiabilityRow:
-      hasConcept(NONCURRENT_LEASE_LIABILITY_CONCEPTS) ||
-      hasLabel([/^(operating|finance)?leaseliabilities$/, /^(operating|finance)?leaseobligations$/]),
-    hasPensionLiabilityRow:
-      hasConcept(PENSION_LIABILITY_CONCEPTS) ||
-      hasLabel([/^pensionliabilities$/, /^pensionandotherpostretirementliabilities$/, /^postretirementliabilities$/])
-  };
 }
 
 function unique<T>(items: T[]) {

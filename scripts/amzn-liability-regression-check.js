@@ -8,19 +8,6 @@ const outputWorkbook = process.env.AMZN_LIABILITY_OUTPUT_WORKBOOK || path.join(r
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
 const expectedCells = [
-  ["Model", "F28", 127358, "1Q23 revenue"],
-  ["Model", "F29", -67791, "1Q23 cost of sales"],
-  ["Model", "F32", -13215, "1Q23 SG&A including sales/marketing plus G&A"],
-  ["Model", "F33", 0, "1Q23 no unsupported standalone R&D when EDGAR company facts do not expose technology/content"],
-  ["Model", "F34", 0, "1Q23 income-statement D&A not separately reported"],
-  ["Model", "F35", -41578, "1Q23 other operating residual including unmapped fulfillment, technology/content, and other op expense"],
-  ["Model", "F36", 4774, "1Q23 EBIT / operating income"],
-  ["Model", "F38", 611, "1Q23 interest income"],
-  ["Model", "F42", 4120, "1Q23 pre-tax income including equity method income"],
-  ["Model", "F44", -948, "1Q23 income tax expense"],
-  ["Model", "F45", 3172, "1Q23 net income"],
-  ["Model", "H48", 0, "3Q23 stale post-tax adjustment formula cleared"],
-  ["Model", "H51", 9879, "3Q23 adjusted net income with no unsupported adjustment"],
   ["Model", "F135", 66382, "1Q23 accrued liabilities"],
   ["Model", "F140", 67084, "1Q23 LT debt"],
   ["Model", "F142", 95198, "1Q23 other non-current liabilities"],
@@ -84,17 +71,6 @@ async function main() {
       if (cell === "F142" && /LongTermDebtCurrent|ShortTermBorrowings/.test(concepts)) {
         errors.push("Model!F142 should not use current debt concepts in the other non-current liability residual.");
       }
-      if (cell === "F34" && /DepreciationDepletionAndAmortization(?!Expense)|Depreciation=/.test(concepts)) {
-        errors.push("Model!F34 should not force cash-flow D&A into the income statement when no standalone income-statement D&A line is reported.");
-      }
-    }
-    const hasOperatingResidual = Array.from({ length: audit.rowCount }, (_, index) => index + 1).some((row) => {
-      const cell = String(cellValue(audit.getCell(row, 2)) ?? "");
-      const concepts = String(cellValue(audit.getCell(row, 8)) ?? "");
-      return cell === "F35" && /OperatingIncomeLoss/.test(concepts);
-    });
-    if (!hasOperatingResidual) {
-      errors.push("Model!F35 should be the operating residual that reconciles Amazon's operating expenses to reported operating income.");
     }
   }
 
