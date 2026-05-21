@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "test:jef-regression": "node scripts/jef-regression-check.js"
+    "test:jef-regression": "node scripts/jef-regression-check.js",
+    "test:nflx-regression": "node scripts/nflx-regression-check.js"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
