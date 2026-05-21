@@ -1618,18 +1618,6 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
-  const segregatedCash =
-    first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation"]) ??
-    first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations"]);
-  const brokerDealerAssets = sum(period, ctx.instant, BROKER_DEALER_CURRENT_ASSETS);
-  if (segregatedCash || brokerDealerAssets) {
-    return {
-      value: (segregatedCash?.value ?? 0) + (brokerDealerAssets?.value ?? 0),
-      sources: compactSources([segregatedCash, brokerDealerAssets]),
-      note:
-        "Included SEC-regulation segregated cash plus financial instruments owned, investments and loans, securities borrowed, securities purchased under agreements to resell, and securities received as collateral."
-    };
-  }
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   const cashAndInvestments = resolveCashAndCurrentInvestments(period, ctx);
   const receivables = resolveAccountsReceivable(period, ctx);
@@ -1639,6 +1627,18 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
       value: currentAssets.value - cashAndInvestments.value - receivables.value - inventory.value,
       sources: compactSources([currentAssets, cashAndInvestments, receivables, inventory]),
       note: "Included current assets less separately modeled cash/current investments, receivables, and inventory."
+    };
+  }
+  const segregatedCash =
+    first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation"]) ??
+    first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations"]);
+  const brokerDealerAssets = sum(period, ctx.instant, BROKER_DEALER_CURRENT_ASSETS);
+  if (segregatedCash || brokerDealerAssets) {
+    return {
+      value: (segregatedCash?.value ?? 0) + (brokerDealerAssets?.value ?? 0),
+      sources: compactSources([segregatedCash, brokerDealerAssets]),
+      note:
+        "Included SEC-regulation segregated cash plus financial instruments owned, investments and loans, securities borrowed, securities purchased under agreements to resell, and securities received as collateral because no current-assets residual bridge was available."
     };
   }
   return difference(period, ctx.instant, C.currentAssets, [C.cash, C.currentInvestments, C.receivables, C.inventory], "Included current assets less separately modeled cash, current investments, receivables, and inventory.");
@@ -5753,6 +5753,15 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     columns,
     ctx,
     auditRows,
+    ["Other Current Liabilities", "Other Current Liabs"],
+    resolveOtherCurrentLiabilities
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
     ["LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt"],
     resolveLongTermDebtInclCurrentPortion
   );
@@ -6530,7 +6539,114 @@ function validateBalanceSheetStatementTotals(
       C.assets
     )
   );
+  errors.push(...validateBalanceSheetOtherBucketMetrics(sheet, periods, columns, ctx, evaluator, warnings));
   return errors;
+}
+
+function validateBalanceSheetOtherBucketMetrics(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const checks: Array<{
+    metricName: string;
+    labels: string[];
+    resolver: (period: string, ctx: ResolveContext) => ResolvedValue;
+  }> = [
+    {
+      metricName: "prepaid and other current assets",
+      labels: ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets"],
+      resolver: resolvePrepaidAndOtherCurrentAssets
+    },
+    {
+      metricName: "other non-current assets",
+      labels: ["Other Non-Current Assets", "Other Long-Term Assets", "Other LT Assets"],
+      resolver: resolveOtherNonCurrentAssets
+    },
+    {
+      metricName: "accrued liabilities",
+      labels: ["Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other", "Accrued Expenses and Other Current Liabilities"],
+      resolver: resolveAccruedLiabilities
+    },
+    {
+      metricName: "other current liabilities",
+      labels: ["Other Current Liabilities", "Other Current Liabs"],
+      resolver: resolveOtherCurrentLiabilities
+    },
+    {
+      metricName: "other non-current liabilities",
+      labels: ["Other Non-Current Liabilities", "Other Long-Term Liabilities", "Other LT Liabilities"],
+      resolver: resolveOtherNonCurrentLiabilities
+    }
+  ];
+
+  for (const check of checks) {
+    errors.push(...validateBalanceSheetMetricAgainstResolver(sheet, periods, columns, ctx, evaluator, warnings, check.metricName, check.labels, check.resolver));
+  }
+  return errors;
+}
+
+function validateBalanceSheetMetricAgainstResolver(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[],
+  metricName: string,
+  labels: string[],
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue
+) {
+  const errors: string[] = [];
+  const rowNumber = findRowInSection(sheet, "Balance Sheet", labels, (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  if (!rowNumber) return errors;
+
+  periods.forEach((period, index) => {
+    const resolved = resolver(period, ctx);
+    if (resolved.value === null) {
+      warnings.unshift(`Balance Sheet ${period}: ${metricName} tie-out skipped because the EDGAR residual bucket could not be resolved.`);
+      return;
+    }
+
+    const cell = sheet.getCell(rowNumber, columns[index]);
+    const expected = resolved.value / 1_000_000;
+    const modelValue = statementMetricCellValue(cell, evaluator, expected);
+    if (modelValue === null) {
+      const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`;
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
+      return;
+    }
+
+    if (!otherBucketMetricTies(modelValue, expected)) {
+      const concepts = resolved.sources.map((source) => source.concept).filter(Boolean).join("/");
+      const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}.`;
+      if (isPartialOtherBucketResolver(metricName, resolved)) {
+        warnings.unshift(`${message} The available EDGAR concept is a partial component, so the broader model other-bucket residual was preserved for review.`);
+        return;
+      }
+      if (hasFormula(cell)) warnings.unshift(message);
+      else errors.push(message);
+    }
+  });
+
+  return errors;
+}
+
+function otherBucketMetricTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= Math.max(5, Math.abs(expected) * 0.00075);
+}
+
+function isPartialOtherBucketResolver(metricName: string, resolved: ResolvedValue) {
+  const concepts = new Set(resolved.sources.map((source) => source.concept));
+  if (metricName === "prepaid and other current assets" && BROKER_DEALER_CURRENT_ASSETS.some((concept) => concepts.has(concept))) return true;
+  return false;
 }
 
 function validateBalanceSheetMetricAgainstEdgar(
