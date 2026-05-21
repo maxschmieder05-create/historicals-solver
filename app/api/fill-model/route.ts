@@ -396,7 +396,17 @@ const C = {
     "RealEstateInvestmentPropertyNet",
     "RealEstateInvestments"
   ],
-  intangibles: ["FiniteLivedIntangibleAssetsNet", "IntangibleAssetsNetExcludingGoodwill"],
+  intangibles: [
+    "FiniteLivedIntangibleAssetsNet",
+    "IntangibleAssetsNetExcludingGoodwill",
+    "ContentAssetsNetNoncurrent",
+    "ContentAssetsNet",
+    "LicensedContentNet",
+    "LicensedContentAssetsNet",
+    "FilmCostsNet",
+    "TelevisionProgrammingAndProductionCostsNet",
+    "ProgramRightsNet"
+  ],
   goodwill: ["Goodwill"],
   assets: ["Assets"],
   ap: ["AccountsPayableCurrent", "AccountsPayableAndAccruedLiabilitiesCurrent", "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent"],
@@ -449,8 +459,7 @@ const BROKER_DEALER_OTHER_CURRENT_LIABILITIES = [
   "SecuritiesSoldUnderAgreementsToRepurchase",
   "OtherSecuredFinancings",
   "ObligationToReturnSecuritiesReceivedAsCollateral",
-  "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent",
-  "ContractWithCustomerLiabilityCurrent"
+  "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent"
 ];
 
 const NON_COMPENSATION_EXPENSE_CONCEPTS = [
@@ -2133,7 +2142,6 @@ export async function POST(request: NextRequest) {
     const sheet = primaryFinancialWorksheet(workbook);
     if (!sheet) return jsonError(`Could not find a worksheet with historical income statement or balance sheet input rows in this workbook.`, 400);
     const isStandardModelSheet = sheet.name === MODEL_SHEET;
-
     let columns = blueColumns(sheet);
     if (!columns.length) return jsonError(`Could not find blue historical input cells in the "${sheet.name}" worksheet.`, 400);
 
@@ -2154,7 +2162,7 @@ export async function POST(request: NextRequest) {
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
-    if (isStandardModelSheet && periods.some(isQuarterPeriod)) {
+    if (periods.some(isQuarterPeriod)) {
       const inlineCtx = await fetchInlineFactContext(company, periods);
       mergeContexts(ctx, inlineCtx);
     }
@@ -2386,6 +2394,11 @@ export async function POST(request: NextRequest) {
     refreshFinalBalanceSheetKeyMetrics(sheet, periods, columns, ctx, auditRows);
     ensureFormulaDisplayCaches(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+    const finalBalanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, periods, columns, auditRows);
+    filledCells += finalBalanceSheetCheckResult.filledCells;
+    commentsAdded += finalBalanceSheetCheckResult.commentsAdded;
+    warnings.push(...finalBalanceSheetCheckResult.warnings);
+    ensureFormulaDisplayCaches(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     requestFullWorkbookRecalculation(workbook);
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile);
@@ -4258,7 +4271,7 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
   let filledCells = 0;
   let commentsAdded = 0;
   const warnings: string[] = [];
-  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT"]);
+  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]);
   const residualRow = findIncomeStatementResidualRowBefore(sheet, ebitRow, [
     "Other Operating Income (Expense)",
     "Other Operating Expenses",
@@ -4270,14 +4283,15 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
 
   const evaluator = new FormulaEvaluator(sheet, { skipCrossSheetFormulas: true });
   periods.forEach((period, index) => {
-    const source = first(period, ctx.duration, C.operatingIncome);
-    if (!source) return;
+    const resolved = resolveModeledOperatingProfit(period, ctx);
+    if (resolved.value === null) return;
+    const source = resolvedAuditSource(period, "ModeledOperatingProfitResolved", "Resolved EDGAR operating profit", resolved);
     const col = columns[index];
     const ebitCell = sheet.getCell(ebitRow, col);
     if (!hasFormula(ebitCell)) return;
     const current = evaluator.evaluateCell(ebitCell);
     if (current === null) return;
-    const expected = source.value / 1_000_000;
+    const expected = resolved.value / 1_000_000;
     if (incomeStatementFormulaTies(current, expected)) return;
 
     const residualCell = sheet.getCell(residualRow, col);
@@ -4300,7 +4314,7 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
       period,
       valueWritten: value,
       mappingType: "calculated",
-      conceptsUsed: C.operatingIncome.join(", "),
+      conceptsUsed: resolved.sources.map((item) => item.concept).join(", "),
       sourceStatement: "income",
       accession: source.accn ?? "",
       sourceUrl: "",
@@ -4315,6 +4329,12 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
   });
 
   return { filledCells, commentsAdded, warnings };
+}
+
+function resolveModeledOperatingProfit(period: string, ctx: ResolveContext): ResolvedValue {
+  const operating = first(period, ctx.duration, ["OperatingIncomeLoss"]);
+  if (operating) return { value: operating.value, sources: [operating], classification: "direct" };
+  return resolvePreTaxIncome(period, ctx);
 }
 
 function reconcileIncomeStatementFormulaMetricToEdgar(
@@ -4356,13 +4376,22 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
 
 function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], ctx: ResolveContext, auditRows: MappingAuditRow[]) {
   refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"], C.revenue, "revenue");
-  refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["EBIT"], C.operatingIncome, "EBIT");
+  refreshFormulaMetricResultsFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"],
+    resolveModeledOperatingProfit,
+    "operating profit"
+  );
   refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], CONTINUING_NET_INCOME_CONCEPTS, "net income");
   refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Net Income Available to Common Shareholders", "Net Income Available to Common Stockholders"], COMMON_SHAREHOLDER_INCOME_CONCEPTS, "net income available to common shareholders");
 
   const revenueRow = findIncomeStatementMetricRow(sheet, ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"]);
   const grossProfitRow = findIncomeStatementMetricRow(sheet, ["Gross Profit"]);
-  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT"]);
+  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]);
   const pretaxRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"]);
   const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
   const preTaxAdjustmentsRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Adjustments"]);
@@ -4410,6 +4439,32 @@ function refreshFormulaMetricResultsFromEdgar(
         value -= priorTotal;
       }
     }
+    if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
+    cell.value = { formula, result: value };
+    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} formula result from EDGAR after dependent formula caches were updated.`, "formula result refreshed"));
+  });
+}
+
+function refreshFormulaMetricResultsFromResolver(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[],
+  labels: string[],
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue,
+  metricName: string
+) {
+  const rowNumber = findIncomeStatementMetricRow(sheet, labels);
+  if (!rowNumber) return;
+  periods.forEach((period, index) => {
+    const resolved = resolver(period, ctx);
+    if (resolved.value === null) return;
+    const source = resolvedAuditSource(period, `${metricName}Resolved`, `Resolved EDGAR ${metricName}`, resolved);
+    const cell = sheet.getCell(rowNumber, columns[index]);
+    const formula = formulaForCell(cell);
+    if (!formula) return;
+    const value = resolved.value / 1_000_000;
     if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
     cell.value = { formula, result: value };
     auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} formula result from EDGAR after dependent formula caches were updated.`, "formula result refreshed"));
@@ -5996,8 +6051,9 @@ function validateIncomeStatementKeyMetrics(
       evaluator,
       warnings,
       "EBIT",
-      ["EBIT"],
-      C.operatingIncome
+      ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"],
+      C.operatingIncome,
+      resolveModeledOperatingProfit
     )
   );
   errors.push(
@@ -6844,7 +6900,9 @@ function validateSegmentStatementTieOut(
     }
     if (!segmentStatementMetricTies(segmentTotal, expected)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} rows sum to ${roundModelValue(segmentTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`;
-      if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
+      if (metricName === "D&A" && Math.abs(expected) <= 0.0001) {
+        warnings.unshift(`${message} The model has no standalone income-statement D&A total for this period, so segment/cash-flow D&A detail is reported as a review warning rather than forced into EBIT.`);
+      } else if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
       else if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
       else errors.push(message);
     }

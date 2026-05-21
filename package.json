@@ -9,9 +9,11 @@
     "lint": "next lint",
     "test:jef-regression": "node scripts/jef-regression-check.js",
     "test:nflx-regression": "node scripts/nflx-regression-check.js",
+    "test:financial-company-regression": "node scripts/financial-company-regression-check.js",
     "test:liability-rules": "node scripts/liability-classification-rules-check.js",
     "test:amzn-liability-regression": "node scripts/amzn-liability-regression-check.js",
-    "test:liability-regression": "npm run test:liability-rules && npm run test:amzn-liability-regression"
+    "test:liability-regression": "npm run test:liability-rules && npm run test:amzn-liability-regression && npm run test:financial-company-regression",
+    "test:statement-regression": "npm run test:liability-regression && npm run test:nflx-regression"
   },
   "dependencies": {
     "exceljs": "^4.4.0",
