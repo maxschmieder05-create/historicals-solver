@@ -6097,6 +6097,7 @@ function validateIncomeStatementKeyMetrics(
     )
   );
   errors.push(...validateIncomeStatementEbitdaFormula(sheet, periods, columns, evaluator, warnings));
+  errors.push(...validateIncomeStatementAdjustedNetIncomeFormula(sheet, periods, columns, evaluator, warnings));
   return errors;
 }
 
@@ -6166,8 +6167,8 @@ function validateIncomeStatementEbitdaFormula(
   const errors: string[] = [];
   const ebitdaRow = findIncomeStatementMetricRow(sheet, ["EBITDA"]);
   if (!ebitdaRow) return errors;
-  const ebitRow = findPriorLabelRow(sheet, ebitdaRow, "EBIT", 8);
-  const daRow = findPriorLabelRow(sheet, ebitdaRow, "Depreciation & Amortization", 4) ?? findPriorLabelRow(sheet, ebitdaRow, "Depreciation and Amortization", 4);
+  const ebitRow = findPriorAnyLabelRow(sheet, ebitdaRow, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"], 10);
+  const daRow = findPriorAnyLabelRow(sheet, ebitdaRow, ["Depreciation & Amortization", "Depreciation and Amortization", "D&A"], 6);
   if (!ebitRow || !daRow) {
     warnings.unshift("Income Statement Analysis: EBITDA tie-out skipped because EBIT or depreciation & amortization row was unavailable.");
     return errors;
@@ -6203,10 +6204,69 @@ function validateIncomeStatementEbitdaFormula(
   return errors;
 }
 
+function validateIncomeStatementAdjustedNetIncomeFormula(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const adjustedNetIncomeRow = findIncomeStatementMetricRow(sheet, ["Adj. Net Income (Loss)", "Adjusted Net Income", "Adj. Net Income"]);
+  if (!adjustedNetIncomeRow) return errors;
+
+  const netIncomeRow = findPriorAnyLabelRow(
+    sheet,
+    adjustedNetIncomeRow,
+    ["Net Income Available to Common Shareholders", "Net Income Available to Common Stockholders", "Net Income (Loss)", "Net Income"],
+    10
+  );
+  const preTaxAdjustmentsRow = findPriorAnyLabelRow(sheet, adjustedNetIncomeRow, ["Pre-Tax Adjustments"], 10);
+  const postTaxAdjustmentsRow = findPriorAnyLabelRow(sheet, adjustedNetIncomeRow, ["Post-Tax Adjustments", "Preferred Stock Dividend"], 10);
+
+  if (!netIncomeRow || !preTaxAdjustmentsRow || !postTaxAdjustmentsRow) {
+    warnings.unshift("Income Statement Analysis: adjusted net income tie-out skipped because net income, pre-tax adjustments, or post-tax adjustments row was unavailable.");
+    return errors;
+  }
+
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const adjustedCell = sheet.getCell(adjustedNetIncomeRow, col);
+    const adjusted = evaluator.evaluateCell(adjustedCell);
+    const netIncome = evaluator.evaluateCell(sheet.getCell(netIncomeRow, col));
+    const preTaxAdjustments = evaluator.evaluateCell(sheet.getCell(preTaxAdjustmentsRow, col));
+    const postTaxAdjustments = evaluator.evaluateCell(sheet.getCell(postTaxAdjustmentsRow, col));
+
+    if (adjusted === null || netIncome === null || preTaxAdjustments === null || postTaxAdjustments === null) {
+      const message = `Income Statement ${columnLetter(col)}${adjustedNetIncomeRow} ${period}: could not evaluate adjusted net income bridge.`;
+      if (hasFormula(adjustedCell)) warnings.unshift(message);
+      else errors.push(message);
+      return;
+    }
+
+    const expected = netIncome + preTaxAdjustments + postTaxAdjustments;
+    if (!valuesTie(adjusted, expected)) {
+      const message = `Income Statement ${columnLetter(col)}${adjustedNetIncomeRow} ${period}: adjusted net income ${roundModelValue(adjusted)} does not equal net income plus pre-tax and post-tax adjustments ${roundModelValue(expected)}.`;
+      if (hasFormula(adjustedCell)) warnings.unshift(message);
+      else errors.push(message);
+    }
+  });
+
+  return errors;
+}
+
 function findIncomeStatementMetricRow(sheet: ExcelJS.Worksheet, labels: string[]) {
   return findRowInSection(sheet, "Income Statement", labels, (label) =>
     /income statement analysis|cash flow statement|cashflow statement|balance sheet/i.test(label)
   );
+}
+
+function findPriorAnyLabelRow(sheet: ExcelJS.Worksheet, startRow: number, labels: string[], maxRows: number) {
+  for (const label of labels) {
+    const rowNumber = findPriorLabelRow(sheet, startRow, label, maxRows);
+    if (rowNumber) return rowNumber;
+  }
+  return null;
 }
 
 function findPriorLabelRow(sheet: ExcelJS.Worksheet, startRow: number, label: string, maxRows: number) {
