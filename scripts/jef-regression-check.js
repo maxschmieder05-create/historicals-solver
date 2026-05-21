@@ -250,6 +250,14 @@ function compareProtectedScheduleRowsBlank(actual, errors) {
   }
 }
 
+function compareNoExternalWorkbookDefinedNames(actual, errors) {
+  const names = actual.definedNames?.model ?? [];
+  const external = names.filter((item) => (item.ranges ?? []).some((range) => /(?:^|')\[[^\]]+\]/.test(range)));
+  if (external.length) {
+    errors.push(`Workbook contains ${external.length} external-workbook defined name(s), which can trigger Excel repair/link prompts.`);
+  }
+}
+
 function isBlank(cell) {
   const got = cellValue(cell);
   return got === null || got === undefined || got === "";
@@ -266,6 +274,7 @@ async function main() {
   compareCashFlowBlank(actual, errors);
   compareProtectedBeginningBalancesBlank(actual, errors);
   compareProtectedScheduleRowsBlank(actual, errors);
+  compareNoExternalWorkbookDefinedNames(actual, errors);
 
   if (errors.length) {
     console.error(errors.slice(0, 40).join("\n"));

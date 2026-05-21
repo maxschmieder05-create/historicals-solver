@@ -1779,12 +1779,11 @@ export async function POST(request: NextRequest) {
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Historicals Solver";
-    workbook.calcProperties.fullCalcOnLoad = true;
-    (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).forceFullCalc = true;
-    (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).calcMode = "auto";
     await workbook.xlsx.load(Buffer.from(await file.arrayBuffer()) as unknown as ExcelJS.Buffer);
+    requestFullWorkbookRecalculation(workbook);
     normalizeSharedFormulas(workbook);
     removeInvalidConditionalFormattingRules(workbook);
+    removeExternalWorkbookDefinedNames(workbook);
     updateCoverCompanyMetadata(workbook, company);
 
     const sheet = primaryFinancialWorksheet(workbook);
@@ -1979,6 +1978,8 @@ export async function POST(request: NextRequest) {
 
     restoreWorkbookLabels(workbook, workbookSnapshot);
     clearStaleFormulaErrorResults(workbook);
+    refreshHistoricalFormulaCachedResults(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
+    requestFullWorkbookRecalculation(workbook);
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
@@ -3008,6 +3009,23 @@ function removeInvalidConditionalFormattingRules(workbook: ExcelJS.Workbook) {
       }))
       .filter((formatting) => formatting.rules?.length);
   });
+}
+
+function removeExternalWorkbookDefinedNames(workbook: ExcelJS.Workbook) {
+  const definedNames = workbook.definedNames as ExcelJS.Workbook["definedNames"] & {
+    model?: Array<{ name: string; ranges?: string[] }>;
+  };
+  if (!definedNames.model?.length) return;
+  definedNames.model = definedNames.model
+    .map((item) => ({
+      ...item,
+      ranges: (item.ranges ?? []).filter((range) => !isExternalWorkbookReference(range))
+    }))
+    .filter((item) => (item.ranges ?? []).length);
+}
+
+function isExternalWorkbookReference(reference: string) {
+  return /(?:^|')\[[^\]]+\]/.test(reference) || /\[[^\]]+\.(?:xlsx|xlsm|xlsb|xls)\]/i.test(reference);
 }
 
 function shouldAuditSkippedWrite(decision: WriteDecision) {
@@ -6022,6 +6040,12 @@ function normalize(input: string) {
 
 function unique<T>(items: T[]) {
   return Array.from(new Set(items));
+}
+
+function requestFullWorkbookRecalculation(workbook: ExcelJS.Workbook) {
+  workbook.calcProperties.fullCalcOnLoad = true;
+  (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).forceFullCalc = true;
+  (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).calcMode = "auto";
 }
 
 function jsonError(error: string, status: number) {
