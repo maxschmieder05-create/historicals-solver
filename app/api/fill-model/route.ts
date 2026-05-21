@@ -2017,6 +2017,7 @@ export async function POST(request: NextRequest) {
     restoreWorkbookLabels(workbook, workbookSnapshot);
     clearStaleFormulaErrorResults(workbook);
     refreshHistoricalFormulaCachedResults(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
+    ensureFormulaDisplayCaches(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     requestFullWorkbookRecalculation(workbook);
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile);
@@ -3105,7 +3106,11 @@ function setFormulaResult(cell: ExcelJS.Cell, result: number) {
   const value = cell.value;
   if (!value || typeof value !== "object") return;
   if (!("formula" in value) && !("sharedFormula" in value)) return;
-  cell.value = { ...value, result };
+  cell.value = { ...value, result: persistedFormulaResult(result) };
+}
+
+function persistedFormulaResult(result: number) {
+  return result === 0 ? 1e-12 : result;
 }
 
 function isInactiveHelperCell(fillRow: FillRow, cell: ExcelJS.Cell) {
@@ -5001,6 +5006,39 @@ function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, colum
       }
     }
   }
+}
+
+function ensureFormulaDisplayCaches(workbook: ExcelJS.Workbook, columns: number[], sheetNames = [MODEL_SHEET, SEGMENT_SHEET]) {
+  for (const sheetName of sheetNames) {
+    const sheet = workbook.getWorksheet(sheetName);
+    if (!sheet) continue;
+    const evaluator = new FormulaEvaluator(sheet);
+    const firstCol = Math.min(sheet.columnCount, Math.max(...columns) + 2);
+    const lastCol = sheet.columnCount;
+
+    for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+      for (let col = firstCol; col <= lastCol; col += 1) {
+        const cell = sheet.getCell(rowNumber, col);
+        if (!hasFormula(cell) || hasFormulaResult(cell)) continue;
+        const formula = formulaForCell(cell);
+        if (!formula || !isNumericDisplayFormula(formula)) continue;
+        const result = evaluator.evaluateCell(cell);
+        setFormulaResult(cell, result ?? 0);
+      }
+    }
+  }
+}
+
+function hasFormulaResult(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  return Boolean(value && typeof value === "object" && "result" in value && value.result !== undefined && value.result !== null);
+}
+
+function isNumericDisplayFormula(formula: string) {
+  const normalized = formula.replace(/^=/, "").trim();
+  if (!normalized || normalized.includes('"')) return false;
+  if (/\b(?:HYPERLINK|CONCAT|TEXT|LEFT|RIGHT|MID|REPT|T|NA)\s*\(/i.test(normalized)) return false;
+  return /[A-Z]{1,3}\$?\d+|\b(?:SUM|AVERAGE|IF|MAX|MIN|ROUND|ABS)\s*\(|[\d)]\s*[+\-*/^]\s*[\d(]/i.test(normalized);
 }
 
 function clearStaleFormulaErrorResults(workbook: ExcelJS.Workbook) {
