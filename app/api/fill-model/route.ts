@@ -1238,7 +1238,28 @@ function resolveDirectNoncontrollingIncome(period: string, ctx: ResolveContext):
 
 function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.duration, ["IncomeTaxExpenseBenefit", "IncomeTaxExpenseBenefitContinuingOperations"]);
+  const pretax = resolvePreTaxIncome(period, ctx);
+  const continuingNet = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
+  const derived = pretax.value !== null && continuingNet
+    ? {
+        value: continuingNet.value - pretax.value,
+        sources: [
+          bridgeSource(period, "IncomeTaxExpenseBenefitDerived", "Income tax expense/benefit derived from EDGAR pre-tax income and net income", continuingNet.value - pretax.value, [pretax, continuingNet]),
+          ...pretax.sources,
+          continuingNet
+        ],
+        note: "Derived as EDGAR net income less EDGAR pre-tax income so the model's pre-tax plus tax formula reconciles to EDGAR net income.",
+        classification: "grouped" as RowClassification
+      }
+    : null;
   if (direct) {
+    if (derived && !statementMetricTies(-direct.value / 1_000_000, derived.value / 1_000_000)) {
+      return {
+        ...derived,
+        sources: [derived.sources[0], direct, ...derived.sources.slice(1)],
+        note: "Derived from EDGAR pre-tax income and net income because the direct income tax fact did not reconcile the income statement for this period."
+      };
+    }
     return {
       value: -direct.value,
       sources: [direct],
@@ -1246,9 +1267,7 @@ function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedV
     };
   }
 
-  const pretax = resolvePreTaxIncome(period, ctx);
-  const continuingNet = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
-  if (pretax.value === null || !continuingNet) {
+  if (!derived) {
     return {
       value: null,
       sources: compactSources([pretax, continuingNet]),
@@ -1256,17 +1275,7 @@ function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedV
     };
   }
 
-  const value = continuingNet.value - pretax.value;
-  return {
-    value,
-    sources: [
-      bridgeSource(period, "IncomeTaxExpenseBenefitDerived", "Income tax expense/benefit derived from EDGAR pre-tax income and net income", value, [pretax, continuingNet]),
-      ...pretax.sources,
-      continuingNet
-    ],
-    note: "Derived as EDGAR net income less EDGAR pre-tax income so the model's pre-tax plus tax formula reconciles to EDGAR net income.",
-    classification: "grouped"
-  };
+  return derived;
 }
 
 function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue {
@@ -6071,6 +6080,8 @@ function validateIncomeStatementKeyMetrics(
       resolvePreTaxIncome
     )
   );
+  errors.push(...validateIncomeStatementPreTaxBridge(sheet, periods, columns, evaluator, warnings));
+  errors.push(...validateIncomeStatementTaxBridge(sheet, periods, columns, evaluator, warnings));
   errors.push(
     ...validateIncomeStatementMetricAgainstEdgar(
       sheet,
@@ -6100,6 +6111,115 @@ function validateIncomeStatementKeyMetrics(
   errors.push(...validateIncomeStatementEbitdaFormula(sheet, periods, columns, evaluator, warnings));
   errors.push(...validateIncomeStatementAdjustedNetIncomeFormula(sheet, periods, columns, evaluator, warnings));
   return errors;
+}
+
+function validateIncomeStatementTaxBridge(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const pretaxRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"]);
+  const taxRow = findIncomeStatementMetricRow(sheet, ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"]);
+  const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
+  if (!pretaxRow || !taxRow || !netIncomeRow || netIncomeRow <= taxRow) return errors;
+
+  const postTaxRows = incomeStatementTaxToNetIncomeBridgeRows(sheet, taxRow, netIncomeRow);
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const pretax = evaluator.evaluateCell(sheet.getCell(pretaxRow, col));
+    const tax = evaluator.evaluateCell(sheet.getCell(taxRow, col));
+    const netIncome = evaluator.evaluateCell(sheet.getCell(netIncomeRow, col));
+    const postTaxValues = postTaxRows.map((rowNumber) => evaluator.evaluateCell(sheet.getCell(rowNumber, col)));
+    if (pretax === null || tax === null || netIncome === null || postTaxValues.some((value) => value === null)) {
+      warnings.unshift(`Income Statement ${period}: tax bridge could not be evaluated from pre-tax income, tax expense, post-tax rows, and net income.`);
+      return;
+    }
+
+    const postTaxItems = (postTaxValues as number[]).reduce((total, value) => total + value, 0);
+    const expectedNetIncome = pretax + tax + postTaxItems;
+    if (!statementMetricTies(expectedNetIncome, netIncome)) {
+      const labels = postTaxRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ") || "[none]";
+      errors.push(
+        `Income Statement ${period}: pre-tax income plus tax expense and post-tax rows equals ${roundModelValue(expectedNetIncome)}, but net income is ${roundModelValue(netIncome)}. Post-tax rows checked: ${labels}.`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function incomeStatementTaxToNetIncomeBridgeRows(sheet: ExcelJS.Worksheet, taxRow: number, netIncomeRow: number) {
+  const rows: number[] = [];
+  for (let rowNumber = taxRow + 1; rowNumber < netIncomeRow; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (isTaxToNetIncomeBridgeRowLabel(label)) rows.push(rowNumber);
+  }
+  return rows;
+}
+
+function isTaxToNetIncomeBridgeRowLabel(label: string) {
+  const normalized = normalize(label);
+  if (!normalized) return false;
+  if (/netincome|earnings|subtotal|total/.test(normalized)) return false;
+  return /discontinued|noncontrolling|minorityinterest|equitymethod|preferred|posttax|other/.test(normalized);
+}
+
+function validateIncomeStatementPreTaxBridge(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  evaluator: FormulaEvaluator,
+  warnings: string[]
+) {
+  const errors: string[] = [];
+  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]);
+  const pretaxRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"]);
+  if (!ebitRow || !pretaxRow || pretaxRow <= ebitRow) return errors;
+
+  const bridgeRows = incomeStatementPreTaxBridgeRows(sheet, ebitRow, pretaxRow);
+  periods.forEach((period, index) => {
+    const col = columns[index];
+    const ebit = evaluator.evaluateCell(sheet.getCell(ebitRow, col));
+    const pretax = evaluator.evaluateCell(sheet.getCell(pretaxRow, col));
+    const bridgeValues = bridgeRows.map((rowNumber) => evaluator.evaluateCell(sheet.getCell(rowNumber, col)));
+    if (ebit === null || pretax === null || bridgeValues.some((value) => value === null)) {
+      warnings.unshift(`Income Statement ${period}: pre-tax bridge could not be evaluated from EBIT, below-operating rows, and pre-tax income.`);
+      return;
+    }
+
+    const belowOperatingItems = (bridgeValues as number[]).reduce((total, value) => total + value, 0);
+    const expectedPreTax = ebit + belowOperatingItems;
+    if (!statementMetricTies(expectedPreTax, pretax)) {
+      const labels = bridgeRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ") || "[none]";
+      errors.push(
+        `Income Statement ${period}: EBIT plus below-operating income/expense equals ${roundModelValue(expectedPreTax)}, but pre-tax income is ${roundModelValue(pretax)}. Below-operating rows checked: ${labels}.`
+      );
+    }
+  });
+
+  return errors;
+}
+
+function incomeStatementPreTaxBridgeRows(sheet: ExcelJS.Worksheet, ebitRow: number, pretaxRow: number) {
+  const rows: number[] = [];
+  for (let rowNumber = ebitRow + 1; rowNumber < pretaxRow; rowNumber += 1) {
+    const label = rowLabel(sheet, rowNumber);
+    if (isBelowOperatingPreTaxBridgeRowLabel(label)) rows.push(rowNumber);
+  }
+  return rows;
+}
+
+function isBelowOperatingPreTaxBridgeRowLabel(label: string) {
+  const normalized = normalize(label);
+  if (!normalized) return false;
+  if (/othernonoperating|nonoperating|otherincome|otherexpense/.test(normalized)) return true;
+  if (/pretax|incomebeforetax|tax|netincome|earnings|subtotal|total|ebit|ebitda|operatingincome/.test(normalized)) return false;
+  return /interest|goodwillimpairment|impairment|gain|loss|equitymethod|unconsolidated|extinguishment|foreigncurrency|investment/.test(
+    normalized
+  );
 }
 
 function validateIncomeStatementOperatingExpenseBridge(
@@ -6203,16 +6323,17 @@ function validateIncomeStatementMetricAgainstEdgar(
 
   periods.forEach((period, index) => {
     const resolved = resolver ? resolver(period, ctx) : null;
-    const edgarValue = resolved?.value !== null && resolved?.value !== undefined
+    const edgarSource = resolved?.value !== null && resolved?.value !== undefined
       ? resolvedAuditSource(period, `${metricName}Resolved`, `Resolved EDGAR ${metricName}`, resolved)
       : first(period, ctx.duration, concepts);
-    if (!edgarValue) {
+    const expectedRaw = resolved?.value !== null && resolved?.value !== undefined ? resolved.value : edgarSource?.value;
+    if (!edgarSource || expectedRaw === null || expectedRaw === undefined) {
       warnings.unshift(`Income Statement ${period}: ${metricName} tie-out skipped because EDGAR ${concepts.join("/")} was unavailable for that period.`);
       return;
     }
 
     const cell = sheet.getCell(rowNumber, columns[index]);
-    const expected = edgarValue.value / 1_000_000;
+    const expected = expectedRaw / 1_000_000;
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`;
