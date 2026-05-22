@@ -1517,16 +1517,26 @@ function zeroResolved(concept: string): ResolvedValue {
 }
 
 function resolveCurrentDebt(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = sum(period, ctx.instant, C.currentDebt);
+  const direct = reportedCurrentDebt(period, ctx);
   return direct ?? { value: 0, sources: [zeroSource(C.currentDebt[0])], note: "No separate current debt concept was reported for this period." };
 }
 
+function reportedCurrentDebt(period: string, ctx: ResolveContext): ResolvedValue | null {
+  const aggregate = first(period, ctx.instant, ["DebtCurrent"]);
+  if (aggregate) return { value: aggregate.value, sources: [aggregate] };
+
+  const currentMaturities = first(period, ctx.instant, ["LongTermDebtCurrent", "CurrentPortionOfLongTermDebt"]);
+  const shortTermBorrowings = first(period, ctx.instant, ["ShortTermBorrowings", "ShortTermBorrowingsCurrent"]);
+  if (!currentMaturities && !shortTermBorrowings) return null;
+  return {
+    value: (currentMaturities?.value ?? 0) + (shortTermBorrowings?.value ?? 0),
+    sources: compactSources([currentMaturities, shortTermBorrowings])
+  };
+}
+
 function debtRowUsesCombinedCurrentDebt(period: string, ctx: ResolveContext) {
-  return Boolean(
-    ctx.template?.hasDebtInclCurrentPortionRow &&
-      ctx.template.hasCurrentDebtRow !== true &&
-      first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS)
-  );
+  if (!ctx.template?.hasDebtInclCurrentPortionRow || ctx.template.hasCurrentDebtRow === true) return false;
+  return Boolean(first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS));
 }
 
 function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1547,13 +1557,12 @@ function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
 
 function resolveLongTermDebtInclCurrentPortion(period: string, ctx: ResolveContext): ResolvedValue {
   if (debtRowUsesCombinedCurrentDebt(period, ctx)) {
-    const totalDebt = resolveTotalDebt(period, ctx);
-    if (totalDebt.value !== null) {
+    const aggregate = first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS);
+    if (aggregate) {
       return {
-        ...totalDebt,
-        note:
-          totalDebt.note ??
-          "Used total reported debt because the template debt row includes the current portion and no separate current debt row is present."
+        value: aggregate.value,
+        sources: [aggregate],
+        note: "Used total reported debt because the template debt row includes the current portion and no separate current debt row is present."
       };
     }
   }
@@ -1571,7 +1580,7 @@ function resolveLongTermDebtInclCurrentPortion(period: string, ctx: ResolveConte
     }
     return { value: combinedDebtAndLease.value, sources: [combinedDebtAndLease] };
   }
-  const detailed = sum(period, ctx.instant, C.currentDebt);
+  const detailed = reportedCurrentDebt(period, ctx);
   if (detailed && ctx.template?.hasCurrentDebtRow !== true) {
     return {
       value: detailed.value,
@@ -1832,7 +1841,16 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
       note: "Calculated from total liabilities less separately modeled borrowings, payables, securities loaned, debt, deferred taxes, and other non-current liabilities."
     };
   }
-  return difference(period, ctx.instant, C.currentLiabilities, [C.ap, C.accrued, C.currentDebt], "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt.");
+  const currentDebtModeledSeparately = ctx.template ? !currentDebtBelongsInAccruedLiabilities(ctx.template) || debtRowUsesCombinedCurrentDebt(period, ctx) : true;
+  return difference(
+    period,
+    ctx.instant,
+    C.currentLiabilities,
+    currentDebtModeledSeparately ? [C.ap, C.accrued, C.currentDebt] : [C.ap, C.accrued],
+    currentDebtModeledSeparately
+      ? "Included current liabilities less separately modeled accounts payable, accrued liabilities, and current debt."
+      : "Included current liabilities less separately modeled accounts payable and accrued liabilities. Current debt remains in the current-liability residual because the template does not expose a separate current debt row."
+  );
 }
 
 function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
@@ -7164,6 +7182,7 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     if (!cell) continue;
     const actual = cellDisplay(cell);
     if (actual !== expected) {
+      if (isFormulaErrorResult(expected) && cellFormula(cell)) continue;
       errors.push(`${address}: row label changed from "${expected}" to "${actual}".`);
     }
   }
