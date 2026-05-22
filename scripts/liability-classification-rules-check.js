@@ -59,11 +59,28 @@ const baseRows = [
 
 const embeddedDebtContext = buildLiabilityTemplateMappingContext(baseRows);
 assert.equal(embeddedDebtContext.hasCurrentDebtRow, false);
+assert.equal(embeddedDebtContext.hasDebtInclCurrentPortionRow, true);
 assert.equal(currentDebtBelongsInAccruedLiabilities(embeddedDebtContext), true);
 assert.equal(
   accruedLiabilityResidual(
     { currentLiabilities: 1000, accountsPayable: 250, otherCurrentLiabilities: 125, currentDebt: 75 },
     embeddedDebtContext
+  ),
+  625
+);
+
+const noDebtLineContext = buildLiabilityTemplateMappingContext([
+  { statement: "balance", label: "Accounts Payable" },
+  { statement: "balance", label: "Accrued Expenses and Other" },
+  { statement: "balance", label: "Other Non-Current Liabilities" }
+]);
+assert.equal(noDebtLineContext.hasCurrentDebtRow, false);
+assert.equal(noDebtLineContext.hasDebtInclCurrentPortionRow, false);
+assert.equal(currentDebtBelongsInAccruedLiabilities(noDebtLineContext), true);
+assert.equal(
+  accruedLiabilityResidual(
+    { currentLiabilities: 1000, accountsPayable: 250, otherCurrentLiabilities: 125, currentDebt: 75 },
+    noDebtLineContext
   ),
   625
 );
