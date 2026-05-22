@@ -13,8 +13,9 @@
     "test:liability-rules": "node scripts/liability-classification-rules-check.js",
     "test:amzn-liability-regression": "node scripts/amzn-liability-regression-check.js",
     "test:syk-random-validation": "node scripts/syk-random-validation-check.js",
+    "test:mck-random-validation": "node scripts/mck-random-validation-check.js",
     "test:liability-regression": "npm run test:liability-rules && npm run test:amzn-liability-regression && npm run test:financial-company-regression",
-    "test:statement-regression": "npm run test:liability-regression && npm run test:nflx-regression && npm run test:syk-random-validation"
+    "test:statement-regression": "npm run test:liability-regression && npm run test:nflx-regression && npm run test:syk-random-validation && npm run test:mck-random-validation"
   },
   "dependencies": {
     "exceljs": "^4.4.0",

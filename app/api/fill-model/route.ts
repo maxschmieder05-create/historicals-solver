@@ -4426,7 +4426,7 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
 
     const residualCell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(residualCell) ?? 0) + expected - current;
-    if (!isReconciliationResidualCellWritable(residualCell)) {
+    if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
       warnings.push(`Income Statement ${period}: EBIT formula did not tie to EDGAR and no writable operating residual row was available.`);
       return;
     }
@@ -4664,7 +4664,7 @@ function reconcileNetIncomeFormulaRowsToEdgar(
 
     const residualCell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
-    if (!isReconciliationResidualCellWritable(residualCell)) {
+    if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
       warnings.push(`Income Statement ${period}: net income does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not writable for reconciliation.`);
       return;
     }
@@ -4731,7 +4731,7 @@ function reconcilePreTaxIncomeFormulaRowsToEdgar(
 
     const residualCell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
-    if (!isReconciliationResidualCellWritable(residualCell)) {
+    if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
       warnings.push(`Income Statement ${period}: pre-tax income does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not writable for reconciliation.`);
       return;
     }
@@ -5109,6 +5109,11 @@ function findWritableBalanceSheetResidualRow(sheet: ExcelJS.Worksheet, rows: num
 
 function isReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
   return isHardcodedFinancialInput(cell);
+}
+
+function isIncomeStatementReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
+  if (isReconciliationResidualCellWritable(cell)) return true;
+  return isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)));
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -7187,7 +7192,7 @@ function isFormulaReplacementAllowedForReconciliation(label: string) {
   if (["pretaxadjustments", "posttaxadjustments", "discontinuedoperations", "incomelossduetononcontrollinginterest"].includes(normalized)) {
     return true;
   }
-  return /other\s+operating\s+income|other\s+operating\s+expense|income\s*tax|pre\s*-\s*tax\s+adjustments|post\s*-\s*tax\s+adjustments|discontinued\s+operations|non\s*-\s*controlling\s+interest|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities/i.test(label);
+  return /other\s+operating\s+income|other\s+operating\s+expense|other\s+non\s*-?\s*operating\s+income|other\s+non\s*-?\s*operating\s+expense|other\s+income\s+\(expense\)|other\s+expense\s+\(income\)|income\s*tax|pre\s*-\s*tax\s+adjustments|post\s*-\s*tax\s+adjustments|discontinued\s+operations|non\s*-\s*controlling\s+interest|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities/i.test(label);
 }
 
 function isBridgeFormula(formula: string) {
