@@ -2429,18 +2429,23 @@ export async function POST(request: NextRequest) {
 
     let periodInfos = templatePeriodInfos(sheet, columns);
     let periods: string[];
-    if (periodInfos.length === columns.length) {
+    const detectedPairs = historicalPeriodColumnPairs(sheet, columns, ctx);
+    if (detectedPairs.length) {
+      periods = detectedPairs.map((pair) => pair.period);
+      columns = detectedPairs.map((pair) => pair.col);
+      periodInfos = detectedPairs.map((pair) => ({ period: pair.period, isEstimate: false }));
+    } else if (periodInfos.length === columns.length) {
       const supportedPairs = periodInfos
         .map((info, index) => ({ ...info, col: columns[index] }))
-        .filter(({ period, isEstimate }) => isSupportedPeriodKey(period) && !isEstimate && (ctx.duration.has(period) || ctx.instant.has(period)));
-      const quarterlyPairs = supportedPairs.filter(({ period }) => isQuarterPeriod(period));
-      const annualPairs = supportedPairs.filter(({ period }) => isAnnualPeriod(period));
-      const pairs = quarterlyPairs.length ? quarterlyPairs : annualPairs;
+        .filter(({ period, isEstimate }) => isHistoricalReportedPeriod(period, isEstimate, ctx));
+      const pairs = preferredHistoricalPairs(supportedPairs);
       periods = pairs.map((pair) => pair.period);
       columns = pairs.map((pair) => pair.col);
+      periodInfos = pairs.map((pair) => ({ period: pair.period, isEstimate: false }));
     } else {
       periods = choosePeriods(ctx, columns.length);
       columns = columns.slice(0, periods.length);
+      periodInfos = periods.map((period) => ({ period, isEstimate: false }));
     }
     if (!periods.length) return jsonError("SEC company facts did not include usable quarterly periods for this company.", 422);
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
@@ -3989,42 +3994,66 @@ function blueColumns(sheet: ExcelJS.Worksheet) {
 }
 
 function periodHeaderColumns(sheet: ExcelJS.Worksheet) {
-  let best: number[] = [];
+  return bestPeriodHeaderRow(sheet)?.columns ?? [];
+}
+
+function templatePeriodInfos(sheet: ExcelJS.Worksheet, columns: number[]) {
+  const header = bestPeriodHeaderRow(sheet);
+  if (!header) return [];
+  const byColumn = new Map(header.infos.map((info) => [info.col, info]));
+  return columns.map((col) => {
+    const info = byColumn.get(col);
+    return info ? { period: info.period, isEstimate: info.isEstimate } : { period: "", isEstimate: false };
+  });
+}
+
+function historicalPeriodColumnPairs(sheet: ExcelJS.Worksheet, columns: number[], ctx: ResolveContext) {
+  const header = bestPeriodHeaderRow(sheet);
+  if (!header) return [];
+  const columnSet = new Set(columns);
+  const pairs = header.infos
+    .filter((info) => columnSet.has(info.col) && isHistoricalReportedPeriod(info.period, info.isEstimate, ctx))
+    .map(({ col, period }) => ({ col, period }));
+  return preferredHistoricalPairs(pairs);
+}
+
+function bestPeriodHeaderRow(sheet: ExcelJS.Worksheet) {
+  let best: { rowNumber: number; columns: number[]; infos: Array<{ col: number; period: string; isEstimate: boolean }>; validCount: number; quarterCount: number } | null = null;
   for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 120); rowNumber += 1) {
-    const cols: number[] = [];
-    for (let col = 4; col <= Math.min(sheet.columnCount, 120); col += 1) {
-      if (isSupportedPeriodKey(normalizePeriodLabel(cellDisplay(sheet.getCell(rowNumber, col))))) cols.push(col);
+    const infos: Array<{ col: number; period: string; isEstimate: boolean }> = [];
+    for (let col = 4; col <= Math.min(sheet.columnCount, 160); col += 1) {
+      const label = cellDisplay(sheet.getCell(rowNumber, col));
+      const period = normalizePeriodLabel(label);
+      if (!isSupportedPeriodKey(period)) continue;
+      infos.push({ col, period, isEstimate: isEstimatePeriodLabel(label) });
     }
-    if (cols.length > best.length) best = cols;
+    const validCount = infos.length;
+    const quarterCount = infos.filter((info) => isQuarterPeriod(info.period)).length;
+    if (!validCount) continue;
+    if (!best || validCount > best.validCount || (validCount === best.validCount && quarterCount > best.quarterCount)) {
+      best = { rowNumber, columns: infos.map((info) => info.col), infos, validCount, quarterCount };
+    }
   }
   return best;
 }
 
-function templatePeriodInfos(sheet: ExcelJS.Worksheet, columns: number[]) {
-  let best: Array<{ period: string; isEstimate: boolean }> = [];
-  let bestCount = 0;
-  let bestQuarterCount = 0;
-  for (let rowNumber = 1; rowNumber <= Math.min(sheet.rowCount, 80); rowNumber += 1) {
-    const infos = columns.map((col) => {
-      const label = cellDisplay(sheet.getCell(rowNumber, col));
-      return {
-        period: normalizePeriodLabel(label),
-        isEstimate: /e\s*$/i.test(label.trim())
-      };
-    });
-    const validCount = infos.filter((info) => isSupportedPeriodKey(info.period)).length;
-    const quarterCount = infos.filter((info) => isQuarterPeriod(info.period)).length;
-    if (validCount > bestCount || (validCount === bestCount && quarterCount > bestQuarterCount)) {
-      best = infos;
-      bestCount = validCount;
-      bestQuarterCount = quarterCount;
-    }
-  }
-  return bestCount ? best : [];
+function isHistoricalReportedPeriod(period: string, isEstimate: boolean, ctx: ResolveContext) {
+  return isSupportedPeriodKey(period) && !isEstimate && (ctx.duration.has(period) || ctx.instant.has(period));
+}
+
+function preferredHistoricalPairs<T extends { period: string }>(pairs: T[]) {
+  const quarterlyPairs = pairs.filter(({ period }) => isQuarterPeriod(period));
+  const annualPairs = pairs.filter(({ period }) => isAnnualPeriod(period));
+  return quarterlyPairs.length ? quarterlyPairs : annualPairs;
+}
+
+function isEstimatePeriodLabel(label: string) {
+  const compact = label.trim().replace(/\s+/g, "").replace(/[’']/g, "");
+  return /(?:^|[^a-z])(?:E|EST|ESTIMATE)$/i.test(compact) || /(?:\d{2}|\d{4})E$/i.test(compact);
 }
 
 function normalizePeriodLabel(label: string) {
-  const compact = label.trim().replace(/\s+/g, "").replace(/[’']/g, "").replace(/e$/i, "");
+  const compact = label.trim().replace(/\s+/g, "").replace(/[’']/g, "").replace(/(?:E|EST|ESTIMATE)$/i, "");
   const direct = compact.match(/^([1-4])Q(\d{2}|\d{4})$/i);
   if (direct) return `${direct[1]}Q${direct[2].slice(-2)}`;
   const qFirst = compact.match(/^Q([1-4])(\d{2}|\d{4})$/i);
@@ -6880,14 +6909,13 @@ function splitFormulaArgs(body: string) {
 }
 
 function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, columns: number[], sheetNames = [MODEL_SHEET, SEGMENT_SHEET]) {
+  const historicalColumns = uniqueNumbers(columns);
   for (const sheetName of sheetNames) {
     const sheet = workbook.getWorksheet(sheetName);
     if (!sheet) continue;
     const evaluator = new FormulaEvaluator(sheet, { useCachedFormulaResults: true, skipCrossSheetFormulas: true });
-    const firstCol = Math.min(...columns);
-    const lastCol = Math.min(sheet.columnCount, Math.max(...columns) + 1);
     for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-      for (let col = firstCol; col <= lastCol; col += 1) {
+      for (const col of historicalColumns) {
         const cell = sheet.getCell(rowNumber, col);
         if (!hasFormula(cell)) continue;
         const formula = formulaForCell(cell);
@@ -7115,15 +7143,14 @@ function refreshBalanceSheetTotalFormulaResult(
 }
 
 function ensureFormulaDisplayCaches(workbook: ExcelJS.Workbook, columns: number[], sheetNames = [MODEL_SHEET, SEGMENT_SHEET]) {
+  const historicalColumns = uniqueNumbers(columns);
   for (const sheetName of sheetNames) {
     const sheet = workbook.getWorksheet(sheetName);
     if (!sheet) continue;
     const evaluator = new FormulaEvaluator(sheet, { useCachedFormulaResults: true, skipCrossSheetFormulas: true });
-    const firstCol = Math.min(...columns);
-    const lastCol = sheet.columnCount;
 
     for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
-      for (let col = firstCol; col <= lastCol; col += 1) {
+      for (const col of historicalColumns) {
         const cell = sheet.getCell(rowNumber, col);
         if (!hasFormula(cell)) continue;
         const formula = formulaForCell(cell);
@@ -8742,6 +8769,10 @@ function normalize(input: string) {
 
 function unique<T>(items: T[]) {
   return Array.from(new Set(items));
+}
+
+function uniqueNumbers(items: number[]) {
+  return Array.from(new Set(items)).sort((a, b) => a - b);
 }
 
 function requestFullWorkbookRecalculation(workbook: ExcelJS.Workbook) {
