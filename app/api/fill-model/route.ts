@@ -3035,6 +3035,11 @@ function contextPeriod(contextXml: string, form: string) {
 
 function segmentLabelFromMembers(members: string[]) {
   const joined = members.join(" ");
+  if (/U\.?S\.?MarketMember/i.test(joined)) return "U.S. Market";
+  if (/InternationalOperatedMarketsMember/i.test(joined)) return "International Operated Markets";
+  if (/InternationalDevelopmentalLicensedMarketsandCorporateMember/i.test(joined)) {
+    return "International Developmental Licensed Markets and Corporate";
+  }
   if (/InvestmentBankingAndCapitalMarkets/i.test(joined)) return "Investment Banking & Capital Markets";
   if (/AssetManagementAndOther/i.test(joined)) return "Asset Management and Other";
   if (/AssetManagementSegmentMember/i.test(joined)) return "Asset Management and Other";
@@ -3900,10 +3905,13 @@ function fillSegmentTotalRow(
     if (!isHardcodedFinancialInput(cell)) return;
     const col = columns[periodIndex];
     const statementSource = ctx && statementConcepts.length ? first(period, ctx.duration, statementConcepts) : null;
+    const segmentTotal = segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
+    const statementValue = statementSource?.value !== undefined ? statementSource.value / 1_000_000 : null;
+    const segmentTotalIsUsable = Math.abs(segmentTotal) > 0.0001 && (statementValue === null || segmentStatementMetricTies(segmentTotal, statementValue));
     const value =
-      statementSource?.value !== undefined
-        ? statementSource.value / 1_000_000
-        : segmentTotalFromModelRows(sheet, rowNumber, col, label) ?? segments.reduce((sum, segment) => sum + (segment[metric].get(period) ?? 0), 0) / 1_000_000;
+      segmentTotalIsUsable
+        ? segmentTotal
+        : statementValue ?? segmentTotalFromModelRows(sheet, rowNumber, col, label) ?? segmentTotal;
     cell.value = value;
     filledCells += 1;
     auditRows.push({
@@ -3913,8 +3921,8 @@ function fillSegmentTotalRow(
       period,
       valueWritten: value,
       mappingType: "calculated",
-      conceptsUsed: statementSource?.concept ?? `Sum of EDGAR reportable segment ${metric} rows`,
-      sourceStatement: statementSource ? "income" : "segment",
+      conceptsUsed: segmentTotalIsUsable ? `Sum of EDGAR reportable segment ${metric} rows` : statementSource?.concept ?? `Sum of EDGAR reportable segment ${metric} rows`,
+      sourceStatement: segmentTotalIsUsable ? "segment" : statementSource ? "income" : "segment",
       accession: statementSource?.accn ?? "",
       sourceUrl: "",
       cellWritable: true,
@@ -3923,7 +3931,9 @@ function fillSegmentTotalRow(
       signConvention: "copied",
       confidence: "high",
       validationStatus: "not_run",
-      notes: statementSource
+      notes: segmentTotalIsUsable
+        ? `Rebuilt ${label} from the sum of EDGAR reportable segment ${metric} rows.`
+        : statementSource
         ? `Rebuilt ${label} from consolidated EDGAR ${label.toLowerCase()} because the Segment Analysis total cell did not contain a formula.`
         : `Rebuilt ${label} because the Segment Analysis total cell did not contain a formula.`
     });
@@ -4095,17 +4105,12 @@ function fillSegmentMetricRows(
   let filledCells = 0;
   let commentsAdded = 0;
   const usedSegments = new Set<number>();
+  const assignedSegments = assignSegmentsToMetricRows(sheet, rows, segments, suffix, periods, usedSegments);
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
     const rowNumber = rows[rowIndex];
     const existingLabel = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
-    if (isGenericSegmentPlaceholder(existingLabel)) {
-      const cleared = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, existingLabel || suffix, auditRows);
-      filledCells += cleared.filledCells;
-      commentsAdded += cleared.commentsAdded;
-      continue;
-    }
-    const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments);
+    const segmentIndex = assignedSegments.get(rowNumber) ?? null;
     if (segmentIndex === null) {
       const cleared = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, existingLabel, auditRows);
       filledCells += cleared.filledCells;
@@ -4115,13 +4120,10 @@ function fillSegmentMetricRows(
 
     const segment = segments[segmentIndex];
     if (!segmentHasMetricData(segment, metric, periods)) continue;
-    usedSegments.add(segmentIndex);
-
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-      if (!isSegmentMetricInputCell(cell)) return;
       const value = (segment[metric].get(period) ?? 0) / 1_000_000;
-      cell.value = value;
+      if (!writeSegmentMetricCell(cell, value)) return;
       filledCells += 1;
       const resolved = segmentResolvedValue(segment, metric, period);
       const comment = mappingCommentForSegment(sheet, cell, existingLabel, segment, period, value, suffix);
@@ -4132,6 +4134,70 @@ function fillSegmentMetricRows(
   }
 
   return { filledCells, commentsAdded };
+}
+
+function writeSegmentMetricCell(cell: ExcelJS.Cell, value: number) {
+  if (isSegmentMetricInputCell(cell)) {
+    cell.value = value;
+    return true;
+  }
+  const bridgeFormula = formulaBridgeForTargetValue(cell, value);
+  if (!bridgeFormula) return false;
+  cell.value = { formula: bridgeFormula, result: value };
+  return true;
+}
+
+function assignSegmentsToMetricRows(
+  sheet: ExcelJS.Worksheet,
+  rows: number[],
+  segments: SegmentRevenue[],
+  suffix: string,
+  periods: string[],
+  usedSegments: Set<number>
+) {
+  const assignments = new Map<number, number>();
+
+  rows.forEach((rowNumber) => {
+    const existingLabel = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
+    if (isGenericSegmentPlaceholder(existingLabel)) return;
+    const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments);
+    if (segmentIndex === null) return;
+    assignments.set(rowNumber, segmentIndex);
+    usedSegments.add(segmentIndex);
+  });
+
+  rows.forEach((rowNumber) => {
+    if (assignments.has(rowNumber)) return;
+    const segmentIndex = nextUnusedSegmentIndex(segments, usedSegments);
+    if (segmentIndex === null) return;
+    const segment = segments[segmentIndex];
+    if (!segmentHasMetricData(segment, metricKeyForSegmentSuffix(suffix), periods)) return;
+    setSegmentMetricRowLabel(sheet, rowNumber, suffix, segment.label);
+    assignments.set(rowNumber, segmentIndex);
+    usedSegments.add(segmentIndex);
+  });
+
+  return assignments;
+}
+
+function metricKeyForSegmentSuffix(suffix: string): "values" | "operatingIncome" | "depreciationAmortization" {
+  if (/operating income/i.test(suffix)) return "operatingIncome";
+  if (/d&a|depreciation/i.test(suffix)) return "depreciationAmortization";
+  return "values";
+}
+
+function setSegmentMetricRowLabel(sheet: ExcelJS.Worksheet, rowNumber: number, suffix: string, segmentLabel: string) {
+  const labelCellForRow = labelCell(sheet, rowNumber);
+  const formula = cellFormula(labelCellForRow);
+  const displayLabel = `${segmentLabel} ${suffix}`;
+  const reference = formula?.match(/^=?\$?([A-Z]+)\$?(\d+)\s*(?:&|$)/i);
+  if (reference && formula) {
+    const baseCell = sheet.getCell(`${reference[1]}${reference[2]}`);
+    baseCell.value = segmentLabel;
+    labelCellForRow.value = { formula, result: displayLabel };
+    return;
+  }
+  labelCellForRow.value = displayLabel;
 }
 
 function clearUnmatchedSegmentRow(
@@ -5608,7 +5674,7 @@ function mappingCommentForSegment(
     "Unit conversion: raw USD to $mm",
     "Sign: copied using model sign convention",
     "Confidence: high",
-    "Notes: Segment Analysis is mapped only to reportable segment rows that match the template labels; generic or blank segment rows are left unchanged."
+    "Notes: Segment Analysis rows may be relabeled to EDGAR reportable segments when the template exposes writable segment input rows."
   ].join("\n");
 }
 
@@ -5641,7 +5707,7 @@ function mappingAuditRow(
     endDate: unique(resolved.sources.map((source) => source.end).filter(Boolean)).join("; "),
     cellWritable: true,
     formulaPreserved: false,
-    formulaStatus: "not a formula cell",
+    formulaStatus: hasFormula(cell) ? "formula updated" : "not a formula cell",
     writeBlockedReason: "",
     signConvention: fillRow.sign === -1 ? "inverted to match model sign convention" : "copied",
     confidence,
@@ -7183,6 +7249,7 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     const actual = cellDisplay(cell);
     if (actual !== expected) {
       if (isFormulaErrorResult(expected) && cellFormula(cell)) continue;
+      if (isSegmentAnalysisLabelRewriteCell(cell)) continue;
       errors.push(`${address}: row label changed from "${expected}" to "${actual}".`);
     }
   }
@@ -7204,6 +7271,19 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
   if (actual && isNumericSumFormula(expected) && isNumericSumFormula(actual)) return true;
   if (actual && !formulaHasCellReference(expected) && isNumericConstantFormula(actual)) return true;
   return false;
+}
+
+function isSegmentAnalysisLabelRewriteCell(cell: ExcelJS.Cell) {
+  const sheet = cell.worksheet;
+  if (sheet.name !== SEGMENT_SHEET || Number(cell.col) > 5) return false;
+  const rowNumber = Number(cell.row);
+  const rows = new Set([
+    ...segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", [6]),
+    ...segmentMixLabelRows(sheet),
+    ...segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", [6]),
+    ...segmentMetricRows(sheet, "Total D&A", "D&A Check", [6])
+  ]);
+  return rows.has(rowNumber);
 }
 
 function isFormulaReplacementAllowedForReconciliation(label: string) {
@@ -7229,6 +7309,7 @@ function restoreWorkbookLabels(workbook: ExcelJS.Workbook, snapshot: WorkbookSna
   for (const [address, expected] of snapshot.labels.entries()) {
     const cell = cellFromSnapshotAddress(workbook, address);
     if (!cell) continue;
+    if (isSegmentAnalysisLabelRewriteCell(cell)) continue;
     if (cellDisplay(cell) !== expected) cell.value = expected;
   }
 }
