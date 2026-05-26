@@ -3878,6 +3878,9 @@ function fillSegmentAnalysis(
   filledCells += revenueReconciliation.filledCells + operatingIncomeReconciliation.filledCells;
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings);
+  filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Revenue", "Revenue Mix", auditRows);
+  filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
+  filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total D&A", "D&A Check", auditRows);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
@@ -3936,6 +3939,60 @@ function fillSegmentTotalRow(
         : statementSource
         ? `Rebuilt ${label} from consolidated EDGAR ${label.toLowerCase()} because the Segment Analysis total cell did not contain a formula.`
         : `Rebuilt ${label} because the Segment Analysis total cell did not contain a formula.`
+    });
+  });
+
+  return filledCells;
+}
+
+function restoreSegmentTotalFormula(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  totalLabel: string,
+  endLabel: string,
+  auditRows: MappingAuditRow[]
+) {
+  const totalRow = findLabelRow(sheet, totalLabel);
+  const rows = segmentMetricRows(sheet, totalLabel, endLabel, columns);
+  if (!totalRow || !rows.length) return 0;
+
+  const firstRow = Math.min(...rows);
+  const lastRow = Math.max(...rows);
+  const evaluator = new FormulaEvaluator(sheet, { useCachedFormulaResults: false, skipCrossSheetFormulas: true });
+  let filledCells = 0;
+
+  periods.forEach((period, periodIndex) => {
+    const col = columns[periodIndex];
+    const cell = sheet.getCell(totalRow, col);
+    if (!hasFormula(cell)) return;
+
+    const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
+    const currentTotal = evaluator.evaluateCell(cell);
+    if (currentTotal !== null && segmentModelRevenueTies(currentTotal, segmentTotal)) return;
+
+    const formula = `SUM(${columnLetter(col)}${firstRow}:${columnLetter(col)}${lastRow})`;
+    cell.value = { formula, result: segmentTotal };
+    evaluator.clear();
+    filledCells += 1;
+    auditRows.push({
+      sheetName: sheet.name,
+      cell: cell.address,
+      modelRowLabel: totalLabel,
+      period,
+      valueWritten: segmentTotal,
+      mappingType: "calculated",
+      conceptsUsed: `Sum of Segment Analysis ${totalLabel.toLowerCase()} rows`,
+      sourceStatement: "segment",
+      accession: "",
+      sourceUrl: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      writeBlockedReason: "",
+      signConvention: "copied",
+      confidence: "high",
+      validationStatus: "OK!",
+      notes: `Rebuilt ${totalLabel} formula so every filled segment row is included in the Segment Analysis total.`
     });
   });
 
@@ -4016,7 +4073,24 @@ function findSegmentResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: n
   const preferred = nonGenericRows.find((rowNumber) =>
     /other|corporate|unallocated|elimination|reconciliation|residual/i.test(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix))
   );
-  return preferred ?? nonGenericRows.at(-1) ?? null;
+  if (preferred) return preferred;
+
+  const genericRow = writableRows.find((rowNumber) => isGenericSegmentPlaceholder(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix)));
+  if (genericRow) {
+    setSegmentMetricRowLabel(sheet, genericRow, suffix, "Other / Reconciliation");
+    return genericRow;
+  }
+
+  const emptyWritableRow = writableRows.find((rowNumber) => {
+    const value = numericCellValue(sheet.getCell(rowNumber, col));
+    return value === null || Math.abs(value) <= 0.0001;
+  });
+  if (emptyWritableRow) {
+    setSegmentMetricRowLabel(sheet, emptyWritableRow, suffix, "Other / Reconciliation");
+    return emptyWritableRow;
+  }
+
+  return null;
 }
 
 function segmentStatementMetricTies(actual: number, expected: number) {
@@ -4212,10 +4286,11 @@ function clearUnmatchedSegmentRow(
   let commentsAdded = 0;
   periods.forEach((period, periodIndex) => {
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-    if (!isSegmentMetricInputCell(cell)) return;
+    const canClearCell = isSegmentMetricInputCell(cell) || Boolean(formulaBridgeForTargetValue(cell, 0)) || hasFormula(cell);
+    if (!canClearCell) return;
     const existing = numericCellValue(cell);
     if (existing === 0 || existing === null) return;
-    cell.value = 0;
+    if (!writeSegmentMetricCell(cell, 0)) cell.value = 0;
     filledCells += 1;
     const notes = "Needs review: Segment Analysis row was not filled because the template label is blank, generic, or does not confidently match an EDGAR reportable segment.";
     addComment(cell, notes);
@@ -7267,6 +7342,8 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
   if (!actual && isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)))) return true;
+  if (!actual && isSegmentAnalysisMetricRewriteCell(cell)) return true;
+  if (actual && isSegmentAnalysisTotalRewriteCell(cell)) return true;
   if (actual && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
   if (actual && isNumericSumFormula(expected) && isNumericSumFormula(actual)) return true;
   if (actual && !formulaHasCellReference(expected) && isNumericConstantFormula(actual)) return true;
@@ -7284,6 +7361,36 @@ function isSegmentAnalysisLabelRewriteCell(cell: ExcelJS.Cell) {
     ...segmentMetricRows(sheet, "Total D&A", "D&A Check", [6])
   ]);
   return rows.has(rowNumber);
+}
+
+function isSegmentAnalysisMetricRewriteCell(cell: ExcelJS.Cell) {
+  const sheet = cell.worksheet;
+  if (sheet.name !== SEGMENT_SHEET || Number(cell.col) < 6) return false;
+  const rowNumber = Number(cell.row);
+  const rows = new Set([
+    ...segmentMetricSectionRows(sheet, "Total Company Revenue", "Revenue Mix"),
+    ...segmentMetricSectionRows(sheet, "Total Company Operating Income", "Operating Income Check"),
+    ...segmentMetricSectionRows(sheet, "Total D&A", "D&A Check")
+  ]);
+  return rows.has(rowNumber);
+}
+
+function isSegmentAnalysisTotalRewriteCell(cell: ExcelJS.Cell) {
+  const sheet = cell.worksheet;
+  if (sheet.name !== SEGMENT_SHEET || Number(cell.col) < 6) return false;
+  const rowNumber = Number(cell.row);
+  return ["Total Company Revenue", "Total Company Operating Income", "Total D&A"].some((label) => findLabelRow(sheet, label) === rowNumber);
+}
+
+function segmentMetricSectionRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabel: string) {
+  const startRow = findLabelRow(sheet, startLabel);
+  const endRow = findLabelRow(sheet, endLabel);
+  if (!startRow || !endRow || endRow <= startRow) return [];
+  const rows: number[] = [];
+  for (let rowNumber = startRow + 1; rowNumber < endRow; rowNumber += 1) {
+    if (rowLabel(sheet, rowNumber)) rows.push(rowNumber);
+  }
+  return rows;
 }
 
 function isFormulaReplacementAllowedForReconciliation(label: string) {
@@ -7676,19 +7783,16 @@ function validateSegmentRevenueTieOut(
     const expectedRevenue = edgarRevenue ? edgarRevenue.value / 1_000_000 : null;
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, segmentTotal)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`;
-      if (hasFormula(totalCell)) warnings.unshift(message);
-      else errors.push(message);
+      errors.push(message);
     }
     if (expectedRevenue === null) return;
     if (!segmentModelRevenueTies(segmentTotal, expectedRevenue)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
-      if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
-      else errors.push(message);
+      errors.push(message);
     }
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, expectedRevenue)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue evaluates to ${roundModelValue(sheetTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
-      if (hasFormula(totalCell)) warnings.unshift(message);
-      else errors.push(message);
+      errors.push(message);
     }
   });
 
