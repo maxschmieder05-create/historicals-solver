@@ -275,6 +275,17 @@ const MODEL_SHEET = "Model";
 const SEGMENT_SHEET = "Segment Analysis";
 const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
 const MAPPING_AUDIT_SHEET = "Mapping Audit";
+const SEC_ARCHIVE_MIN_INTERVAL_MS = 150;
+const secArchiveHtmlCache = new Map<string, string>();
+let lastSecArchiveFetchAt = 0;
+let secArchiveBlockedUntil = 0;
+
+class SecArchiveRateLimitError extends Error {
+  constructor() {
+    super("SEC filing archive is temporarily rate limited. Please wait for the SEC cooldown and rerun so Segment Analysis can be filled from filing segment tables.");
+    this.name = "SecArchiveRateLimitError";
+  }
+}
 
 const C = {
   revenue: [
@@ -2595,13 +2606,18 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error(error);
+    if (error instanceof SecArchiveRateLimitError) return jsonError(error.message, 503);
     return jsonError(error instanceof Error ? error.message : "Unexpected fill error.", 500);
   }
 }
 
 async function findCompany(query: string): Promise<CompanyMatch> {
   const response = await fetch("https://www.sec.gov/files/company_tickers.json", { headers: SEC_HEADERS, next: { revalidate: 86_400 } });
-  if (!response.ok) throw new Error("Could not load SEC ticker directory.");
+  if (!response.ok) {
+    const fallback = fallbackCompanyMatch(query);
+    if (fallback) return fallback;
+    throw new Error("Could not load SEC ticker directory.");
+  }
   const directory = (await response.json()) as Record<string, { cik_str: number; ticker: string; title: string }>;
   const normalized = normalize(query);
   const matches = Object.values(directory).map((item) => ({
@@ -2620,6 +2636,24 @@ async function findCompany(query: string): Promise<CompanyMatch> {
   );
 }
 
+function fallbackCompanyMatch(query: string): CompanyMatch | null {
+  const normalized = normalize(query);
+  const fallbackCompanies: CompanyMatch[] = [
+    { cik: "0000320193", ticker: "AAPL", title: "Apple Inc." },
+    { cik: "0000927653", ticker: "MCK", title: "McKesson Corporation" },
+    { cik: "0000063908", ticker: "MCD", title: "McDonald's Corporation" },
+    { cik: "0001018724", ticker: "AMZN", title: "Amazon.com, Inc." },
+    { cik: "0000004962", ticker: "AXP", title: "American Express Company" },
+    { cik: "0001065280", ticker: "NFLX", title: "Netflix, Inc." },
+    { cik: "0000310764", ticker: "SYK", title: "Stryker Corporation" }
+  ];
+  return (
+    fallbackCompanies.find((company) => normalize(company.ticker) === normalized) ??
+    fallbackCompanies.find((company) => normalize(company.title) === normalized) ??
+    null
+  );
+}
+
 async function fetchCompanyFacts(cik: string) {
   const response = await fetch(`https://data.sec.gov/api/xbrl/companyfacts/CIK${cik}.json`, { headers: SEC_HEADERS });
   if (!response.ok) throw new Error("Could not load SEC company facts for that company.");
@@ -2627,7 +2661,7 @@ async function fetchCompanyFacts(cik: string) {
 }
 
 async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: string[]) {
-  const filings = await fetchFilingRefs(company, 40);
+  const filings = await fetchFilingRefs(company, filingScanLimit(periods));
 
   const annual = new Map<string, Map<string, SegmentMetrics>>();
   const quarterly = new Map<string, Map<string, SegmentMetrics>>();
@@ -2637,14 +2671,15 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
       const accession = filing.accessionNumber.replace(/-/g, "");
       const cikNoZeros = String(Number(company.cik));
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
-      const html = await fetch(url, { headers: { ...SEC_HEADERS, Accept: "text/html" } }).then((res) => (res.ok ? res.text() : ""));
+      const html = await fetchSecArchiveHtml(url, true);
       if (!html) continue;
       const parsed = parseInlineSegmentRevenue(html, filing.form);
       for (const [period, values] of parsed.entries()) {
         if (isTenK(filing.form)) annual.set(period, values);
         else quarterly.set(period, values);
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof SecArchiveRateLimitError) throw error;
       // Segment data is supplemental; model-level company facts still fill the workbook.
     }
   }
@@ -2684,7 +2719,7 @@ function firstSegmentMetricsForLabel(periods: Map<string, Map<string, SegmentMet
 async function fetchInlineFactContext(company: CompanyMatch, periods: string[]): Promise<ResolveContext> {
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
-  const filings = await fetchFilingRefs(company, 60);
+  const filings = await fetchFilingRefs(company, filingScanLimit(periods));
   const wanted = new Set(periods);
 
   for (const filing of filings) {
@@ -2692,7 +2727,7 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[]):
       const accession = filing.accessionNumber.replace(/-/g, "");
       const cikNoZeros = String(Number(company.cik));
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
-      const html = await fetch(url, { headers: { ...SEC_HEADERS, Accept: "text/html" } }).then((res) => (res.ok ? res.text() : ""));
+      const html = await fetchSecArchiveHtml(url);
       if (!html) continue;
       mergeInlineFacts(html, filing, wanted, { duration, instant }, url);
       mergeNarrativeOperatingExpenseFacts(html, filing, wanted, { duration, instant }, url);
@@ -2702,6 +2737,51 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[]):
   }
 
   return { duration, instant };
+}
+
+function filingScanLimit(periods: string[]) {
+  const years = periods.map(periodYear).filter(Number.isFinite);
+  const span = years.length ? Math.max(...years) - Math.min(...years) + 1 : 4;
+  return Math.min(28, Math.max(12, span * 4 + 8));
+}
+
+async function fetchSecArchiveHtml(url: string, failOnRateLimit = false) {
+  const cached = secArchiveHtmlCache.get(url);
+  if (cached !== undefined) return cached;
+  if (Date.now() < secArchiveBlockedUntil) {
+    if (failOnRateLimit) throw new SecArchiveRateLimitError();
+    return "";
+  }
+
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    await throttleSecArchiveFetch();
+    const response = await fetch(url, { headers: { ...SEC_HEADERS, Accept: "text/html" } });
+    if (response.ok) {
+      const html = await response.text();
+      secArchiveHtmlCache.set(url, html);
+      return html;
+    }
+    if (response.status !== 429) break;
+    if (attempt === 1) {
+      secArchiveBlockedUntil = Date.now() + 5 * 60_000;
+      if (failOnRateLimit) throw new SecArchiveRateLimitError();
+      return "";
+    }
+    await sleep(1_000 * (attempt + 1));
+  }
+
+  return "";
+}
+
+async function throttleSecArchiveFetch() {
+  const now = Date.now();
+  const waitMs = Math.max(0, SEC_ARCHIVE_MIN_INTERVAL_MS - (now - lastSecArchiveFetchAt));
+  if (waitMs > 0) await sleep(waitMs);
+  lastSecArchiveFetchAt = Date.now();
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function fetchFilingRefs(company: CompanyMatch, limit: number) {
@@ -2740,7 +2820,7 @@ function collectFilingRefs(source: any, filings: FilingRef[]) {
 }
 
 function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext, sourceUrl = "") {
-  const contexts = parseInlineContexts(html);
+  const contexts = parseInlineContexts(html, filing.form);
   for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
     const attrs = match[1];
     const unitRef = attrs.match(/\bunitRef="([^"]+)"/)?.[1] ?? "";
@@ -2761,6 +2841,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
       value,
       sourceUrl,
       form: filing.form,
+      fp: `Q${periodQuarter(context.period)}`,
       filed: filing.filingDate,
       accn: filing.accessionNumber,
       start: context.start,
@@ -2869,7 +2950,8 @@ function operatingExpenseTableCurrentQuarterValue(numbers: number[], period: str
   return numbers[0] ?? null;
 }
 
-function parseInlineContexts(html: string) {
+function parseInlineContexts(html: string, form: string) {
+  const fiscalFocus = supportedInlineFactFiscalFocus(parseInlineFiscalFocus(html));
   const contexts = new Map<string, InlineContext>();
   for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
     const body = match[0];
@@ -2882,10 +2964,23 @@ function parseInlineContexts(html: string) {
     const end = body.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
     if (start && end) {
       if (!isSupportedInlineDuration(start, end)) continue;
-      contexts.set(match[1], { period: periodKeyFromDate(end), instant: false, start, end, hasDimensions: hasInlineDimensions(body) });
+      contexts.set(match[1], { period: contextPeriod(body, form, fiscalFocus) ?? periodKeyFromDate(end), instant: false, start, end, hasDimensions: hasInlineDimensions(body) });
     }
   }
   return contexts;
+}
+
+function supportedInlineFactFiscalFocus(focus: InlineFiscalFocus | null) {
+  if (!focus) return null;
+  const fiscalYearEndMonth = fiscalYearEndMonthFromFocus(focus);
+  return fiscalYearEndMonth >= 8 && fiscalYearEndMonth <= 10 ? focus : null;
+}
+
+function fiscalYearEndMonthFromFocus(focus: InlineFiscalFocus) {
+  const focusDate = new Date(`${focus.end}T00:00:00Z`);
+  if (Number.isNaN(focusDate.getTime())) return 0;
+  const periodOffset = focus.fp === "FY" ? 0 : (4 - Number(focus.fp.slice(1))) * 3;
+  return ((focusDate.getUTCMonth() + periodOffset) % 12) + 1;
 }
 
 function isSupportedInlineDuration(start: string, end: string) {
@@ -2922,11 +3017,18 @@ type InlineSegmentContext = {
   members: string[];
 };
 
+type InlineFiscalFocus = {
+  fy: number;
+  fp: "Q1" | "Q2" | "Q3" | "Q4" | "FY";
+  end: string;
+};
+
 function parseInlineSegmentRevenue(html: string, form: string) {
+  const fiscalFocus = parseInlineFiscalFocus(html);
   const contexts = new Map<string, InlineSegmentContext>();
   for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
     const body = match[0];
-    const period = contextPeriod(body, form);
+    const period = contextPeriod(body, form, fiscalFocus);
     const members = Array.from(body.matchAll(/<xbrldi:explicitMember\b[^>]*>([^<]+)<\/xbrldi:explicitMember>/g)).map((member) => member[1]);
     contexts.set(match[1], { period, members });
   }
@@ -3049,7 +3151,47 @@ function segmentMetric(concept: string): SegmentMetricKey | null {
   return null;
 }
 
-function contextPeriod(contextXml: string, form: string) {
+function parseInlineFiscalFocus(html: string): InlineFiscalFocus | null {
+  const fy = inlineDocumentFact(html, "DocumentFiscalYearFocus");
+  const fp = inlineDocumentFact(html, "DocumentFiscalPeriodFocus");
+  const end = normalizeInlineDate(inlineDocumentPeriodEndDate(html) ?? inlineDocumentFact(html, "DocumentPeriodEndDate") ?? "");
+  const fiscalYear = fy ? Number(fy) : NaN;
+  const fiscalPeriod = fp?.toUpperCase();
+  if (!Number.isFinite(fiscalYear) || !end || !["Q1", "Q2", "Q3", "Q4", "FY"].includes(fiscalPeriod ?? "")) return null;
+  return { fy: fiscalYear, fp: fiscalPeriod as InlineFiscalFocus["fp"], end };
+}
+
+function inlineDocumentFact(html: string, localName: string) {
+  const pattern = new RegExp(`<ix:(?:nonNumeric|nonFraction)\\b[^>]*\\bname=["']dei:${localName}["'][^>]*>([\\s\\S]*?)<\\/ix:(?:nonNumeric|nonFraction)>`, "i");
+  const match = html.match(pattern);
+  return match ? decodeXml(match[1].replace(/<[^>]+>/g, "").trim()) : null;
+}
+
+function inlineDocumentPeriodEndDate(html: string) {
+  const tag = html.match(/<ix:nonNumeric\b[^>]*\bname=["']dei:DocumentPeriodEndDate["'][^>]*>/i);
+  if (!tag || tag.index === undefined) return null;
+  const body = html.slice(tag.index + tag[0].length, tag.index + tag[0].length + 600);
+  const firstClose = body.indexOf("</ix:nonNumeric>");
+  if (firstClose < 0) return null;
+  const firstRaw = inlineText(body.slice(0, firstClose));
+  if (normalizeInlineDate(firstRaw)) return firstRaw;
+  const secondClose = body.indexOf("</ix:nonNumeric>", firstClose + "</ix:nonNumeric>".length);
+  return inlineText(body.slice(0, secondClose >= 0 ? secondClose : firstClose));
+}
+
+function inlineText(value: string) {
+  return decodeXml(value.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
+}
+
+function normalizeInlineDate(value: string) {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) return trimmed;
+  const parsed = new Date(trimmed);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+}
+
+function contextPeriod(contextXml: string, form: string, fiscalFocus?: InlineFiscalFocus | null) {
   const start = contextXml.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
   const end = contextXml.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
   if (!start || !end) return null;
@@ -3058,10 +3200,32 @@ function contextPeriod(contextXml: string, form: string) {
   const days = (endDate.getTime() - startDate.getTime()) / 86_400_000;
   if (isTenK(form) && days < 330) return null;
   if (!isTenK(form) && days > 115) return null;
+  const fiscalPeriod = fiscalFocus ? periodKeyFromFiscalFocus(end, fiscalFocus) : null;
+  if (fiscalPeriod) return fiscalPeriod;
   const year = endDate.getUTCFullYear();
   const quarter = Math.floor(endDate.getUTCMonth() / 3) + 1;
   if (isTenK(form)) return `4Q${String(year).slice(-2)}`;
   return `${quarter}Q${String(year).slice(-2)}`;
+}
+
+function periodKeyFromFiscalFocus(end: string, focus: InlineFiscalFocus) {
+  const endDate = new Date(`${end}T00:00:00Z`);
+  const focusDate = new Date(`${focus.end}T00:00:00Z`);
+  if (Number.isNaN(endDate.getTime()) || Number.isNaN(focusDate.getTime())) return null;
+  const monthDelta = (endDate.getUTCFullYear() - focusDate.getUTCFullYear()) * 12 + endDate.getUTCMonth() - focusDate.getUTCMonth();
+  const quarterOffset = Math.round(monthDelta / 3);
+  let quarter = focus.fp === "FY" ? 4 : Number(focus.fp.slice(1));
+  let fiscalYear = focus.fy;
+  quarter += quarterOffset;
+  while (quarter <= 0) {
+    quarter += 4;
+    fiscalYear -= 1;
+  }
+  while (quarter > 4) {
+    quarter -= 4;
+    fiscalYear += 1;
+  }
+  return `${quarter}Q${String(fiscalYear).slice(-2)}`;
 }
 
 function segmentLabelFromMembers(members: string[]) {
@@ -3232,6 +3396,8 @@ function buildFactContext(payload: any, company?: CompanyMatch): ResolveContext 
   const instant = new Map<string, Map<string, FactSource>>();
   const cumulativeDuration = new Map<string, Map<string, FactSource>>();
   const annualDuration = new Map<string, Map<string, FactSource>>();
+  const fiscalYearEndMonth = inferFiscalYearEndMonth(payload);
+  const useFiscalDatePeriodKeys = fiscalYearEndMonth !== null && fiscalYearEndMonth >= 8 && fiscalYearEndMonth <= 10;
 
   for (const taxonomy of taxonomies) {
     for (const [concept, detail] of Object.entries<any>(taxonomy)) {
@@ -3241,7 +3407,9 @@ function buildFactContext(payload: any, company?: CompanyMatch): ResolveContext 
       for (const fact of unitFacts) {
         if (!isUsableFact(fact)) continue;
         const instantFact = isInstantFact(fact);
-        const period = fact.end ? periodKeyFromDate(fact.end) : periodKey(fact);
+        const period =
+          (useFiscalDatePeriodKeys ? periodKeyForFactEndDate(fact, fiscalYearEndMonth) : null) ??
+          (fact.end ? periodKeyFromDate(fact.end) : periodKey(fact));
         if (!period) continue;
         const source = {
           concept,
@@ -3257,14 +3425,14 @@ function buildFactContext(payload: any, company?: CompanyMatch): ResolveContext 
         };
         if (!instantFact && isAnnualDurationFact(fact)) {
           setSource(annualDuration, period, concept, source);
-          const annualPeriod = annualPeriodKey(fact);
+          const annualPeriod = annualPeriodKey(fact, useFiscalDatePeriodKeys ? fiscalYearEndMonth : null);
           if (annualPeriod) setSource(duration, annualPeriod, concept, source);
         } else if (!instantFact && isYearToDateFact(fact)) {
           setSource(cumulativeDuration, period, concept, source);
         } else if (instantFact || isQuarterDurationFact(fact)) {
           setSource(instantFact ? instant : duration, period, concept, source);
           if (instantFact && isAnnualInstantFact(fact)) {
-            const annualPeriod = annualPeriodKey(fact);
+            const annualPeriod = annualPeriodKey(fact, useFiscalDatePeriodKeys ? fiscalYearEndMonth : null);
             if (annualPeriod) setSource(instant, annualPeriod, concept, source);
           }
         }
@@ -3388,8 +3556,9 @@ function isAnnualInstantFact(fact: SecFact) {
   return Boolean(fact.end && fact.fp === "FY" && isTenK(fact.form));
 }
 
-function annualPeriodKey(fact: SecFact) {
-  const fiscalYear = fact.fy ?? (fact.end ? new Date(`${fact.end}T00:00:00Z`).getUTCFullYear() : null);
+function annualPeriodKey(fact: SecFact, fiscalYearEndMonth?: number | null) {
+  const fiscalPeriod = periodKeyForFactEndDate(fact, fiscalYearEndMonth);
+  const fiscalYear = fiscalPeriod ? periodYear(fiscalPeriod) : fact.fy ?? (fact.end ? new Date(`${fact.end}T00:00:00Z`).getUTCFullYear() : null);
   if (!fiscalYear) return null;
   return `FY${String(fiscalYear).slice(-2)}`;
 }
@@ -3422,6 +3591,51 @@ function periodKey(fact: SecFact) {
   if (fact.fp === "Q4") return `4Q${yy}`;
   if (fact.fp === "FY") return `4Q${yy}`;
   return null;
+}
+
+function inferFiscalYearEndMonth(payload: any) {
+  const counts = new Map<number, number>();
+  const taxonomies = Object.values(payload?.facts ?? {}) as any[];
+  for (const taxonomy of taxonomies) {
+    for (const detail of Object.values<any>(taxonomy)) {
+      const units = detail.units ?? {};
+      const facts: SecFact[] = units.USD ?? units.shares ?? units["USD/shares"] ?? Object.values(units)[0] ?? [];
+      for (const fact of facts) {
+        if (!fact.end || fact.fp !== "FY" || !isTenK(fact.form)) continue;
+        const date = new Date(`${fact.end}T00:00:00Z`);
+        if (Number.isNaN(date.getTime())) continue;
+        const month = date.getUTCMonth() + 1;
+        counts.set(month, (counts.get(month) ?? 0) + 1);
+      }
+    }
+  }
+  return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+}
+
+function periodKeyForFactEndDate(fact: SecFact, fiscalYearEndMonth?: number | null) {
+  if (!fact.end || !fiscalYearEndMonth) return null;
+  if (!["Q1", "Q2", "Q3", "Q4", "FY"].includes(fact.fp ?? "")) return null;
+  return fiscalPeriodKeyFromDate(fact.end, fiscalYearEndMonth);
+}
+
+function fiscalPeriodKeyFromDate(date: string, fiscalYearEndMonth: number) {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) return null;
+
+  let best: { period: string; distance: number } | null = null;
+  const endYear = parsed.getUTCFullYear();
+  for (let fiscalYear = endYear - 1; fiscalYear <= endYear + 1; fiscalYear += 1) {
+    for (let quarter = 1; quarter <= 4; quarter += 1) {
+      const monthIndex = fiscalYearEndMonth - 1 - (4 - quarter) * 3;
+      const quarterEnd = new Date(Date.UTC(fiscalYear, monthIndex + 1, 0));
+      const distance = Math.abs(parsed.getTime() - quarterEnd.getTime());
+      if (!best || distance < best.distance) {
+        best = { period: `${quarter}Q${String(fiscalYear).slice(-2)}`, distance };
+      }
+    }
+  }
+
+  return best?.period ?? null;
 }
 
 function periodKeyFromDate(date: string) {
@@ -3919,21 +4133,20 @@ function fillSegmentAnalysis(
   }
 
   const revenueResult = fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows);
-  const operatingIncomeResult = fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, usableSegments, "operatingIncome", "Operating Income", auditRows);
-  const depreciationResult = fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A", auditRows);
+  const hasOperatingIncomeSegments = hasSegmentMetricData(usableSegments, "operatingIncome", periods);
+  const hasDepreciationSegments = hasSegmentMetricData(usableSegments, "depreciationAmortization", periods);
+  const operatingIncomeResult = hasOperatingIncomeSegments
+    ? fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, usableSegments, "operatingIncome", "Operating Income", auditRows)
+    : clearSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, "Operating Income", auditRows);
+  const depreciationResult = hasDepreciationSegments
+    ? fillSegmentMetricRows(sheet, periods, columns, depreciationRows, usableSegments, "depreciationAmortization", "D&A", auditRows)
+    : clearSegmentMetricRows(sheet, periods, columns, depreciationRows, "D&A", auditRows);
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
   commentsAdded += revenueResult.commentsAdded + operatingIncomeResult.commentsAdded + depreciationResult.commentsAdded;
   const revenueReconciliation = reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, rows, "Revenue", revenueConcepts, ctx, auditRows);
-  const operatingIncomeReconciliation = reconcileSegmentMetricRowsToStatementTotal(
-    sheet,
-    periods,
-    columns,
-    operatingIncomeRows,
-    "Operating Income",
-    C.operatingIncome,
-    ctx,
-    auditRows
-  );
+  const operatingIncomeReconciliation = hasOperatingIncomeSegments
+    ? reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, operatingIncomeRows, "Operating Income", C.operatingIncome, ctx, auditRows)
+    : { filledCells: 0, commentsAdded: 0, warnings: [] };
   filledCells += revenueReconciliation.filledCells + operatingIncomeReconciliation.filledCells;
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings);
@@ -3941,10 +4154,39 @@ function fillSegmentAnalysis(
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total D&A", "D&A Check", auditRows);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue);
-  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
-  filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
+  if (hasOperatingIncomeSegments) {
+    filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
+  }
+  if (hasDepreciationSegments) {
+    filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "depreciationAmortization", "Total D&A", auditRows);
+  }
 
   return { filledCells, commentsAdded, warnings };
+}
+
+function hasSegmentMetricData(
+  segments: SegmentRevenue[],
+  metric: "values" | "operatingIncome" | "depreciationAmortization",
+  periods: string[]
+) {
+  return segments.some((segment) => segmentHasMetricData(segment, metric, periods));
+}
+
+function clearSegmentMetricRows(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  rows: number[],
+  suffix: string,
+  auditRows: MappingAuditRow[]
+) {
+  return rows.reduce(
+    (total, rowNumber) => {
+      const result = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, segmentRowLabel(sheet, rowNumber, suffix), auditRows);
+      return { filledCells: total.filledCells + result.filledCells, commentsAdded: total.commentsAdded + result.commentsAdded };
+    },
+    { filledCells: 0, commentsAdded: 0 }
+  );
 }
 
 function selectSegmentFamilyForTemplate(
@@ -3964,7 +4206,7 @@ function selectSegmentFamilyForTemplate(
       if (b.score.detailRows !== a.score.detailRows) return b.score.detailRows - a.score.detailRows;
       return a.score.totalError - b.score.totalError;
     });
-  return scored[0]?.candidate.segments ?? segments.slice(0, maxRows);
+  return scored[0]?.candidate.segments ?? candidates[0]?.segments ?? segments.filter((segment) => !segment.aggregate).slice(0, maxRows);
 }
 
 function segmentFamilyCandidates(segments: SegmentRevenue[], maxRows: number) {
@@ -3979,11 +4221,12 @@ function segmentFamilyCandidates(segments: SegmentRevenue[], maxRows: number) {
   const candidates: Array<{ family: string; segments: SegmentRevenue[] }> = [];
   byFamily.forEach((familySegments, family) => {
     const sorted = familySegments.slice().sort((a, b) => segmentSort(a.label, b.label));
-    if (sorted.length <= maxRows) candidates.push({ family, segments: sorted });
 
     const withoutAggregates = sorted.filter((segment) => !segment.aggregate);
-    if (withoutAggregates.length && withoutAggregates.length < sorted.length && withoutAggregates.length <= maxRows) {
+    if (withoutAggregates.length >= 2 && withoutAggregates.length < sorted.length && withoutAggregates.length <= maxRows) {
       candidates.push({ family, segments: withoutAggregates });
+    } else if (sorted.length <= maxRows) {
+      candidates.push({ family, segments: sorted });
     }
   });
 
@@ -7955,6 +8198,7 @@ function validateSegmentStatementTieOut(
     return !isGenericSegmentPlaceholder(label);
   });
   if (!totalRow || !rows.length) return errors;
+  if (metricName !== "Revenue" && !segmentMetricRowsHaveValues(sheet, rows, columns, evaluator)) return errors;
 
   periods.forEach((period, index) => {
     const col = columns[index];
@@ -7991,6 +8235,12 @@ function validateSegmentStatementTieOut(
   });
 
   return errors;
+}
+
+function segmentMetricRowsHaveValues(sheet: ExcelJS.Worksheet, rows: number[], columns: number[], evaluator: FormulaEvaluator) {
+  return rows.some((rowNumber) =>
+    columns.some((col) => Math.abs(evaluator.evaluateCell(sheet.getCell(rowNumber, col)) ?? numericCellValue(sheet.getCell(rowNumber, col)) ?? 0) > 0.0001)
+  );
 }
 
 function linkedSegmentStatementTargetValue(

@@ -16,7 +16,13 @@ const expectedLabels = [
   ["C12", "Wearables, Home and Accessories Revenue"]
 ];
 
-const revenueColumns = ["G", "H", "I", "K", "L", "N", "P", "Q", "S", "U"];
+const expectedRevenueCells = [
+  ["F7", 117154, "1Q23 total revenue"],
+  ["I7", 89498, "4Q23 total revenue"],
+  ["K7", 119575, "1Q24 total revenue"]
+];
+
+const revenueColumns = ["F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "U"];
 
 function cellValue(cell) {
   const value = cell.value;
@@ -78,7 +84,18 @@ async function main() {
     }
   }
 
-  for (const col of ["G", "H", "I", "K", "L", "M"]) {
+  for (const [address, expected, label] of expectedRevenueCells) {
+    const actual = numericCell(segmentSheet.getCell(address));
+    if (!valuesMatch(actual, expected)) errors.push(`${label} Segment Analysis!${address}: expected ${expected}, got ${actual ?? "[blank]"}.`);
+  }
+
+  const operatingIncomeReconciliation = numericCell(segmentSheet.getCell("F35")) ?? 0;
+  const operatingIncomeLabel = String(cellValue(segmentSheet.getCell("C35")) ?? "");
+  if (operatingIncomeLabel.includes("Other / Reconciliation") || !valuesMatch(operatingIncomeReconciliation, 0)) {
+    errors.push("Segment operating income should not invent an Other / Reconciliation row when Apple does not report product-level operating income.");
+  }
+
+  for (const col of ["F", "G", "H", "I", "K", "L", "M"]) {
     const goodwill = numericCell(modelSheet.getCell(`${col}128`));
     const check = numericCell(modelSheet.getCell(`${col}158`));
     if (!valuesMatch(goodwill ?? NaN, 0)) errors.push(`Model!${col}128 Goodwill should be cleared to 0, got ${goodwill ?? "[blank]"}.`);
