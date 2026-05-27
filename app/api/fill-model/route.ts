@@ -113,9 +113,20 @@ type LlmCandidateFact = {
   values: Record<string, number>;
 };
 
+type FilingCommentaryEvidence = {
+  period: string;
+  text: string;
+  topics: string[];
+  sourceUrl?: string;
+  form?: string;
+  filed?: string;
+  accn?: string;
+};
+
 type ResolveContext = {
   duration: Map<string, Map<string, FactSource>>;
   instant: Map<string, Map<string, FactSource>>;
+  commentary?: Map<string, FilingCommentaryEvidence[]>;
   template?: TemplateMappingContext;
 };
 
@@ -2599,7 +2610,7 @@ export async function POST(request: NextRequest) {
         cell.value = resolved.value / (effectiveFillRow.scale ?? 1);
         filledCells += 1;
 
-        const auditNote = auditNoteForResolvedValue(effectiveFillRow, resolved);
+        const auditNote = auditNoteForResolvedValue(effectiveFillRow, resolved, period, ctx);
         if (auditNote) rowNotes.add(auditNote);
         const mappingConfidence = effectiveFillRow.comment?.startsWith("LLM-assisted") ? "medium" : "high";
         const confidence = lowerConfidence(mappingConfidence, validation.confidence);
@@ -2867,6 +2878,7 @@ function firstSegmentMetricsForLabel(periods: Map<string, Map<string, SegmentMet
 async function fetchInlineFactContext(company: CompanyMatch, periods: string[], bulkSupport?: SecBulkSupport): Promise<ResolveContext> {
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
+  const commentary = new Map<string, FilingCommentaryEvidence[]>();
   const filings = await fetchFilingRefs(company, filingScanLimit(periods), bulkSupport);
   const wanted = new Set(periods);
 
@@ -2879,12 +2891,13 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[], 
       if (!html) continue;
       mergeInlineFacts(html, filing, wanted, { duration, instant }, url);
       mergeNarrativeOperatingExpenseFacts(html, filing, wanted, { duration, instant }, url);
+      mergeFilingCommentaryEvidence(html, filing, wanted, { duration, instant, commentary }, url);
     } catch {
       // Inline facts are a supplement to SEC companyfacts; keep filling with the facts already available.
     }
   }
 
-  return { duration, instant };
+  return { duration, instant, commentary };
 }
 
 function filingScanLimit(periods: string[]) {
@@ -3107,6 +3120,75 @@ function mergeNarrativeOperatingExpenseFacts(html: string, filing: FilingRef, wa
   }
 }
 
+function mergeFilingCommentaryEvidence(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext, sourceUrl = "") {
+  const period = filingCommentaryPeriod(filing, html);
+  if (!period || !wanted.has(period)) return;
+
+  const text = htmlText(html);
+  const evidence = extractFilingCommentaryEvidence(text, period, filing, sourceUrl);
+  if (!evidence.length) return;
+  const existing = ctx.commentary?.get(period) ?? [];
+  ctx.commentary?.set(period, uniqueCommentaryEvidence([...existing, ...evidence]).slice(0, 18));
+}
+
+function filingCommentaryPeriod(filing: FilingRef, html: string) {
+  const focus = parseInlineFiscalFocus(html);
+  if (focus) return focus.fp === "FY" ? `4Q${String(focus.fy).slice(-2)}` : `${focus.fp.slice(1)}Q${String(focus.fy).slice(-2)}`;
+  const periodEnd = filingPeriodEndDate(filing, html) ?? filing.reportDate;
+  return periodEnd ? periodKeyFromDate(periodEnd) : null;
+}
+
+function extractFilingCommentaryEvidence(text: string, period: string, filing: FilingRef, sourceUrl = ""): FilingCommentaryEvidence[] {
+  const topics = [
+    { topic: "revenue", pattern: /\b(revenue|revenues|net sales|sales revenue|subscription revenue|product revenue|service revenue)\b/i },
+    { topic: "segment revenue", pattern: /\b(segment|reportable segment|geographic|product category|external customers)\b/i },
+    { topic: "cost of revenue", pattern: /\b(cost of revenue|cost of sales|costs of goods|costs of services|fulfillment)\b/i },
+    { topic: "operating expenses", pattern: /\b(operating expenses|selling general and administrative|sales and marketing|research and development|technology and content)\b/i },
+    { topic: "depreciation and amortization", pattern: /\b(depreciation|amortization)\b/i },
+    { topic: "interest", pattern: /\b(interest income|interest expense|net interest|borrowings|debt)\b/i },
+    { topic: "income tax", pattern: /\b(income tax|tax provision|effective tax rate)\b/i },
+    { topic: "current assets", pattern: /\b(current assets|accounts receivable|inventory|prepaid|cash and cash equivalents)\b/i },
+    { topic: "current liabilities", pattern: /\b(current liabilities|accounts payable|accrued liabilities|deferred revenue|customer deposits)\b/i },
+    { topic: "debt and leases", pattern: /\b(long-term debt|short-term debt|lease liabilities|finance lease|operating lease)\b/i }
+  ];
+
+  const evidence: FilingCommentaryEvidence[] = [];
+  for (const item of topics) {
+    const match = text.match(item.pattern);
+    if (!match || match.index === undefined) continue;
+    const snippet = cleanCommentarySnippet(text.slice(Math.max(0, match.index - 260), Math.min(text.length, match.index + 620)));
+    if (snippet.length < 80) continue;
+    evidence.push({
+      period,
+      text: snippet,
+      topics: [item.topic],
+      sourceUrl,
+      form: filing.form,
+      filed: filing.filingDate,
+      accn: filing.accessionNumber
+    });
+  }
+  return evidence;
+}
+
+function cleanCommentarySnippet(text: string) {
+  return text
+    .replace(/\s+/g, " ")
+    .replace(/\bTable of Contents\b/gi, "")
+    .trim()
+    .slice(0, 650);
+}
+
+function uniqueCommentaryEvidence(items: FilingCommentaryEvidence[]) {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const key = `${item.period}|${item.accn ?? ""}|${item.topics.join(",")}|${item.text.slice(0, 120)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function filingPeriodEndDate(filing: FilingRef, html: string) {
   const ixPeriod = html.match(/name="dei:DocumentPeriodEndDate"[^>]*>([^<]+)</i)?.[1];
   if (ixPeriod) return decodeXml(ixPeriod.trim());
@@ -3197,6 +3279,12 @@ function hasInlineDimensions(contextBody: string) {
 function mergeContexts(target: ResolveContext, source: ResolveContext) {
   source.instant.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.instant, period, concept, fact)));
   source.duration.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.duration, period, concept, fact)));
+  source.commentary?.forEach((items, period) => {
+    const existing = target.commentary?.get(period) ?? [];
+    const merged = uniqueCommentaryEvidence([...existing, ...items]);
+    if (!target.commentary) target.commentary = new Map();
+    target.commentary.set(period, merged);
+  });
 }
 
 type SegmentMetricKey = "revenue" | "operatingIncome" | "depreciationAmortization";
@@ -5156,14 +5244,15 @@ function isNumericConstantFormula(formula: string | null) {
   return Boolean(formula?.replace(/^=/, "").trim().match(/^[+-]?\d+(?:\.\d+)?$/));
 }
 
-function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue) {
+function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue, period?: string, ctx?: ResolveContext) {
   const derived = derivedSource(resolved);
   const sourceLabels = unique(resolved.sources.map(sourceDisplayLabel).filter(Boolean));
   const classification = resolved.classification ?? fillRow.classification;
   const grouped = classification === "grouped" || sourceLabels.length > 1 || Boolean((resolved.note || fillRow.comment) && fillRow.classification === "grouped");
   const isDerived = Boolean(derived?.derivedTotalValue !== undefined);
   const hasAnalystNote = Boolean((resolved.note || fillRow.comment) && (grouped || isDerived));
-  if (!grouped && !hasAnalystNote && !isDerived) return null;
+  const commentary = period && ctx ? filingCommentaryJustification(fillRow, resolved, period, ctx) : "";
+  if (!grouped && !hasAnalystNote && !isDerived && !commentary) return null;
 
   const parts: string[] = [];
   if (grouped && sourceLabels.length) parts.push(`Grouped from EDGAR: ${sourceLabels.join(", ")}.`);
@@ -5171,7 +5260,49 @@ function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue) {
   if (isDerived && derived?.derivedPriorPeriods?.length) {
     parts.push(`Quarterly value was derived from ${derived.derivedTotalLabel || derived.label} less ${derived.derivedPriorPeriods.join(", ")}.`);
   }
+  if (commentary) parts.push(commentary);
   return parts.filter(Boolean).join(" ");
+}
+
+function filingCommentaryJustification(fillRow: FillRow, resolved: ResolvedValue, period: string, ctx: ResolveContext) {
+  if (!shouldUseFilingCommentary(fillRow, resolved)) return "";
+  const evidence = rankedFilingCommentary(fillRow, resolved, period, ctx).slice(0, 2);
+  if (!evidence.length) return "";
+  return `Filing commentary support: ${evidence.map(commentaryEvidenceSummary).join(" ")}`;
+}
+
+function shouldUseFilingCommentary(fillRow: FillRow, resolved: ResolvedValue) {
+  const classification = resolved.classification ?? fillRow.classification;
+  return classification === "grouped" || classification === "partial" || resolved.sources.length > 1 || Boolean(derivedSource(resolved)) || fillRow.comment?.startsWith("LLM-assisted");
+}
+
+function rankedFilingCommentary(fillRow: FillRow, resolved: ResolvedValue, period: string, ctx: ResolveContext) {
+  const evidence = ctx.commentary?.get(period) ?? [];
+  if (!evidence.length) return [];
+  const tokens = significantTokens([
+    fillRow.label,
+    fillRow.modelContext?.sectionHeader,
+    fillRow.modelContext?.previousLabel,
+    fillRow.modelContext?.nextLabel,
+    ...resolved.sources.flatMap((source) => [source.concept, source.label])
+  ].join(" "));
+  return evidence
+    .map((item) => {
+      const haystack = significantTokens(`${item.topics.join(" ")} ${item.text}`);
+      let score = 0;
+      tokens.forEach((token) => {
+        if (haystack.has(token)) score += token.length >= 7 ? 3 : 1;
+      });
+      return { item, score };
+    })
+    .filter(({ score }) => score >= 2)
+    .sort((a, b) => b.score - a.score)
+    .map(({ item }) => item);
+}
+
+function commentaryEvidenceSummary(item: FilingCommentaryEvidence) {
+  const source = [item.form, item.filed].filter(Boolean).join(" filed ");
+  return `${source ? `${source}: ` : ""}"${item.text.slice(0, 280)}${item.text.length > 280 ? "..." : ""}"`;
 }
 
 function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, period: string, resolved: ResolvedValue): SecWriteValidation {
@@ -6089,7 +6220,7 @@ async function llmAssistedFillRow(
   state.calls += 1;
   try {
     const modelChoice = chooseLlmMappingModel(fillRow, candidates);
-    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model);
+    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model, ctx);
     const mapped = llmDecisionToFillRow(fillRow, decision, candidates, modelChoice);
     state.decisions.set(fillRow.row, mapped);
     return mapped;
@@ -6214,7 +6345,8 @@ async function requestLlmMappingDecision(
   fillRow: FillRow,
   periods: string[],
   candidates: LlmCandidateFact[],
-  model: string
+  model: string,
+  ctx: ResolveContext
 ): Promise<LlmMappingDecision> {
   const apiKey = llmApiKey();
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
@@ -6240,7 +6372,7 @@ async function requestLlmMappingDecision(
       model,
       messages: [
         { role: "system", content: system },
-        { role: "user", content: JSON.stringify(llmMappingPayload(company, fillRow, periods, candidates)) }
+        { role: "user", content: JSON.stringify(llmMappingPayload(company, fillRow, periods, candidates, ctx)) }
       ],
       temperature: 0,
       max_tokens: 700,
@@ -6263,7 +6395,7 @@ async function requestLlmMappingDecision(
   return JSON.parse(text) as LlmMappingDecision;
 }
 
-function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: string[], candidates: LlmCandidateFact[]) {
+function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: string[], candidates: LlmCandidateFact[], ctx: ResolveContext) {
   return {
     company: { ticker: company.ticker, name: company.title },
     row: {
@@ -6276,8 +6408,27 @@ function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: str
       modelSignConvention: fillRow.modelContext?.signConvention ?? fillRow.sign ?? 1
     },
     periods,
-    candidates
+    candidates,
+    filingCommentary: llmFilingCommentaryEvidence(fillRow, periods, ctx)
   };
+}
+
+function llmFilingCommentaryEvidence(fillRow: FillRow, periods: string[], ctx: ResolveContext) {
+  const byText = new Map<string, FilingCommentaryEvidence>();
+  const emptyResolved: ResolvedValue = { value: null, sources: [] };
+  periods.forEach((period) => {
+    rankedFilingCommentary(fillRow, emptyResolved, period, ctx)
+      .slice(0, 3)
+      .forEach((item) => byText.set(`${item.accn ?? ""}|${item.text}`, item));
+  });
+  return Array.from(byText.values())
+    .slice(0, 8)
+    .map((item) => ({
+      period: item.period,
+      topics: item.topics,
+      source: [item.form, item.filed, item.accn].filter(Boolean).join(" / "),
+      text: item.text
+    }));
 }
 
 function llmMappingJsonSchema() {
