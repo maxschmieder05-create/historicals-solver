@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import ExcelJS from "exceljs";
+import JSZip from "jszip";
 import {
   COMBINED_NONCURRENT_DEBT_AND_LEASE_CONCEPTS,
   NONCURRENT_DEBT_CONCEPTS,
@@ -2803,7 +2804,7 @@ export async function POST(request: NextRequest) {
 
     addMappingAuditSheet(workbook, auditRows);
 
-    const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
+    const output = await writeWorkbookBufferWithRecalculation(workbook);
     const outputName = `${company.ticker}_historicals_filled.xlsx`;
     const summary = encodeURIComponent(
       JSON.stringify({
@@ -2819,7 +2820,8 @@ export async function POST(request: NextRequest) {
       })
     );
 
-    return new NextResponse(output, {
+    const responseBody = output.buffer.slice(output.byteOffset, output.byteOffset + output.byteLength) as ArrayBuffer;
+    return new NextResponse(responseBody, {
       headers: {
         "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "content-disposition": `attachment; filename="${outputName}"`,
@@ -9558,6 +9560,49 @@ function requestFullWorkbookRecalculation(workbook: ExcelJS.Workbook) {
   workbook.calcProperties.fullCalcOnLoad = true;
   (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).forceFullCalc = true;
   (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).calcMode = "auto";
+}
+
+async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook): Promise<Buffer<ArrayBuffer>> {
+  const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
+  return enforceXlsxFullRecalculation(output);
+}
+
+async function enforceXlsxFullRecalculation(output: Buffer<ArrayBuffer>): Promise<Buffer<ArrayBuffer>> {
+  const zip = await JSZip.loadAsync(output);
+  const workbookXmlFile = zip.file("xl/workbook.xml");
+  if (!workbookXmlFile) return output;
+
+  const workbookXml = await workbookXmlFile.async("string");
+  const calcPr = '<calcPr calcId="0" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>';
+  const updatedWorkbookXml = /<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/.test(workbookXml)
+    ? workbookXml.replace(/<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/, calcPr)
+    : workbookXml.replace(/<\/workbook>\s*$/i, `${calcPr}</workbook>`);
+  zip.file("xl/workbook.xml", updatedWorkbookXml);
+
+  zip.remove("xl/calcChain.xml");
+  await removeCalcChainRelationship(zip);
+  await removeCalcChainContentType(zip);
+
+  return Buffer.from(await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }));
+}
+
+async function removeCalcChainRelationship(zip: JSZip) {
+  const relsFile = zip.file("xl/_rels/workbook.xml.rels");
+  if (!relsFile) return;
+  const relsXml = await relsFile.async("string");
+  const updatedRelsXml = relsXml.replace(
+    /\s*<Relationship\b[^>]*Type=(["'])http:\/\/schemas\.openxmlformats\.org\/officeDocument\/2006\/relationships\/calcChain\1[^>]*\/>/gi,
+    ""
+  );
+  zip.file("xl/_rels/workbook.xml.rels", updatedRelsXml);
+}
+
+async function removeCalcChainContentType(zip: JSZip) {
+  const contentTypesFile = zip.file("[Content_Types].xml");
+  if (!contentTypesFile) return;
+  const contentTypesXml = await contentTypesFile.async("string");
+  const updatedContentTypesXml = contentTypesXml.replace(/\s*<Override\b[^>]*PartName=(["'])\/xl\/calcChain\.xml\1[^>]*\/>/gi, "");
+  zip.file("[Content_Types].xml", updatedContentTypesXml);
 }
 
 function jsonError(error: string, status: number) {
