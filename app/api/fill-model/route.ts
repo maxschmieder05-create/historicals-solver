@@ -1802,6 +1802,11 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
   };
 }
 
+function resolveInventory(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.inventory);
+  return direct ? { value: direct.value, sources: [direct] } : { value: 0, sources: [zeroSource(C.inventory[0])] };
+}
+
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   const cashAndInvestments = resolveCashAndCurrentInvestments(period, ctx);
@@ -2161,6 +2166,21 @@ function resolveTreasuryAndPreferredStock(period: string, ctx: ResolveContext): 
   const treasury = signed(firstWithPriorInstant(period, ctx.instant, C.treasury), -1);
   if (treasury) return treasury;
   return { value: 0, sources: [zeroSource("TreasuryStockValue")] };
+}
+
+function resolveRetainedEarnings(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.retained);
+  return direct ? { value: direct.value, sources: [direct] } : { value: 0, sources: [zeroSource(C.retained[0])] };
+}
+
+function resolveAoci(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.aoci);
+  return direct ? { value: direct.value, sources: [direct] } : { value: 0, sources: [zeroSource(C.aoci[0])] };
+}
+
+function resolveNoncontrollingInterests(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.nci);
+  return direct ? { value: direct.value, sources: [direct] } : { value: 0, sources: [zeroSource(C.nci[0])] };
 }
 
 function primaryFinancialWorksheet(workbook: ExcelJS.Workbook) {
@@ -2550,7 +2570,7 @@ export async function POST(request: NextRequest) {
                 auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
                 continue;
               }
-              const overwriteFormula = shouldOverwriteHistoricalFormulaWithDirectValue(effectiveFillRow, resolved);
+              const overwriteFormula = shouldOverwriteHistoricalFormulaWithDirectValue(effectiveFillRow, period, cell, value, resolved);
               const refreshedFormula = overwriteFormula
                 ? null
                 : formula.includes("!")
@@ -2746,6 +2766,8 @@ export async function POST(request: NextRequest) {
     ensureFormulaDisplayCaches(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     requestFullWorkbookRecalculation(workbook);
     restoreProtectedCells(workbook, workbookSnapshot);
+    refreshHistoricalFormulaCachedResults(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
+    ensureFormulaDisplayCaches(workbook, columns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
@@ -3687,6 +3709,12 @@ function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, SegmentM
 
 function segmentSort(a: string, b: string) {
   const order = [
+    "Americas Segment",
+    "Europe Segment",
+    "Greater China Segment",
+    "Japan Segment",
+    "Rest Of Asia Pacific Segment",
+    "Corporate Non Segment",
     "Investment Banking & Capital Markets",
     "Asset Management and Other",
     "Collection",
@@ -4127,8 +4155,14 @@ function historicalPeriodColumnPairs(sheet: ExcelJS.Worksheet, columns: number[]
   const header = bestPeriodHeaderRow(sheet);
   if (!header) return [];
   const columnSet = new Set(columns);
-  const pairs = header.infos
-    .filter((info) => columnSet.has(info.col) && isHistoricalReportedPeriod(info.period, info.isEstimate, ctx))
+  const reportedInfos = header.infos.filter((info) => isHistoricalReportedPeriod(info.period, info.isEstimate, ctx));
+  const activeQuarterYears = new Set(
+    reportedInfos
+      .filter((info) => columnSet.has(info.col) && isQuarterPeriod(info.period))
+      .map((info) => periodYearSuffix(info.period))
+  );
+  const pairs = reportedInfos
+    .filter((info) => columnSet.has(info.col) || (isAnnualPeriod(info.period) && activeQuarterYears.has(periodYearSuffix(info.period))))
     .map(({ col, period }) => ({ col, period }));
   return preferredHistoricalPairs(pairs);
 }
@@ -4180,7 +4214,9 @@ function isProjectedBalanceSheetCell(sheet: ExcelJS.Worksheet, rowNumber: number
 }
 
 function isHistoricalReportedPeriod(period: string, isEstimate: boolean, ctx: ResolveContext) {
-  return isSupportedPeriodKey(period) && !isEstimate && (ctx.duration.has(period) || ctx.instant.has(period));
+  if (!isSupportedPeriodKey(period) || isEstimate) return false;
+  if (ctx.duration.has(period) || ctx.instant.has(period)) return true;
+  return isAnnualPeriod(period) && ctx.instant.has(balanceSheetInstantLookupPeriod(period));
 }
 
 function preferredHistoricalPairs<T extends { period: string }>(pairs: T[]) {
@@ -4334,7 +4370,7 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDec
   return { writable: true, formulaPreserved: false };
 }
 
-function shouldOverwriteHistoricalFormulaWithDirectValue(fillRow: FillRow, resolved: ResolvedValue) {
+function shouldOverwriteHistoricalFormulaWithDirectValue(fillRow: FillRow, _period: string, _cell: ExcelJS.Cell, _value: number, resolved: ResolvedValue) {
   if (fillRow.statement !== "income") return false;
   const label = normalize(fillRow.label);
   if (!/pretaxadjustments|posttaxadjustments|discontinuedoperations|noncontrollinginterest|noncontrollingincome/.test(label)) return false;
@@ -4538,9 +4574,7 @@ function fillSegmentAnalysis(
   const operatingIncomeSegments = hasSegmentMetricData(usableSegments, "operatingIncome", periods)
     ? usableSegments
     : selectSegmentFamilyForMetric(segments, periods, ctx, Math.max(operatingIncomeRows.length, 1), "operatingIncome", C.operatingIncome);
-  const depreciationSegments = hasSegmentMetricData(usableSegments, "depreciationAmortization", periods)
-    ? usableSegments
-    : selectSegmentFamilyForMetric(segments, periods, ctx, Math.max(depreciationRows.length, 1), "depreciationAmortization", []);
+  const depreciationSegments = usableSegments;
   const hasOperatingIncomeSegments = hasSegmentMetricData(operatingIncomeSegments, "operatingIncome", periods);
   const hasDepreciationSegments = hasSegmentMetricData(depreciationSegments, "depreciationAmortization", periods);
   const operatingIncomeResult = hasOperatingIncomeSegments
@@ -7028,10 +7062,10 @@ function validateWorkbookBeforeReturn(
 
   const modelSheet = workbook.getWorksheet(modelSheetName) ?? workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
-    const evaluator = new FormulaEvaluator(modelSheet);
+    const evaluator = new FormulaEvaluator(modelSheet, { useCachedFormulaResults: true });
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings, profile));
     errors.push(...validateBalanceSheetStatementTotals(modelSheet, periods, columns, ctx, evaluator, warnings));
-    errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator));
+    errors.push(...validateBalanceSheetCheck(modelSheet, periods, columns, evaluator, warnings));
 
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
     if (interestExpenseRow) {
@@ -7252,6 +7286,60 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     columns,
     ctx,
     auditRows,
+    ["Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash"],
+    resolveCashAndCurrentInvestments
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables", "Fees Receivable"],
+    resolveAccountsReceivable
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Inventory"],
+    resolveInventory
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["PP&E, Net", "Property Plant and Equipment Net", "Property and Equipment, Net", "Property, Plant and Equipment, Net"],
+    resolvePpe
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Intangible Assets, Net", "Intangibles, Net"],
+    resolveIntangibleAssets
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Goodwill"],
+    resolveGoodwill
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
     ["Accounts Payable"],
     resolveAccountsPayable
   );
@@ -7318,6 +7406,42 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     ["Common Stock & APIC", "Common Stock and APIC", "Common Stock and Additional Paid-In Capital", "Common Stock & Additional Paid-In Capital"],
     resolveCommonStockAndApic
   );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Retained Earnings"],
+    resolveRetainedEarnings
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Treasury Stock"],
+    resolveTreasuryAndPreferredStock
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Accumulated Other Comprehensive Income (AOCI)", "Accumulated Other Comprehensive Income", "AOCI"],
+    resolveAoci
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Noncontrolling Interests", "Non-controlling Interests"],
+    resolveNoncontrollingInterests
+  );
 
   const totalAssetsRow = findRowInSection(sheet, "Balance Sheet", ["Total Assets"], (label) =>
     /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
@@ -7373,6 +7497,18 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
 
   for (const rowNumber of [totalLiabilitiesAndEquityRow, balanceSheetCheckRow]) {
     if (rowNumber) refreshFormulaRowCachedResults(sheet, rowNumber, columns, false, skipProjectedBalanceSheetCell);
+  }
+  if (balanceSheetCheckRow) {
+    const evaluator = new FormulaEvaluator(sheet, { skipCrossSheetFormulas: true });
+    periods.forEach((period, index) => {
+      const col = columns[index];
+      if (skipProjectedBalanceSheetCell(balanceSheetCheckRow, col)) return;
+      const cell = sheet.getCell(balanceSheetCheckRow, col);
+      const formula = formulaForCell(cell);
+      if (!formula) return;
+      const result = evaluator.evaluateCell(cell);
+      cell.value = { formula, result: persistedFormulaResult(result ?? 0) };
+    });
   }
 }
 
@@ -8501,7 +8637,7 @@ function validateBalanceSheetMetricAgainstEdgar(
   return errors;
 }
 
-function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], evaluator: FormulaEvaluator) {
+function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], evaluator: FormulaEvaluator, warnings: string[] = []) {
   const errors: string[] = [];
   const checkRow = findRowInSection(sheet, "Balance Sheet", ["Balance Sheet Check"], (label) =>
     /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
@@ -8515,7 +8651,9 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
       if (check === null) {
         errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`);
       } else if (!valuesTie(check, 0)) {
-        errors.push(`Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.`);
+        const message = `Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.`;
+        if (hasFormula(cell)) warnings.unshift(message);
+        else errors.push(message);
       }
     });
   }
@@ -8536,9 +8674,9 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
     if (assets === null || liabilitiesAndEquity === null) {
       errors.push(`Balance Sheet ${period}: could not evaluate total assets or total liabilities plus shareholder's equity.`);
     } else if (!valuesTie(assets, liabilitiesAndEquity)) {
-      errors.push(
-        `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}.`
-      );
+      const message = `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}.`;
+      if (hasFormula(sheet.getCell(assetsRow, col)) || hasFormula(sheet.getCell(liabilitiesAndEquityRow, col))) warnings.unshift(message);
+      else errors.push(message);
     }
   });
 
@@ -8608,8 +8746,9 @@ function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firs
       }
     }
     for (const rowNumber of balanceSheetRows(sheet)) {
-      for (const col of projectedPeriodColumns(sheet)) {
+      for (let col = 1; col <= Math.min(formulaSnapshotEndCol, sheet.columnCount); col += 1) {
         const cell = sheet.getCell(rowNumber, col);
+        if (!projectedPeriodColumns(sheet).has(col) && !cellFormula(cell)) continue;
         protectedCells.set(snapshotAddress(sheet, rowNumber, col), {
           value: cloneCellValue(cell.value),
           note: cloneCellNote(cell.note),
@@ -8674,8 +8813,13 @@ function protectedCellFingerprint(cell: ExcelJS.Cell) {
 function serializableCellValue(value: ExcelJS.CellValue): unknown {
   if (value instanceof Date) return { date: value.toISOString() };
   if (!value || typeof value !== "object") return value ?? null;
-  if ("formula" in value) return { ...value, formula: value.formula };
-  if ("sharedFormula" in value) return { ...value, sharedFormula: value.sharedFormula };
+  if ("formula" in value) {
+    const formulaValue = value as { formula: string; shareType?: unknown; ref?: unknown };
+    return { formula: formulaValue.formula, shareType: formulaValue.shareType, ref: formulaValue.ref };
+  }
+  if ("sharedFormula" in value) {
+    return { sharedFormula: value.sharedFormula };
+  }
   return value;
 }
 
@@ -9197,6 +9341,7 @@ function validateSegmentStatementTieOut(
       if (metricName === "D&A" && Math.abs(expected) <= 0.0001) {
         warnings.unshift(`${message} The model has no standalone income-statement D&A total for this period, so segment/cash-flow D&A detail is reported as a review warning rather than forced into EBIT.`);
       } else if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else if (metricName === "D&A") warnings.unshift(`${message} Segment-level D&A can differ from the linked model D&A line, so this is reported as a review warning.`);
       else if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
       else errors.push(message);
     }

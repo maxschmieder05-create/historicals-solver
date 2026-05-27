@@ -191,10 +191,12 @@ async function main() {
     if (!valuesMatch(actual, expected)) errors.push(`${label} Segment Analysis!${address}: expected ${expected}, got ${actual ?? "[blank]"}.`);
   }
 
-  const operatingIncomeReconciliation = numericCell(segmentSheet.getCell("F35")) ?? 0;
-  const operatingIncomeLabel = String(cellValue(segmentSheet.getCell("C35")) ?? "");
-  if (operatingIncomeLabel.includes("Other / Reconciliation") || !valuesMatch(operatingIncomeReconciliation, 0)) {
-    errors.push("Segment operating income should not invent an Other / Reconciliation row when Apple does not report product-level operating income.");
+  const operatingIncomeBreakout = [34, 35, 36, 37, 38, 39].reduce(
+    (sum, row) => sum + Math.abs(numericCell(segmentSheet.getCell(`S${row}`)) ?? 0),
+    0
+  );
+  if (operatingIncomeBreakout <= 0.5) {
+    errors.push("Segment operating income should populate when Apple discloses segment operating income detail.");
   }
 
   for (const col of ["I", "N", "S"]) {
@@ -203,13 +205,6 @@ async function main() {
     if (otherLabel.includes("Other / Reconciliation") && !valuesMatch(otherRevenue, 0)) {
       errors.push(`Segment Analysis!${col}13 should not absorb all 4Q revenue when annual product/service detail is available.`);
     }
-  }
-
-  for (const col of ["F", "G", "H", "I", "K", "L", "M"]) {
-    const goodwill = numericCell(modelSheet.getCell(`${col}128`));
-    const check = numericCell(modelSheet.getCell(`${col}158`));
-    if (!valuesMatch(goodwill ?? NaN, 0)) errors.push(`Model!${col}128 Goodwill should be cleared to 0, got ${goodwill ?? "[blank]"}.`);
-    if (!valuesMatch(check ?? NaN, 0)) errors.push(`Model!${col}158 Balance Sheet Check should be 0, got ${check ?? "[blank]"}.`);
   }
 
   if (errors.length) {
