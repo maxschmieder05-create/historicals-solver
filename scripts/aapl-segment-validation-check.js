@@ -106,6 +106,23 @@ function projectedColumns(sheet) {
   return best.filter((info) => info.isEstimate).map((info) => info.col);
 }
 
+function historicalPeriodColumns(sheet) {
+  let best = [];
+  for (let row = 1; row <= Math.min(sheet.rowCount, 120); row += 1) {
+    const infos = [];
+    for (let col = 4; col <= Math.min(sheet.columnCount, 160); col += 1) {
+      const label = cellValue(sheet.getCell(row, col));
+      const period = normalizePeriodLabel(label);
+      if (!/^(?:[1-4]Q\d{2}|FY\d{2})$/i.test(period)) continue;
+      infos.push({ col, period, isEstimate: isEstimatePeriodLabel(label) });
+    }
+    const score = infos.length + infos.filter((info) => /^[1-4]Q/i.test(info.period)).length * 3;
+    const bestScore = best.length + best.filter((info) => /^[1-4]Q/i.test(info.period)).length * 3;
+    if (score > bestScore) best = infos;
+  }
+  return best.filter((info) => !info.isEstimate);
+}
+
 function balanceSheetRows(sheet) {
   const rows = [];
   let inBalanceSheet = false;
@@ -120,6 +137,98 @@ function balanceSheetRows(sheet) {
     if (label) rows.push(row);
   }
   return rows;
+}
+
+function findBalanceSheetRow(sheet, labels) {
+  const wanted = labels.map(normalizeLabel);
+  return balanceSheetRows(sheet).find((row) => wanted.includes(normalizeLabel(rowLabel(sheet, row)))) ?? null;
+}
+
+function assertTie(errors, label, actual, expected, tolerance = 0.5) {
+  if (typeof actual !== "number" || typeof expected !== "number" || Math.abs(actual - expected) > tolerance) {
+    errors.push(`${label}: expected ${expected ?? "[blank]"}, got ${actual ?? "[blank]"}.`);
+  }
+}
+
+function assertBalanceSheetIntegrity(sheet, errors) {
+  const periodColumns = historicalPeriodColumns(sheet);
+  const periodsByName = new Map(periodColumns.map((info) => [info.period.toUpperCase(), info.col]));
+  const rows = balanceSheetRows(sheet);
+
+  for (const year of ["23", "24", "25"]) {
+    const fourthQuarterCol = periodsByName.get(`4Q${year}`);
+    const annualCol = periodsByName.get(`FY${year}`);
+    if (!fourthQuarterCol || !annualCol) continue;
+    for (const row of rows) {
+      const label = rowLabel(sheet, row);
+      if (!label || /balance sheet/i.test(label)) continue;
+      const fourthQuarter = numericCell(sheet.getCell(row, fourthQuarterCol));
+      const annual = numericCell(sheet.getCell(row, annualCol));
+      if (fourthQuarter === null || annual === null) continue;
+      assertTie(errors, `Model ${label} FY20${year} annual should equal 4Q`, annual, fourthQuarter);
+    }
+  }
+
+  const totalAssetsRow = findBalanceSheetRow(sheet, ["Total Assets"]);
+  const totalLiabilitiesAndEquityRow = findBalanceSheetRow(sheet, [
+    "Total Liabilities & Shareholder's Equity",
+    "Total Liabilities and Shareholder's Equity"
+  ]);
+  const balanceCheckRow = findBalanceSheetRow(sheet, ["Balance Sheet Check"]);
+  const totalCurrentAssetsRow = findBalanceSheetRow(sheet, ["Total Current Assets"]);
+  const currentAssetRows = [
+    findBalanceSheetRow(sheet, ["Cash & Cash Equivalents", "Cash and Cash Equivalents"]),
+    findBalanceSheetRow(sheet, ["Accounts Receivable", "Accounts Receivable, Net"]),
+    findBalanceSheetRow(sheet, ["Inventory"]),
+    findBalanceSheetRow(sheet, ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets"])
+  ].filter(Boolean);
+  const totalCurrentLiabilitiesRow = findBalanceSheetRow(sheet, [
+    "Total Current Liabilities",
+    "Total Current Liabilities (Excl. Debt)",
+    "Total Current Liabilities Excl. Debt"
+  ]);
+  const currentLiabilityRows = [
+    findBalanceSheetRow(sheet, ["Accounts Payable"]),
+    findBalanceSheetRow(sheet, ["Accrued Liabilities", "Accrued Expenses"]),
+    findBalanceSheetRow(sheet, ["Other Current Liabilities", "Other Current Liabs"])
+  ].filter(Boolean);
+  const totalEquityRow = findBalanceSheetRow(sheet, [
+    "Total Shareholder's Equity",
+    "Total Shareholders' Equity",
+    "Total Stockholders' Equity"
+  ]);
+  const equityRows = [
+    findBalanceSheetRow(sheet, ["Common Stock & APIC", "Common Stock and APIC"]),
+    findBalanceSheetRow(sheet, ["Retained Earnings"]),
+    findBalanceSheetRow(sheet, ["Treasury Stock"]),
+    findBalanceSheetRow(sheet, ["Accumulated Other Comprehensive Income (AOCI)", "Accumulated Other Comprehensive Income", "AOCI"])
+  ].filter(Boolean);
+
+  for (const { col, period } of periodColumns) {
+    if (totalAssetsRow && totalLiabilitiesAndEquityRow) {
+      assertTie(
+        errors,
+        `Model Balance Sheet ${period} total assets should equal liabilities and equity`,
+        numericCell(sheet.getCell(totalAssetsRow, col)),
+        numericCell(sheet.getCell(totalLiabilitiesAndEquityRow, col))
+      );
+    }
+    if (balanceCheckRow) {
+      assertTie(errors, `Model Balance Sheet ${period} check should be zero`, numericCell(sheet.getCell(balanceCheckRow, col)), 0);
+    }
+    if (totalCurrentAssetsRow && currentAssetRows.length >= 2) {
+      const componentSum = currentAssetRows.reduce((sum, row) => sum + (numericCell(sheet.getCell(row, col)) ?? 0), 0);
+      assertTie(errors, `Model Balance Sheet ${period} current assets should sum`, numericCell(sheet.getCell(totalCurrentAssetsRow, col)), componentSum);
+    }
+    if (totalCurrentLiabilitiesRow && currentLiabilityRows.length >= 2) {
+      const componentSum = currentLiabilityRows.reduce((sum, row) => sum + (numericCell(sheet.getCell(row, col)) ?? 0), 0);
+      assertTie(errors, `Model Balance Sheet ${period} current liabilities should sum`, numericCell(sheet.getCell(totalCurrentLiabilitiesRow, col)), componentSum);
+    }
+    if (totalEquityRow && equityRows.length >= 2) {
+      const componentSum = equityRows.reduce((sum, row) => sum + (numericCell(sheet.getCell(row, col)) ?? 0), 0);
+      assertTie(errors, `Model Balance Sheet ${period} shareholders' equity should sum`, numericCell(sheet.getCell(totalEquityRow, col)), componentSum);
+    }
+  }
 }
 
 function cellFingerprint(cell) {
@@ -168,6 +277,7 @@ async function main() {
   if (!segmentSheet || !modelSheet) throw new Error("Workbook is missing Model or Segment Analysis sheet.");
   if (!inputModelSheet) throw new Error("Input workbook is missing Model sheet.");
   assertProjectedBalanceSheetPreserved(inputModelSheet, modelSheet, errors);
+  assertBalanceSheetIntegrity(modelSheet, errors);
 
   for (const [address, expected] of expectedLabels) {
     const actual = String(cellValue(segmentSheet.getCell(address)) ?? "");
