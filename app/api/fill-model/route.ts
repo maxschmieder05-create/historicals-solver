@@ -3428,7 +3428,12 @@ function parseInlineContexts(html: string, form: string) {
     const body = match[0];
     const instant = body.match(/<xbrli:instant>([^<]+)<\/xbrli:instant>/)?.[1];
     if (instant) {
-      contexts.set(match[1], { period: periodKeyFromDate(instant), instant: true, end: instant, hasDimensions: hasInlineDimensions(body) });
+      contexts.set(match[1], {
+        period: fiscalFocus ? periodKeyFromFiscalFocus(instant, fiscalFocus) ?? periodKeyFromDate(instant) : periodKeyFromDate(instant),
+        instant: true,
+        end: instant,
+        hasDimensions: hasInlineDimensions(body)
+      });
       continue;
     }
     const start = body.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
