@@ -2690,7 +2690,7 @@ export async function POST(request: NextRequest) {
       if (rowNotes.size) {
         const sourceCell = labelCell(sheet, fillRow.row);
         if (canAddComment(sourceCell)) {
-          addComment(sourceCell, Array.from(rowNotes).join(" "));
+          addComment(sourceCell, rowAnnotationSummary(Array.from(rowNotes)));
           commentsAdded += 1;
         }
       }
@@ -5681,6 +5681,23 @@ function shortAnnotationSentence(text: string, maxLength = 180) {
   const boundary = compact.slice(0, maxLength + 1).search(/\s+\S*$/);
   const end = boundary > 80 ? boundary : maxLength;
   return `${compact.slice(0, end).trim()}...`;
+}
+
+function rowAnnotationSummary(notes: string[]) {
+  const compactNotes = unique(notes.map(rowAnnotationNote).filter(Boolean));
+  if (!compactNotes.length) return "";
+  const shown = compactNotes.slice(0, 3);
+  const remaining = compactNotes.length - shown.length;
+  return [...shown, remaining > 0 ? `+${remaining} more item(s) in Mapping Audit.` : ""].filter(Boolean).join("\n");
+}
+
+function rowAnnotationNote(note: string) {
+  const hasFilingSupport = /\bFiling says:/i.test(note);
+  const withoutFilingExcerpt = note.replace(/\s*Filing says:.*$/i, "").trim();
+  const sentences = withoutFilingExcerpt.match(/[^.!?]+[.!?]/g)?.map((item) => item.trim()) ?? [];
+  const summary = sentences.length ? sentences.slice(0, 2).join(" ") : withoutFilingExcerpt;
+  const suffix = hasFilingSupport ? " Filing support available in Mapping Audit." : "";
+  return shortAnnotationSentence(`${summary}${suffix}`, 220);
 }
 
 function sourceDisplayLabel(source: FactSource) {
