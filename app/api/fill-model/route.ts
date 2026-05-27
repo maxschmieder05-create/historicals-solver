@@ -2387,7 +2387,7 @@ function detectTemplateProfile(workbook: ExcelJS.Workbook, sheet: ExcelJS.Worksh
     rationale.push("SEC facts include broker/dealer or financial asset/liability concepts.");
   }
 
-  if (financialScore >= 4 && financialScore >= owlScore) {
+  if (financialScore >= 4) {
     return { kind: "financial_company", confidence: financialScore >= 6 ? "high" : "medium", rationale, sheetName: sheet.name, hasSegmentAnalysis };
   }
   if (owlScore >= 5) {
@@ -2582,7 +2582,7 @@ export async function POST(request: NextRequest) {
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Historicals Solver";
     await workbook.xlsx.load(Buffer.from(await file.arrayBuffer()) as unknown as ExcelJS.Buffer);
-    requestFullWorkbookRecalculation(workbook);
+    requestAutomaticWorkbookCalculation(workbook);
     normalizeSharedFormulas(workbook);
     removeInvalidConditionalFormattingRules(workbook);
     removeExternalWorkbookDefinedNames(workbook);
@@ -2903,7 +2903,7 @@ export async function POST(request: NextRequest) {
     commentsAdded += partialBalanceSheetCheckResult.commentsAdded;
     warnings.push(...partialBalanceSheetCheckResult.warnings);
     ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
-    requestFullWorkbookRecalculation(workbook);
+    requestAutomaticWorkbookCalculation(workbook);
     restoreProtectedCells(workbook, workbookSnapshot);
     refreshHistoricalFormulaCachedResults(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
@@ -7273,34 +7273,42 @@ function validateWorkbookBeforeReturn(
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
   if (segmentSheet) {
     const segmentEvaluator = new FormulaEvaluator(segmentSheet);
+    const isFinancialCompanySegmentContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
-    errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings));
-    errors.push(
-      ...validateSegmentStatementTieOut(
-        segmentSheet,
-        periods,
-        columns,
-        ctx,
-        segmentEvaluator,
-        warnings,
-        "operating income",
-        "Total Company Operating Income",
-        "Operating Income Check",
-        "Operating Income",
-        C.operatingIncome
-      )
-    );
-    errors.push(
-      ...validateSegmentStatementTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings, "D&A", "Total D&A", "D&A Check", "D&A", C.da)
-    );
+    if (isFinancialCompanySegmentContext) {
+      warnings.push("Segment Analysis tie-outs were treated as review warnings for a financial-company template because segment rows may represent revenue components rather than additive reportable segments.");
+    } else {
+      errors.push(...validateSegmentRevenueTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings));
+      errors.push(
+        ...validateSegmentStatementTieOut(
+          segmentSheet,
+          periods,
+          columns,
+          ctx,
+          segmentEvaluator,
+          warnings,
+          "operating income",
+          "Total Company Operating Income",
+          "Operating Income Check",
+          "Operating Income",
+          C.operatingIncome
+        )
+      );
+      errors.push(
+        ...validateSegmentStatementTieOut(segmentSheet, periods, columns, ctx, segmentEvaluator, warnings, "D&A", "Total D&A", "D&A Check", "D&A", C.da)
+      );
+    }
   }
   if (modelSheetName !== MODEL_SHEET) return errors;
 
   const modelSheet = workbook.getWorksheet(modelSheetName) ?? workbook.getWorksheet(MODEL_SHEET);
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet, { useCachedFormulaResults: true });
+    const isFinancialCompanyStatementContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings, profile));
-    errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
+    if (!isFinancialCompanyStatementContext) {
+      errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
+    }
     errors.push(...validateBalanceSheetCheck(modelSheet, balanceSheetPeriods, balanceSheetColumns, evaluator, warnings));
 
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
@@ -7942,7 +7950,8 @@ function validateIncomeStatementKeyMetrics(
   profile: TemplateProfile
 ) {
   const errors: string[] = [];
-  if (profile.kind === "financial_company" && hasAnyConcept(ctx, "duration", C.netRevenue)) {
+  const isFinancialCompanyStatementContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
+  if (isFinancialCompanyStatementContext && hasAnyConcept(ctx, "duration", C.netRevenue)) {
     errors.push(
       ...validateIncomeStatementMetricAgainstEdgar(
         sheet,
@@ -7972,6 +7981,38 @@ function validateIncomeStatementKeyMetrics(
       )
     );
   }
+
+  if (isFinancialCompanyStatementContext) {
+    errors.push(
+      ...validateIncomeStatementMetricAgainstEdgar(
+        sheet,
+        periods,
+        columns,
+        ctx,
+        evaluator,
+        warnings,
+        "pre-tax income",
+        ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"],
+        PRETAX_INCOME_CONCEPTS,
+        resolvePreTaxIncome
+      )
+    );
+    errors.push(
+      ...validateIncomeStatementMetricAgainstEdgar(
+        sheet,
+        periods,
+        columns,
+        ctx,
+        evaluator,
+        warnings,
+        "net income",
+        ["Net Income (Loss)", "Net Income"],
+        CONTINUING_NET_INCOME_CONCEPTS
+      )
+    );
+    return errors;
+  }
+
   errors.push(...validateIncomeStatementGrossProfitBridge(sheet, periods, columns, evaluator, warnings));
   errors.push(
     ...validateIncomeStatementMetricAgainstEdgar(
@@ -9097,10 +9138,10 @@ function isSegmentAnalysisLabelRewriteCell(cell: ExcelJS.Cell) {
   if (sheet.name !== SEGMENT_SHEET || Number(cell.col) > 5) return false;
   const rowNumber = Number(cell.row);
   const rows = new Set([
-    ...segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", [6]),
+    ...segmentMetricSectionRows(sheet, "Total Company Revenue", "Revenue Mix"),
     ...segmentMixLabelRows(sheet),
-    ...segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", [6]),
-    ...segmentMetricRows(sheet, "Total D&A", "D&A Check", [6])
+    ...segmentMetricSectionRows(sheet, "Total Company Operating Income", "Operating Income Check"),
+    ...segmentMetricSectionRows(sheet, "Total D&A", "D&A Check")
   ]);
   return rows.has(rowNumber);
 }
@@ -9725,38 +9766,49 @@ function uniquePeriodColumnPairs(pairs: Array<{ period: string; col: number }>) 
   return result.sort((a, b) => a.col - b.col);
 }
 
-function requestFullWorkbookRecalculation(workbook: ExcelJS.Workbook) {
-  workbook.calcProperties.fullCalcOnLoad = true;
-  (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).forceFullCalc = true;
-  (workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & { forceFullCalc?: boolean; calcMode?: string }).calcMode = "auto";
+function requestAutomaticWorkbookCalculation(workbook: ExcelJS.Workbook) {
+  const calcProperties = workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & {
+    forceFullCalc?: boolean;
+    calcMode?: string;
+    calcOnSave?: boolean;
+  };
+  calcProperties.calcMode = "auto";
+  const optionalCalcProperties = calcProperties as Partial<typeof calcProperties>;
+  delete optionalCalcProperties.fullCalcOnLoad;
+  delete optionalCalcProperties.forceFullCalc;
+  delete optionalCalcProperties.calcOnSave;
 }
 
 async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook): Promise<Buffer<ArrayBuffer>> {
   refreshWorkbookFormulaDisplayCaches(workbook);
   validateWorkbookFormulaCellsReadyForDisplay(workbook);
   const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
-  return enforceXlsxFullRecalculation(output);
+  return enforceXlsxAutomaticCalculation(output);
 }
 
-async function enforceXlsxFullRecalculation(output: Buffer<ArrayBuffer>): Promise<Buffer<ArrayBuffer>> {
+async function enforceXlsxAutomaticCalculation(output: Buffer<ArrayBuffer>): Promise<Buffer<ArrayBuffer>> {
   const zip = await JSZip.loadAsync(output);
   const workbookXmlFile = zip.file("xl/workbook.xml");
   if (!workbookXmlFile) return output;
 
   const workbookXml = await workbookXmlFile.async("string");
-  const calcPr = '<calcPr calcId="0" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1" calcOnSave="1"/>';
+  const calcPr = '<calcPr calcMode="auto"/>';
   const updatedWorkbookXml = /<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/.test(workbookXml)
     ? workbookXml.replace(/<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/, calcPr)
-    : workbookXml.replace(/<\/workbook>\s*$/i, `${calcPr}</workbook>`);
+    : insertWorkbookCalcPr(workbookXml, calcPr);
   zip.file("xl/workbook.xml", updatedWorkbookXml);
 
   zip.remove("xl/calcChain.xml");
   await removeCalcChainRelationship(zip);
   await removeCalcChainContentType(zip);
-  await markWorksheetFormulasForRecalculation(zip);
   await validateXlsxFormulaCellsReadyForDisplay(zip);
 
   return Buffer.from(await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }));
+}
+
+function insertWorkbookCalcPr(workbookXml: string, calcPr: string) {
+  if (/<extLst\b/i.test(workbookXml)) return workbookXml.replace(/<extLst\b/i, `${calcPr}<extLst`);
+  return workbookXml.replace(/<\/workbook>\s*$/i, `${calcPr}</workbook>`);
 }
 
 function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
@@ -9813,6 +9865,7 @@ async function markWorksheetFormulasForRecalculation(zip: JSZip) {
 function markFormulaCellForRecalculation(cellXml: string) {
   return cellXml.replace(/<f\b([^>]*)>/, (match, attrs: string) => {
     if (/\bca=/.test(attrs)) return match;
+    if (/\/\s*$/.test(attrs)) return `<f${attrs.replace(/\/\s*$/, "")} ca="1"/>`;
     return `<f${attrs} ca="1">`;
   });
 }
@@ -9855,8 +9908,8 @@ function formulaStringValue(cellXml: string, sharedStrings: Map<number, string>)
 
 async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
   const workbookXml = await zip.file("xl/workbook.xml")?.async("string");
-  if (!workbookXml || !/<calcPr\b[^>]*calcMode="auto"[^>]*fullCalcOnLoad="1"[^>]*forceFullCalc="1"[^>]*calcOnSave="1"/.test(workbookXml)) {
-    throw new Error("Workbook calculation properties are not set to automatic full recalculation.");
+  if (!workbookXml || !/<calcPr\b[^>]*calcMode="auto"/.test(workbookXml)) {
+    throw new Error("Workbook calculation properties are not set to automatic calculation.");
   }
 
   const problems: string[] = [];
@@ -9867,15 +9920,12 @@ async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
     if (!file) continue;
     const xml = await file.async("string");
     for (const cellXml of xml.match(/<c\b[^>]*>[\s\S]*?<\/c>/g) ?? []) {
-      const address = cellXml.match(/\br="([^"]+)"/)?.[1] ?? "?";
-      if (/<f\b/.test(cellXml)) {
-        const hasCachedValue = /<v>[\s\S]*?<\/v>/.test(cellXml);
-        const markedForCalculation = /<f\b[^>]*\bca="1"/.test(cellXml);
-        if (!hasCachedValue && !markedForCalculation) problems.push(`${path}!${address}: formula has no display cache and is not marked for recalculation`);
-        continue;
-      }
+      if (/<f\b/.test(cellXml)) continue;
       const textValue = formulaStringValue(cellXml, sharedStrings);
-      if (textValue && isPlainTextFormula(textValue)) problems.push(`${path}!${address}: formula is stored as text`);
+      if (textValue && isPlainTextFormula(textValue)) {
+        const address = cellXml.match(/\br="([^"]+)"/)?.[1] ?? "?";
+        problems.push(`${path}!${address}: formula is stored as text`);
+      }
     }
   }
 
