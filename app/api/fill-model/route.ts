@@ -4244,8 +4244,32 @@ function isProjectedBalanceSheetCell(sheet: ExcelJS.Worksheet, rowNumber: number
 
 function isHistoricalReportedPeriod(period: string, isEstimate: boolean, ctx: ResolveContext) {
   if (!isSupportedPeriodKey(period) || isEstimate) return false;
-  if (ctx.duration.has(period) || ctx.instant.has(period)) return true;
-  return isAnnualPeriod(period) && ctx.instant.has(balanceSheetInstantLookupPeriod(period));
+  if (hasReportedFinancialStatementPeriod(period, ctx)) return true;
+  return isAnnualPeriod(period) && hasReportedFinancialStatementPeriod(balanceSheetInstantLookupPeriod(period), ctx);
+}
+
+function hasReportedFinancialStatementPeriod(period: string, ctx: ResolveContext) {
+  const durationFacts = ctx.duration.get(period);
+  if (
+    durationFacts &&
+    [
+      ...TOTAL_REVENUE_CONCEPTS,
+      ...C.cogs,
+      ...C.grossProfit,
+      ...C.operatingIncome,
+      ...PRETAX_INCOME_CONCEPTS,
+      ...CONTINUING_NET_INCOME_CONCEPTS
+    ].some((concept) => durationFacts.has(concept))
+  ) {
+    return true;
+  }
+
+  const instantFacts = ctx.instant.get(period);
+  if (instantFacts && [...C.assets, ...C.liabilities, ...C.equity].some((concept) => instantFacts.has(concept))) {
+    return true;
+  }
+
+  return false;
 }
 
 function preferredHistoricalPairs<T extends { period: string }>(pairs: T[]) {
@@ -9371,15 +9395,21 @@ function validateSegmentRevenueTieOut(
     if (expectedRevenue === null) return;
     if (!segmentModelRevenueTies(segmentTotal, expectedRevenue)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
-      errors.push(message);
+      if (isMissingFourthQuarterSegmentDetail(period, segmentTotal, expectedRevenue)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else errors.push(message);
     }
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, expectedRevenue)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue evaluates to ${roundModelValue(sheetTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
-      errors.push(message);
+      if (isMissingFourthQuarterSegmentDetail(period, sheetTotal, expectedRevenue)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else errors.push(message);
     }
   });
 
   return errors;
+}
+
+function isMissingFourthQuarterSegmentDetail(period: string, actual: number, expected: number) {
+  return isFourthQuarterPeriod(period) && Math.abs(actual) <= 0.0001 && Math.abs(expected) > 0.0001;
 }
 
 function validateSegmentStatementTieOut(
@@ -9429,12 +9459,14 @@ function validateSegmentStatementTieOut(
         warnings.unshift(`${message} The model has no standalone income-statement D&A total for this period, so segment/cash-flow D&A detail is reported as a review warning rather than forced into EBIT.`);
       } else if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
       else if (metricName === "D&A") warnings.unshift(`${message} Segment-level D&A can differ from the linked model D&A line, so this is reported as a review warning.`);
+      else if (isMissingFourthQuarterSegmentDetail(period, segmentTotal, expected)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
       else if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
       else errors.push(message);
     }
     if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, expected)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`;
-      if (hasFormula(totalCell)) warnings.unshift(message);
+      if (isMissingFourthQuarterSegmentDetail(period, sheetTotal, expected)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else if (hasFormula(totalCell)) warnings.unshift(message);
       else errors.push(message);
     }
   });
