@@ -9612,6 +9612,8 @@ function requestFullWorkbookRecalculation(workbook: ExcelJS.Workbook) {
 }
 
 async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook): Promise<Buffer<ArrayBuffer>> {
+  refreshWorkbookFormulaDisplayCaches(workbook);
+  validateWorkbookFormulaCellsReadyForDisplay(workbook);
   const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
   return enforceXlsxFullRecalculation(output);
 }
@@ -9622,7 +9624,7 @@ async function enforceXlsxFullRecalculation(output: Buffer<ArrayBuffer>): Promis
   if (!workbookXmlFile) return output;
 
   const workbookXml = await workbookXmlFile.async("string");
-  const calcPr = '<calcPr calcId="0" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1"/>';
+  const calcPr = '<calcPr calcId="0" calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1" calcOnSave="1"/>';
   const updatedWorkbookXml = /<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/.test(workbookXml)
     ? workbookXml.replace(/<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/, calcPr)
     : workbookXml.replace(/<\/workbook>\s*$/i, `${calcPr}</workbook>`);
@@ -9631,8 +9633,147 @@ async function enforceXlsxFullRecalculation(output: Buffer<ArrayBuffer>): Promis
   zip.remove("xl/calcChain.xml");
   await removeCalcChainRelationship(zip);
   await removeCalcChainContentType(zip);
+  await markWorksheetFormulasForRecalculation(zip);
+  await validateXlsxFormulaCellsReadyForDisplay(zip);
 
   return Buffer.from(await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }));
+}
+
+function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
+  for (const sheet of workbook.worksheets) {
+    const evaluator = new FormulaEvaluator(sheet, { useCachedFormulaResults: false });
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (!hasFormula(cell)) return;
+        if (hasFormulaResult(cell)) return;
+        const formulaBefore = formulaForCell(cell);
+        const result = evaluator.evaluateCell(cell);
+        if (result === null) return;
+        setFormulaResult(cell, result);
+        const formulaAfter = formulaForCell(cell);
+        if (formulaAfter !== formulaBefore) {
+          throw new Error(`Formula display-cache refresh changed ${sheet.name}!${cell.address}.`);
+        }
+      });
+    });
+  }
+}
+
+function validateWorkbookFormulaCellsReadyForDisplay(workbook: ExcelJS.Workbook) {
+  const textFormulas: string[] = [];
+  workbook.eachSheet((sheet) => {
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (typeof cell.value === "string" && isPlainTextFormula(cell.value)) {
+          textFormulas.push(`${sheet.name}!${cell.address}`);
+        }
+      });
+    });
+  });
+  if (textFormulas.length) {
+    throw new Error(`Workbook contains formulas stored as text: ${textFormulas.slice(0, 12).join(", ")}`);
+  }
+}
+
+async function markWorksheetFormulasForRecalculation(zip: JSZip) {
+  const sharedStrings = await sharedStringValues(zip);
+  const worksheetPaths = Object.keys(zip.files).filter((path) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
+  for (const path of worksheetPaths) {
+    const file = zip.file(path);
+    if (!file) continue;
+    const xml = await file.async("string");
+    const updated = xml.replace(/<c\b[^>]*>[\s\S]*?<\/c>/g, (cellXml) => {
+      if (/<f\b/.test(cellXml)) return markFormulaCellForRecalculation(cellXml);
+      return convertPlainTextFormulaCell(cellXml, sharedStrings);
+    });
+    zip.file(path, updated);
+  }
+}
+
+function markFormulaCellForRecalculation(cellXml: string) {
+  return cellXml.replace(/<f\b([^>]*)>/, (match, attrs: string) => {
+    if (/\bca=/.test(attrs)) return match;
+    return `<f${attrs} ca="1">`;
+  });
+}
+
+function convertPlainTextFormulaCell(cellXml: string, sharedStrings: Map<number, string>) {
+  const stringValue = formulaStringValue(cellXml, sharedStrings);
+  if (!stringValue || !isPlainTextFormula(stringValue)) return cellXml;
+  const formula = escapeXml(stringValue.replace(/^=/, ""));
+  const attrs = (cellXml.match(/^<c\b([^>]*)>/)?.[1] ?? "").replace(/\s+t=(["'])(?:s|str|inlineStr)\1/g, "");
+  return `<c${attrs}><f ca="1">${formula}</f></c>`;
+}
+
+async function sharedStringValues(zip: JSZip) {
+  const values = new Map<number, string>();
+  const sharedStringsFile = zip.file("xl/sharedStrings.xml");
+  if (!sharedStringsFile) return values;
+
+  const xml = await sharedStringsFile.async("string");
+  let index = 0;
+  for (const match of xml.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/g)) {
+    const text = Array.from(match[1].matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g))
+      .map((item) => unescapeXml(item[1]))
+      .join("");
+    values.set(index, text);
+    index += 1;
+  }
+  return values;
+}
+
+function formulaStringValue(cellXml: string, sharedStrings: Map<number, string>) {
+  if (/\bt=(["'])s\1/.test(cellXml)) {
+    const sharedStringIndex = Number(cellXml.match(/<v>(\d+)<\/v>/)?.[1]);
+    return Number.isFinite(sharedStringIndex) ? sharedStrings.get(sharedStringIndex) ?? null : null;
+  }
+  const value = cellXml.match(/<v>([\s\S]*?)<\/v>/)?.[1];
+  if (value !== undefined) return unescapeXml(value);
+  const inlineText = cellXml.match(/<is>\s*<t[^>]*>([\s\S]*?)<\/t>\s*<\/is>/)?.[1];
+  return inlineText === undefined ? null : unescapeXml(inlineText);
+}
+
+async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
+  const workbookXml = await zip.file("xl/workbook.xml")?.async("string");
+  if (!workbookXml || !/<calcPr\b[^>]*calcMode="auto"[^>]*fullCalcOnLoad="1"[^>]*forceFullCalc="1"[^>]*calcOnSave="1"/.test(workbookXml)) {
+    throw new Error("Workbook calculation properties are not set to automatic full recalculation.");
+  }
+
+  const problems: string[] = [];
+  const sharedStrings = await sharedStringValues(zip);
+  const worksheetPaths = Object.keys(zip.files).filter((path) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
+  for (const path of worksheetPaths) {
+    const file = zip.file(path);
+    if (!file) continue;
+    const xml = await file.async("string");
+    for (const cellXml of xml.match(/<c\b[^>]*>[\s\S]*?<\/c>/g) ?? []) {
+      const address = cellXml.match(/\br="([^"]+)"/)?.[1] ?? "?";
+      if (/<f\b/.test(cellXml)) {
+        const hasCachedValue = /<v>[\s\S]*?<\/v>/.test(cellXml);
+        const markedForCalculation = /<f\b[^>]*\bca="1"/.test(cellXml);
+        if (!hasCachedValue && !markedForCalculation) problems.push(`${path}!${address}: formula has no display cache and is not marked for recalculation`);
+        continue;
+      }
+      const textValue = formulaStringValue(cellXml, sharedStrings);
+      if (textValue && isPlainTextFormula(textValue)) problems.push(`${path}!${address}: formula is stored as text`);
+    }
+  }
+
+  if (problems.length) {
+    throw new Error(`Workbook has formula cells that may not display until manual edit: ${problems.slice(0, 12).join(", ")}`);
+  }
+}
+
+function isPlainTextFormula(value: string) {
+  return /^=\s*(?:[A-Z_@]|\d|[+\-.]|\()/i.test(value.trim());
+}
+
+function escapeXml(value: string) {
+  return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function unescapeXml(value: string) {
+  return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
 }
 
 async function removeCalcChainRelationship(zip: JSZip) {
