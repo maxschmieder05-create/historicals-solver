@@ -13,7 +13,7 @@ import {
 import { loadSecBulkSupport, readSecBulkSubmissionFile, type SecBulkSupport } from "./sec-bulk";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+export const maxDuration = 900;
 
 type SecFact = {
   val: number;
@@ -524,6 +524,12 @@ const BROKER_DEALER_RECEIVABLES = [
   "ReceivablesFromCustomers",
   "FeesInterestAndOther"
 ];
+
+const INLINE_INSTANT_EXTENSION_CONCEPTS = new Set([
+  ...C.intangibles,
+  "ContentLiabilitiesCurrent",
+  "ContentLiabilitiesNoncurrent"
+]);
 
 const BROKER_DEALER_CURRENT_ASSETS = [
   "FinancialInstrumentsOwnedAtFairValue",
@@ -1872,17 +1878,16 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, C.intangibles);
+  if (direct) return { value: direct.value, sources: [direct] };
   if (first(period, ctx.instant, ["PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"])) {
     return { value: 0, sources: [zeroSource("IntangibleAssetsNet")], note: "No separate intangible assets line item was reported in the SEC balance sheet for this period." };
   }
-  const direct = first(period, ctx.instant, C.intangibles);
-  return direct
-    ? { value: direct.value, sources: [direct] }
-    : {
-        value: 0,
-        sources: [zeroSource(C.intangibles[0])],
-        note: "No separate intangible assets line item was reported in the SEC balance sheet for this period, so stale template values were cleared."
-      };
+  return {
+    value: 0,
+    sources: [zeroSource(C.intangibles[0])],
+    note: "No separate intangible assets line item was reported in the SEC balance sheet for this period, so stale template values were cleared."
+  };
 }
 
 function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1897,28 +1902,50 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
 }
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
+  const otherAssetsNoncurrent = first(period, ctx.instant, ["OtherAssetsNoncurrent"]);
+  const operatingLeaseAssets = sum(period, ctx.instant, ["OperatingLeaseRightOfUseAsset", "OperatingLeaseRightOfUseAssetNet"]);
+
   const assets = first(period, ctx.instant, C.assets);
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   const ppe = resolvePpe(period, ctx);
   const intangibles = resolveIntangibleAssets(period, ctx);
   const goodwill = resolveGoodwill(period, ctx);
   if (assets && currentAssets && currentAssets.value !== null && ppe.value !== null && intangibles.value !== null && goodwill.value !== null) {
+    const residual = assets.value - currentAssets.value - (ppe.value ?? 0) - intangibles.value - goodwill.value;
+    const operatingLeaseAssetValue = operatingLeaseAssets?.value ?? null;
+    if (otherAssetsNoncurrent && statementMetricTies(residual, otherAssetsNoncurrent.value)) {
+      return {
+        value: otherAssetsNoncurrent.value,
+        sources: [otherAssetsNoncurrent],
+        note: "Mapped to directly reported other non-current assets."
+      };
+    }
+    if (otherAssetsNoncurrent && operatingLeaseAssets && operatingLeaseAssetValue !== null && statementMetricTies(residual, otherAssetsNoncurrent.value + operatingLeaseAssetValue)) {
+      return {
+        value: otherAssetsNoncurrent.value + operatingLeaseAssetValue,
+        sources: compactSources([otherAssetsNoncurrent, operatingLeaseAssets]),
+        note: "Mapped to directly reported other non-current assets plus operating lease right-of-use assets so the non-current asset section ties to SEC total assets."
+      };
+    }
     return {
-      value: assets.value - currentAssets.value - (ppe.value ?? 0) - intangibles.value - goodwill.value,
+      value: residual,
       sources: compactSources([assets, currentAssets, ppe, intangibles, goodwill]),
       note: "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill."
     };
   }
-  const direct = sum(period, ctx.instant, ["OtherAssetsNoncurrent", "OperatingLeaseRightOfUseAsset", "OperatingLeaseRightOfUseAssetNet"]);
-  if (direct) {
-    const hasBroadOtherAsset = direct.sources.some((source) => source.concept === "OtherAssetsNoncurrent");
+  if (otherAssetsNoncurrent) {
     return {
-      value: direct.value,
-      sources: direct.sources,
-      classification: hasBroadOtherAsset ? undefined : "partial",
-      note: hasBroadOtherAsset
-        ? "Mapped to directly reported other non-current assets and operating lease right-of-use assets."
-        : "Mapped to operating lease right-of-use assets only. This is a partial non-current asset bucket when the model row is a broad other-assets category."
+      value: otherAssetsNoncurrent.value,
+      sources: [otherAssetsNoncurrent],
+      note: "Mapped to directly reported other non-current assets."
+    };
+  }
+  if (operatingLeaseAssets) {
+    return {
+      value: operatingLeaseAssets.value,
+      sources: operatingLeaseAssets.sources,
+      classification: "partial",
+      note: "Mapped to operating lease right-of-use assets only. This is a partial non-current asset bucket when the model row is a broad other-assets category."
     };
   }
   const broadOtherAssets = sumWithNote(
@@ -3215,13 +3242,15 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
     const unitRef = attrs.match(/\bunitRef="([^"]+)"/)?.[1] ?? "";
     if (!/usd|shares/i.test(unitRef)) continue;
     const name = attrs.match(/\bname="([^"]+)"/)?.[1] ?? "";
+    const taxonomy = name.includes(":") ? name.split(":")[0] ?? "" : "";
     const concept = name.includes(":") ? name.split(":").pop() ?? name : name;
     const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
     if (!concept || !contextRef) continue;
     if (["AssetsCurrent", "OtherAssets"].includes(concept)) continue;
     const context = contexts.get(contextRef);
     if (!context?.period || !wanted.has(context.period)) continue;
-    if (context.instant) continue;
+    if (context.instant && /^(?:us-gaap|dei|srt)$/i.test(taxonomy)) continue;
+    if (context.instant && !INLINE_INSTANT_EXTENSION_CONCEPTS.has(concept)) continue;
     if (context.hasDimensions) continue;
     const value = ixNumber(match[2], attrs);
     if (value === null) continue;

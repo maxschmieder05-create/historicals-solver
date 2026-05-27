@@ -1,6 +1,7 @@
 const fs = require("node:fs/promises");
 const path = require("node:path");
 const ExcelJS = require("exceljs");
+const { postWorkbook } = require("./fill-workbook-api");
 
 const repoRoot = path.resolve(__dirname, "..");
 const inputWorkbook = process.env.AMZN_INPUT_WORKBOOK || "/Users/maxschmieder/Downloads/AMZN_historicals_filled (4).xlsx";
@@ -30,16 +31,7 @@ function valuesMatch(actual, expected) {
 }
 
 async function fillWorkbook() {
-  await fs.mkdir(path.dirname(outputWorkbook), { recursive: true });
-  const bytes = await fs.readFile(inputWorkbook);
-  const formData = new FormData();
-  formData.append("ticker", "AMZN");
-  formData.append("file", new Blob([bytes]), path.basename(inputWorkbook));
-
-  const response = await fetch(apiUrl, { method: "POST", body: formData });
-  const body = Buffer.from(await response.arrayBuffer());
-  if (!response.ok) throw new Error(`Fill API failed (${response.status}): ${body.toString("utf8")}`);
-  await fs.writeFile(outputWorkbook, body);
+  await postWorkbook({ apiUrl, ticker: "AMZN", inputWorkbook, outputWorkbook });
 }
 
 async function main() {
