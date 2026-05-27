@@ -33,6 +33,12 @@ type CompanyMatch = {
   title: string;
 };
 
+type MarketQuote = {
+  currentPrice: number | null;
+  fiftyTwoWeekHigh: number | null;
+  fiftyTwoWeekLow: number | null;
+};
+
 type FactSource = {
   concept: string;
   label: string;
@@ -2212,13 +2218,61 @@ function financialWorksheetScore(sheet: ExcelJS.Worksheet) {
   return score;
 }
 
-function updateCoverCompanyMetadata(workbook: ExcelJS.Workbook, company: CompanyMatch) {
+async function updateCoverCompanyMetadata(workbook: ExcelJS.Workbook, company: CompanyMatch, ctx: ResolveContext, warnings: string[]) {
   const cover = workbook.getWorksheet("Cover");
   if (!cover) return;
-  const companyNameRow = findCoverRow(cover, "Company Name");
-  if (companyNameRow) cover.getCell(companyNameRow, 6).value = company.title;
-  const tickerRow = findCoverRow(cover, "Ticker");
-  if (tickerRow) cover.getCell(tickerRow, 6).value = company.ticker;
+  setCoverValue(cover, "Company Name", company.title);
+  setCoverValue(cover, "Ticker", company.ticker);
+
+  const fiscalYearEndDate = latestFiscalYearEndDate(ctx);
+  if (fiscalYearEndDate) {
+    const fiscalYearCell = setCoverValue(cover, "Last Fiscal Year", dateFromIsoDate(fiscalYearEndDate));
+    if (fiscalYearCell) fiscalYearCell.numFmt = "m/d/yy";
+  }
+
+  const quote = await fetchMarketQuote(company.ticker).catch(() => null);
+  if (!quote) {
+    if (findAnyCoverRow(cover, ["Current Price", "Current Share Price", "Current Stock Price"]) || findCoverRow(cover, "52-Week High") || findCoverRow(cover, "52-Week Low")) {
+      warnings.push("Cover market-price fields were left unchanged because current quote data was unavailable.");
+    }
+    return;
+  }
+
+  const currentPriceCell = setCoverValueAny(cover, ["Current Price", "Current Share Price", "Current Stock Price"], roundCurrency(quote.currentPrice));
+  const highCell = setCoverValue(cover, "52-Week High", roundCurrency(quote.fiftyTwoWeekHigh));
+  const lowCell = setCoverValue(cover, "52-Week Low", roundCurrency(quote.fiftyTwoWeekLow));
+  for (const cell of [currentPriceCell, highCell, lowCell]) {
+    if (cell) cell.numFmt = "$0.00";
+  }
+  if (currentPriceCell || highCell || lowCell) {
+    warnings.push("Cover market-price fields were sourced from Yahoo Finance chart data because those fields are not available in EDGAR.");
+  }
+}
+
+function setCoverValue(sheet: ExcelJS.Worksheet, label: string, value: ExcelJS.CellValue) {
+  if (value === null || value === undefined) return null;
+  const row = findCoverRow(sheet, label);
+  if (!row) return null;
+  const cell = sheet.getCell(row, 6);
+  cell.value = value;
+  return cell;
+}
+
+function setCoverValueAny(sheet: ExcelJS.Worksheet, labels: string[], value: ExcelJS.CellValue) {
+  if (value === null || value === undefined) return null;
+  const row = findAnyCoverRow(sheet, labels);
+  if (!row) return null;
+  const cell = sheet.getCell(row, 6);
+  cell.value = value;
+  return cell;
+}
+
+function findAnyCoverRow(sheet: ExcelJS.Worksheet, labels: string[]) {
+  for (const label of labels) {
+    const row = findCoverRow(sheet, label);
+    if (row) return row;
+  }
+  return null;
 }
 
 function findCoverRow(sheet: ExcelJS.Worksheet, label: string) {
@@ -2229,6 +2283,70 @@ function findCoverRow(sheet: ExcelJS.Worksheet, label: string) {
     }
   }
   return null;
+}
+
+function latestFiscalYearEndDate(ctx: ResolveContext) {
+  const candidates: string[] = [];
+  for (const periodFacts of [...ctx.duration.values(), ...ctx.instant.values()]) {
+    for (const source of periodFacts.values()) {
+      if (source.end && source.fp === "FY" && isTenK(source.form)) candidates.push(source.end);
+    }
+  }
+  return candidates.sort().at(-1) ?? null;
+}
+
+function dateFromIsoDate(value: string) {
+  return new Date(`${value}T00:00:00Z`);
+}
+
+function roundCurrency(value: number | null) {
+  if (value === null || !Number.isFinite(value)) return null;
+  return Math.round(value * 100) / 100;
+}
+
+async function fetchMarketQuote(ticker: string): Promise<MarketQuote | null> {
+  const yahooSymbol = encodeURIComponent(ticker.replace(/\./g, "-"));
+  const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=1y&interval=1d&includePrePost=false`, {
+    headers: {
+      "User-Agent": SEC_HEADERS["User-Agent"],
+      Accept: "application/json"
+    },
+    cache: "no-store"
+  });
+  if (!response.ok) return null;
+
+  const payload = (await response.json()) as any;
+  const result = payload?.chart?.result?.[0];
+  if (!result || payload?.chart?.error) return null;
+
+  const meta = result.meta ?? {};
+  const quote = result.indicators?.quote?.[0] ?? {};
+  const close = finiteNumbers(quote.close).at(-1) ?? null;
+  const historyHigh = maxFinite(quote.high);
+  const historyLow = minFinite(quote.low);
+  return {
+    currentPrice: finiteNumber(meta.regularMarketPrice) ?? close,
+    fiftyTwoWeekHigh: finiteNumber(meta.fiftyTwoWeekHigh) ?? historyHigh,
+    fiftyTwoWeekLow: finiteNumber(meta.fiftyTwoWeekLow) ?? historyLow
+  };
+}
+
+function finiteNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function finiteNumbers(values: unknown) {
+  return Array.isArray(values) ? values.filter((value): value is number => typeof value === "number" && Number.isFinite(value)) : [];
+}
+
+function maxFinite(values: unknown) {
+  const numbers = finiteNumbers(values);
+  return numbers.length ? Math.max(...numbers) : null;
+}
+
+function minFinite(values: unknown) {
+  const numbers = finiteNumbers(values);
+  return numbers.length ? Math.min(...numbers) : null;
 }
 
 function detectTemplateProfile(workbook: ExcelJS.Workbook, sheet: ExcelJS.Worksheet, ctx: ResolveContext): TemplateProfile {
@@ -2468,7 +2586,8 @@ export async function POST(request: NextRequest) {
     normalizeSharedFormulas(workbook);
     removeInvalidConditionalFormattingRules(workbook);
     removeExternalWorkbookDefinedNames(workbook);
-    updateCoverCompanyMetadata(workbook, company);
+    const coverWarnings: string[] = [];
+    await updateCoverCompanyMetadata(workbook, company, ctx, coverWarnings);
 
     const sheet = primaryFinancialWorksheet(workbook);
     if (!sheet) return jsonError(`Could not find a worksheet with historical income statement or balance sheet input rows in this workbook.`, 400);
@@ -2529,6 +2648,7 @@ export async function POST(request: NextRequest) {
     const llmState = createLlmMappingState();
     let filledCells = 0;
     let commentsAdded = 0;
+    warnings.push(...coverWarnings);
     warnings.push(...bulkSupport.warnings);
     if (bulkSupport.latestRefreshAt) warnings.push(`SEC bulk support latest archive timestamp: ${bulkSupport.latestRefreshAt}.`);
     warnings.push(...normalizedPackage.diagnostics.filter((item) => item.severity !== "info").map((item) => `${item.layer}: ${item.message}`));
