@@ -150,6 +150,67 @@ function assertTie(errors, label, actual, expected, tolerance = 0.5) {
   }
 }
 
+function assertAaplIncomeStatementConsistency(modelSheet, errors) {
+  const periodColumns = new Map(historicalPeriodColumns(modelSheet).map((info) => [info.period.toUpperCase(), info.col]));
+  const rowByLabel = new Map();
+  const incomeStatementStart = Array.from({ length: modelSheet.rowCount }, (_, index) => index + 1)
+    .filter((row) => normalizeLabel(rowLabel(modelSheet, row)) === normalizeLabel("Income Statement"))
+    .find((row) => {
+      for (let offset = 1; offset <= 8; offset += 1) {
+        if (normalizeLabel(rowLabel(modelSheet, row + offset)) === normalizeLabel("Revenue")) return true;
+      }
+      return false;
+    });
+  if (!incomeStatementStart) {
+    errors.push("Model Income Statement section was not found.");
+    return;
+  }
+
+  for (let row = incomeStatementStart + 1; row <= modelSheet.rowCount; row += 1) {
+    const sectionLabel = normalizeLabel(rowLabel(modelSheet, row));
+    if (/incomestatementanalysis|cashflowstatement|balancesheet|workingcapital|schedule|drivers/i.test(sectionLabel)) break;
+    const label = normalizeLabel(rowLabel(modelSheet, row));
+    if (label) rowByLabel.set(label, row);
+  }
+
+  const row = (label) => rowByLabel.get(normalizeLabel(label));
+  const cell = (label, period) => {
+    const rowNumber = row(label);
+    const col = periodColumns.get(period);
+    return rowNumber && col ? numericCell(modelSheet.getCell(rowNumber, col)) : null;
+  };
+
+  for (const period of ["1Q25", "2Q25", "3Q25", "4Q25", "1Q26", "2Q26"]) {
+    assertTie(errors, `Model Depreciation & Amortization ${period} should use income-statement-only zero policy`, cell("Depreciation & Amortization", period), 0);
+  }
+
+  const expected2Q26 = [
+    ["Revenue", 111184],
+    ["Cost of Goods Sold", -56403],
+    ["Gross Profit", 54781],
+    ["Selling, General & Administration (SG&A)", -7477],
+    ["Research & Development (R&D)", -11419],
+    ["Depreciation & Amortization", 0],
+    ["Other Operating Income (Expense)", 0],
+    ["EBIT", 35885],
+    ["Interest Income", 0],
+    ["Interest (Expense)", -216],
+    ["Other Non-Operating Income (Expense)", 164],
+    ["Pre-Tax Income (Loss)", 35833],
+    ["Income Tax Benefit (Expense)", -6255],
+    ["Net Income (Loss)", 29578],
+    ["Pre-Tax Adjustments", 0],
+    ["Post-Tax Adjustments", 0],
+    ["Discontinued Operations", 0],
+    ["Income (Loss) due to Non-Controlling Interest", 0],
+    ["Adj. Net Income (Loss)", 29578]
+  ];
+
+  for (const [label, expected] of expected2Q26) {
+    assertTie(errors, `Model ${label} 2Q26 should follow reported income-statement methodology`, cell(label, "2Q26"), expected);
+  }
+}
+
 function assertBalanceSheetIntegrity(sheet, errors) {
   const periodColumns = historicalPeriodColumns(sheet);
   const periodsByName = new Map(periodColumns.map((info) => [info.period.toUpperCase(), info.col]));
@@ -278,6 +339,7 @@ async function main() {
   if (!inputModelSheet) throw new Error("Input workbook is missing Model sheet.");
   assertProjectedBalanceSheetPreserved(inputModelSheet, modelSheet, errors);
   assertBalanceSheetIntegrity(modelSheet, errors);
+  assertAaplIncomeStatementConsistency(modelSheet, errors);
 
   for (const [address, expected] of expectedLabels) {
     const actual = String(cellValue(segmentSheet.getCell(address)) ?? "");

@@ -2787,6 +2787,13 @@ export async function POST(request: NextRequest) {
     refreshHistoricalFormulaCachedResults(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
     ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
+    if (isStandardModelSheet) {
+      const finalIncomeConsistencyResult = reconcileFinalIncomeStatementConsistency(sheet, periods, columns, ctx, auditRows);
+      filledCells += finalIncomeConsistencyResult.filledCells;
+      commentsAdded += finalIncomeConsistencyResult.commentsAdded;
+      warnings.push(...finalIncomeConsistencyResult.warnings);
+      refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+    }
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile, balanceSheetPeriods, balanceSheetColumns);
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
@@ -4390,14 +4397,23 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDec
   return { writable: true, formulaPreserved: false };
 }
 
-function shouldOverwriteHistoricalFormulaWithDirectValue(fillRow: FillRow, _period: string, _cell: ExcelJS.Cell, _value: number, resolved: ResolvedValue) {
+function shouldOverwriteHistoricalFormulaWithDirectValue(fillRow: FillRow, _period: string, cell: ExcelJS.Cell, _value: number, resolved: ResolvedValue) {
   if (fillRow.statement === "balance" && fillRow.kind === "instant") {
     return true;
   }
   if (fillRow.statement !== "income") return false;
+  if (isIncomeStatementDepreciationAmortizationFillRow(fillRow)) return true;
+  const formula = formulaForCell(cell);
+  if (formula && !formulaHasCellReference(formula)) return true;
   const label = normalize(fillRow.label);
   if (!/pretaxadjustments|posttaxadjustments|discontinuedoperations|noncontrollinginterest|noncontrollingincome/.test(label)) return false;
   return resolved.sources.some((source) => /NotReported|Bridge/.test(source.concept));
+}
+
+function isIncomeStatementDepreciationAmortizationFillRow(fillRow: FillRow) {
+  if (fillRow.statement !== "income") return false;
+  const label = normalize(fillRow.label);
+  return label === "da" || /^depreciation(?:and)?amortization/.test(label) || /^depreciationexpense$/.test(label);
 }
 
 function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
@@ -5762,6 +5778,31 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
     commentsAdded += 1;
     auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", note, "formula result refreshed"));
   });
+
+  return { filledCells, commentsAdded, warnings };
+}
+
+function reconcileFinalIncomeStatementConsistency(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const results = [
+    reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows),
+    reconcilePreTaxIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows),
+    reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows)
+  ];
+
+  for (const result of results) {
+    filledCells += result.filledCells;
+    commentsAdded += result.commentsAdded;
+    warnings.push(...result.warnings);
+  }
 
   return { filledCells, commentsAdded, warnings };
 }
@@ -8857,6 +8898,8 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
   if (!actual && balanceSheetRows(cell.worksheet).has(Number(cell.row)) && !isProjectedBalanceSheetCell(cell.worksheet, Number(cell.row), Number(cell.col))) {
     return true;
   }
+  if (!actual && isIncomeStatementConstantFormulaReplacement(cell, expected)) return true;
+  if (!actual && isIncomeStatementDepreciationAmortizationCell(cell)) return true;
   if (!actual && isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)))) return true;
   if (!actual && isSegmentAnalysisMetricRewriteCell(cell)) return true;
   if (actual && isSegmentAnalysisTotalRewriteCell(cell)) return true;
@@ -8864,6 +8907,19 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
   if (actual && isNumericSumFormula(expected) && isNumericSumFormula(actual)) return true;
   if (actual && !formulaHasCellReference(expected) && isNumericConstantFormula(actual)) return true;
   return false;
+}
+
+function isIncomeStatementConstantFormulaReplacement(cell: ExcelJS.Cell, expected: string) {
+  if (formulaHasCellReference(expected)) return false;
+  const rowNumber = Number(cell.row);
+  const sectionStart = findSectionHeaderRow(cell.worksheet, "Income Statement");
+  const sectionEnd = findSectionHeaderRow(cell.worksheet, "Income Statement Analysis");
+  return Boolean(sectionStart && rowNumber > sectionStart && (!sectionEnd || rowNumber < sectionEnd));
+}
+
+function isIncomeStatementDepreciationAmortizationCell(cell: ExcelJS.Cell) {
+  const rowNumber = Number(cell.row);
+  return findIncomeStatementMetricRow(cell.worksheet, ["Depreciation & Amortization", "Depreciation and Amortization", "D&A"]) === rowNumber;
 }
 
 function isSegmentAnalysisLabelRewriteCell(cell: ExcelJS.Cell) {
