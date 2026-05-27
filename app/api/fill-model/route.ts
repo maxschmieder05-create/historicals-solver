@@ -5482,10 +5482,10 @@ function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue, pe
   if (!grouped && !hasAnalystNote && !isDerived && !commentary) return null;
 
   const parts: string[] = [];
-  if (grouped && sourceLabels.length) parts.push(`Grouped from EDGAR: ${sourceLabels.join(", ")}.`);
-  if (resolved.note || fillRow.comment) parts.push(resolved.note || fillRow.comment || "");
+  if (grouped && sourceLabels.length) parts.push(`Grouped from ${summarizeList(sourceLabels, 3)}.`);
+  if (resolved.note || fillRow.comment) parts.push(shortAnnotationSentence(resolved.note || fillRow.comment || ""));
   if (isDerived && derived?.derivedPriorPeriods?.length) {
-    parts.push(`Quarterly value was derived from ${derived.derivedTotalLabel || derived.label} less ${derived.derivedPriorPeriods.join(", ")}.`);
+    parts.push(`Derived from ${derived.derivedTotalLabel || derived.label} less ${summarizeList(derived.derivedPriorPeriods, 4)}.`);
   }
   if (commentary) parts.push(commentary);
   return parts.filter(Boolean).join(" ");
@@ -5493,9 +5493,9 @@ function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue, pe
 
 function filingCommentaryJustification(fillRow: FillRow, resolved: ResolvedValue, period: string, ctx: ResolveContext) {
   if (!shouldUseFilingCommentary(fillRow, resolved)) return "";
-  const evidence = rankedFilingCommentary(fillRow, resolved, period, ctx).slice(0, 2);
+  const evidence = rankedFilingCommentary(fillRow, resolved, period, ctx).slice(0, 1);
   if (!evidence.length) return "";
-  return `Filing commentary support: ${evidence.map(commentaryEvidenceSummary).join(" ")}`;
+  return `Filing says: ${evidence.map(commentaryEvidenceSummary).join(" ")}`;
 }
 
 function shouldUseFilingCommentary(fillRow: FillRow, resolved: ResolvedValue) {
@@ -5529,7 +5529,8 @@ function rankedFilingCommentary(fillRow: FillRow, resolved: ResolvedValue, perio
 
 function commentaryEvidenceSummary(item: FilingCommentaryEvidence) {
   const source = [item.form, item.filed].filter(Boolean).join(" filed ");
-  return `${source ? `${source}: ` : ""}"${item.text.slice(0, 280)}${item.text.length > 280 ? "..." : ""}"`;
+  const text = shortAnnotationSentence(item.text, 140);
+  return `${source ? `${source}: ` : ""}"${text}"`;
 }
 
 function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, period: string, resolved: ResolvedValue): SecWriteValidation {
@@ -5640,6 +5641,20 @@ function validationStatusText(validation: SecWriteValidation) {
 
 function appendValidationNotes(notes: string | null | undefined, validation: SecWriteValidation) {
   return [notes, validation.notes.length ? `SEC validation: ${validation.notes.join(" ")}` : ""].filter(Boolean).join(" ");
+}
+
+function summarizeList(items: string[], limit = 3) {
+  const shown = items.map((item) => shortAnnotationSentence(item, 80)).slice(0, limit);
+  const remaining = items.length - shown.length;
+  return `${shown.join(", ")}${remaining > 0 ? `, +${remaining} more` : ""}`;
+}
+
+function shortAnnotationSentence(text: string, maxLength = 180) {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= maxLength) return compact;
+  const boundary = compact.slice(0, maxLength + 1).search(/\s+\S*$/);
+  const end = boundary > 80 ? boundary : maxLength;
+  return `${compact.slice(0, end).trim()}...`;
 }
 
 function sourceDisplayLabel(source: FactSource) {
@@ -6894,33 +6909,29 @@ function mappingComment(
   notes?: string | null
 ) {
   const source = resolved.sources[0];
-  const concepts = resolved.sources.length
-    ? resolved.sources.map((item) => `${item.concept} = ${roundModelValue(item.value / (fillRow.scale ?? 1))} mm`).join("; ")
-    : "None";
+  const conceptLabels = resolved.sources.length ? unique(resolved.sources.map(sourceDisplayLabel).filter(Boolean)) : [];
+  const sourceText = [source?.form || "SEC filing", source?.filed ? `filed ${source.filed}` : ""].filter(Boolean).join(", ");
+  const endText = source?.end && source.end !== period ? ` (ended ${source.end})` : "";
+  const valueUnit = mappingValueUnit(fillRow, resolved);
+  const noteText = notes ? shortAnnotationSentence(notes, 240) : resolved.note ? shortAnnotationSentence(resolved.note, 240) : "";
   return [
-    "EDGAR mapping:",
-    `Source: ${source?.form || "SEC filing"}${source?.accn ? `, accession #${source.accn}` : ""}${source?.filed ? `, filed ${source.filed}` : ""}`,
-    `Period: ${period}${source?.end ? ` / period ended ${source.end}` : ""}`,
-    `Model row: ${fillRow.modelContext?.sheetName || MODEL_SHEET}!${fillRow.row} ${fillRow.label}`,
-    `Mapping type: ${resolved.classification || fillRow.classification}`,
-    `Concepts used: ${concepts}`,
-    `Units: ${unique(resolved.sources.map((source) => source.unit ?? "").filter(Boolean)).join(", ") || "not specified"}`,
-    `Unit conversion: ${unitConversionDescription(fillRow, resolved)}`,
-    `Sign: ${fillRow.sign === -1 ? "inverted because model expects this row as negative" : "copied using model sign convention"}`,
+    `EDGAR: ${sourceText || "SEC filing"}`,
+    `Period: ${period}${endText}`,
+    `Value: ${roundModelValue(valueWritten)}${valueUnit}`,
+    conceptLabels.length ? `From: ${summarizeList(conceptLabels, 2)}` : "",
     `Confidence: ${confidence}`,
-    `Value written: ${valueWritten}`,
-    notes ? `Notes: ${notes}` : resolved.note ? `Notes: ${resolved.note}` : ""
+    noteText ? `Note: ${noteText}` : ""
   ]
     .filter(Boolean)
     .join("\n");
 }
 
-function unitConversionDescription(fillRow: FillRow, resolved: ResolvedValue) {
+function mappingValueUnit(fillRow: FillRow, resolved: ResolvedValue) {
   const units = unique(resolved.sources.map((source) => source.unit ?? "").filter(Boolean));
-  if (units.length === 1 && units[0] === "shares") return "raw shares to mm shares";
-  if (units.length === 1 && units[0] === "USD/shares") return "copied per-share amount";
-  if ((fillRow.scale ?? 1) === 1_000_000) return "raw USD to $mm";
-  return `raw SEC value divided by ${fillRow.scale ?? 1}`;
+  if (units.length === 1 && units[0] === "shares") return " mm shares";
+  if (units.length === 1 && units[0] === "USD/shares") return "";
+  if ((fillRow.scale ?? 1) === 1_000_000) return " mm";
+  return "";
 }
 
 function mappingCommentForSegment(
@@ -6933,16 +6944,12 @@ function mappingCommentForSegment(
   suffix: string
 ) {
   return [
-    "EDGAR mapping:",
-    "Source: SEC inline XBRL segment table",
+    "EDGAR: inline XBRL segment table",
     `Period: ${period}`,
-    `Model row: ${sheet.name}!${cell.address} ${modelLabel}`,
-    "Mapping type: segment",
-    `Concepts used: reportable segment ${segment.label} ${suffix} = ${valueWritten} mm`,
-    "Unit conversion: raw USD to $mm",
-    "Sign: copied using model sign convention",
+    `Value: ${roundModelValue(valueWritten)} mm`,
+    `From: ${segment.label} ${suffix}`,
     "Confidence: high",
-    "Notes: Segment Analysis rows may be relabeled to EDGAR reportable segments when the template exposes writable segment input rows."
+    "Note: Segment row matched to an EDGAR reportable segment."
   ].join("\n");
 }
 
