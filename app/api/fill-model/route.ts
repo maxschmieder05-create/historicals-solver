@@ -2941,6 +2941,25 @@ export async function POST(request: NextRequest) {
       commentsAdded += finalIncomeConsistencyResult.commentsAdded;
       warnings.push(...finalIncomeConsistencyResult.warnings);
       refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+
+      const finalBalanceSheetTotalResult = reconcileBalanceSheetStatementTotalsToEdgar(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
+      filledCells += finalBalanceSheetTotalResult.filledCells;
+      commentsAdded += finalBalanceSheetTotalResult.commentsAdded;
+      warnings.push(...finalBalanceSheetTotalResult.warnings);
+      refreshHistoricalFormulaCachedResults(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
+      refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
+      const finalPartialBalanceSheetCheckResult = reconcilePartialBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
+      filledCells += finalPartialBalanceSheetCheckResult.filledCells;
+      commentsAdded += finalPartialBalanceSheetCheckResult.commentsAdded;
+      warnings.push(...finalPartialBalanceSheetCheckResult.warnings);
+      const unsupportedTotalBalanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, auditRows, (period) => {
+        const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+        return !first(lookupPeriod, ctx.instant, C.assets);
+      });
+      filledCells += unsupportedTotalBalanceSheetCheckResult.filledCells;
+      commentsAdded += unsupportedTotalBalanceSheetCheckResult.commentsAdded;
+      warnings.push(...unsupportedTotalBalanceSheetCheckResult.warnings);
+      ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     }
 
     const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile, balanceSheetPeriods, balanceSheetColumns);
@@ -6307,7 +6326,13 @@ function formatDividendFormulaNumber(value: number) {
   return value.toFixed(3).replace(/0+$/, "").replace(/\.$/, "");
 }
 
-function reconcileBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], auditRows: MappingAuditRow[]) {
+function reconcileBalanceSheetCheck(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  auditRows: MappingAuditRow[],
+  shouldReconcilePeriod: (period: string) => boolean = () => true
+) {
   let filledCells = 0;
   let commentsAdded = 0;
   const warnings: string[] = [];
@@ -6337,6 +6362,7 @@ function reconcileBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[],
   const evaluator = new FormulaEvaluator(sheet);
   periods.forEach((period, index) => {
     const col = columns[index];
+    if (!shouldReconcilePeriod(period)) return;
     if (isProjectedBalanceSheetCell(sheet, checkRow, col)) return;
     const checkCell = sheet.getCell(checkRow, col);
     const check = evaluator.evaluateCell(checkCell);
@@ -6551,7 +6577,7 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       if (isProjectedBalanceSheetCell(sheet, totalRow, col)) return;
       const totalCell = sheet.getCell(totalRow, col);
       const expected = source.value / 1_000_000;
-      const actual = statementMetricCellValue(totalCell, evaluator, expected);
+      const actual = evaluator.evaluateCell(totalCell) ?? statementMetricCellValue(totalCell, evaluator, expected);
       if (actual === null || statementMetricTies(actual, expected)) return;
 
       if (!hasFormula(totalCell) && isHardcodedFinancialInput(totalCell)) {
