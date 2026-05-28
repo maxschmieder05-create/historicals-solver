@@ -90,6 +90,31 @@ type ResolvedValue = {
   classification?: RowClassification;
 };
 
+type ReportedLineItemCategory =
+  | "revenue"
+  | "cost_of_revenue"
+  | "research_and_development"
+  | "selling_general_administrative"
+  | "income_statement_depreciation_amortization"
+  | "other_operating_income_expense"
+  | "operating_income"
+  | "interest_income"
+  | "interest_expense"
+  | "other_non_operating_income_expense"
+  | "pretax_income"
+  | "income_tax"
+  | "net_income"
+  | "current_assets"
+  | "non_current_assets"
+  | "total_assets"
+  | "current_liabilities"
+  | "non_current_liabilities"
+  | "total_liabilities"
+  | "equity"
+  | "segment_only"
+  | "cash_flow_or_support"
+  | "unknown";
+
 type LlmMappingDecision = {
   operation: "direct" | "sum" | "difference" | "needs_review";
   selectedConcepts: string[];
@@ -6609,6 +6634,133 @@ function commentaryEvidenceSummary(item: FilingCommentaryEvidence) {
   return `${source ? `${source}: ` : ""}"${text}"`;
 }
 
+function expectedReportedLineItemCategory(fillRow: FillRow): ReportedLineItemCategory | null {
+  const label = normalize(fillRow.label);
+  const labelText = fillRow.label.toLowerCase();
+  const concepts = fillRow.concepts ?? [];
+  const hasConcept = (items: string[]) => concepts.some((concept) => items.includes(concept));
+
+  if (fillRow.resolver === resolveTotalRevenue || /^(total)?revenues?$|^netrevenues?$|^sales$|^totalsales$|^netsales$|^totalnetsales$/.test(label)) return "revenue";
+  if (fillRow.resolver === resolveResearchDevelopmentExpense || hasConcept(C.rd) || /research|development|engineering|technologydevelopment|productdevelopment/.test(label)) return "research_and_development";
+  if (fillRow.resolver === resolveSellingGeneralAdministrativeExpense || hasConcept(C.sga) || /sellinggeneraladministrative|sga|generaladministrative|sellingmarketing|corporateoverhead|administrativeexpense/.test(label)) return "selling_general_administrative";
+  if (fillRow.resolver === resolveIncomeStatementDepreciationAmortization || hasConcept(C.da) || /depreciation|amortization|depletion/.test(label)) return "income_statement_depreciation_amortization";
+  if (fillRow.resolver === resolveOtherOperatingIncomeExpense || /otheroperatingincome|otheroperatingexpense|restructuring|litigation|accretion|assetimpairment/.test(label)) return "other_operating_income_expense";
+  if (fillRow.resolver === resolveInterestIncome || hasConcept(C.interestIncome) || /interestincome|interestearned|investmentinterestincome/.test(label)) return "interest_income";
+  if (
+    fillRow.resolver === resolveInterestExpense ||
+    fillRow.resolver === resolveNonOperatingInterestExpenseAfterNetRevenue ||
+    hasConcept(C.interestExpense) ||
+    /interestexpense|debtinterest|financingexpense|interestanddebtexpense/.test(label)
+  ) {
+    return "interest_expense";
+  }
+  if (fillRow.resolver === resolveOtherNonOperatingIncomeExpense || hasConcept(C.otherNonOp) || /othernonoperating|otherincome|otherexpense|foreignexchange|equitymethod|investmentgain|investmentloss|miscellaneousnonoperating/.test(label)) {
+    return "other_non_operating_income_expense";
+  }
+  if (fillRow.resolver === resolvePreTaxIncome || hasConcept(PRETAX_INCOME_CONCEPTS) || /pretax|pre-tax|incomebeforetax|incomebeforeincometax/.test(labelText) || /incomebeforetax|incomebeforeincometax/.test(label)) return "pretax_income";
+  if (fillRow.resolver === resolveIncomeTaxExpense || hasConcept(C.taxes) || /incometax|taxexpense|taxbenefit|provisionfortax/.test(label)) return "income_tax";
+  if (fillRow.resolver === resolveNetIncome || hasConcept(C.netIncome) || /netincome|netloss|profitloss/.test(label)) return "net_income";
+  if (hasConcept(C.cogs) || hasConcept(C.healthCareCosts) || /costofrevenue|costofsales|costofgood|costofoperation|costofservice|costofproduct|merchandisecost|fulfillmentcost/.test(label)) return "cost_of_revenue";
+  if (hasConcept(C.operatingIncome) || /ebit|operatingincome|operatingprofit|operatingloss/.test(label)) return "operating_income";
+
+  if (fillRow.statement === "balance") {
+    if (hasConcept(C.assets) || /^totalassets$|^assets$/.test(label)) return "total_assets";
+    if (hasConcept(C.currentAssets) || /currentassets|cash|receivable|inventory|shortterminvestment|marketablesecuritiescurrent|prepaid|othercurrentasset/.test(label)) return "current_assets";
+    if (hasConcept([...C.ppe, ...C.intangibles, ...C.goodwill]) || /noncurrentasset|non-currentasset|propertyplant|equipment|ppe|goodwill|intangible|longterminvestment|rightofuseasset/.test(label)) return "non_current_assets";
+    if (hasConcept(C.liabilities) || /^totalliabilities$|^liabilities$/.test(label)) return "total_liabilities";
+    if (hasConcept(C.currentLiabilities) || /currentliabilities|accountspayable|accrued|customerdeposit|currentdebt|shorttermborrowing|othercurrentliabilit/.test(label)) return "current_liabilities";
+    if (/noncurrentliabilit|non-currentliabilit|longtermdebt|deferredtaxliabilit|pensionliabilit|leaseobligationnoncurrent|otherliabilit/.test(label)) return "non_current_liabilities";
+    if (hasConcept(C.equity) || /equity|stockholder|shareholder|retainedearnings|treasurystock|accumulatedothercomprehensive|noncontrollinginterest/.test(label)) return "equity";
+  }
+
+  return null;
+}
+
+function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory {
+  const concept = source.concept;
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  const labelAndNote = `${source.label || ""} ${source.note || ""}`.toLowerCase();
+
+  if (/^segment:/i.test(concept) || /\bsegment\b|external customer|external revenue|reportable segment|\bmember\b/.test(labelAndNote)) return "segment_only";
+  if (source.sourceLayer === "model") return "cash_flow_or_support";
+  if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
+
+  if (/OtherNonOperatingIncomeExpenseResidual/i.test(concept)) return "other_non_operating_income_expense";
+  if (/IncomeTaxExpenseBenefitDerived/i.test(concept)) return "income_tax";
+  if (/IncomeBeforeTaxesDerived|BeforeIncomeTaxesIncluding/i.test(concept)) return "pretax_income";
+  if (/NetIncomeLossDerived/i.test(concept)) return "net_income";
+
+  if (isCombinedInterestAndOtherIncomeSource(source)) return "other_non_operating_income_expense";
+  if (INTEREST_EXPENSE_CONCEPTS.includes(concept) || interestExpenseScore(source) >= 5) return "interest_expense";
+  if (INTEREST_INCOME_CONCEPTS.includes(concept) || interestIncomeScore(source) >= 5) return "interest_income";
+  if (PRETAX_INCOME_CONCEPTS.includes(concept) || preTaxIncomeScore(source) >= 5) return "pretax_income";
+  if (INCOME_TAX_CONCEPTS.includes(concept) || incomeTaxScore(source) >= 5) return "income_tax";
+  if (CONTINUING_NET_INCOME_CONCEPTS.includes(concept) || netIncomeScore(source) >= 5) return "net_income";
+  if (C.operatingIncome.includes(concept) || /\boperating\b.*\b(income|profit|loss)\b|\b(income|profit|loss)\b.*\boperations?\b/.test(text)) return "operating_income";
+  if (TOTAL_REVENUE_CONCEPTS.includes(concept) || (!isRevenueComponentSource(source) && /\b(net )?(sales|revenues?)\b|\btotal net sales\b/.test(text))) return "revenue";
+  if (isRevenueComponentSource(source)) return "revenue";
+  if ([...C.cogs, ...C.healthCareCosts].includes(concept) || /\bcost\b.*\b(revenue|sales|goods|operations?|services?|products?)\b|\bmerchandise costs?\b|\bfulfillment costs?\b/.test(text)) return "cost_of_revenue";
+  if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(concept) || /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b/.test(text)) return "research_and_development";
+  if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(concept) || /\bselling\b.*\bgeneral\b.*\badministrative\b|\bsg&a\b|\bgeneral and administrative\b|\bselling and marketing\b|\bcorporate overhead\b|\badministrative expense\b/.test(text)) return "selling_general_administrative";
+  if (INCOME_STATEMENT_DA_CONCEPTS.includes(concept) || /\bdepreciation\b|\bamortization\b|\bdepletion\b/.test(text)) return "income_statement_depreciation_amortization";
+  if (
+    concept === "OtherOperatingIncomeExpenseNet" ||
+    ["AssetRetirementObligationAccretionExpense", "AccretionExpense", "RestructuringCharges", "RestructuringAndRelatedCost", "LitigationSettlementExpense"].includes(concept) ||
+    GENERIC_IMPAIRMENT_CONCEPTS.includes(concept) ||
+    /\bother operating\b|\brestructuring\b|\blitigation\b|\baccretion\b|\basset impairment\b|\bimpairment charge\b/.test(text)
+  ) {
+    return "other_operating_income_expense";
+  }
+  if (OTHER_NON_OPERATING_CONCEPTS.includes(concept) || otherNonOperatingScore(source) >= 5) return "other_non_operating_income_expense";
+
+  if ([...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory, ...C.currentAssets].includes(concept)) return "current_assets";
+  if ([...C.ppe, ...C.intangibles, ...C.goodwill].includes(concept) || /\bnoncurrent assets?\b|\bproperty\b.*\bplant\b|\bgoodwill\b|\bintangibles?\b/.test(text)) return "non_current_assets";
+  if (C.assets.includes(concept)) return "total_assets";
+  if ([...C.ap, ...C.accrued, ...C.customerDeposits, ...C.currentLiabilities, ...C.currentDebt].includes(concept)) return "current_liabilities";
+  if ([...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS].includes(concept) || /\bnoncurrent liabilit|\blong[- ]term debt|\bdeferred tax liabilit|\bpension liabilit/.test(text)) return "non_current_liabilities";
+  if (C.liabilities.includes(concept)) return "total_liabilities";
+  if ([...C.equity, ...C.commonApic, ...C.retained, ...C.treasury, ...C.aoci, ...C.nci].includes(concept) || /\bequity\b|\bstockholders?\b|\bshareholders?\b|\bretained earnings\b|\btreasury stock\b|\bnoncontrolling interest\b/.test(text)) return "equity";
+
+  return "unknown";
+}
+
+function reportedLineItemCategoryCompatible(expected: ReportedLineItemCategory, actual: ReportedLineItemCategory, fillRow: FillRow, source: FactSource) {
+  if (actual === "unknown") return true;
+  if (actual === expected) return true;
+  if (actual === "segment_only") return fillRow.modelContext?.sheetName === SEGMENT_SHEET || /segment analysis/i.test(fillRow.modelContext?.sectionHeader ?? "");
+  if (expected === "cash_flow_or_support") return actual === "cash_flow_or_support";
+  if (actual === "cash_flow_or_support") return false;
+  if (source.sourceLayer === "derived") return derivedSourceCategoryCompatible(expected, source);
+
+  if (expected === "current_assets" || expected === "non_current_assets") return actual === expected;
+  if (expected === "current_liabilities" || expected === "non_current_liabilities") return actual === expected;
+  if (expected === "equity" && actual === "total_liabilities") return false;
+
+  return false;
+}
+
+function derivedSourceCategoryCompatible(expected: ReportedLineItemCategory, source: FactSource) {
+  const actual = reportedLineItemCategory({ ...source, sourceLayer: undefined });
+  if (actual === expected) return true;
+  return /Bridge|Derived|Residual/i.test(source.concept) && [
+    "other_non_operating_income_expense",
+    "pretax_income",
+    "income_tax",
+    "net_income",
+    "current_assets",
+    "non_current_assets",
+    "current_liabilities",
+    "non_current_liabilities",
+    "equity",
+    "cash_flow_or_support"
+  ].includes(expected);
+}
+
+function lineItemCategoryLabel(category: ReportedLineItemCategory) {
+  return category.replace(/_/g, " ");
+}
+
 function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, period: string, resolved: ResolvedValue): SecWriteValidation {
   const notes: string[] = [];
   let status: SecWriteValidation["status"] = "ok";
@@ -6625,6 +6777,11 @@ function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, 
   }
 
   const expectedUnits = expectedUnitsForFillRow(fillRow);
+  const expectedCategory = expectedReportedLineItemCategory(fillRow);
+  const sourceCategories = sources.map((source) => ({ source, category: reportedLineItemCategory(source) }));
+  const hasCompatibleCategory =
+    expectedCategory === null || sourceCategories.some(({ source, category }) => reportedLineItemCategoryCompatible(expectedCategory, category, fillRow, source));
+
   for (const source of sources) {
     if (source.cik && source.cik !== company.cik) {
       status = "blocked";
@@ -6654,6 +6811,22 @@ function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, 
     }
     if (source.isAmendment) {
       notes.push(`${source.form ?? "Filing"} is an amended filing; accession ${source.accn ?? "unknown"} was kept distinct in validation.`);
+    }
+  }
+
+  if (expectedCategory) {
+    for (const { source, category } of sourceCategories) {
+      const compatible = reportedLineItemCategoryCompatible(expectedCategory, category, fillRow, source);
+      const derivedBridgeExplainsComponents = resolvedIsDerived && hasCompatibleCategory && source.sourceLayer !== "derived" && category !== "segment_only";
+      if (!compatible && !derivedBridgeExplainsComponents) {
+        status = "blocked";
+        confidence = "low";
+        notes.push(
+          `Classification mismatch: ${source.concept} was identified as ${lineItemCategoryLabel(category)}, but ${fillRow.label} expects ${lineItemCategoryLabel(expectedCategory)}.`
+        );
+      } else if (category !== "unknown" && category !== "cash_flow_or_support") {
+        notes.push(`Classification: ${source.concept} identified as ${lineItemCategoryLabel(category)}.`);
+      }
     }
   }
 

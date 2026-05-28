@@ -69,10 +69,11 @@ async function main() {
   await workbook.xlsx.readFile(outputWorkbook);
   const segmentSheet = workbook.getWorksheet("Segment Analysis");
   const modelSheet = workbook.getWorksheet("Model");
+  const auditSheet = workbook.getWorksheet("Mapping Audit");
   const errors = [];
 
-  if (!segmentSheet || !modelSheet) {
-    throw new Error("Workbook is missing Model or Segment Analysis sheet.");
+  if (!segmentSheet || !modelSheet || !auditSheet) {
+    throw new Error("Workbook is missing Model, Segment Analysis, or Mapping Audit sheet.");
   }
 
   const totalRow = findRow(segmentSheet, "Total Company Operating Income");
@@ -135,6 +136,69 @@ async function main() {
       errors.push(`Segment Analysis should not promote OCI/reclassification member "${label}" to an operating income segment.`);
     }
   }
+
+  function auditRowsFor({ sheetName = "Model", labelPattern, period = "1Q23" }) {
+    const rows = [];
+    for (let row = 2; row <= auditSheet.rowCount; row += 1) {
+      const sheet = cellValue(auditSheet.getCell(row, 1));
+      const label = String(cellValue(auditSheet.getCell(row, 3)) ?? "");
+      const rowPeriod = cellValue(auditSheet.getCell(row, 5));
+      if (sheet === sheetName && rowPeriod === period && labelPattern.test(label)) rows.push(row);
+    }
+    return rows;
+  }
+
+  function auditRowText(row) {
+    return [8, 9, 10, 20, 22, 23, 24]
+      .map((col) => String(cellValue(auditSheet.getCell(row, col)) ?? ""))
+      .join(" | ");
+  }
+
+  function requireAuditSource(description, criteria) {
+    const rows = auditRowsFor(criteria);
+    if (!rows.length) {
+      errors.push(`Mapping Audit missing ${description}.`);
+      return;
+    }
+    const joined = rows.map(auditRowText).join("\n");
+    for (const pattern of criteria.mustInclude ?? []) {
+      if (!pattern.test(joined)) errors.push(`Mapping Audit ${description} should include ${pattern}; got ${joined || "[blank]"}.`);
+    }
+    for (const pattern of criteria.mustNotInclude ?? []) {
+      if (pattern.test(joined)) errors.push(`Mapping Audit ${description} should not include ${pattern}; got ${joined}.`);
+    }
+  }
+
+  requireAuditSource("RSG primary consolidated revenue mapping", {
+    sheetName: "Segment Analysis",
+    labelPattern: /total company revenue/i,
+    mustInclude: [/RevenueFromContractWithCustomerExcludingAssessedTax/i, /revenue/i],
+    mustNotInclude: [/\bRevenues=/i, /segment:/i, /external customer/i]
+  });
+  requireAuditSource("RSG income-statement D&A mapping", {
+    labelPattern: /^Depreciation & Amortization$/i,
+    mustInclude: [/DepreciationDepletionAndAmortization/i]
+  });
+  requireAuditSource("RSG standalone interest expense mapping", {
+    labelPattern: /Interest \(Expense\)|Interest Expense/i,
+    mustInclude: [/InterestExpense/i],
+    mustNotInclude: [/OtherNonoperatingIncomeExpense/i]
+  });
+  requireAuditSource("RSG explicit other operating item mapping", {
+    labelPattern: /Other Operating Income \(Expense\)/i,
+    period: "2Q24",
+    mustInclude: [/AssetRetirementObligationAccretionExpense/i, /RestructuringCharges/i]
+  });
+  requireAuditSource("RSG other non-operating mapping", {
+    labelPattern: /Other Non-Operating Income \(Expense\)/i,
+    mustInclude: [/OtherNonoperatingIncomeExpense/i],
+    mustNotInclude: [/InterestExpense/i, /InvestmentIncomeInterest/i]
+  });
+  requireAuditSource("RSG segment revenue stays in Segment Analysis", {
+    sheetName: "Segment Analysis",
+    labelPattern: /Total Company Revenue/i,
+    mustInclude: [/Segment Analysis total company revenue|RevenueFromContractWithCustomerExcludingAssessedTax/i]
+  });
 
   if (errors.length) {
     console.error(errors.join("\n"));
