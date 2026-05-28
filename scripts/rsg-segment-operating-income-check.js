@@ -74,13 +74,23 @@ async function main() {
   const totalRow = findRow(segmentSheet, "Total Company Operating Income");
   const checkRow = findRow(segmentSheet, "Operating Income Check");
   const modelEbitRow = findRow(modelSheet, "EBIT") ?? findRow(modelSheet, "Operating Income");
+  const modelDaRow = findRow(modelSheet, "Depreciation & Amortization");
+  const otherOperatingRow = findRow(modelSheet, "Other Operating Income (Expense)");
 
-  if (!totalRow || !checkRow || !modelEbitRow) {
-    throw new Error("Workbook is missing Segment Analysis operating income rows or Model EBIT row.");
+  if (!totalRow || !checkRow || !modelEbitRow || !modelDaRow || !otherOperatingRow) {
+    throw new Error("Workbook is missing Segment Analysis operating income rows or Model EBIT/D&A/other operating rows.");
   }
 
   const historicalColumns = Array.from({ length: 15 }, (_, index) => index + 6);
   const nonzeroDetailLabels = new Set();
+  const expectedDaByPeriod = new Map([
+    ["1Q23", -358.7],
+    ["2023", -1501.3]
+  ]);
+  const expectedOtherOperatingByPeriod = new Map([
+    ["1Q23", -29.6],
+    ["2023", -132.1]
+  ]);
 
   for (const col of historicalColumns) {
     const period = cellValue(segmentSheet.getCell(5, col));
@@ -93,6 +103,17 @@ async function main() {
     }
     if (Math.abs(check) > 0.05) {
       errors.push(`Segment Analysis!${columnLetter(col)}${checkRow} ${period}: expected operating income check near zero, got ${check}.`);
+    }
+
+    const expectedDa = expectedDaByPeriod.get(String(period));
+    if (expectedDa !== undefined && !valuesMatch(numericCell(modelSheet.getCell(modelDaRow, col)), expectedDa)) {
+      errors.push(`Model!${columnLetter(col)}${modelDaRow} ${period}: expected primary-statement D&A ${expectedDa}, got ${numericCell(modelSheet.getCell(modelDaRow, col)) ?? "[blank]"}.`);
+    }
+    const expectedOtherOperating = expectedOtherOperatingByPeriod.get(String(period));
+    if (expectedOtherOperating !== undefined && !valuesMatch(numericCell(modelSheet.getCell(otherOperatingRow, col)), expectedOtherOperating)) {
+      errors.push(
+        `Model!${columnLetter(col)}${otherOperatingRow} ${period}: expected explicit accretion/restructuring operating items ${expectedOtherOperating}, got ${numericCell(modelSheet.getCell(otherOperatingRow, col)) ?? "[blank]"}.`
+      );
     }
 
     for (let row = totalRow + 1; row < checkRow; row += 1) {
