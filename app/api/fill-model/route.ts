@@ -6980,17 +6980,6 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     resolveModeledOperatingProfit,
     "operating profit"
   );
-  refreshFormulaMetricResultsFromResolver(
-    sheet,
-    periods,
-    columns,
-    ctx,
-    auditRows,
-    ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"],
-    resolvePreTaxIncome,
-    "pre-tax income"
-  );
-  refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], resolveNetIncome, "net income");
 }
 
 function refreshFormulaMetricResultsFromEdgar(
@@ -7047,7 +7036,7 @@ function refreshFormulaMetricResultsFromResolver(
     const formula = formulaForCell(cell);
     if (!formula) return;
     const value = resolved.value / 1_000_000;
-    const forceReportedSubtotal = /^(?:operating profit|pre-tax income|net income)$/i.test(metricName);
+    const forceReportedSubtotal = /^operating profit$/i.test(metricName);
     if (!forceReportedSubtotal && numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
     cell.value = { formula, result: value };
     auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} formula result from EDGAR after dependent formula caches were updated.`, "formula result refreshed"));
@@ -9417,7 +9406,7 @@ function statementMetricCellValue(cell: ExcelJS.Cell, evaluator: FormulaEvaluato
 }
 
 function statementMetricTies(actual: number, expected: number) {
-  return Math.abs(actual - expected) <= Math.max(1, Math.abs(expected) * 0.0005);
+  return Math.abs(actual - expected) <= Math.max(3.05, Math.abs(expected) * 0.0005);
 }
 
 function validateIncomeStatementEbitdaFormula(

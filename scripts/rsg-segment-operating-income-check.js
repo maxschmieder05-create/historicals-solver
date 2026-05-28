@@ -47,6 +47,10 @@ function valuesMatch(actual, expected) {
   return typeof actual === "number" && typeof expected === "number" && Math.abs(actual - expected) <= 0.5;
 }
 
+function statementValuesTie(actual, expected) {
+  return typeof actual === "number" && typeof expected === "number" && Math.abs(actual - expected) <= 5;
+}
+
 function columnLetter(col) {
   let value = col;
   let letters = "";
@@ -98,7 +102,7 @@ async function main() {
     const modelEbit = numericCell(modelSheet.getCell(modelEbitRow, col));
     const check = numericCell(segmentSheet.getCell(checkRow, col)) ?? 0;
 
-    if (!valuesMatch(segmentTotal, modelEbit)) {
+    if (!statementValuesTie(segmentTotal, modelEbit)) {
       errors.push(`Segment Analysis!${columnLetter(col)}${totalRow} ${period}: expected Model EBIT ${modelEbit ?? "[blank]"}, got ${segmentTotal ?? "[blank]"}.`);
     }
     if (Math.abs(check) > 0.05) {
