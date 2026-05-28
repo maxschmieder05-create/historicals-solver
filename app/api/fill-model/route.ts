@@ -4147,6 +4147,7 @@ function isUsableFact(fact: SecFact) {
 }
 
 function isInstantFact(fact: SecFact) {
+  if (fact.end && !fact.start) return true;
   return Boolean(fact.frame?.endsWith("I")) || !["Q1", "Q2", "Q3", "Q4", "FY"].includes(fact.fp ?? "");
 }
 
