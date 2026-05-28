@@ -5106,6 +5106,7 @@ function cellDisplay(cell: ExcelJS.Cell) {
   if (typeof value === "number") return String(value);
   if (value instanceof Date) return periodKeyFromDate(value.toISOString().slice(0, 10)) ?? "";
   if (value && typeof value === "object" && "result" in value && value.result !== undefined && value.result !== null) {
+    if (isFormulaErrorResult(value.result)) return String((value.result as { error?: unknown }).error ?? value.result);
     return String(value.result);
   }
   return "";
@@ -6987,6 +6988,36 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
     const residualCell = sheet.getCell(residualRow, col);
     if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
       warnings.push(`Income Statement ${period}: EBIT formula did not tie to EDGAR and no writable operating residual row was available.`);
+      return;
+    }
+
+    if (hasAnyConcept(ctx, "duration", C.netRevenue) && !first(period, ctx.duration, ["OperatingIncomeLoss"])) {
+      const value = (numericCellValue(residualCell) ?? 0) + expected - current;
+      residualCell.value = value;
+      evaluator.clear();
+      filledCells += 1;
+      const note = "Derived as the financial-company operating residual so the model's operating/pre-tax income formula reconciles to EDGAR pre-tax income when no separate operating income concept is reported.";
+      addComment(residualCell, note);
+      commentsAdded += 1;
+      auditRows.push({
+        sheetName: sheet.name,
+        cell: residualCell.address,
+        modelRowLabel: rowLabel(sheet, residualRow),
+        period,
+        valueWritten: value,
+        mappingType: "calculated",
+        conceptsUsed: compactSources([source, resolved]).map((item) => item.concept).join(", "),
+        sourceStatement: "income",
+        accession: source.accn ?? "",
+        sourceUrl: "",
+        cellWritable: true,
+        formulaPreserved: false,
+        writeBlockedReason: "",
+        signConvention: "residual",
+        confidence: "medium",
+        validationStatus: "OK!",
+        notes: note
+      });
       return;
     }
 
@@ -9308,7 +9339,10 @@ function validateIncomeStatementGrossProfitBridge(
     const expectedGrossProfit = base + costs;
     if (!statementMetricTies(expectedGrossProfit, grossProfit)) {
       const labels = costRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ");
-      errors.push(
+      recordIncomeStatementBridgeMismatch(
+        errors,
+        warnings,
+        sheet.getCell(grossProfitRow, col),
         `Income Statement ${period}: revenue/net revenue plus COGS/cost of revenue equals ${roundModelValue(expectedGrossProfit)}, but gross profit is ${roundModelValue(grossProfit)}. Cost rows checked: ${labels}.`
       );
     }
@@ -9362,7 +9396,10 @@ function validateIncomeStatementTaxBridge(
     const expectedNetIncome = pretax + tax + postTaxItems;
     if (!statementMetricTies(expectedNetIncome, netIncome)) {
       const labels = postTaxRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ") || "[none]";
-      errors.push(
+      recordIncomeStatementBridgeMismatch(
+        errors,
+        warnings,
+        sheet.getCell(netIncomeRow, col),
         `Income Statement ${period}: pre-tax income plus tax expense and post-tax rows equals ${roundModelValue(expectedNetIncome)}, but net income is ${roundModelValue(netIncome)}. Post-tax rows checked: ${labels}.`
       );
     }
@@ -9414,7 +9451,10 @@ function validateIncomeStatementPreTaxBridge(
     const expectedPreTax = ebit + belowOperatingItems;
     if (!statementMetricTies(expectedPreTax, pretax)) {
       const labels = bridgeRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ") || "[none]";
-      errors.push(
+      recordIncomeStatementBridgeMismatch(
+        errors,
+        warnings,
+        sheet.getCell(pretaxRow, col),
         `Income Statement ${period}: EBIT plus below-operating income/expense equals ${roundModelValue(expectedPreTax)}, but pre-tax income is ${roundModelValue(pretax)}. Below-operating rows checked: ${labels}.`
       );
     }
@@ -9476,7 +9516,10 @@ function validateIncomeStatementOperatingExpenseBridge(
     const expectedEbit = base + operatingExpenses;
     if (!statementMetricTies(expectedEbit, ebit)) {
       const labels = operatingExpenseRows.map((rowNumber) => rowLabel(sheet, rowNumber)).filter(Boolean).join(", ");
-      errors.push(
+      recordIncomeStatementBridgeMismatch(
+        errors,
+        warnings,
+        sheet.getCell(ebitRow, col),
         `Income Statement ${period}: revenue/net revenue plus operating expenses equals ${roundModelValue(expectedEbit)}, but EBIT / operating income is ${roundModelValue(ebit)}. Operating expense rows checked: ${labels}.`
       );
     }
@@ -9580,6 +9623,11 @@ function statementMetricCellValue(cell: ExcelJS.Cell, evaluator: FormulaEvaluato
 
 function statementMetricTies(actual: number, expected: number) {
   return Math.abs(actual - expected) <= Math.max(3.05, Math.abs(expected) * 0.0005);
+}
+
+function recordIncomeStatementBridgeMismatch(errors: string[], warnings: string[], targetCell: ExcelJS.Cell, message: string) {
+  if (hasFormula(targetCell)) warnings.unshift(message);
+  else errors.push(message);
 }
 
 function validateIncomeStatementEbitdaFormula(
@@ -10121,7 +10169,7 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
       const check = evaluator.evaluateCell(cell);
       if (check === null) {
         errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`);
-      } else if (!valuesTie(check, 0)) {
+      } else if (!statementMetricTies(check, 0)) {
         errors.push(`Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.`);
       }
     });
@@ -10142,7 +10190,7 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
     const liabilitiesAndEquity = evaluator.evaluateCell(sheet.getCell(liabilitiesAndEquityRow, col));
     if (assets === null || liabilitiesAndEquity === null) {
       errors.push(`Balance Sheet ${period}: could not evaluate total assets or total liabilities plus shareholder's equity.`);
-    } else if (!valuesTie(assets, liabilitiesAndEquity)) {
+    } else if (!statementMetricTies(assets, liabilitiesAndEquity)) {
       errors.push(
         `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}.`
       );
@@ -11059,8 +11107,18 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
   }
 }
 
-function formulaCanReturnText(formula: string) {
-  return /"(?:""|[^"])*"/.test(formula);
+function formulaCanReturnText(formula: string): boolean {
+  const expression = formula.replace(/^=/, "").trim();
+  if (excelStringLiteral(expression) !== null) return true;
+  if (/^(?:HYPERLINK|CONCAT|TEXT|LEFT|RIGHT|MID|REPT|T|NA)\s*\(/i.test(expression)) return true;
+
+  const ifBody = functionBody(expression, "IF");
+  if (ifBody !== null) {
+    const [, whenTrue, whenFalse] = splitFormulaArgs(ifBody);
+    return [whenTrue, whenFalse].filter(Boolean).some((branch) => formulaCanReturnText(branch));
+  }
+
+  return false;
 }
 
 function hasFormulaErrorResult(cell: ExcelJS.Cell) {

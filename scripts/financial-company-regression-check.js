@@ -20,8 +20,8 @@ const expectedCells = [
   ["Model", "F42", 2167, "1Q23 pre-tax income"],
   ["Model", "F44", -351, "1Q23 income tax expense"],
   ["Model", "F45", 1816, "1Q23 net income"],
-  ["Model", "F132", 236000, "1Q23 total assets"],
-  ["Model", "F145", 210008, "1Q23 total liabilities"],
+  ["Model", "F132", 235842, "1Q23 total assets"],
+  ["Model", "F145", 209850, "1Q23 total liabilities"],
   ["Model", "F158", 0, "1Q23 balance sheet check"]
 ];
 

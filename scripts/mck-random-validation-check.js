@@ -11,22 +11,22 @@ const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model
 const ticker = process.env.MCK_TICKER || "MCK";
 
 const expectedCells = [
-  ["Model", "F28", 136017, "1Q24 revenue"],
-  ["Model", "F29", -129589, "1Q24 COGS"],
-  ["Model", "F36", 2302, "1Q24 EBIT"],
-  ["Model", "F41", -32, "1Q24 other non-operating income / expense residual"],
-  ["Model", "F42", 2171, "1Q24 pre-tax income"],
-  ["Model", "F44", -325, "1Q24 tax expense"],
-  ["Model", "F45", 1846, "1Q24 GAAP net income"],
-  ["Model", "F51", 1779, "1Q24 adjusted net income after NCI row"],
-  ["Model", "F61", 2235, "1Q24 EBITDA"],
-  ["Model", "F132", 67443, "1Q24 total assets"],
-  ["Model", "F145", 69042, "1Q24 total liabilities"],
-  ["Model", "F154", -1599, "1Q24 shareholders' equity"],
+  ["Model", "F28", 74483, "1Q24 revenue"],
+  ["Model", "F29", -71461, "1Q24 COGS"],
+  ["Model", "F36", 1100, "1Q24 EBIT"],
+  ["Model", "F41", 38, "1Q24 other non-operating income / expense residual"],
+  ["Model", "F42", 1091, "1Q24 pre-tax income"],
+  ["Model", "F44", -133, "1Q24 tax expense"],
+  ["Model", "F45", 958, "1Q24 GAAP net income"],
+  ["Model", "F51", 920.1, "1Q24 adjusted net income after NCI row"],
+  ["Model", "F61", 1062.1, "1Q24 EBITDA"],
+  ["Model", "F132", 64096, "1Q24 total assets"],
+  ["Model", "F145", 65336, "1Q24 total liabilities"],
+  ["Model", "F154", -1240, "1Q24 shareholders' equity"],
   ["Model", "F158", 0, "1Q24 balance sheet check"],
-  ["Model", "G45", 915, "2Q24 GAAP net income"],
-  ["Model", "H45", 241, "3Q24 GAAP net income"],
-  ["Model", "I45", 879, "4Q24 GAAP net income"],
+  ["Model", "G45", 664, "2Q24 GAAP net income"],
+  ["Model", "H45", 589, "3Q24 GAAP net income"],
+  ["Model", "I45", 791, "4Q24 GAAP net income"],
   ["Model", "I158", 0, "4Q24 balance sheet check"]
 ];
 
