@@ -10331,15 +10331,15 @@ function uniquePeriodColumnPairs(pairs: Array<{ period: string; col: number }>) 
 
 function requestAutomaticWorkbookCalculation(workbook: ExcelJS.Workbook) {
   const calcProperties = workbook.calcProperties as ExcelJS.Workbook["calcProperties"] & {
+    fullCalcOnLoad?: boolean;
     forceFullCalc?: boolean;
     calcMode?: string;
     calcOnSave?: boolean;
   };
   calcProperties.calcMode = "auto";
-  const optionalCalcProperties = calcProperties as Partial<typeof calcProperties>;
-  delete optionalCalcProperties.fullCalcOnLoad;
-  delete optionalCalcProperties.forceFullCalc;
-  delete optionalCalcProperties.calcOnSave;
+  calcProperties.fullCalcOnLoad = true;
+  calcProperties.forceFullCalc = true;
+  calcProperties.calcOnSave = true;
 }
 
 async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook): Promise<Buffer<ArrayBuffer>> {
@@ -10355,7 +10355,7 @@ async function enforceXlsxAutomaticCalculation(output: Buffer<ArrayBuffer>): Pro
   if (!workbookXmlFile) return output;
 
   const workbookXml = await workbookXmlFile.async("string");
-  const calcPr = '<calcPr calcMode="auto"/>';
+  const calcPr = '<calcPr calcMode="auto" fullCalcOnLoad="1" forceFullCalc="1" calcOnSave="1"/>';
   const updatedWorkbookXml = /<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/.test(workbookXml)
     ? workbookXml.replace(/<calcPr\b[^>]*(?:\/>|>[\s\S]*?<\/calcPr>)/, calcPr)
     : insertWorkbookCalcPr(workbookXml, calcPr);
@@ -10364,6 +10364,7 @@ async function enforceXlsxAutomaticCalculation(output: Buffer<ArrayBuffer>): Pro
   zip.remove("xl/calcChain.xml");
   await removeCalcChainRelationship(zip);
   await removeCalcChainContentType(zip);
+  await markWorksheetFormulasForRecalculation(zip);
   await validateXlsxFormulaCellsReadyForDisplay(zip);
 
   return Buffer.from(await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }));
@@ -10479,6 +10480,9 @@ async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
   if (!workbookXml || !/<calcPr\b[^>]*calcMode="auto"/.test(workbookXml)) {
     throw new Error("Workbook calculation properties are not set to automatic calculation.");
   }
+  if (!/<calcPr\b[^>]*fullCalcOnLoad="1"/.test(workbookXml) || !/<calcPr\b[^>]*forceFullCalc="1"/.test(workbookXml)) {
+    throw new Error("Workbook calculation properties are not set to force formula recalculation on open.");
+  }
 
   const problems: string[] = [];
   const sharedStrings = await sharedStringValues(zip);
@@ -10488,7 +10492,13 @@ async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
     if (!file) continue;
     const xml = await file.async("string");
     for (const cellXml of xml.match(/<c\b[^>]*>[\s\S]*?<\/c>/g) ?? []) {
-      if (/<f\b/.test(cellXml)) continue;
+      if (/<f\b/.test(cellXml)) {
+        if (!/<f\b[^>]*\bca="1"/.test(cellXml)) {
+          const address = cellXml.match(/\br="([^"]+)"/)?.[1] ?? "?";
+          problems.push(`${path}!${address}: formula is not marked for recalculation`);
+        }
+        continue;
+      }
       const textValue = formulaStringValue(cellXml, sharedStrings);
       if (textValue && isPlainTextFormula(textValue)) {
         const address = cellXml.match(/\br="([^"]+)"/)?.[1] ?? "?";

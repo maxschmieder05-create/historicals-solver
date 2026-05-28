@@ -1,5 +1,7 @@
 const path = require("node:path");
+const fs = require("node:fs/promises");
 const ExcelJS = require("exceljs");
+const JSZip = require("jszip");
 const { postWorkbook } = require("./fill-workbook-api");
 
 const repoRoot = path.resolve(__dirname, "..");
@@ -91,6 +93,7 @@ async function main() {
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(outputWorkbook);
+  await validateWorkbookRecalculationMetadata(outputWorkbook);
   const facts = await fetchCompanyFacts();
   const errors = [];
   const model = workbook.getWorksheet("Model");
@@ -133,6 +136,81 @@ async function main() {
   }
 
   console.log(`${ticker} balance-sheet instant regression passed across ${periods.length} quarter column(s): ${outputWorkbook}`);
+}
+
+async function validateWorkbookRecalculationMetadata(file) {
+  const zip = await JSZip.loadAsync(await fs.readFile(file));
+  const workbookXml = await zip.file("xl/workbook.xml")?.async("string");
+  const errors = [];
+  if (!workbookXml || !/<calcPr\b[^>]*calcMode="auto"/.test(workbookXml)) {
+    errors.push("workbook.xml is missing automatic calculation mode.");
+  }
+  if (!workbookXml || !/<calcPr\b[^>]*fullCalcOnLoad="1"/.test(workbookXml) || !/<calcPr\b[^>]*forceFullCalc="1"/.test(workbookXml)) {
+    errors.push("workbook.xml is not forcing a full formula recalculation on open.");
+  }
+  if (zip.file("xl/calcChain.xml")) {
+    errors.push("xl/calcChain.xml should be removed so Excel rebuilds formula dependencies.");
+  }
+
+  const sharedStrings = await sharedStringValues(zip);
+  let formulaCount = 0;
+  let recalculationMarkedCount = 0;
+  for (const path of Object.keys(zip.files).filter((item) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(item))) {
+    const xml = await zip.file(path)?.async("string");
+    if (!xml) continue;
+    for (const cellXml of xml.match(/<c\b[^>]*>[\s\S]*?<\/c>/g) ?? []) {
+      const address = cellXml.match(/\br="([^"]+)"/)?.[1] ?? "?";
+      if (/<f\b/.test(cellXml)) {
+        formulaCount += 1;
+        if (/<f\b[^>]*\bca="1"/.test(cellXml)) recalculationMarkedCount += 1;
+        else errors.push(`${path}!${address}: formula is not marked for recalculation.`);
+        continue;
+      }
+      const textValue = formulaStringValue(cellXml, sharedStrings);
+      if (textValue && isPlainTextFormula(textValue)) {
+        errors.push(`${path}!${address}: formula is stored as text.`);
+      }
+    }
+  }
+  if (!formulaCount) errors.push("No formula cells were found in the generated workbook.");
+  if (!recalculationMarkedCount) errors.push("No formula cells were marked for recalculation.");
+  if (errors.length) throw new Error(`Generated workbook recalculation metadata failed: ${errors.slice(0, 12).join(" | ")}`);
+}
+
+async function sharedStringValues(zip) {
+  const values = new Map();
+  const sharedStringsFile = zip.file("xl/sharedStrings.xml");
+  if (!sharedStringsFile) return values;
+
+  const xml = await sharedStringsFile.async("string");
+  let index = 0;
+  for (const match of xml.matchAll(/<si\b[^>]*>([\s\S]*?)<\/si>/g)) {
+    const text = Array.from(match[1].matchAll(/<t\b[^>]*>([\s\S]*?)<\/t>/g))
+      .map((item) => unescapeXml(item[1]))
+      .join("");
+    values.set(index, text);
+    index += 1;
+  }
+  return values;
+}
+
+function formulaStringValue(cellXml, sharedStrings) {
+  if (/\bt=(["'])s\1/.test(cellXml)) {
+    const sharedStringIndex = Number(cellXml.match(/<v>(\d+)<\/v>/)?.[1]);
+    return Number.isFinite(sharedStringIndex) ? sharedStrings.get(sharedStringIndex) ?? null : null;
+  }
+  const value = cellXml.match(/<v>([\s\S]*?)<\/v>/)?.[1];
+  if (value !== undefined) return unescapeXml(value);
+  const inlineText = cellXml.match(/<is>\s*<t[^>]*>([\s\S]*?)<\/t>\s*<\/is>/)?.[1];
+  return inlineText === undefined ? null : unescapeXml(inlineText);
+}
+
+function isPlainTextFormula(value) {
+  return /^=\s*(?:[A-Z_@]|\d|[+\-.]|\()/i.test(value.trim());
+}
+
+function unescapeXml(value) {
+  return value.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&");
 }
 
 function validateCostcoNetOtherIncomeBridge(sheet) {
