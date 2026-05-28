@@ -6141,8 +6141,8 @@ function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue, pe
 
   const parts: string[] = [];
   const includedLineItems = groupedLineItemNote(fillRow, resolved);
-  if (includedLineItems) parts.push(includedLineItems);
-  else if (grouped && sourceLabels.length) parts.push(`Grouped from ${summarizeList(sourceLabels, 3)}.`);
+  if (includedLineItems) return includedLineItems;
+  if (grouped && sourceLabels.length) parts.push(`Grouped from ${summarizeList(sourceLabels, 3)}.`);
   if (resolved.note || fillRow.comment) parts.push(shortAnnotationSentence(resolved.note || fillRow.comment || ""));
   if (isDerived && derived?.derivedPriorPeriods?.length) {
     parts.push(`Derived from ${derived.derivedTotalLabel || derived.label} less ${summarizeList(derived.derivedPriorPeriods, 4)}.`);
@@ -6161,10 +6161,7 @@ function groupedLineItemNote(fillRow: FillRow, resolved: ResolvedValue) {
 
   const labels = groupedLineItemLabels(resolved);
   if (!labels.length) return "";
-  const target = shortAnnotationSentence(fillRow.label, 60);
-  const lineItems = summarizeList(labels, 4);
-  if (derived || resolved.classification === "partial") return `Line items used for ${target}: ${lineItems}.`;
-  return `${lineItems} ${labels.length === 1 ? "is" : "are"} included in ${target}.`;
+  return includedLineItemList(labels);
 }
 
 function groupedLineItemLabels(resolved: ResolvedValue) {
@@ -6176,6 +6173,10 @@ function groupedLineItemLabels(resolved: ResolvedValue) {
       .map(sourceDisplayLabel)
       .filter(Boolean)
   );
+}
+
+function includedLineItemList(labels: string[]) {
+  return ["Includes:", ...labels.map((label) => `- ${shortAnnotationSentence(label, 100)}`)].join("\n");
 }
 
 function filingCommentaryJustification(fillRow: FillRow, resolved: ResolvedValue, period: string, ctx: ResolveContext) {
@@ -7619,9 +7620,11 @@ function mappingComment(
   confidence: "high" | "medium" | "low",
   notes?: string | null
 ) {
+  const lineItemNote = groupedLineItemNote(fillRow, resolved);
+  if (lineItemNote) return lineItemNote;
+
   const source = resolved.sources[0];
   const conceptLabels = resolved.sources.length ? unique(resolved.sources.map(sourceDisplayLabel).filter(Boolean)) : [];
-  const lineItemNote = groupedLineItemNote(fillRow, resolved);
   const sourceText = [source?.form || "SEC filing", source?.filed ? `filed ${source.filed}` : ""].filter(Boolean).join(", ");
   const endText = source?.end && source.end !== period ? ` (ended ${source.end})` : "";
   const valueUnit = mappingValueUnit(fillRow, resolved);
