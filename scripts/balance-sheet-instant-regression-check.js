@@ -52,6 +52,26 @@ const directBalanceSheetChecks = [
   { row: 151, label: "stockholders' equity", concepts: ["StockholdersEquity"], formulaResult: true }
 ];
 
+const costcoNetOtherIncomeBridgeChecks = [
+  { period: "1Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
+  { period: "2Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
+  { period: "3Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
+  { period: "4Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
+  { period: "2025", row: 39, label: "interest expense separated from net other income", expected: 0 },
+  { period: "3Q25", row: 41, label: "other non-operating income bridge", expected: 50 },
+  { period: "4Q25", row: 41, label: "other non-operating income bridge", expected: 169 },
+  { period: "2025", row: 41, label: "other non-operating income bridge", expected: 435 },
+  { period: "3Q25", row: 42, label: "pre-tax income", expected: 2580 },
+  { period: "4Q25", row: 42, label: "pre-tax income", expected: 3510 },
+  { period: "2025", row: 42, label: "pre-tax income", expected: 10818 },
+  { period: "3Q25", row: 44, label: "income tax expense", expected: -677 },
+  { period: "4Q25", row: 44, label: "income tax expense", expected: -900 },
+  { period: "2025", row: 44, label: "income tax expense", expected: -2719 },
+  { period: "3Q25", row: 45, label: "net income", expected: 1903 },
+  { period: "4Q25", row: 45, label: "net income", expected: 2610 },
+  { period: "2025", row: 45, label: "net income", expected: 8099 }
+];
+
 function cellValue(cell) {
   const value = cell.value;
   if (typeof value === "number") return value;
@@ -103,12 +123,39 @@ async function main() {
     errors.push(`${ticker}: no no-frame InventoryNet instant facts were available to exercise the SEC instant classification regression.`);
   }
 
+  if (ticker.toUpperCase() === "COST") {
+    errors.push(...validateCostcoNetOtherIncomeBridge(model));
+  }
+
   if (errors.length) {
     console.error(errors.join("\n"));
     throw new Error(`${ticker} balance-sheet instant regression failed with ${errors.length} issue(s).`);
   }
 
   console.log(`${ticker} balance-sheet instant regression passed across ${periods.length} quarter column(s): ${outputWorkbook}`);
+}
+
+function validateCostcoNetOtherIncomeBridge(sheet) {
+  const errors = [];
+  for (const check of costcoNetOtherIncomeBridgeChecks) {
+    const col = findPeriodColumn(sheet, check.period);
+    if (!col) {
+      errors.push(`COST ${check.label}: could not find ${check.period} column.`);
+      continue;
+    }
+    const actual = cellValue(sheet.getCell(check.row, col));
+    if (!valuesMatch(actual, check.expected)) {
+      errors.push(`COST ${check.period} ${check.label} Model!${columnLetter(col)}${check.row}: expected ${check.expected}, got ${actual ?? "[blank]"}.`);
+    }
+  }
+  return errors;
+}
+
+function findPeriodColumn(sheet, period) {
+  for (let col = 1; col <= sheet.columnCount; col += 1) {
+    if (String(sheet.getCell(25, col).text || "").replace(/[’']/g, "").trim().toUpperCase() === period.toUpperCase()) return col;
+  }
+  return null;
 }
 
 async function fetchCompanyFacts() {

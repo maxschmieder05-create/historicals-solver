@@ -1119,6 +1119,15 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   for (const concept of C.interestExpense) {
     const source = facts.get(concept);
     if (source && source.value !== 0) {
+      if (concept === "InterestExpense" && genericInterestExpenseAlreadyIncludedInOtherIncomeBridge(period, ctx)) {
+        return {
+          value: 0,
+          sources: [zeroSource("InterestExpenseSeparatedFromNetOtherIncome"), source],
+          note:
+            "Set to zero because EDGAR's other income line already bridges operating income to income before taxes; separately subtracting generic interest expense would double-count the below-operating bridge.",
+          classification: "grouped"
+        };
+      }
       return {
         value: -Math.abs(source.value),
         sources: [source],
@@ -1129,6 +1138,24 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   const zero = first(period, ctx.duration, C.interestExpense);
   if (fallback && (!zero || zero.value === 0)) return fallback;
   return zero ? { value: 0, sources: [zero] } : { value: null, sources: [] };
+}
+
+function genericInterestExpenseAlreadyIncludedInOtherIncomeBridge(period: string, ctx: ResolveContext) {
+  if (netOtherIncomeBridgeTiesPreTax(period, ctx)) return true;
+
+  const fiscalYear = periodYearSuffix(period);
+  if (!fiscalYear || isAnnualPeriod(period)) return false;
+  return netOtherIncomeBridgeTiesPreTax(`FY${fiscalYear}`, ctx);
+}
+
+function netOtherIncomeBridgeTiesPreTax(period: string, ctx: ResolveContext) {
+  const operatingIncome = first(period, ctx.duration, C.operatingIncome);
+  const otherIncome = first(period, ctx.duration, ["OtherIncome", "OtherNonoperatingIncomeExpense"]);
+  if (!operatingIncome || !otherIncome) return false;
+
+  const pretax = resolvePreTaxIncome(period, ctx);
+  if (pretax.value === null) return false;
+  return statementMetricTies((operatingIncome.value + otherIncome.value) / 1_000_000, pretax.value / 1_000_000);
 }
 
 function resolveNonOperatingInterestExpenseAfterNetRevenue(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1404,7 +1431,7 @@ function resolveDirectNoncontrollingIncome(period: string, ctx: ResolveContext):
 }
 
 function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = first(period, ctx.duration, ["IncomeTaxExpenseBenefit", "IncomeTaxExpenseBenefitContinuingOperations"]);
+  const direct = directIncomeTaxExpenseSource(period, ctx);
   const pretax = resolvePreTaxIncome(period, ctx);
   const continuingNet = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
   const derived = pretax.value !== null && continuingNet
@@ -1470,8 +1497,33 @@ function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue
     };
   }
 
+  const derivedFromNetIncomeAndTax = resolvePreTaxIncomeFromNetIncomeAndTax(period, ctx);
+  if (derivedFromNetIncomeAndTax.value !== null) return derivedFromNetIncomeAndTax;
+
   const fallback = first(period, ctx.duration, PRETAX_INCOME_CONCEPTS);
   return fallback ? { value: fallback.value, sources: [fallback], classification: "direct" } : { value: null, sources: [] };
+}
+
+function directIncomeTaxExpenseSource(period: string, ctx: ResolveContext) {
+  return first(period, ctx.duration, ["IncomeTaxExpenseBenefit", "IncomeTaxExpenseBenefitContinuingOperations"]);
+}
+
+function resolvePreTaxIncomeFromNetIncomeAndTax(period: string, ctx: ResolveContext): ResolvedValue {
+  const continuingNet = first(period, ctx.duration, CONTINUING_NET_INCOME_CONCEPTS);
+  const taxExpense = directIncomeTaxExpenseSource(period, ctx);
+  if (!continuingNet || !taxExpense) return { value: null, sources: compactSources([continuingNet, taxExpense]) };
+
+  const value = continuingNet.value + taxExpense.value;
+  return {
+    value,
+    sources: [
+      bridgeSource(period, "IncomeBeforeTaxesDerivedFromNetIncomeAndTax", "Income before taxes derived from EDGAR net income and income tax expense", value, [continuingNet, taxExpense]),
+      continuingNet,
+      taxExpense
+    ],
+    note: "Derived from EDGAR net income plus EDGAR income tax expense when a standalone income-before-taxes fact was not available for the period.",
+    classification: "grouped"
+  };
 }
 
 function resolveDiscontinuedOperationsBridge(period: string, ctx: ResolveContext): ResolvedValue {
