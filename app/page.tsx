@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, FormEvent, useMemo, useState } from "react";
-import { ArrowDownToLine, FileSpreadsheet, Loader2, Search, UploadCloud } from "lucide-react";
+import { ArrowDownToLine, CheckCircle2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
   companyName: string;
@@ -89,6 +89,14 @@ export default function Home() {
 
   return (
     <main className="shell">
+      <div className="topbar" aria-hidden="true">
+        <div className="brandMark">
+          <span />
+          <span />
+          <span />
+          <span />
+        </div>
+      </div>
       <section className="workspace">
         <div className="intro">
           <p className="eyebrow">EDGAR to model</p>
@@ -97,9 +105,27 @@ export default function Home() {
             Drop a valuation template, enter a ticker or company name, and download a workbook with historical income
             statement and balance sheet cells populated from SEC company facts.
           </p>
+          <div className="assurance">
+            <span>
+              <ShieldCheck aria-hidden="true" size={16} />
+              SEC EDGAR sourced
+            </span>
+            <span>
+              <CheckCircle2 aria-hidden="true" size={16} />
+              Audit notes included
+            </span>
+          </div>
         </div>
 
         <form className="tool" onSubmit={handleSubmit}>
+          <div className="toolHeader">
+            <FileSpreadsheet aria-hidden="true" size={22} />
+            <div>
+              <strong>Fill model historicals</strong>
+              <span>Upload an Excel valuation template and choose the company.</span>
+            </div>
+          </div>
+
           <div className="field">
             <label htmlFor="ticker">Ticker or company name</label>
             <div className="searchBox">
@@ -124,9 +150,11 @@ export default function Home() {
             onDrop={handleDrop}
           >
             <input type="file" accept=".xlsx" onChange={handleFileChange} />
-            <UploadCloud aria-hidden="true" size={34} />
-            <span>{file ? file.name : "Drop Excel model here"}</span>
-            <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB selected` : "Only .xlsx files are accepted"}</small>
+            <span className="dropIcon">
+              <UploadCloud aria-hidden="true" size={30} />
+            </span>
+            <span className="dropTitle">{file ? file.name : "Drop Excel model here"}</span>
+            <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB selected` : "Click to browse or drag in an .xlsx file"}</small>
           </label>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
