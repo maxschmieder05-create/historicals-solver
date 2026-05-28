@@ -3144,7 +3144,7 @@ export async function POST(request: NextRequest) {
               const validation = validateResolvedValueForWrite(company, effectiveFillRow, period, resolved);
               if (validation.status === "blocked") {
                 unresolved += 1;
-                const note = `SEC validation blocked formula refresh: ${validation.notes.join(" ")}`;
+                const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
                 addComment(cell, note);
                 commentsAdded += 1;
                 auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
@@ -3161,12 +3161,8 @@ export async function POST(request: NextRequest) {
                   : formulaBridgeForTargetValue(cell, value) ?? formula;
               cell.value = refreshedFormula ? { formula: refreshedFormula, result: value } : value;
               filledCells += 1;
-              const note = overwriteFormula
-                ? effectiveFillRow.statement === "balance"
-                  ? "Replaced a balance-sheet formula with the EDGAR period-end balance so instant values are not derived from prior quarters."
-                  : "Replaced a stale model bridge formula with the EDGAR-supported value."
-                : "Updated the preserved formula's cached result from EDGAR while keeping the model formula in place.";
-              addComment(cell, appendValidationNotes(note, validation));
+              const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
+              addComment(cell, note);
               commentsAdded += 1;
               auditRows.push({
                 sheetName: sheet.name,
@@ -3192,7 +3188,7 @@ export async function POST(request: NextRequest) {
                 signConvention: "formula result refreshed",
                 confidence: validation.confidence,
                 validationStatus: validationStatusText(validation),
-                notes: appendValidationNotes(note, validation)
+                notes: note
               });
               continue;
             }
@@ -3222,7 +3218,7 @@ export async function POST(request: NextRequest) {
         if (validation.status === "blocked") {
           unresolved += 1;
           const value = resolved.value / (effectiveFillRow.scale ?? 1);
-          const note = `SEC validation blocked write: ${validation.notes.join(" ")}`;
+          const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
           addComment(cell, note);
           commentsAdded += 1;
           auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
@@ -5495,14 +5491,20 @@ function fillSegmentTotalRow(
       confidence: "high",
       validationStatus: "not_run",
       notes: segmentTotalIsUsable
-        ? `Rebuilt ${label} from the sum of EDGAR reportable segment ${metric} rows.`
+        ? lineItemSentence(label, segments.map((segment) => `${segment.label} ${segmentMetricDisplayLabel(metric)}`), "includes")
         : statementSource
-        ? `Rebuilt ${label} from consolidated EDGAR ${label.toLowerCase()} because the Segment Analysis total cell did not contain a formula.`
-        : `Rebuilt ${label} because the Segment Analysis total cell did not contain a formula.`
+        ? lineItemSentence(label, [sourceLineItemLabel(statementSource)], "maps")
+        : lineItemSentence(label, [], "includes")
     });
   });
 
   return filledCells;
+}
+
+function segmentMetricDisplayLabel(metric: SegmentMetricMapKey) {
+  if (metric === "operatingIncome") return "Operating Income";
+  if (metric === "depreciationAmortization") return "D&A";
+  return "Revenue";
 }
 
 function restoreSegmentTotalFormula(
@@ -5553,7 +5555,7 @@ function restoreSegmentTotalFormula(
         signConvention: "calculated",
         confidence: "high",
         validationStatus: "OK!",
-        notes: `Refreshed ${totalLabel} formula result so the generated workbook displays the filled segment total.`
+        notes: lineItemSentence(totalLabel, [`Segment Analysis ${totalLabel}`], "includes")
       });
       return;
     }
@@ -5579,7 +5581,7 @@ function restoreSegmentTotalFormula(
       signConvention: "copied",
       confidence: "high",
       validationStatus: "OK!",
-      notes: `Rebuilt ${totalLabel} formula so every filled segment row is included in the Segment Analysis total.`
+      notes: lineItemSentence(totalLabel, [`Segment Analysis ${totalLabel}`], "includes")
     });
   });
 
@@ -5637,7 +5639,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
         signConvention: "not written",
         confidence: "low",
         validationStatus: "needs_review",
-        notes: `Needs review: EDGAR consolidated ${suffix.toLowerCase()} was available for ${period}, but the parser could not validate detailed 4Q segment rows from annual less Q1-Q3 facts.`
+        notes: lineItemSentence(`${suffix} segment detail`, [sourceLineItemLabel(expectedSource)], "includes")
       });
       return;
     }
@@ -5652,7 +5654,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
     const value = (numericCellValue(cell) ?? 0) + expected - actual;
     cell.value = value;
     filledCells += 1;
-    const note = `Calculated as the residual needed for Segment Analysis ${suffix} rows to tie to EDGAR consolidated ${suffix.toLowerCase()}.`;
+    const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(expectedSource) || `Consolidated ${suffix}`], "includes");
     addComment(cell, note);
     commentsAdded += 1;
     auditRows.push({
@@ -5778,7 +5780,7 @@ function restoreSegmentCheckFormula(
       signConvention: "calculated",
       confidence: "high",
       validationStatus: "OK!",
-      notes: `Rebuilt ${checkLabel} formula because the Segment Analysis check cell was blank.`
+      notes: lineItemSentence(checkLabel, [`Segment Analysis ${checkLabel}`], "includes")
     });
   });
 
@@ -6161,22 +6163,96 @@ function groupedLineItemNote(fillRow: FillRow, resolved: ResolvedValue) {
 
   const labels = groupedLineItemLabels(resolved);
   if (!labels.length) return "";
-  return includedLineItemList(labels);
+  return lineItemMappingSentence(fillRow.label, resolved, "includes");
 }
 
 function groupedLineItemLabels(resolved: ResolvedValue) {
-  return unique(
-    resolved.sources
-      .filter((source) => source.value !== 0)
-      .filter((source) => source.sourceLayer !== "model")
-      .filter((source) => source.sourceLayer !== "derived")
-      .map(sourceDisplayLabel)
-      .filter(Boolean)
-  );
+  return sourceLineItemLabels(resolved);
 }
 
-function includedLineItemList(labels: string[]) {
-  return ["Includes:", ...labels.map((label) => `- ${shortAnnotationSentence(label, 100)}`)].join("\n");
+function lineItemMappingSentence(modelRow: string, resolved: ResolvedValue, mode?: "maps" | "includes") {
+  const labels = sourceLineItemLabels(resolved);
+  return lineItemSentence(modelRow, labels, mode ?? (labels.length === 1 && (resolved.classification ?? "direct") === "direct" ? "maps" : "includes"));
+}
+
+function lineItemSentence(modelRow: string, labels: string[], mode: "maps" | "includes" = labels.length === 1 ? "maps" : "includes") {
+  const cleanModelRow = cleanLineItemLabel(modelRow) || "Model row";
+  const cleanLabels = uniqueByNormalizedLabel(labels.map(cleanLineItemLabel).filter(Boolean));
+  const shownLabels = cleanLabels.slice(0, 6);
+  const remaining = cleanLabels.length - shownLabels.length;
+  const displayLabels = remaining > 0 ? [...shownLabels, `${remaining} other line item${remaining === 1 ? "" : "s"}`] : shownLabels;
+  if (!displayLabels.length) return `${cleanModelRow} needs review because no EDGAR line item was available.`;
+  const verb = mode === "maps" ? "maps to" : "includes";
+  return `${cleanModelRow} ${verb} ${humanReadableList(displayLabels)}.`;
+}
+
+function uniqueByNormalizedLabel(labels: string[]) {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const label of labels) {
+    const key = normalize(label);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push(label);
+  }
+  return result;
+}
+
+function sourceLineItemLabels(resolved: ResolvedValue) {
+  const labels: string[] = [];
+  const seen = new Set<string>();
+  for (const source of resolved.sources) {
+    if (source.value === 0 || source.sourceLayer === "model") continue;
+    const label = sourceLineItemLabel(source);
+    if (!label) continue;
+    const key = normalize(label);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    labels.push(label);
+  }
+  return labels;
+}
+
+function sourceLineItemLabel(source: FactSource) {
+  const preferred = cleanLineItemLabel(source.label || "");
+  if (preferred && preferred !== source.concept && !isTechnicalLineItemLabel(preferred)) return preferred;
+  const fallback = cleanLineItemLabel(source.note || "");
+  if (fallback && !isTechnicalLineItemLabel(fallback)) return fallback;
+  return cleanLineItemLabel(humanizeConcept(source.concept));
+}
+
+function cleanLineItemLabel(label: string) {
+  return label
+    .replace(/\s+/g, " ")
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/^\s*EDGAR\s*[:\-]\s*/i, "")
+    .replace(/\s*\((?:in\s+)?(?:millions|thousands|USD \$|shares|except per share data)\)\s*$/i, "")
+    .trim();
+}
+
+function isTechnicalLineItemLabel(label: string) {
+  return /\b(parser|mapped|calculated|derived|validation|accession|period|formula|residual|resolved|carried forward|SEC validation|LLM-assisted)\b/i.test(label);
+}
+
+function humanizeConcept(concept: string) {
+  return concept
+    .replace(/^segment:/i, "")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/\bAnd\b/g, "and")
+    .replace(/\bOf\b/g, "of")
+    .replace(/\bFor\b/g, "for")
+    .replace(/\bNet\b/g, "net")
+    .replace(/\bLoss\b/g, "loss")
+    .replace(/\bExpense\b/g, "expense")
+    .replace(/\bIncome\b/g, "income")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function humanReadableList(items: string[]) {
+  if (items.length <= 1) return items[0] ?? "";
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(", ")}, and ${items[items.length - 1]}`;
 }
 
 function filingCommentaryJustification(fillRow: FillRow, resolved: ResolvedValue, period: string, ctx: ResolveContext) {
@@ -6327,8 +6403,8 @@ function validationStatusText(validation: SecWriteValidation) {
   return `${validation.status}: ${validation.notes.join(" ")}`.slice(0, 500);
 }
 
-function appendValidationNotes(notes: string | null | undefined, validation: SecWriteValidation) {
-  return [notes, validation.notes.length ? `SEC validation: ${validation.notes.join(" ")}` : ""].filter(Boolean).join(" ");
+function appendValidationNotes(notes: string | null | undefined, _validation: SecWriteValidation) {
+  return notes ?? "";
 }
 
 function summarizeList(items: string[], limit = 3) {
@@ -6356,6 +6432,8 @@ function rowAnnotationSummary(notes: string[]) {
 function rowAnnotationNote(note: string) {
   const hasFilingSupport = /\bFiling says:/i.test(note);
   const withoutFilingExcerpt = note.replace(/\s*Filing says:.*$/i, "").trim();
+  if (/\b(?:maps to|includes)\b/i.test(withoutFilingExcerpt)) return shortAnnotationSentence(withoutFilingExcerpt, 220);
+  if (isTechnicalLineItemLabel(withoutFilingExcerpt)) return "";
   const sentences = withoutFilingExcerpt.match(/[^.!?]+[.!?]/g)?.map((item) => item.trim()) ?? [];
   const summary = sentences.length ? sentences.slice(0, 2).join(" ") : withoutFilingExcerpt;
   const suffix = hasFilingSupport ? " Filing support available in Mapping Audit." : "";
@@ -6493,7 +6571,7 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
 
     cell.value = { formula, result: value };
     filledCells += 1;
-    const note = `Updated the preserved ${metricName} formula's cached result from EDGAR because the historical input cell links to another model sheet.`;
+    const note = lineItemSentence(rowLabel(sheet, rowNumber), [sourceLineItemLabel(source)], "maps");
     addComment(cell, note);
     commentsAdded += 1;
     auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", note, "formula result refreshed"));
@@ -6711,7 +6789,7 @@ function reconcileNetIncomeFormulaRowsToEdgar(
     residualCell.value = value;
     evaluator.clear();
     filledCells += 1;
-    const note = "Calculated as the residual needed for the model's net income formula to tie to EDGAR net income.";
+    const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(source)], "includes");
     addComment(residualCell, note);
     commentsAdded += 1;
     auditRows.push({
@@ -6778,7 +6856,7 @@ function reconcilePreTaxIncomeFormulaRowsToEdgar(
     residualCell.value = value;
     evaluator.clear();
     filledCells += 1;
-    const note = "Calculated as the residual needed for the model's pre-tax income formula to tie to EDGAR income before taxes.";
+    const note = lineItemSentence(rowLabel(sheet, residualRow), sourceLineItemLabels(resolved), "includes");
     addComment(residualCell, note);
     commentsAdded += 1;
     auditRows.push(statementTotalAuditRow(sheet, residualCell, rowLabel(sheet, residualRow), period, value, source, "income", note, "residual"));
@@ -6869,7 +6947,7 @@ function reconcileBalanceSheetCheck(
     residualCell.value = value;
     evaluator.clear();
     filledCells += 1;
-    const note = "Calculated as the residual needed for the Balance Sheet Check to tie to zero using EDGAR-sourced mapped balances.";
+    const note = lineItemSentence(rowLabel(sheet, residualRow), ["Balance Sheet Check"], "includes");
     addComment(residualCell, note);
     commentsAdded += 1;
     auditRows.push({
@@ -6951,8 +7029,7 @@ function reconcilePartialBalanceSheetCheck(
     residualCell.value = value;
     evaluator.clear();
     filledCells += 1;
-    const note =
-      "Calculated as a final residual only because the EDGAR mapping for this other bucket is partial; exact SEC residual buckets are not overwritten by the balance-sheet check.";
+    const note = lineItemSentence(rowLabel(sheet, residualRow), ["Balance Sheet Check"], "includes");
     addComment(residualCell, note);
     commentsAdded += 1;
     auditRows.push({
@@ -7073,7 +7150,7 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
         totalCell.value = expected;
         evaluator.clear();
         filledCells += 1;
-        const note = `Mapped directly to EDGAR ${metric.name} because the balance-sheet total cell was hardcoded.`;
+        const note = lineItemSentence(rowLabel(sheet, totalRow), [sourceLineItemLabel(source)], "maps");
         addComment(totalCell, note);
         commentsAdded += 1;
         auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
@@ -7091,7 +7168,7 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       residualCell.value = value;
       evaluator.clear();
       filledCells += 1;
-      const note = `Calculated as the residual needed for balance-sheet ${metric.name} to tie to EDGAR.`;
+      const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(source)], "includes");
       addComment(residualCell, note);
       commentsAdded += 1;
       auditRows.push(statementTotalAuditRow(sheet, residualCell, rowLabel(sheet, residualRow), period, value, source, "balance", note, "residual"));
@@ -7129,7 +7206,9 @@ function statementTotalAuditRow(
     signConvention,
     confidence: signConvention === "residual" ? "medium" : "high",
     validationStatus: "OK!",
-    notes: note
+    notes: /\b(?:maps to|includes)\b/i.test(note)
+      ? note
+      : lineItemSentence(label, [sourceLineItemLabel(source)], signConvention === "copied" ? "maps" : "includes")
   };
 }
 
@@ -7615,30 +7694,12 @@ function compactSources(items: Array<FactSource | ResolvedValue | null | undefin
 function mappingComment(
   fillRow: FillRow,
   resolved: ResolvedValue,
-  period: string,
-  valueWritten: number,
-  confidence: "high" | "medium" | "low",
-  notes?: string | null
+  _period: string,
+  _valueWritten: number,
+  _confidence: "high" | "medium" | "low",
+  _notes?: string | null
 ) {
-  const lineItemNote = groupedLineItemNote(fillRow, resolved);
-  if (lineItemNote) return lineItemNote;
-
-  const source = resolved.sources[0];
-  const conceptLabels = resolved.sources.length ? unique(resolved.sources.map(sourceDisplayLabel).filter(Boolean)) : [];
-  const sourceText = [source?.form || "SEC filing", source?.filed ? `filed ${source.filed}` : ""].filter(Boolean).join(", ");
-  const endText = source?.end && source.end !== period ? ` (ended ${source.end})` : "";
-  const valueUnit = mappingValueUnit(fillRow, resolved);
-  const noteText = mappingNoteText(notes, lineItemNote, resolved.note);
-  return [
-    `EDGAR: ${sourceText || "SEC filing"}`,
-    `Period: ${period}${endText}`,
-    `Value: ${roundModelValue(valueWritten)}${valueUnit}`,
-    lineItemNote || (conceptLabels.length ? `From: ${summarizeList(conceptLabels, 2)}` : ""),
-    `Confidence: ${confidence}`,
-    noteText && noteText !== lineItemNote ? `Note: ${noteText}` : ""
-  ]
-    .filter(Boolean)
-    .join("\n");
+  return lineItemMappingSentence(fillRow.label, resolved);
 }
 
 function mappingNoteText(notes: string | null | undefined, lineItemNote: string, fallbackNote?: string) {
@@ -7659,22 +7720,15 @@ function mappingValueUnit(fillRow: FillRow, resolved: ResolvedValue) {
 }
 
 function mappingCommentForSegment(
-  sheet: ExcelJS.Worksheet,
-  cell: ExcelJS.Cell,
+  _sheet: ExcelJS.Worksheet,
+  _cell: ExcelJS.Cell,
   modelLabel: string,
   segment: SegmentRevenue,
-  period: string,
-  valueWritten: number,
+  _period: string,
+  _valueWritten: number,
   suffix: string
 ) {
-  return [
-    "EDGAR: inline XBRL segment table",
-    `Period: ${period}`,
-    `Value: ${roundModelValue(valueWritten)} mm`,
-    `From: ${segment.label} ${suffix}`,
-    "Confidence: high",
-    "Note: Segment row matched to an EDGAR reportable segment."
-  ].join("\n");
+  return lineItemSentence(modelLabel, [`${segment.label} ${suffix}`], "maps");
 }
 
 function mappingAuditRow(
@@ -7711,7 +7765,7 @@ function mappingAuditRow(
     signConvention: fillRow.sign === -1 ? "inverted to match model sign convention" : "copied",
     confidence,
     validationStatus: "not_run",
-    notes: notes || resolved.note || fillRow.comment || ""
+    notes: notes || lineItemMappingSentence(fillRow.label, resolved)
   };
 }
 
@@ -7778,7 +7832,7 @@ function blockedMappingAuditRow(
     signConvention: fillRow.sign === -1 ? "would invert to match model sign convention" : "would copy",
     confidence: validation.confidence,
     validationStatus: validationStatusText(validation),
-    notes: `Value was flagged for review instead of written. ${validation.notes.join(" ")}`
+    notes: lineItemMappingSentence(fillRow.label, resolved)
   };
 }
 
@@ -7815,7 +7869,7 @@ function mappingAuditRowForSegment(
     signConvention: "copied",
     confidence: "high",
     validationStatus: "not_run",
-    notes: resolved.note || ""
+    notes: lineItemSentence(modelLabel, [`${resolved.sources[0]?.label ?? modelLabel} ${suffix}`], "maps")
   };
 }
 
@@ -10355,8 +10409,9 @@ function addMappingAuditSheet(workbook: ExcelJS.Workbook, auditRows: MappingAudi
 }
 
 function addComment(cell: ExcelJS.Cell, text: string) {
-  const existing = commentText(cell.note);
-  const body = `${existing ? `${existing}\n\n` : ""}EDGAR Mapper:\n${text}`;
+  const existing = nonEdgarMapperCommentText(commentText(cell.note));
+  const userText = userFacingCommentText(cell, text);
+  const body = `${existing ? `${existing}\n\n` : ""}EDGAR Mapper:\n${userText}`;
   cell.note = {
     texts: [
       {
@@ -10371,10 +10426,28 @@ function addComment(cell: ExcelJS.Cell, text: string) {
   };
 }
 
+function userFacingCommentText(cell: ExcelJS.Cell, text: string) {
+  const compact = shortAnnotationSentence(text.replace(/\s+/g, " ").trim(), 260);
+  if (compact && /\b(?:maps to|includes|needs review)\b/i.test(compact) && !hasLegacyCommentDetail(compact)) return compact;
+  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
+  const label = rowNumber ? rowLabel(cell.worksheet, rowNumber) : "";
+  return lineItemSentence(label || "Model row", [], "includes");
+}
+
+function hasLegacyCommentDetail(text: string) {
+  return /\b(?:EDGAR:|Period:|Value:|Confidence:|parser|timestamp|accession|fragment|Filing says:|LLM-assisted|SEC validation|formula|residual|calculated|mapped to directly)\b/i.test(text);
+}
+
 function commentText(note: ExcelJS.Cell["note"]) {
   if (!note) return "";
   if (typeof note === "string") return note;
   return note.texts?.map((text) => text.text).join("") ?? "";
+}
+
+function nonEdgarMapperCommentText(text: string) {
+  return text
+    .replace(/(?:^|\n{2,})EDGAR Mapper:\n[\s\S]*$/i, "")
+    .trim();
 }
 
 function roundModelValue(value: number) {
