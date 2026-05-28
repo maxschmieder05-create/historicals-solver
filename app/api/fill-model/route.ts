@@ -4020,6 +4020,7 @@ function parseInlineSegmentRevenue(html: string, form: string) {
 
     const metric = segmentMetric(concept);
     if (!metric) continue;
+    if (context.members.some(isNonSegmentMetricMember)) continue;
 
     const label = segmentLabelFromMembers(context.members);
     if (!label) continue;
@@ -4239,6 +4240,10 @@ function isReportableSegmentMember(member: string) {
 
 function isNonRevenueComponentMember(member: string) {
   return /RelatedParty|Reclassification|AccumulatedOtherComprehensiveIncome|Aoci|Geographic|Region|Country|MinimumMember|MaximumMember/i.test(member);
+}
+
+function isNonSegmentMetricMember(member: string) {
+  return /RelatedParty|Reclassification|AccumulatedOtherComprehensiveIncome|Aoci|MinimumMember|MaximumMember/i.test(member);
 }
 
 function cleanSegmentMember(member: string) {
@@ -5247,9 +5252,18 @@ function fillSegmentAnalysis(
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
   commentsAdded += revenueResult.commentsAdded + operatingIncomeResult.commentsAdded + depreciationResult.commentsAdded;
   const revenueReconciliation = reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, rows, "Revenue", revenueConcepts, ctx, auditRows, resolveTotalRevenue);
-  const operatingIncomeReconciliation = hasOperatingIncomeSegments
-    ? reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, operatingIncomeRows, "Operating Income", C.operatingIncome, ctx, auditRows)
-    : { filledCells: 0, commentsAdded: 0, warnings: [] };
+  const operatingIncomeReconciliation = reconcileSegmentMetricRowsToStatementTotal(
+    sheet,
+    periods,
+    columns,
+    operatingIncomeRows,
+    "Operating Income",
+    C.operatingIncome,
+    ctx,
+    auditRows,
+    undefined,
+    { allowFourthQuarterResidual: true }
+  );
   filledCells += revenueReconciliation.filledCells + operatingIncomeReconciliation.filledCells;
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings);
@@ -5257,9 +5271,7 @@ function fillSegmentAnalysis(
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total D&A", "D&A Check", auditRows);
   filledCells += fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue, resolveTotalRevenue);
-  if (hasOperatingIncomeSegments) {
-    filledCells += fillSegmentTotalRow(sheet, periods, columns, operatingIncomeSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
-  }
+  filledCells += fillSegmentTotalRow(sheet, periods, columns, operatingIncomeSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
   if (hasDepreciationSegments) {
     filledCells += fillSegmentTotalRow(sheet, periods, columns, depreciationSegments, "depreciationAmortization", "Total D&A", auditRows);
   }
@@ -5517,7 +5529,34 @@ function restoreSegmentTotalFormula(
 
     const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     const currentTotal = evaluator.evaluateCell(cell);
-    if (currentTotal !== null && segmentModelRevenueTies(currentTotal, segmentTotal)) return;
+    if (currentTotal !== null && segmentModelRevenueTies(currentTotal, segmentTotal)) {
+      const cachedTotal = numericCellValue(cell);
+      const existingFormula = formulaForCell(cell);
+      if (!existingFormula || (cachedTotal !== null && segmentModelRevenueTies(cachedTotal, segmentTotal))) return;
+      cell.value = { formula: existingFormula, result: segmentTotal };
+      evaluator.clear();
+      filledCells += 1;
+      auditRows.push({
+        sheetName: sheet.name,
+        cell: cell.address,
+        modelRowLabel: totalLabel,
+        period,
+        valueWritten: segmentTotal,
+        mappingType: "calculated",
+        conceptsUsed: `Sum of Segment Analysis ${totalLabel.toLowerCase()} rows`,
+        sourceStatement: "segment",
+        accession: "",
+        sourceUrl: "",
+        cellWritable: true,
+        formulaPreserved: false,
+        writeBlockedReason: "",
+        signConvention: "calculated",
+        confidence: "high",
+        validationStatus: "OK!",
+        notes: `Refreshed ${totalLabel} formula result so the generated workbook displays the filled segment total.`
+      });
+      return;
+    }
 
     const formula = `SUM(${columnLetter(col)}${firstRow}:${columnLetter(col)}${lastRow})`;
     cell.value = { formula, result: segmentTotal };
@@ -5556,7 +5595,8 @@ function reconcileSegmentMetricRowsToStatementTotal(
   concepts: string[],
   ctx: ResolveContext,
   auditRows: MappingAuditRow[],
-  resolver?: (period: string, ctx: ResolveContext) => ResolvedValue
+  resolver?: (period: string, ctx: ResolveContext) => ResolvedValue,
+  options: { allowFourthQuarterResidual?: boolean } = {}
 ) {
   let filledCells = 0;
   let commentsAdded = 0;
@@ -5576,7 +5616,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
     const actual = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     if (segmentStatementMetricTies(actual, expected)) return;
 
-    if (isFourthQuarterPeriod(period) && Math.abs(actual) <= 0.0001 && Math.abs(expected) > 0.0001) {
+    if (!options.allowFourthQuarterResidual && isFourthQuarterPeriod(period) && Math.abs(actual) <= 0.0001 && Math.abs(expected) > 0.0001) {
       warnings.push(
         `Segment Analysis ${period}: ${suffix} detail did not tie to EDGAR because no reliable 4Q breakout was available; leaving the residual unallocated for review.`
       );
