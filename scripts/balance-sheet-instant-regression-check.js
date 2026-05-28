@@ -55,14 +55,18 @@ const directBalanceSheetChecks = [
 ];
 
 const costcoNetOtherIncomeBridgeChecks = [
-  { period: "1Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
-  { period: "2Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
-  { period: "3Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
-  { period: "4Q25", row: 39, label: "interest expense separated from net other income", expected: 0 },
-  { period: "2025", row: 39, label: "interest expense separated from net other income", expected: 0 },
-  { period: "3Q25", row: 41, label: "other non-operating income bridge", expected: 50 },
-  { period: "4Q25", row: 41, label: "other non-operating income bridge", expected: 169 },
-  { period: "2025", row: 41, label: "other non-operating income bridge", expected: 435 },
+  { period: "1Q23", row: 38, label: "combined interest income left out of dedicated interest income", expected: 0 },
+  { period: "1Q23", row: 39, label: "standalone interest expense", expected: -34 },
+  { period: "1Q23", row: 41, label: "interest income and other, net", expected: 53 },
+  { period: "1Q23", row: 42, label: "pre-tax income", expected: 1770 },
+  { period: "1Q25", row: 39, label: "standalone interest expense", expected: -37 },
+  { period: "2Q25", row: 39, label: "standalone interest expense", expected: -36 },
+  { period: "3Q25", row: 39, label: "standalone interest expense", expected: -35 },
+  { period: "4Q25", row: 39, label: "standalone interest expense", expected: -46 },
+  { period: "2025", row: 39, label: "standalone interest expense", expected: -154 },
+  { period: "3Q25", row: 41, label: "interest income and other, net", expected: 85 },
+  { period: "4Q25", row: 41, label: "interest income and other, net", expected: 215 },
+  { period: "2025", row: 41, label: "interest income and other, net", expected: 589 },
   { period: "3Q25", row: 42, label: "pre-tax income", expected: 2580 },
   { period: "4Q25", row: 42, label: "pre-tax income", expected: 3510 },
   { period: "2025", row: 42, label: "pre-tax income", expected: 10818 },
@@ -128,6 +132,7 @@ async function main() {
 
   if (ticker.toUpperCase() === "COST") {
     errors.push(...validateCostcoNetOtherIncomeBridge(model));
+    errors.push(...validateCostcoPreTaxBridgeConsistency(model));
   }
 
   if (errors.length) {
@@ -224,6 +229,31 @@ function validateCostcoNetOtherIncomeBridge(sheet) {
     const actual = cellValue(sheet.getCell(check.row, col));
     if (!valuesMatch(actual, check.expected)) {
       errors.push(`COST ${check.period} ${check.label} Model!${columnLetter(col)}${check.row}: expected ${check.expected}, got ${actual ?? "[blank]"}.`);
+    }
+  }
+  return errors;
+}
+
+function validateCostcoPreTaxBridgeConsistency(sheet) {
+  const errors = [];
+  for (const { period, col } of modelQuarterPeriods(sheet)) {
+    const ebit = cellValue(sheet.getCell(36, col));
+    const interestIncome = cellValue(sheet.getCell(38, col));
+    const interestExpense = cellValue(sheet.getCell(39, col));
+    const goodwillImpairment = cellValue(sheet.getCell(40, col));
+    const otherNonOperating = cellValue(sheet.getCell(41, col));
+    const pretax = cellValue(sheet.getCell(42, col));
+    const bridgeValues = [ebit, interestIncome, interestExpense, goodwillImpairment, otherNonOperating, pretax];
+    if (!bridgeValues.every((value) => typeof value === "number")) {
+      errors.push(`COST ${period} pre-tax bridge: missing numeric EBIT, interest, goodwill, other non-operating, or pre-tax value.`);
+      continue;
+    }
+    if (interestExpense > 0) {
+      errors.push(`COST ${period} standalone interest expense should be stored as a model reduction, got ${interestExpense}.`);
+    }
+    const expectedPreTax = ebit + interestIncome + interestExpense + goodwillImpairment + otherNonOperating;
+    if (!valuesMatch(expectedPreTax, pretax)) {
+      errors.push(`COST ${period} pre-tax bridge: expected ${expectedPreTax}, got ${pretax}.`);
     }
   }
   return errors;

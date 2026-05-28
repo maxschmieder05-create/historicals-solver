@@ -393,6 +393,7 @@ const GENERIC_IMPAIRMENT_CONCEPTS = [
 ];
 
 const OTHER_NON_OPERATING_CONCEPTS = [
+  "InterestAndOtherIncome",
   "OtherNonoperatingIncomeExpense",
   "OtherIncome",
   "OtherExpense",
@@ -1229,6 +1230,14 @@ function interestExpenseScore(source: FactSource) {
   return score;
 }
 
+function isCombinedInterestAndOtherIncomeSource(source: FactSource) {
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/interestexpense|interestcost|interestpaid|cashflow|cashflowstatement/.test(compact)) return false;
+  if (/interestandother(?:income|expense|net)?|interestincomeandother|otherincomeandinterest|otherinterestincome/.test(compact)) return true;
+  return /\binterest\b/.test(text) && /\bother\b/.test(text) && /\b(?:income|expense|gain|loss|net)\b/.test(text);
+}
+
 function goodwillImpairmentScore(source: FactSource) {
   const text = sourceSearchText(source);
   let score = conceptScore(source, GOODWILL_IMPAIRMENT_CONCEPTS);
@@ -1253,6 +1262,7 @@ function otherNonOperatingScore(source: FactSource) {
   if (/incometax|taxexpense|taxbenefit|revenue|netsales|costofrevenue|costofsales|grossprofit|operatingincome|operatingexpense/.test(compact)) {
     if (!/nonoperating/.test(compact)) return 0;
   }
+  if (isCombinedInterestAndOtherIncomeSource(source)) return conceptScore(source, OTHER_NON_OPERATING_CONCEPTS) + 10;
   if (/interestincome|interestexpense|goodwillimpairment/.test(compact) || interestIncomeScore(source) >= 4) return 0;
 
   let score = conceptScore(source, OTHER_NON_OPERATING_CONCEPTS);
@@ -1337,7 +1347,7 @@ function resolveInterestIncome(period: string, ctx: ResolveContext): ResolvedVal
 
 function interestIncomeAlreadyIncludedInOtherIncomeBridge(period: string, ctx: ResolveContext, source: FactSource) {
   const compact = sourceCompactText(source);
-  if (/interestandotherincome|interestotherincome|interestandother/.test(compact)) return true;
+  if (isCombinedInterestAndOtherIncomeSource(source) || /interestandotherincome|interestotherincome|interestandother/.test(compact)) return true;
   if (!netOtherIncomeBridgeTiesPreTax(period, ctx)) return false;
   if (/other|investment|dividend|net/.test(compact)) return true;
   return !["InterestIncomeNonOperating", "InterestIncomeOperating"].includes(source.concept);
@@ -1358,15 +1368,6 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   if (!facts) return fallback ?? { value: null, sources: [] };
   const source = firstSemanticDurationSource(period, ctx, C.interestExpense, interestExpenseScore);
   if (source && source.value !== 0) {
-    if (source.concept === "InterestExpense" && genericInterestExpenseAlreadyIncludedInOtherIncomeBridge(period, ctx)) {
-      return {
-        value: 0,
-        sources: [zeroSource("InterestExpenseSeparatedFromNetOtherIncome"), source],
-        note:
-          "Set to zero because EDGAR's other income line already bridges operating income to income before taxes; separately subtracting generic interest expense would double-count the below-operating bridge.",
-        classification: "grouped"
-      };
-    }
     return {
       value: expenseAsModelReduction(source.value),
       sources: [source],
@@ -1377,14 +1378,6 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   const zero = first(period, ctx.duration, C.interestExpense);
   if (fallback && (!zero || zero.value === 0)) return fallback;
   return zero ? { value: 0, sources: [zero] } : { value: null, sources: [] };
-}
-
-function genericInterestExpenseAlreadyIncludedInOtherIncomeBridge(period: string, ctx: ResolveContext) {
-  if (netOtherIncomeBridgeTiesPreTax(period, ctx)) return true;
-
-  const fiscalYear = periodYearSuffix(period);
-  if (!fiscalYear || isAnnualPeriod(period)) return false;
-  return netOtherIncomeBridgeTiesPreTax(`FY${fiscalYear}`, ctx);
 }
 
 function netOtherIncomeBridgeTiesPreTax(period: string, ctx: ResolveContext) {
