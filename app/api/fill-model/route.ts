@@ -6107,13 +6107,42 @@ function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue, pe
   if (!grouped && !hasAnalystNote && !isDerived && !commentary) return null;
 
   const parts: string[] = [];
-  if (grouped && sourceLabels.length) parts.push(`Grouped from ${summarizeList(sourceLabels, 3)}.`);
+  const includedLineItems = groupedLineItemNote(fillRow, resolved);
+  if (includedLineItems) parts.push(includedLineItems);
+  else if (grouped && sourceLabels.length) parts.push(`Grouped from ${summarizeList(sourceLabels, 3)}.`);
   if (resolved.note || fillRow.comment) parts.push(shortAnnotationSentence(resolved.note || fillRow.comment || ""));
   if (isDerived && derived?.derivedPriorPeriods?.length) {
     parts.push(`Derived from ${derived.derivedTotalLabel || derived.label} less ${summarizeList(derived.derivedPriorPeriods, 4)}.`);
   }
   if (commentary) parts.push(commentary);
   return parts.filter(Boolean).join(" ");
+}
+
+function groupedLineItemNote(fillRow: FillRow, resolved: ResolvedValue) {
+  const classification =
+    resolved.classification === "grouped" || fillRow.classification === "grouped"
+      ? "grouped"
+      : resolved.classification ?? fillRow.classification;
+  const derived = derivedSource(resolved);
+  if (classification !== "grouped" && classification !== "partial" && resolved.sources.length < 2 && !derived) return "";
+
+  const labels = groupedLineItemLabels(resolved);
+  if (!labels.length) return "";
+  const target = shortAnnotationSentence(fillRow.label, 60);
+  const lineItems = summarizeList(labels, 4);
+  if (derived || resolved.classification === "partial") return `Line items used for ${target}: ${lineItems}.`;
+  return `${lineItems} ${labels.length === 1 ? "is" : "are"} included in ${target}.`;
+}
+
+function groupedLineItemLabels(resolved: ResolvedValue) {
+  return unique(
+    resolved.sources
+      .filter((source) => source.value !== 0)
+      .filter((source) => source.sourceLayer !== "model")
+      .filter((source) => source.sourceLayer !== "derived")
+      .map(sourceDisplayLabel)
+      .filter(Boolean)
+  );
 }
 
 function filingCommentaryJustification(fillRow: FillRow, resolved: ResolvedValue, period: string, ctx: ResolveContext) {
@@ -7559,20 +7588,30 @@ function mappingComment(
 ) {
   const source = resolved.sources[0];
   const conceptLabels = resolved.sources.length ? unique(resolved.sources.map(sourceDisplayLabel).filter(Boolean)) : [];
+  const lineItemNote = groupedLineItemNote(fillRow, resolved);
   const sourceText = [source?.form || "SEC filing", source?.filed ? `filed ${source.filed}` : ""].filter(Boolean).join(", ");
   const endText = source?.end && source.end !== period ? ` (ended ${source.end})` : "";
   const valueUnit = mappingValueUnit(fillRow, resolved);
-  const noteText = notes ? shortAnnotationSentence(notes, 240) : resolved.note ? shortAnnotationSentence(resolved.note, 240) : "";
+  const noteText = mappingNoteText(notes, lineItemNote, resolved.note);
   return [
     `EDGAR: ${sourceText || "SEC filing"}`,
     `Period: ${period}${endText}`,
     `Value: ${roundModelValue(valueWritten)}${valueUnit}`,
-    conceptLabels.length ? `From: ${summarizeList(conceptLabels, 2)}` : "",
+    lineItemNote || (conceptLabels.length ? `From: ${summarizeList(conceptLabels, 2)}` : ""),
     `Confidence: ${confidence}`,
-    noteText ? `Note: ${noteText}` : ""
+    noteText && noteText !== lineItemNote ? `Note: ${noteText}` : ""
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+function mappingNoteText(notes: string | null | undefined, lineItemNote: string, fallbackNote?: string) {
+  const raw = notes || fallbackNote || "";
+  if (!raw) return "";
+  const withoutLineItems = lineItemNote && raw.startsWith(lineItemNote)
+    ? raw.slice(lineItemNote.length).replace(/^\s+/, "")
+    : raw;
+  return shortAnnotationSentence(withoutLineItems, 240);
 }
 
 function mappingValueUnit(fillRow: FillRow, resolved: ResolvedValue) {
