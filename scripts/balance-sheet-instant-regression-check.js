@@ -169,6 +169,11 @@ async function validateWorkbookRecalculationMetadata(file) {
         formulaCount += 1;
         if (/<f\b[^>]*\bca="1"/.test(cellXml)) recalculationMarkedCount += 1;
         else errors.push(`${path}!${address}: formula is not marked for recalculation.`);
+        const formula = unescapeXml(cellXml.match(/<f\b[^>]*>([\s\S]*?)<\/f>/)?.[1] ?? "");
+        const cachedValue = formulaStringValue(cellXml, sharedStrings);
+        if (!/#REF!?/i.test(formula) && cachedValue && /^#REF!?$/i.test(cachedValue)) {
+          errors.push(`${path}!${address}: formula has stale cached #REF result.`);
+        }
         continue;
       }
       const textValue = formulaStringValue(cellXml, sharedStrings);

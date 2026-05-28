@@ -8494,6 +8494,7 @@ function clearStaleFormulaErrorResults(workbook: ExcelJS.Workbook) {
 }
 
 function isFormulaErrorResult(value: unknown) {
+  if (value && typeof value === "object" && "error" in value) return isFormulaErrorResult(value.error);
   return typeof value === "string" && /^#(?:REF|VALUE|DIV\/0|NAME\?|N\/A|NUM|NULL)!?$/i.test(value);
 }
 
@@ -10415,9 +10416,12 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
         if (!hasFormula(cell)) return;
         const formulaBefore = formulaForCell(cell);
         if (!formulaBefore) return;
-        if (hasFormulaResult(cell) && !formulaCanReturnText(formulaBefore)) return;
+        if (hasFormulaResult(cell) && !formulaCanReturnText(formulaBefore) && !hasFormulaErrorResult(cell)) return;
         const result = evaluator.evaluateDisplayCell(cell);
-        if (result === null) return;
+        if (result === null) {
+          if (hasFormulaErrorResult(cell)) clearFormulaResult(cell);
+          return;
+        }
         setFormulaResult(cell, result);
         const formulaAfter = formulaForCell(cell);
         if (formulaAfter !== formulaBefore) {
@@ -10430,6 +10434,20 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
 
 function formulaCanReturnText(formula: string) {
   return /"(?:""|[^"])*"/.test(formula);
+}
+
+function hasFormulaErrorResult(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  return Boolean(value && typeof value === "object" && "result" in value && isFormulaErrorResult(value.result));
+}
+
+function clearFormulaResult(cell: ExcelJS.Cell) {
+  const value = cell.value;
+  if (!value || typeof value !== "object") return;
+  if (!("formula" in value) && !("sharedFormula" in value)) return;
+  const nextValue = { ...value } as Record<string, unknown>;
+  delete nextValue.result;
+  cell.value = nextValue as unknown as ExcelJS.CellValue;
 }
 
 function validateWorkbookFormulaCellsReadyForDisplay(workbook: ExcelJS.Workbook) {
