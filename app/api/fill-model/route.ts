@@ -4702,11 +4702,11 @@ function sumNumericCells(sheet: ExcelJS.Worksheet, rowNumber: number, columns: n
   return values.reduce((total, value) => total + value, 0);
 }
 
-function setFormulaResult(cell: ExcelJS.Cell, result: number) {
+function setFormulaResult(cell: ExcelJS.Cell, result: FormulaDisplayResult) {
   const value = cell.value;
   if (!value || typeof value !== "object") return;
   if (!("formula" in value) && !("sharedFormula" in value)) return;
-  cell.value = { ...value, result: persistedFormulaResult(result) };
+  cell.value = { ...value, result: typeof result === "number" ? persistedFormulaResult(result) : result };
 }
 
 function persistedFormulaResult(result: number) {
@@ -7383,8 +7383,11 @@ function validateWorkbookBeforeReturn(
   return errors;
 }
 
+type FormulaDisplayResult = number | string;
+
 class FormulaEvaluator {
   private readonly cache = new Map<string, number | null>();
+  private readonly displayCache = new Map<string, FormulaDisplayResult | null>();
 
   constructor(
     private readonly sheet: ExcelJS.Worksheet,
@@ -7393,6 +7396,7 @@ class FormulaEvaluator {
 
   clear() {
     this.cache.clear();
+    this.displayCache.clear();
   }
 
   evaluateCell(cell: ExcelJS.Cell, visited = new Set<string>()): number | null {
@@ -7423,10 +7427,36 @@ class FormulaEvaluator {
     return result;
   }
 
+  evaluateDisplayCell(cell: ExcelJS.Cell, visited = new Set<string>()): FormulaDisplayResult | null {
+    const address = `${cell.worksheet.name}!${cell.address}`;
+    if (this.displayCache.has(address)) return this.displayCache.get(address) ?? null;
+
+    if (visited.has(address)) return null;
+    visited.add(address);
+
+    const value = cell.value;
+    let result: FormulaDisplayResult | null = null;
+    if (typeof value === "number" || typeof value === "string") {
+      result = value;
+    } else if (value && typeof value === "object" && ("formula" in value || "sharedFormula" in value)) {
+      const formula = formulaForCell(cell);
+      result = formula ? this.evaluateDisplayFormula(formula, cell, visited) : null;
+      if (result === null && "result" in value && (typeof value.result === "number" || typeof value.result === "string")) result = value.result;
+    } else if (value && typeof value === "object" && "result" in value && (typeof value.result === "number" || typeof value.result === "string")) {
+      result = value.result;
+    }
+
+    visited.delete(address);
+    this.displayCache.set(address, result);
+    return result;
+  }
+
   private evaluateFormula(formula: string, cell: ExcelJS.Cell, visited: Set<string>): number | null {
     const expression = formula.replace(/^=/, "");
     const ifValue = this.evaluateIfExpression(expression, cell, visited);
     if (ifValue !== undefined) return ifValue;
+    const functionValue = this.evaluateNumericFunctionExpression(expression, cell, visited);
+    if (functionValue !== undefined) return functionValue;
 
     const withoutSums = this.replaceSumCalls(expression, cell, visited);
     if (withoutSums === null) return null;
@@ -7445,6 +7475,48 @@ class FormulaEvaluator {
     } catch {
       return null;
     }
+  }
+
+  private evaluateNumericFunctionExpression(expression: string, cell: ExcelJS.Cell, visited: Set<string>) {
+    const normalized = expression.trim();
+    const functionName = normalized.match(/^([A-Z]+)\s*\(/i)?.[1]?.toUpperCase();
+    if (!functionName || !["ABS", "ROUND", "MAX", "MIN", "AVERAGE"].includes(functionName)) return undefined;
+    const body = functionBody(normalized, functionName);
+    if (body === null) return undefined;
+    const values = splitFormulaArgs(body).map((arg) => this.evaluateFormula(arg, cell, visited));
+    if (values.some((value) => value === null)) return null;
+    const numbers = values as number[];
+    if (functionName === "ABS") return numbers.length === 1 ? Math.abs(numbers[0]) : null;
+    if (functionName === "ROUND") {
+      if (numbers.length !== 2) return null;
+      const factor = 10 ** numbers[1];
+      return Math.round(numbers[0] * factor) / factor;
+    }
+    if (functionName === "MAX") return numbers.length ? Math.max(...numbers) : null;
+    if (functionName === "MIN") return numbers.length ? Math.min(...numbers) : null;
+    if (functionName === "AVERAGE") return numbers.length ? numbers.reduce((total, value) => total + value, 0) / numbers.length : null;
+    return null;
+  }
+
+  private evaluateDisplayFormula(formula: string, cell: ExcelJS.Cell, visited: Set<string>): FormulaDisplayResult | null {
+    const expression = formula.replace(/^=/, "").trim();
+    const stringLiteral = excelStringLiteral(expression);
+    if (stringLiteral !== null) return stringLiteral;
+
+    const ifValue = this.evaluateIfDisplayExpression(expression, cell, visited);
+    if (ifValue !== undefined) return ifValue;
+
+    return this.evaluateFormula(expression, cell, visited);
+  }
+
+  private evaluateIfDisplayExpression(expression: string, cell: ExcelJS.Cell, visited: Set<string>) {
+    const body = functionBody(expression, "IF");
+    if (body === null) return undefined;
+    const [condition, whenTrue, whenFalse] = splitFormulaArgs(body);
+    if (!condition || !whenTrue) return null;
+    const conditionResult = this.evaluateCondition(condition, cell, visited);
+    if (conditionResult === null) return null;
+    return this.evaluateDisplayFormula(conditionResult ? whenTrue : whenFalse ?? "0", cell, visited);
   }
 
   private replaceSumCalls(expression: string, cell: ExcelJS.Cell, visited: Set<string>) {
@@ -7562,6 +7634,11 @@ function splitFormulaArgs(body: string) {
   }
   args.push(current);
   return args;
+}
+
+function excelStringLiteral(expression: string) {
+  if (!/^"(?:""|[^"])*"$/.test(expression)) return null;
+  return expression.slice(1, -1).replace(/""/g, '"');
 }
 
 function refreshHistoricalFormulaCachedResults(workbook: ExcelJS.Workbook, columns: number[], sheetNames = [MODEL_SHEET, SEGMENT_SHEET]) {
@@ -9878,9 +9955,10 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
     sheet.eachRow({ includeEmpty: false }, (row) => {
       row.eachCell({ includeEmpty: false }, (cell) => {
         if (!hasFormula(cell)) return;
-        if (hasFormulaResult(cell)) return;
         const formulaBefore = formulaForCell(cell);
-        const result = evaluator.evaluateCell(cell);
+        if (!formulaBefore) return;
+        if (hasFormulaResult(cell) && !formulaCanReturnText(formulaBefore)) return;
+        const result = evaluator.evaluateDisplayCell(cell);
         if (result === null) return;
         setFormulaResult(cell, result);
         const formulaAfter = formulaForCell(cell);
@@ -9890,6 +9968,10 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
       });
     });
   }
+}
+
+function formulaCanReturnText(formula: string) {
+  return /"(?:""|[^"])*"/.test(formula);
 }
 
 function validateWorkbookFormulaCellsReadyForDisplay(workbook: ExcelJS.Workbook) {
