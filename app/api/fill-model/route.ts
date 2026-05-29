@@ -423,6 +423,7 @@ const GENERIC_IMPAIRMENT_CONCEPTS = [
 
 const OTHER_NON_OPERATING_CONCEPTS = [
   "InterestAndOtherIncome",
+  "NonoperatingIncomeExpense",
   "OtherNonoperatingIncomeExpense",
   "OtherIncome",
   "OtherExpense",
@@ -457,7 +458,16 @@ const C = {
     "CostOfGoodsSold",
     "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
     "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
-    "DirectCostsOfLeasedAndRentedPropertyOrEquipment"
+    "DirectCostsOfLeasedAndRentedPropertyOrEquipment",
+    "CostOfOperations",
+    "CostOfServices",
+    "CostOfServicesRevenue",
+    "CostOfProductsSold",
+    "MerchandiseCosts",
+    "FulfillmentExpense",
+    "FulfillmentCosts",
+    "FulfillmentCost",
+    "FulfillmentAndShippingExpense"
   ],
   healthCareCosts: [
     "PolicyholderBenefitsAndClaimsIncurredHealthCare",
@@ -1206,7 +1216,13 @@ const PRIMARY_COST_OF_REVENUE_CONCEPTS = [
   "CostOfGoodsAndServicesSold",
   "CostOfGoodsSold",
   "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
-  "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"
+  "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization",
+  "CostOfOperations",
+  "CostOfServices",
+  "CostOfServicesRevenue",
+  "CostOfProductsSold",
+  "MerchandiseCosts",
+  ...FULFILLMENT_EXPENSE_CONCEPTS
 ];
 
 function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1223,7 +1239,7 @@ function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValu
   const component = sumWithNote(
     period,
     ctx.duration,
-    ["CostOfProductsSold", "CostOfServicesRevenue"],
+    ["CostOfProductsSold", "CostOfServicesRevenue", "CostOfServices", "MerchandiseCosts", ...FULFILLMENT_EXPENSE_CONCEPTS],
     "Grouped from consolidated product and service cost-of-revenue lines because no broader consolidated cost of revenue line was reported."
   );
   if (component.value !== null) return { ...(signed(component, -1) ?? component), classification: "grouped" };
@@ -1480,11 +1496,11 @@ function resolveInterestIncome(period: string, ctx: ResolveContext): ResolvedVal
   }
   if (interestIncomeAlreadyIncludedInOtherIncomeBridge(period, ctx, direct)) {
     return {
-      value: 0,
-      sources: [zeroSource("InterestIncomeNettedInOtherIncome"), direct],
+      value: null,
+      sources: [direct],
       note:
-        "Set to zero because the EDGAR other income line already bridges operating income to income before taxes and the interest/investment income source is a broad or netted disclosure.",
-      classification: "grouped"
+        "Not mapped as standalone interest income because the EDGAR line combines interest with other income/expense; combined lines belong in other non-operating unless separately disclosed.",
+      classification: "partial"
     };
   }
   return {
@@ -1498,9 +1514,7 @@ function resolveInterestIncome(period: string, ctx: ResolveContext): ResolvedVal
 function interestIncomeAlreadyIncludedInOtherIncomeBridge(period: string, ctx: ResolveContext, source: FactSource) {
   const compact = sourceCompactText(source);
   if (isCombinedInterestAndOtherIncomeSource(source) || /interestandotherincome|interestotherincome|interestandother/.test(compact)) return true;
-  if (!netOtherIncomeBridgeTiesPreTax(period, ctx)) return false;
-  if (/other|investment|dividend|net/.test(compact)) return true;
-  return !["InterestIncomeNonOperating", "InterestIncomeOperating"].includes(source.concept);
+  return false;
 }
 
 function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1595,14 +1609,7 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
   const direct = firstSemanticDurationSource(period, ctx, C.otherNonOp, otherNonOperatingScore);
   if (direct) {
     if (otherIncomeExpenseLineShouldBeSplit(period, ctx, direct)) {
-      const residual = resolveOtherNonOperatingResidual(period, ctx);
-      if (residual.value !== null) {
-        return {
-          ...residual,
-          note:
-            "Derived from the reported below-operating bridge after separately mapping disclosed interest income and interest expense; the broad other income/expense line was not reused wholesale."
-        };
-      }
+      return resolveOtherNonOperatingFromReportedLine(period, ctx, direct);
     }
     return {
       value: otherNonOperatingValue(direct),
@@ -1612,13 +1619,10 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     };
   }
 
-  const residual = resolveOtherNonOperatingResidual(period, ctx);
-  if (residual.value !== null) return residual;
-
   return {
     value: null,
-    sources: residual.sources,
-    note: "No explicit EDGAR other non-operating line was reported, and the income statement bridge did not require a supported residual."
+    sources: [],
+    note: "No explicit EDGAR other non-operating line was reported. Pre-tax tie-outs are validation checks and do not create a residual other non-operating row."
   };
 }
 
@@ -1634,41 +1638,35 @@ function otherIncomeExpenseLineShouldBeSplit(period: string, ctx: ResolveContext
 }
 
 function isBroadOtherIncomeExpenseLine(source: FactSource) {
+  if (["InterestAndOtherIncome", "NonoperatingIncomeExpense", "OtherNonoperatingIncomeExpense", "OtherIncome", "OtherExpense", "OtherIncomeExpenseNet", "OtherNonOperatingIncomeExpense"].includes(source.concept)) return true;
   const compact = sourceCompactText(source);
   if (isCombinedInterestAndOtherIncomeSource(source)) return true;
   return /^(other)?nonoperatingincomeexpense$|^otherincome(expense)?net$|^otherincome$|^otherexpense$/.test(compact);
 }
 
-function resolveOtherNonOperatingResidual(period: string, ctx: ResolveContext): ResolvedValue {
-  const operatingIncome = first(period, ctx.duration, C.operatingIncome);
-  const pretax = resolvePreTaxIncome(period, ctx);
-  if (!operatingIncome || pretax.value === null) return { value: null, sources: compactSources([operatingIncome, pretax]) };
-
+function resolveOtherNonOperatingFromReportedLine(period: string, ctx: ResolveContext, source: FactSource): ResolvedValue {
   const interestIncome = resolveInterestIncome(period, ctx);
   const interestExpense = resolveInterestExpense(period, ctx);
   const goodwillImpairment = resolveGoodwillImpairment(period, ctx);
   const knownBelowOperating = [interestIncome, interestExpense, goodwillImpairment]
     .filter((item) => item.value !== null)
     .reduce((total, item) => total + (item.value ?? 0), 0);
-  const value = pretax.value - operatingIncome.value - knownBelowOperating;
-  if (Math.abs(value / 1_000_000) < 1) {
-    return { value: null, sources: compactSources([operatingIncome, pretax, interestIncome, interestExpense, goodwillImpairment]) };
-  }
+  const value = otherNonOperatingValue(source) - knownBelowOperating;
 
   return {
     value,
     sources: [
-      bridgeSource(period, "OtherNonOperatingIncomeExpenseResidual", "Other non-operating income/expense residual", value, [
-        pretax,
-        operatingIncome,
+      bridgeSource(period, "OtherNonOperatingIncomeExpenseFromReportedLine", "Other non-operating income/expense from reported line", value, [
+        source,
         interestIncome,
         interestExpense,
         goodwillImpairment
       ]),
-      ...compactSources([pretax, operatingIncome, interestIncome, interestExpense, goodwillImpairment])
+      source,
+      ...compactSources([interestIncome, interestExpense, goodwillImpairment])
     ],
     note:
-      "Derived as the residual below operating income and above pre-tax income after separately mapped interest income, interest expense, and goodwill impairment, because the EDGAR bridge clearly supports a non-operating plug.",
+      "Derived from an explicit reported other/combined non-operating line after removing separately classified interest income, interest expense, and goodwill impairment. This is a split of a reported line, not a reconciliation plug.",
     classification: "grouped"
   };
 }
@@ -1732,7 +1730,7 @@ function resolveOtherOperatingExpenseGroup(period: string, ctx: ResolveContext):
   const detail = sumWithNote(
     period,
     ctx.duration,
-    [...FULFILLMENT_EXPENSE_CONCEPTS, ...NON_COMPENSATION_EXPENSE_CONCEPTS, ...OTHER_OPERATING_EXPENSE_CONCEPTS],
+    [...NON_COMPENSATION_EXPENSE_CONCEPTS, ...OTHER_OPERATING_EXPENSE_CONCEPTS],
     "These were grouped because the model row is labeled Other Operating Expenses and the model does not provide separate rows for the included EDGAR expense categories."
   );
   if (detail.value !== null) return { ...(signed(detail, -1) ?? detail), classification: "grouped" };
@@ -1743,6 +1741,16 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
   const direct = first(period, ctx.duration, ["OtherOperatingIncomeExpenseNet"]);
   if (direct) {
     return { value: direct.value, sources: [direct], note: "Mapped to EDGAR other operating income/expense, net.", classification: "direct" };
+  }
+
+  if (reportedOperatingIncomeTiesWithoutOtherOperating(period, ctx)) {
+    return {
+      value: 0,
+      sources: [zeroSource("OtherOperatingIncomeExpenseNotReported")],
+      note:
+        "Set to zero because EDGAR reported operating income ties from revenue, cost of revenue, R&D, SG&A, and standalone income-statement D&A without a separate other operating line.",
+      classification: "grouped"
+    };
   }
 
   const explicitItems = resolveExplicitOtherOperatingItems(period, ctx);
@@ -1762,6 +1770,47 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
     note: "Set to zero because no standalone other operating income/expense line was reported. Operating income tie-outs do not create this row by residual.",
     classification: "grouped"
   };
+}
+
+function reportedOperatingIncomeTiesWithoutOtherOperating(period: string, ctx: ResolveContext) {
+  const operating = first(period, ctx.duration, ["OperatingIncomeLoss"]);
+  if (!operating) return false;
+
+  const revenue = selectOperatingBridgeRevenueSourceWithoutOtherOperating(period, ctx);
+  const cogs = resolveCostOfRevenue(period, ctx);
+  const sga = resolveSellingGeneralAdministrativeExpense(period, ctx);
+  const rd = resolveResearchDevelopmentExpense(period, ctx);
+  const da = resolveIncomeStatementDepreciationAmortization(period, ctx);
+  if (!revenue || [cogs, sga, rd, da].some((item) => item.value === null)) return false;
+
+  const modeledOperatingIncome = revenue.value + (cogs.value ?? 0) + (sga.value ?? 0) + (rd.value ?? 0) + (da.value ?? 0);
+  return statementMetricTies(modeledOperatingIncome / 1_000_000, operating.value / 1_000_000);
+}
+
+function selectOperatingBridgeRevenueSourceWithoutOtherOperating(period: string, ctx: ResolveContext) {
+  const facts = ctx.duration.get(period);
+  const operating = first(period, ctx.duration, ["OperatingIncomeLoss"]);
+  if (!facts || !operating) return null;
+
+  const candidates = uniqueFactSources(
+    TOTAL_REVENUE_CONCEPTS.map((concept) => facts.get(concept))
+      .filter((source): source is FactSource => Boolean(source))
+      .filter((source) => !isSegmentLikeRevenueSource(source))
+  );
+  if (candidates.length <= 1) return candidates[0] ?? null;
+
+  const cogs = resolveCostOfRevenue(period, ctx);
+  const sga = resolveSellingGeneralAdministrativeExpense(period, ctx);
+  const rd = resolveResearchDevelopmentExpense(period, ctx);
+  const da = resolveIncomeStatementDepreciationAmortization(period, ctx);
+  if ([cogs, sga, rd, da].some((item) => item.value === null)) return candidates[0] ?? null;
+
+  return candidates
+    .map((candidate) => ({
+      candidate,
+      variance: Math.abs(candidate.value + (cogs.value ?? 0) + (sga.value ?? 0) + (rd.value ?? 0) + (da.value ?? 0) - operating.value)
+    }))
+    .sort((a, b) => a.variance - b.variance)[0]?.candidate ?? candidates[0] ?? null;
 }
 
 function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1959,20 +2008,13 @@ function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedV
         ],
         note: "Derived as EDGAR net income less EDGAR pre-tax income so the model's pre-tax plus tax formula reconciles to EDGAR net income.",
         classification: "grouped" as RowClassification
-      }
+    }
     : null;
   if (direct) {
-    if (derived && !statementMetricTies(-direct.value / 1_000_000, derived.value / 1_000_000)) {
-      return {
-        ...derived,
-        sources: [derived.sources[0], direct, ...derived.sources.slice(1)],
-        note: "Derived from EDGAR pre-tax income and net income because the direct income tax fact did not reconcile the income statement for this period."
-      };
-    }
     return {
       value: -direct.value,
       sources: [direct],
-      note: "Mapped to EDGAR income tax expense/benefit, preserving whether the reported tax line is an expense or benefit while making expenses reduce net income in the model.",
+      note: "Mapped to EDGAR income tax expense/benefit. Reported tax classification is authoritative; net-income tie-outs validate the line instead of replacing it with a residual.",
       classification: C.taxes.includes(direct.concept) ? "direct" : "grouped"
     };
   }
@@ -1995,14 +2037,12 @@ function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
   ]);
   if (direct) {
-    if (derivedFromNetIncomeAndTax.value !== null && !statementMetricTies(direct.value / 1_000_000, derivedFromNetIncomeAndTax.value / 1_000_000)) {
-      return {
-        ...derivedFromNetIncomeAndTax,
-        note:
-          "Derived from EDGAR net income and income tax expense because the available pre-tax concept did not reconcile the consolidated income statement subtotal."
-      };
-    }
-    return { value: direct.value, sources: [direct], classification: "direct" };
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to EDGAR income before taxes. Reported pre-tax income is authoritative; net-income/tax tie-outs validate it instead of replacing it.",
+      classification: "direct"
+    };
   }
 
   const beforeEquity = first(period, ctx.duration, [
@@ -2025,17 +2065,10 @@ function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue
 
   const semanticDirect = semanticPreTaxIncomeSource(period, ctx);
   if (semanticDirect) {
-    if (derivedFromNetIncomeAndTax.value !== null && !statementMetricTies(semanticDirect.value / 1_000_000, derivedFromNetIncomeAndTax.value / 1_000_000)) {
-      return {
-        ...derivedFromNetIncomeAndTax,
-        note:
-          "Derived from EDGAR net income and income tax expense because the semantic pre-tax match did not reconcile the consolidated income statement subtotal."
-      };
-    }
     return {
       value: semanticDirect.value,
       sources: [semanticDirect],
-      note: "Mapped to an EDGAR income-before-tax equivalent using concept semantics and filing labels.",
+      note: "Mapped to an EDGAR income-before-tax equivalent using concept semantics and filing labels. Tie-outs validate the classification instead of replacing it.",
       classification: "grouped"
     };
   }
@@ -3366,8 +3399,7 @@ export async function POST(request: NextRequest) {
           const sourceCell = labelCell(sheet, fillRow.row);
           if (fillRow.noFillComment && canAddComment(sourceCell)) {
             if (fillRow.noFillComment.startsWith("Cannot find exact schedule value in EDGAR")) sourceCell.note = "";
-            addComment(sourceCell, fillRow.noFillComment);
-            commentsAdded += 1;
+            if (addComment(sourceCell, fillRow.noFillComment)) commentsAdded += 1;
           }
           warnings.push(`${fillRow.label}: left unchanged because no confident EDGAR match was found.`);
           continue;
@@ -3390,8 +3422,7 @@ export async function POST(request: NextRequest) {
               if (validation.status === "blocked") {
                 unresolved += 1;
                 const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
-                addComment(cell, note);
-                commentsAdded += 1;
+                if (addComment(cell, note)) commentsAdded += 1;
                 auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
                 continue;
               }
@@ -3407,8 +3438,7 @@ export async function POST(request: NextRequest) {
               cell.value = refreshedFormula ? { formula: refreshedFormula, result: value } : value;
               filledCells += 1;
               const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
-              addComment(cell, note);
-              commentsAdded += 1;
+              if (addComment(cell, note)) commentsAdded += 1;
               auditRows.push({
                 sheetName: sheet.name,
                 cell: cell.address,
@@ -3464,8 +3494,7 @@ export async function POST(request: NextRequest) {
           unresolved += 1;
           const value = resolved.value / (effectiveFillRow.scale ?? 1);
           const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
-          addComment(cell, note);
-          commentsAdded += 1;
+          if (addComment(cell, note)) commentsAdded += 1;
           auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
           rowNotes.add(note);
           continue;
@@ -3480,8 +3509,7 @@ export async function POST(request: NextRequest) {
         const confidence = lowerConfidence(mappingConfidence, validation.confidence);
         const notes = appendValidationNotes(auditNote, validation);
         const cellComment = mappingComment(effectiveFillRow, resolved, period, cell.value as number, confidence, notes);
-        addComment(cell, cellComment);
-        commentsAdded += 1;
+        if (addComment(cell, cellComment)) commentsAdded += 1;
         const auditRow = mappingAuditRow(sheet, cell, effectiveFillRow, period, cell.value as number, resolved, confidence, notes);
         auditRow.validationStatus = validationStatusText(validation);
         auditRows.push(auditRow);
@@ -3496,8 +3524,7 @@ export async function POST(request: NextRequest) {
       if (rowNotes.size) {
         const sourceCell = labelCell(sheet, fillRow.row);
         if (canAddComment(sourceCell)) {
-          addComment(sourceCell, rowAnnotationSummary(Array.from(rowNotes)));
-          commentsAdded += 1;
+          if (addComment(sourceCell, rowAnnotationSummary(Array.from(rowNotes)))) commentsAdded += 1;
         }
       }
 
@@ -4351,6 +4378,8 @@ function removeUnreconciledRevenueDisclosureGroups(
   totalRevenueByPeriod: Map<string, { value: number; priority: number }>
 ) {
   byPeriod.forEach((periodValues, period) => {
+    markRevenueDisclosureAggregateRows(periodValues);
+
     const totalRevenue = totalRevenueByPeriod.get(period)?.value;
     if (totalRevenue === undefined) return;
 
@@ -4371,6 +4400,41 @@ function removeUnreconciledRevenueDisclosureGroups(
     Array.from(periodValues.entries()).forEach(([key, metrics]) => {
       if (metrics.revenue === undefined) return;
       if (!reconciledFamilies.has(metrics.family ?? "other")) periodValues.delete(key);
+    });
+  });
+}
+
+function markRevenueDisclosureAggregateRows(periodValues: Map<string, SegmentMetrics>) {
+  const byFamily = new Map<string, SegmentMetrics[]>();
+  periodValues.forEach((metrics) => {
+    const family = metrics.family ?? "other";
+    const rows = byFamily.get(family) ?? [];
+    rows.push(metrics);
+    byFamily.set(family, rows);
+    if (metrics.label && isAggregateRevenueBreakoutLabel(metrics.label)) metrics.aggregate = true;
+  });
+
+  byFamily.forEach((rows) => {
+    rows.forEach((metrics, index) => {
+      const target = metrics.revenue;
+      if (target === undefined || target <= 0 || metrics.aggregate) return;
+
+      let runningTotal = 0;
+      let componentCount = 0;
+      for (let priorIndex = index - 1; priorIndex >= 0; priorIndex -= 1) {
+        const candidate = rows[priorIndex];
+        if (candidate.aggregate) continue;
+        const value = candidate.revenue;
+        if (value === undefined || value <= 0) continue;
+
+        runningTotal += value;
+        componentCount += 1;
+        if (componentCount >= 2 && segmentRevenueTies(runningTotal, target)) {
+          metrics.aggregate = true;
+          return;
+        }
+        if (runningTotal > Math.abs(target) * 1.01) return;
+      }
     });
   });
 }
@@ -4469,7 +4533,10 @@ function isUsefulRevenueBreakoutLabel(label: string | null | undefined): label i
 }
 
 function isAggregateRevenueBreakoutLabel(label: string) {
-  return /^(total|consolidated|company|net sales|sales|revenue|revenues|net revenue|gross revenue|intercompany revenue|intersegment revenue|total revenue|total revenues|total net sales)$/i.test(label.trim());
+  return (
+    /^(total|consolidated|company|net sales|sales|revenue|revenues|net revenue|gross revenue|intercompany revenue|intersegment revenue|total revenue|total revenues|total net sales)$/i.test(label.trim()) ||
+    /\btotal$/i.test(label.trim())
+  );
 }
 
 function revenueDisclosureFamily(kind: RevenueDisclosureKind, tableInfo: { key: string }) {
@@ -5649,16 +5716,20 @@ function fillSegmentAnalysis(
   );
   const operatingIncomeFallback = hasOperatingIncomeSegments
     ? { filledCells: 0, commentsAdded: 0, warnings: [] as string[] }
-    : fillSegmentResidualRowsFromStatement(sheet, periods, columns, operatingIncomeRows, "Operating Income", ctx, auditRows, resolveModeledOperatingProfit);
+    : {
+        filledCells: fillSegmentStatementTotalRow(sheet, periods, columns, "Total Company Operating Income", auditRows, ctx, resolveModeledOperatingProfit),
+        commentsAdded: 0,
+        warnings: ["Segment operating income detail was not disclosed for the selected revenue drivers; segment operating income rows were left blank."]
+      };
   filledCells += revenueReconciliation.filledCells + operatingIncomeReconciliation.filledCells + operatingIncomeFallback.filledCells;
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded + operatingIncomeFallback.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings, ...operatingIncomeFallback.warnings);
-  filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Revenue", "Revenue Mix", auditRows);
+  filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Revenue", "Revenue Mix", auditRows, { overwriteHardcoded: true });
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total D&A", "D&A Check", auditRows);
   filledCells += usableSegments.length
     ? fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue, resolveTotalRevenue)
-    : fillSegmentStatementTotalRow(sheet, periods, columns, "Total Company Revenue", auditRows, ctx, resolveTotalRevenue);
+    : 0;
   filledCells += fillSegmentTotalRow(sheet, periods, columns, operatingIncomeSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
   if (hasDepreciationSegments) {
     filledCells += fillSegmentTotalRow(sheet, periods, columns, depreciationSegments, "depreciationAmortization", "Total D&A", auditRows);
@@ -5699,8 +5770,7 @@ function fillSegmentResidualRowsFromStatement(
     cell.value = value;
     filledCells += 1;
     const note = lineItemSentence(rowLabel(sheet, residualRow), sourceLineItemLabels(resolved), "includes");
-    addComment(cell, note);
-    commentsAdded += 1;
+    if (addComment(cell, note)) commentsAdded += 1;
     const source = resolvedAuditSource(period, `${suffix}Resolved`, `Resolved EDGAR ${suffix}`, resolved);
     auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, residualRow), period, value, source, "segment", note, "residual"));
   });
@@ -6013,7 +6083,8 @@ function restoreSegmentTotalFormula(
   columns: number[],
   totalLabel: string,
   endLabel: string,
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  options: { overwriteHardcoded?: boolean } = {}
 ) {
   const totalRow = findLabelRow(sheet, totalLabel);
   const rows = segmentMetricRows(sheet, totalLabel, endLabel, columns);
@@ -6027,11 +6098,11 @@ function restoreSegmentTotalFormula(
   periods.forEach((period, periodIndex) => {
     const col = columns[periodIndex];
     const cell = sheet.getCell(totalRow, col);
-    if (!hasFormula(cell)) return;
+    if (!hasFormula(cell) && !options.overwriteHardcoded) return;
 
     const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     const currentTotal = evaluator.evaluateCell(cell);
-    if (currentTotal !== null && segmentModelRevenueTies(currentTotal, segmentTotal)) {
+    if (hasFormula(cell) && currentTotal !== null && segmentModelRevenueTies(currentTotal, segmentTotal)) {
       const cachedTotal = numericCellValue(cell);
       const existingFormula = formulaForCell(cell);
       if (!existingFormula || (cachedTotal !== null && segmentModelRevenueTies(cachedTotal, segmentTotal))) return;
@@ -6159,8 +6230,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
     cell.value = value;
     filledCells += 1;
     const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(expectedSource) || `Consolidated ${suffix}`], "includes");
-    addComment(cell, note);
-    commentsAdded += 1;
+    if (addComment(cell, note)) commentsAdded += 1;
     auditRows.push({
       sheetName: sheet.name,
       cell: cell.address,
@@ -6327,8 +6397,7 @@ function fillSegmentMetricRows(
       filledCells += 1;
       const resolved = segmentResolvedValue(segment, metric, period);
       const comment = mappingCommentForSegment(sheet, cell, existingLabel, segment, period, value, suffix);
-      addComment(cell, comment);
-      commentsAdded += 1;
+      if (addComment(cell, comment)) commentsAdded += 1;
       auditRows.push(mappingAuditRowForSegment(sheet, cell, existingLabel, period, value, resolved, suffix));
     });
   }
@@ -6422,8 +6491,7 @@ function clearUnmatchedSegmentRow(
     if (!writeSegmentMetricCell(cell, 0)) cell.value = 0;
     filledCells += 1;
     const notes = "Needs review: Segment Analysis row was not filled because the template label is blank, generic, or does not confidently match an EDGAR reportable segment.";
-    addComment(cell, notes);
-    commentsAdded += 1;
+    if (addComment(cell, notes)) commentsAdded += 1;
     auditRows.push({
       sheetName: sheet.name,
       cell: cell.address,
@@ -6651,16 +6719,9 @@ function auditNoteForResolvedValue(fillRow: FillRow, resolved: ResolvedValue, pe
   const commentary = period && ctx ? filingCommentaryJustification(fillRow, resolved, period, ctx) : "";
   if (!grouped && !hasAnalystNote && !isDerived && !commentary) return null;
 
-  const parts: string[] = [];
   const includedLineItems = groupedLineItemNote(fillRow, resolved);
   if (includedLineItems) return includedLineItems;
-  if (grouped && sourceLabels.length) parts.push(`Grouped from ${summarizeList(sourceLabels, 3)}.`);
-  if (resolved.note || fillRow.comment) parts.push(shortAnnotationSentence(resolved.note || fillRow.comment || ""));
-  if (isDerived && derived?.derivedPriorPeriods?.length) {
-    parts.push(`Derived from ${derived.derivedTotalLabel || derived.label} less ${summarizeList(derived.derivedPriorPeriods, 4)}.`);
-  }
-  if (commentary) parts.push(commentary);
-  return parts.filter(Boolean).join(" ");
+  return null;
 }
 
 function groupedLineItemNote(fillRow: FillRow, resolved: ResolvedValue) {
@@ -6687,13 +6748,11 @@ function lineItemMappingSentence(modelRow: string, resolved: ResolvedValue, mode
 
 function lineItemSentence(modelRow: string, labels: string[], mode: "maps" | "includes" = labels.length === 1 ? "maps" : "includes") {
   const cleanModelRow = cleanLineItemLabel(modelRow) || "Model row";
-  const cleanLabels = uniqueByNormalizedLabel(labels.map(cleanLineItemLabel).filter(Boolean));
-  const shownLabels = cleanLabels.slice(0, 6);
-  const remaining = cleanLabels.length - shownLabels.length;
-  const displayLabels = remaining > 0 ? [...shownLabels, `${remaining} other line item${remaining === 1 ? "" : "s"}`] : shownLabels;
-  if (!displayLabels.length) return `${cleanModelRow} needs review because no EDGAR line item was available.`;
-  const verb = mode === "maps" ? "maps to" : "includes";
-  return `${cleanModelRow} ${verb} ${humanReadableList(displayLabels)}.`;
+  const cleanLabels = uniqueByNormalizedLabel(labels.map(cleanLineItemLabel).filter((label) => label && !isTechnicalLineItemLabel(label)));
+  if (!cleanLabels.length) return "";
+  const effectiveMode = cleanLabels.length === 1 ? "maps" : mode;
+  const verb = effectiveMode === "maps" ? "maps directly to" : "includes";
+  return `${cleanModelRow} ${verb}:\n${cleanLabels.map((label) => `- ${label}`).join("\n")}`;
 }
 
 function uniqueByNormalizedLabel(labels: string[]) {
@@ -6728,7 +6787,7 @@ function sourceLineItemLabel(source: FactSource) {
   if (preferred && preferred !== source.concept && !isTechnicalLineItemLabel(preferred)) return preferred;
   const fallback = cleanLineItemLabel(source.note || "");
   if (fallback && !isTechnicalLineItemLabel(fallback)) return fallback;
-  return cleanLineItemLabel(humanizeConcept(source.concept));
+  return "";
 }
 
 function cleanLineItemLabel(label: string) {
@@ -6741,7 +6800,7 @@ function cleanLineItemLabel(label: string) {
 }
 
 function isTechnicalLineItemLabel(label: string) {
-  return /\b(parser|mapped|calculated|derived|validation|accession|period|formula|residual|resolved|carried forward|SEC validation|LLM-assisted)\b/i.test(label);
+  return /\b(parser|mapped|calculated|derived|validation|accession|period|formula|residual|resolved|carried forward|SEC validation|LLM-assisted|Balance Sheet Check|Segment Analysis)\b/i.test(label);
 }
 
 function humanizeConcept(concept: string) {
@@ -6814,6 +6873,7 @@ function expectedReportedLineItemCategory(fillRow: FillRow): ReportedLineItemCat
   const hasConcept = (items: string[]) => concepts.some((concept) => items.includes(concept));
 
   if (fillRow.resolver === resolveTotalRevenue || /^(total)?revenues?$|^netrevenues?$|^sales$|^totalsales$|^netsales$|^totalnetsales$/.test(label)) return "revenue";
+  if (hasConcept(C.cogs) || hasConcept(C.healthCareCosts) || /costofrevenue|costofsales|costofgood|costofoperation|costofservice|costofproduct|merchandisecost|fulfillmentcost/.test(label)) return "cost_of_revenue";
   if (fillRow.resolver === resolveResearchDevelopmentExpense || hasConcept(C.rd) || /research|development|engineering|technologydevelopment|productdevelopment/.test(label)) return "research_and_development";
   if (fillRow.resolver === resolveSellingGeneralAdministrativeExpense || hasConcept(C.sga) || /sellinggeneraladministrative|sga|generaladministrative|sellingmarketing|corporateoverhead|administrativeexpense/.test(label)) return "selling_general_administrative";
   if (fillRow.resolver === resolveIncomeStatementDepreciationAmortization || hasConcept(C.da) || /depreciation|amortization|depletion/.test(label)) return "income_statement_depreciation_amortization";
@@ -6833,7 +6893,6 @@ function expectedReportedLineItemCategory(fillRow: FillRow): ReportedLineItemCat
   if (fillRow.resolver === resolvePreTaxIncome || hasConcept(PRETAX_INCOME_CONCEPTS) || /pretax|pre-tax|incomebeforetax|incomebeforeincometax/.test(labelText) || /incomebeforetax|incomebeforeincometax/.test(label)) return "pretax_income";
   if (fillRow.resolver === resolveIncomeTaxExpense || hasConcept(C.taxes) || /incometax|taxexpense|taxbenefit|provisionfortax/.test(label)) return "income_tax";
   if (fillRow.resolver === resolveNetIncome || hasConcept(C.netIncome) || /netincome|netloss|profitloss/.test(label)) return "net_income";
-  if (hasConcept(C.cogs) || hasConcept(C.healthCareCosts) || /costofrevenue|costofsales|costofgood|costofoperation|costofservice|costofproduct|merchandisecost|fulfillmentcost/.test(label)) return "cost_of_revenue";
   if (hasConcept(C.operatingIncome) || /ebit|operatingincome|operatingprofit|operatingloss/.test(label)) return "operating_income";
 
   if (fillRow.statement === "balance") {
@@ -6859,7 +6918,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (source.sourceLayer === "model") return "cash_flow_or_support";
   if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
 
-  if (/OtherNonOperatingIncomeExpenseResidual/i.test(concept)) return "other_non_operating_income_expense";
+  if (/OtherNonOperatingIncomeExpense(?:Residual|FromReportedLine)/i.test(concept)) return "other_non_operating_income_expense";
   if (/IncomeTaxExpenseBenefitDerived/i.test(concept)) return "income_tax";
   if (/IncomeBeforeTaxesDerived|BeforeIncomeTaxesIncluding/i.test(concept)) return "pretax_income";
   if (/NetIncomeLossDerived/i.test(concept)) return "net_income";
@@ -6939,7 +6998,7 @@ function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, 
   let status: SecWriteValidation["status"] = "ok";
   let confidence: SecWriteValidation["confidence"] = resolved.classification === "partial" ? "medium" : "high";
   const sources = resolved.sources.filter((source) => source.sourceLayer !== "model" && !/NotReported/.test(source.concept));
-  const resolvedIsDerived = Boolean(derivedSource(resolved));
+  const resolvedIsDerived = Boolean(derivedSource(resolved) || sources.some((source) => source.sourceLayer === "derived"));
 
   if (resolved.value === null || Number.isNaN(resolved.value)) {
     return { status: "blocked", confidence: "low", notes: ["No numeric SEC-backed value was available."] };
@@ -7079,25 +7138,6 @@ function shortAnnotationSentence(text: string, maxLength = 180) {
   return `${compact.slice(0, end).trim()}...`;
 }
 
-function rowAnnotationSummary(notes: string[]) {
-  const compactNotes = unique(notes.map(rowAnnotationNote).filter(Boolean));
-  if (!compactNotes.length) return "";
-  const shown = compactNotes.slice(0, 3);
-  const remaining = compactNotes.length - shown.length;
-  return [...shown, remaining > 0 ? `+${remaining} more item(s) in Mapping Audit.` : ""].filter(Boolean).join("\n");
-}
-
-function rowAnnotationNote(note: string) {
-  const hasFilingSupport = /\bFiling says:/i.test(note);
-  const withoutFilingExcerpt = note.replace(/\s*Filing says:.*$/i, "").trim();
-  if (/\b(?:maps to|includes)\b/i.test(withoutFilingExcerpt)) return shortAnnotationSentence(withoutFilingExcerpt, 220);
-  if (isTechnicalLineItemLabel(withoutFilingExcerpt)) return "";
-  const sentences = withoutFilingExcerpt.match(/[^.!?]+[.!?]/g)?.map((item) => item.trim()) ?? [];
-  const summary = sentences.length ? sentences.slice(0, 2).join(" ") : withoutFilingExcerpt;
-  const suffix = hasFilingSupport ? " Filing support available in Mapping Audit." : "";
-  return shortAnnotationSentence(`${summary}${suffix}`, 220);
-}
-
 function sourceDisplayLabel(source: FactSource) {
   const label = source.note || source.label || source.concept;
   if (!label) return "";
@@ -7148,7 +7188,6 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
   periods.forEach((period, index) => {
     const resolved = resolveModeledOperatingProfit(period, ctx);
     if (resolved.value === null) return;
-    const source = resolvedAuditSource(period, "ModeledOperatingProfitResolved", "Resolved EDGAR operating profit", resolved);
     const col = columns[index];
     const ebitCell = sheet.getCell(ebitRow, col);
     if (!hasFormula(ebitCell)) return;
@@ -7158,76 +7197,9 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
     if (incomeStatementFormulaTies(current, expected)) return;
 
     const residualCell = sheet.getCell(residualRow, col);
-    if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
-      warnings.push(`Income Statement ${period}: EBIT formula did not tie to EDGAR and no writable operating residual row was available.`);
-      return;
-    }
-
-    if (hasAnyConcept(ctx, "duration", C.netRevenue) && !first(period, ctx.duration, ["OperatingIncomeLoss"])) {
-      const value = (numericCellValue(residualCell) ?? 0) + expected - current;
-      residualCell.value = value;
-      evaluator.clear();
-      filledCells += 1;
-      const note = "Derived as the financial-company operating residual so the model's operating/pre-tax income formula reconciles to EDGAR pre-tax income when no separate operating income concept is reported.";
-      addComment(residualCell, note);
-      commentsAdded += 1;
-      auditRows.push({
-        sheetName: sheet.name,
-        cell: residualCell.address,
-        modelRowLabel: rowLabel(sheet, residualRow),
-        period,
-        valueWritten: value,
-        mappingType: "calculated",
-        conceptsUsed: compactSources([source, resolved]).map((item) => item.concept).join(", "),
-        sourceStatement: "income",
-        accession: source.accn ?? "",
-        sourceUrl: "",
-        cellWritable: true,
-        formulaPreserved: false,
-        writeBlockedReason: "",
-        signConvention: "residual",
-        confidence: "medium",
-        validationStatus: "OK!",
-        notes: note
-      });
-      return;
-    }
-
-    const residualResolved = resolveOtherOperatingIncomeExpense(period, ctx);
-    const residualValue = residualResolved.value;
-    if (residualValue === null || !residualResolved.sources.some((item) => item.sourceLayer !== "model" && !/NotReported/.test(item.concept))) {
-      warnings.push(
-        `Income Statement ${period}: EBIT formula did not tie to EDGAR, but no reported other operating income/expense line was available; leaving ${rowLabel(sheet, residualRow)} unchanged instead of using it as a plug.`
-      );
-      return;
-    }
-
-    const value = residualValue / 1_000_000;
-    residualCell.value = value;
-    evaluator.clear();
-    filledCells += 1;
-    const note = lineItemMappingSentence(rowLabel(sheet, residualRow), residualResolved);
-    addComment(residualCell, note);
-    commentsAdded += 1;
-    auditRows.push({
-      sheetName: sheet.name,
-      cell: residualCell.address,
-      modelRowLabel: rowLabel(sheet, residualRow),
-      period,
-      valueWritten: value,
-      mappingType: residualResolved.classification || "grouped",
-      conceptsUsed: residualResolved.sources.map((item) => item.concept).join(", "),
-      sourceStatement: "income",
-      accession: source.accn ?? "",
-      sourceUrl: "",
-      cellWritable: true,
-      formulaPreserved: false,
-      writeBlockedReason: "",
-      signConvention: "copied",
-      confidence: "high",
-      validationStatus: "OK!",
-      notes: note
-    });
+    warnings.push(
+      `Income Statement ${period}: EBIT formula evaluates to ${roundModelValue(current)}, but EDGAR reported ${roundModelValue(expected)}. Classification is preserved and ${rowLabel(sheet, residualRow)} was not used as a balancing account.`
+    );
   });
 
   return { filledCells, commentsAdded, warnings };
@@ -7269,8 +7241,7 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
     cell.value = { formula, result: value };
     filledCells += 1;
     const note = lineItemSentence(rowLabel(sheet, rowNumber), [sourceLineItemLabel(source)], "maps");
-    addComment(cell, note);
-    commentsAdded += 1;
+    if (addComment(cell, note)) commentsAdded += 1;
     auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", note, "formula result refreshed"));
   });
 
@@ -7322,6 +7293,16 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"],
     resolveModeledOperatingProfit,
     "operating profit"
+  );
+  refreshFormulaMetricResultsFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"],
+    resolvePreTaxIncome,
+    "pre-tax income"
   );
   refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], resolveNetIncome, "net income");
   refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Net Income Available to Common Shareholders", "Net Income Available to Common Stockholders"], COMMON_SHAREHOLDER_INCOME_CONCEPTS, "net income available to common shareholders");
@@ -7488,37 +7469,9 @@ function reconcileNetIncomeFormulaRowsToEdgar(
     if (actual === null || incomeStatementFormulaTies(actual, expected)) return;
 
     const residualCell = sheet.getCell(residualRow, col);
-    const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
-    if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
-      warnings.push(`Income Statement ${period}: net income does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not writable for reconciliation.`);
-      return;
-    }
-
-    residualCell.value = value;
-    evaluator.clear();
-    filledCells += 1;
-    const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(source)], "includes");
-    addComment(residualCell, note);
-    commentsAdded += 1;
-    auditRows.push({
-      sheetName: sheet.name,
-      cell: residualCell.address,
-      modelRowLabel: rowLabel(sheet, residualRow),
-      period,
-      valueWritten: value,
-      mappingType: "calculated",
-      conceptsUsed: CONTINUING_NET_INCOME_CONCEPTS.join(", "),
-      sourceStatement: "income",
-      accession: source.accn ?? "",
-      sourceUrl: "",
-      cellWritable: true,
-      formulaPreserved: false,
-      writeBlockedReason: "",
-      signConvention: "residual",
-      confidence: "medium",
-      validationStatus: "OK!",
-      notes: note
-    });
+    warnings.push(
+      `Income Statement ${period}: net income formula evaluates to ${roundModelValue(actual)}, but EDGAR reported ${roundModelValue(expected)}. Classification is preserved and ${rowLabel(sheet, residualRow)} was not used as a balancing account.`
+    );
   });
 
   return { filledCells, commentsAdded, warnings };
@@ -7547,7 +7500,6 @@ function reconcilePreTaxIncomeFormulaRowsToEdgar(
   periods.forEach((period, index) => {
     const resolved = resolvePreTaxIncome(period, ctx);
     if (resolved.value === null) return;
-    const source = resolvedAuditSource(period, "PreTaxIncomeResolved", "Resolved EDGAR pre-tax income", resolved);
     const col = columns[index];
     const pretaxCell = sheet.getCell(pretaxRow, col);
     const actual = evaluator.evaluateCell(pretaxCell);
@@ -7555,19 +7507,9 @@ function reconcilePreTaxIncomeFormulaRowsToEdgar(
     if (actual === null || incomeStatementFormulaTies(actual, expected)) return;
 
     const residualCell = sheet.getCell(residualRow, col);
-    const value = (numericCellValue(residualCell) ?? 0) + expected - actual;
-    if (!isIncomeStatementReconciliationResidualCellWritable(residualCell)) {
-      warnings.push(`Income Statement ${period}: pre-tax income does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not writable for reconciliation.`);
-      return;
-    }
-
-    residualCell.value = value;
-    evaluator.clear();
-    filledCells += 1;
-    const note = lineItemSentence(rowLabel(sheet, residualRow), sourceLineItemLabels(resolved), "includes");
-    addComment(residualCell, note);
-    commentsAdded += 1;
-    auditRows.push(statementTotalAuditRow(sheet, residualCell, rowLabel(sheet, residualRow), period, value, source, "income", note, "residual"));
+    warnings.push(
+      `Income Statement ${period}: pre-tax income formula evaluates to ${roundModelValue(actual)}, but EDGAR reported ${roundModelValue(expected)}. Classification is preserved and ${rowLabel(sheet, residualRow)} was not used as a balancing account.`
+    );
   });
 
   return { filledCells, commentsAdded, warnings };
@@ -7590,6 +7532,23 @@ function formulaBridgeForTargetValue(cell: ExcelJS.Cell, targetValue: number) {
   }
   const bridgeTotal = targetValue + priorSum;
   return `${formatDividendFormulaNumber(bridgeTotal)}-SUM(${columnLetter(Math.min(startCol, endCol))}${startRow}:${columnLetter(Math.max(startCol, endCol))}${endRow})`;
+}
+
+function rowAnnotationSummary(notes: string[]) {
+  const compactNotes = unique(notes.map(rowAnnotationNote).filter(Boolean));
+  if (!compactNotes.length) return "";
+  return compactNotes.join("\n\n");
+}
+
+function rowAnnotationNote(note: string) {
+  return normalizedLineItemComment(note);
+}
+
+function normalizedLineItemComment(text: string) {
+  const normalized = text.replace(/\r\n/g, "\n").trim();
+  if (!normalized || hasLegacyCommentDetail(normalized)) return "";
+  if (!/^[^\n]+ (?:includes|maps directly to):\n- /i.test(normalized)) return "";
+  return normalized;
 }
 
 function formulaHasCellReference(formula: string) {
@@ -7662,8 +7621,7 @@ function reconcileBalanceSheetCheck(
     evaluator.clear();
     filledCells += 1;
     const note = lineItemSentence(rowLabel(sheet, residualRow), ["Balance Sheet Check"], "includes");
-    addComment(residualCell, note);
-    commentsAdded += 1;
+    if (addComment(residualCell, note)) commentsAdded += 1;
     auditRows.push({
       sheetName: sheet.name,
       cell: residualCell.address,
@@ -7749,8 +7707,7 @@ function reconcilePartialBalanceSheetCheck(
     evaluator.clear();
     filledCells += 1;
     const note = lineItemSentence(rowLabel(sheet, residualRow), ["Balance Sheet Check"], "includes");
-    addComment(residualCell, note);
-    commentsAdded += 1;
+    if (addComment(residualCell, note)) commentsAdded += 1;
     auditRows.push({
       sheetName: sheet.name,
       cell: residualCell.address,
@@ -7944,8 +7901,7 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
         evaluator.clear();
         filledCells += 1;
         const note = lineItemSentence(rowLabel(sheet, totalRow), [sourceLineItemLabel(source)], "maps");
-        addComment(totalCell, note);
-        commentsAdded += 1;
+        if (addComment(totalCell, note)) commentsAdded += 1;
         auditRows.push(statementTotalAuditRow(sheet, totalCell, rowLabel(sheet, totalRow), period, expected, source, "balance", note));
         return;
       }
@@ -7967,8 +7923,7 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       evaluator.clear();
       filledCells += 1;
       const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(source)], "includes");
-      addComment(residualCell, note);
-      commentsAdded += 1;
+      if (addComment(residualCell, note)) commentsAdded += 1;
       auditRows.push(statementTotalAuditRow(sheet, residualCell, rowLabel(sheet, residualRow), period, value, source, "balance", note, "residual"));
     });
   }
@@ -8004,7 +7959,7 @@ function statementTotalAuditRow(
     signConvention,
     confidence: signConvention === "residual" ? "medium" : "high",
     validationStatus: "OK!",
-    notes: /\b(?:maps to|includes)\b/i.test(note)
+    notes: normalizedLineItemComment(note)
       ? note
       : lineItemSentence(label, [sourceLineItemLabel(source)], signConvention === "copied" ? "maps" : "includes")
   };
@@ -8544,7 +8499,7 @@ function mappingAuditRow(
   valueWritten: number,
   resolved: ResolvedValue,
   confidence: "high" | "medium" | "low",
-  notes?: string | null
+  _notes?: string | null
 ): MappingAuditRow {
   return {
     sheetName: sheet.name,
@@ -8570,7 +8525,7 @@ function mappingAuditRow(
     signConvention: fillRow.sign === -1 ? "inverted to match model sign convention" : "copied",
     confidence,
     validationStatus: "not_run",
-    notes: notes || lineItemMappingSentence(fillRow.label, resolved)
+    notes: lineItemMappingSentence(fillRow.label, resolved)
   };
 }
 
@@ -8599,7 +8554,7 @@ function skippedMappingAuditRow(sheet: ExcelJS.Worksheet, cell: ExcelJS.Cell, fi
     signConvention: "not written",
     confidence: "low",
     validationStatus: decision.formulaPreserved ? "formula_preserved" : "skipped",
-    notes: decision.formulaPreserved ? "Formula preserved; EDGAR value was not written over an existing model formula." : "Skipped because the cell was not an active model input."
+    notes: ""
   };
 }
 
@@ -9314,9 +9269,7 @@ function refreshBalanceSheetInputFromResolver(
       signConvention: "copied",
       confidence: "high",
       validationStatus: "OK!",
-      notes: formula
-        ? "Replaced the balance-sheet formula with the EDGAR period-end value so annual and 4Q instant balances are not derived from quarterly activity."
-        : "Updated the balance-sheet input from EDGAR-sourced line items."
+      notes: lineItemMappingSentence(rowLabel(sheet, rowNumber), resolved)
     });
   });
 }
@@ -9904,7 +9857,7 @@ function statementMetricTies(actual: number, expected: number) {
 }
 
 function recordIncomeStatementBridgeMismatch(errors: string[], warnings: string[], targetCell: ExcelJS.Cell, message: string) {
-  errors.push(message);
+  warnings.unshift(`${message} Classification is preserved for review; no balancing income-statement account was created.`);
 }
 
 function validateIncomeStatementEbitdaFormula(
@@ -10867,7 +10820,7 @@ function cleanStaleProtectedHistoricalRows(
         signConvention: "not written",
         confidence: "high",
         validationStatus: "cleared",
-        notes: stale.note
+        notes: ""
       });
     });
     if (clearedRow) {
@@ -11017,7 +10970,7 @@ function clearCashFlowStatementHistoricalInputs(sheet: ExcelJS.Worksheet, period
         signConvention: "not written",
         confidence: "high",
         validationStatus: "cleared",
-        notes: "Cash Flow Statement historical inputs are intentionally left blank and are not mapped from EDGAR."
+        notes: ""
       });
     });
   });
@@ -11068,15 +11021,14 @@ function clearStaleShareRepurchaseAssumptionAmounts(sheet: ExcelJS.Worksheet, pe
         signConvention: "not written",
         confidence: "high",
         validationStatus: "cleared",
-        notes: note
+        notes: ""
       });
     });
     if (clearedRow) {
       const sourceCell = labelCell(sheet, rowNumber);
       if (canAddComment(sourceCell)) {
         sourceCell.note = "";
-        addComment(sourceCell, note);
-        commentsAdded += 1;
+        if (addComment(sourceCell, note)) commentsAdded += 1;
       }
     }
   }
@@ -11326,6 +11278,10 @@ function addMappingAuditSheet(workbook: ExcelJS.Workbook, auditRows: MappingAudi
 function addComment(cell: ExcelJS.Cell, text: string) {
   const existing = nonEdgarMapperCommentText(commentText(cell.note));
   const userText = userFacingCommentText(cell, text);
+  if (!userText) {
+    cell.note = existing;
+    return false;
+  }
   const body = `${existing ? `${existing}\n\n` : ""}EDGAR Mapper:\n${userText}`;
   cell.note = {
     texts: [
@@ -11339,18 +11295,15 @@ function addComment(cell: ExcelJS.Cell, text: string) {
     ],
     editAs: "oneCells"
   };
+  return true;
 }
 
-function userFacingCommentText(cell: ExcelJS.Cell, text: string) {
-  const compact = shortAnnotationSentence(text.replace(/\s+/g, " ").trim(), 260);
-  if (compact && /\b(?:maps to|includes|needs review)\b/i.test(compact) && !hasLegacyCommentDetail(compact)) return compact;
-  const rowNumber = Number(cell.address.match(/\d+$/)?.[0]);
-  const label = rowNumber ? rowLabel(cell.worksheet, rowNumber) : "";
-  return lineItemSentence(label || "Model row", [], "includes");
+function userFacingCommentText(_cell: ExcelJS.Cell, text: string) {
+  return normalizedLineItemComment(text);
 }
 
 function hasLegacyCommentDetail(text: string) {
-  return /\b(?:EDGAR:|Period:|Value:|Confidence:|parser|timestamp|accession|fragment|Filing says:|LLM-assisted|SEC validation|formula|residual|calculated|mapped to directly)\b/i.test(text);
+  return /\b(?:EDGAR:|Period:|Value:|Confidence:|parser|timestamp|accession|fragment|Filing says:|LLM-assisted|SEC validation|formula|residual|calculated|needs review|mapped to directly)\b/i.test(text);
 }
 
 function commentText(note: ExcelJS.Cell["note"]) {
