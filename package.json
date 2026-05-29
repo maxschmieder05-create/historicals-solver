@@ -20,6 +20,7 @@
     "test:rsg-segment-operating-income": "node scripts/rsg-segment-operating-income-check.js",
     "test:goog-current-investments": "node scripts/goog-current-investments-regression-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",
+    "test:balance-sheet-conservation": "node scripts/balance-sheet-conservation-check.js",
     "test:cost-balance-sheet-regression": "npm run test:balance-sheet-instant-regression",
     "test:liability-regression": "npm run test:liability-rules && npm run test:amzn-liability-regression && npm run test:financial-company-regression",
     "test:statement-regression": "npm run test:liability-regression && npm run test:nflx-regression && npm run test:syk-random-validation && npm run test:mck-random-validation"

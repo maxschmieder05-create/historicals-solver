@@ -2304,6 +2304,7 @@ function reportedCurrentDebt(period: string, ctx: ResolveContext): ResolvedValue
 
 function debtRowUsesCombinedCurrentDebt(period: string, ctx: ResolveContext) {
   if (!ctx.template?.hasDebtInclCurrentPortionRow || ctx.template.hasCurrentDebtRow === true) return false;
+  if (currentDebtBelongsInAccruedLiabilities(ctx.template)) return false;
   return Boolean(first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS));
 }
 
