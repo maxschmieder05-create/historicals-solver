@@ -780,6 +780,8 @@ const TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS = [
 ];
 
 const CASH_ROW_COMBINABLE_CURRENT_INVESTMENT_CONCEPTS = new Set([
+  "MarketableSecuritiesCurrent",
+  "ShortTermInvestments",
   "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
   "DebtSecuritiesAvailableForSaleCurrent",
   "OtherShortTermInvestments"
@@ -2409,6 +2411,12 @@ function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): 
   };
 }
 
+function currentInvestmentsAreModeledInCash(period: string, ctx: ResolveContext) {
+  const cash = first(period, ctx.instant, C.cash);
+  if (!cash) return false;
+  return shouldCombineCashAndCurrentInvestments(period, ctx, cash, sum(period, ctx.instant, C.currentInvestments));
+}
+
 function shouldCombineCashAndCurrentInvestments(
   period: string,
   ctx: ResolveContext,
@@ -2446,13 +2454,12 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 
 function resolveInventory(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.inventory);
-  return direct
-    ? { value: direct.value, sources: [direct] }
-    : {
-        value: null,
-        sources: [],
-        note: "No explicit SEC inventory balance was reported for this period. The row was left unresolved instead of defaulting to zero."
-      };
+  if (direct) return { value: direct.value, sources: [direct] };
+  return {
+    value: 0,
+    sources: [zeroSource(C.inventory[0])],
+    note: "No SEC inventory balance was reported for this period, so stale template inventory was cleared."
+  };
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
@@ -2461,24 +2468,28 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
   const receivables = resolveAccountsReceivable(period, ctx);
   const inventory = balanceSheetComponentForResidual(period, ctx, resolveInventory, C.inventory[0]);
   const currentInvestments = sum(period, ctx.instant, C.currentInvestments);
+  const separateCurrentInvestments = currentInvestmentsAreModeledInCash(period, ctx) ? 0 : currentInvestments?.value ?? 0;
   const directOtherCurrentAssets = sumWithNote(
     period,
     ctx.instant,
     OTHER_CURRENT_ASSET_CONCEPTS,
     "Mapped to directly reported prepaid expense / other current asset concepts."
   );
-  if (directOtherCurrentAssets.value !== null) return directOtherCurrentAssets;
   if (currentAssets && cashAndInvestments.value !== null && receivables.value !== null && inventory.value !== null) {
-    const lessCurrentInvestments = currentInvestments?.value ?? 0;
     const inventoryValue = inventory.value ?? 0;
+    const residualValue = currentAssets.value - cashAndInvestments.value - receivables.value - inventoryValue - separateCurrentInvestments;
+    if (directOtherCurrentAssets.value !== null && statementMetricTies(residualValue, directOtherCurrentAssets.value)) return directOtherCurrentAssets;
     return {
-      value: currentAssets.value - cashAndInvestments.value - receivables.value - inventoryValue - lessCurrentInvestments,
+      value: residualValue,
       sources: compactSources([currentAssets, cashAndInvestments, receivables, inventory, currentInvestments]),
-      note: currentInvestments && currentInvestments.value
+      note: separateCurrentInvestments
         ? "Included current assets less separately classified cash, marketable securities / short-term investments, receivables, and inventory. Current investments are not included in this other-current-assets bucket."
-        : "Included current assets less separately modeled cash, receivables, and inventory."
+        : currentInvestments && currentInvestments.value
+          ? "Included current assets less the cash row, receivables, and inventory. Current investments were already included in cash because the template has no separate current-investments row."
+          : "Included current assets less separately modeled cash, receivables, and inventory."
     };
   }
+  if (directOtherCurrentAssets.value !== null) return directOtherCurrentAssets;
   const segregatedCash =
     first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation"]) ??
     first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations"]);
@@ -2528,9 +2539,9 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
   const direct = first(period, ctx.instant, C.intangibles);
   if (direct) return { value: direct.value, sources: [direct] };
   return {
-    value: null,
-    sources: [],
-    note: "No explicit SEC intangible assets balance was reported for this period. The row was left unresolved instead of defaulting to zero."
+    value: 0,
+    sources: [zeroSource(C.intangibles[0])],
+    note: "No SEC intangible assets balance was reported for this period, so stale template intangibles were cleared."
   };
 }
 
@@ -2552,10 +2563,11 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
   const assets = first(period, ctx.instant, C.assets);
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   const ppe = resolvePpe(period, ctx);
-  const intangibles = balanceSheetComponentForResidual(period, ctx, resolveIntangibleAssets, C.intangibles[0]);
+  const intangibles = resolveIntangibleAssets(period, ctx);
   const goodwill = balanceSheetComponentForResidual(period, ctx, resolveGoodwill, C.goodwill[0]);
-  if (assets && currentAssets && currentAssets.value !== null && ppe.value !== null && intangibles.value !== null && goodwill.value !== null) {
-    const residual = assets.value - currentAssets.value - (ppe.value ?? 0) - intangibles.value - goodwill.value;
+  if (assets && currentAssets && currentAssets.value !== null && ppe.value !== null && goodwill.value !== null) {
+    const intangibleValue = intangibles.value ?? 0;
+    const residual = assets.value - currentAssets.value - (ppe.value ?? 0) - intangibleValue - goodwill.value;
     const operatingLeaseAssetValue = operatingLeaseAssets?.value ?? null;
     if (otherAssetsNoncurrent && statementMetricTies(residual, otherAssetsNoncurrent.value)) {
       return {
@@ -2573,8 +2585,11 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
     }
     return {
       value: residual,
-      sources: compactSources([assets, currentAssets, ppe, intangibles, goodwill]),
-      note: "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill."
+      sources: compactSources([assets, currentAssets, ppe, intangibles.value !== null ? intangibles : zeroResolved(C.intangibles[0]), goodwill]),
+      note:
+        intangibles.value === null
+          ? "Calculated from SEC total assets less current assets, PP&E, and goodwill because EDGAR did not report a separate current-period intangible-assets balance for this template row."
+          : "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill."
     };
   }
   if (otherAssetsNoncurrent) {
@@ -10160,7 +10175,12 @@ function validateBalanceSheetClassificationCompleteness(
   periods.forEach((period, index) => {
     const lookupPeriod = balanceSheetInstantLookupPeriod(period);
     const currentInvestments = sum(lookupPeriod, ctx.instant, C.currentInvestments);
-    if (currentInvestments?.value && Math.abs(currentInvestments.value) > 5_000_000 && !investmentRow) {
+    if (
+      currentInvestments?.value &&
+      Math.abs(currentInvestments.value) > 5_000_000 &&
+      !investmentRow &&
+      !currentInvestmentsAreModeledInCash(lookupPeriod, ctx)
+    ) {
       errors.push(
         `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no separate investment row; this balance was not allowed to be dumped into other current assets.`
       );
