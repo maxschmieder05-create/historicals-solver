@@ -3776,7 +3776,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
     values.forEach((_, label) => labels.add(label));
   });
 
-  return Array.from(labels)
+  const segments = Array.from(labels)
     .map((label) => {
       const metrics = firstSegmentMetricsForLabel(quarterly, label);
       return {
@@ -3811,8 +3811,48 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
           ])
         )
       };
-    })
-    .sort((a, b) => segmentSort(a.label, b.label));
+    });
+  coalesceRenamedOtherRevenueBuckets(segments, periods);
+  return segments.sort((a, b) => segmentSort(a.label, b.label));
+}
+
+function coalesceRenamedOtherRevenueBuckets(segments: SegmentRevenue[], periods: string[]) {
+  const latestAnnual = periods
+    .map((period) => `FY${periodYearSuffix(period)}`)
+    .sort(comparePeriods)
+    .reverse()
+    .find((period) => segments.some((segment) => Math.abs(segment.annualValues?.get(period) ?? 0) > 0.0001));
+  if (!latestAnnual) return;
+
+  segments.forEach((source) => {
+    const match = source.label.match(/^(.+?)\s+other$/i);
+    if (!match || /&| and /i.test(source.label)) return;
+    if (Math.abs(source.annualValues?.get(latestAnnual) ?? 0) > 0.0001) return;
+    const prefix = normalize(match[1]);
+    const target = segments.find((candidate) => {
+      if (candidate === source || candidate.family !== source.family || candidate.aggregate) return false;
+      if (!normalize(candidate.label).startsWith(prefix)) return false;
+      if (!/(subscription|platform|device|service|product|license|software)/i.test(candidate.label)) return false;
+      return Math.abs(candidate.annualValues?.get(latestAnnual) ?? 0) > 0.0001;
+    });
+    if (!target) return;
+
+    periods.forEach((period) => {
+      const sourceValue = source.values.get(period) ?? 0;
+      const targetValue = target.values.get(period) ?? 0;
+      if (Math.abs(sourceValue) > 0.0001 && Math.abs(targetValue) <= 0.0001) target.values.set(period, sourceValue);
+    });
+    unique(periods.map(periodYearSuffix)).forEach((year) => {
+      const annualValue = target.annualValues?.get(`FY${year}`) ?? 0;
+      const q1 = target.values.get(`1Q${year}`) ?? 0;
+      const q2 = target.values.get(`2Q${year}`) ?? 0;
+      const q3 = target.values.get(`3Q${year}`) ?? 0;
+      if (Math.abs(annualValue) > 0.0001 && [q1, q2, q3].some((value) => Math.abs(value) > 0.0001)) {
+        target.values.set(`4Q${year}`, annualValue - q1 - q2 - q3);
+      }
+    });
+    source.aggregate = true;
+  });
 }
 
 function firstSegmentMetricsForLabel(periods: Map<string, Map<string, SegmentMetrics>>, label: string) {
@@ -4486,7 +4526,7 @@ function revenueDisclosureKind(
   if (/\b(geographic|geographical|region|country|domestic|international|foreign|americas|europe|asia pacific)\b/i.test(text)) {
     return "geographic";
   }
-  if (/\b(disaggregation of revenue|disaggregated revenue|revenue disaggregat|net sales by category|sales by category)\b/i.test(text)) {
+  if (/\b(disaggregation of revenues?|disaggregated revenues?|revenues? disaggregat|net sales by category|sales by category)\b/i.test(text)) {
     return "revenue_disaggregation";
   }
   if (/\b(product|service|products and services|goods and services|subscription|license|advertising|online stores|physical stores)\b/i.test(text)) {
@@ -4539,8 +4579,8 @@ function isAggregateRevenueBreakoutLabel(label: string) {
   );
 }
 
-function revenueDisclosureFamily(kind: RevenueDisclosureKind, tableInfo: { key: string }) {
-  return `${kind}:${tableInfo.key}`;
+function revenueDisclosureFamily(kind: RevenueDisclosureKind, _tableInfo: { key: string }) {
+  return kind;
 }
 
 function segmentDisclosureKey(label: string, family?: string) {
@@ -4600,7 +4640,7 @@ function inlineDocumentPeriodEndDate(html: string) {
 }
 
 function inlineText(value: string) {
-  return decodeXml(value.replace(/<[^>]+>/g, "").replace(/\s+/g, " ").trim());
+  return decodeXml(value.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 }
 
 function normalizeInlineDate(value: string) {
@@ -5663,7 +5703,6 @@ function fillSegmentAnalysis(
   const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns).slice(0, 6);
   const depreciationRows = segmentMetricRows(sheet, "Total D&A", "D&A Check", columns).slice(0, 6);
   const selectedSegments = selectSegmentFamilyForTemplate(segments, periods, ctx, Math.max(rows.length, 1));
-
   const usableSegments = selectedSegments;
 
   if (!usableSegments.length) {
@@ -5734,8 +5773,33 @@ function fillSegmentAnalysis(
   if (hasDepreciationSegments) {
     filledCells += fillSegmentTotalRow(sheet, periods, columns, depreciationSegments, "depreciationAmortization", "Total D&A", auditRows);
   }
+  filledCells += refreshSegmentAnnualSumFormulas(sheet, ["Total Company Revenue", "Total Company Operating Income", "Total D&A"]);
 
   return { filledCells, commentsAdded, warnings };
+}
+
+function refreshSegmentAnnualSumFormulas(sheet: ExcelJS.Worksheet, sectionLabels: string[]) {
+  const headerRow = bestPeriodHeaderRow(sheet)?.rowNumber ?? 5;
+  let filledCells = 0;
+  sectionLabels.forEach((sectionLabel) => {
+    const startRow = findLabelRow(sheet, sectionLabel);
+    const endLabel = segmentTotalEndLabel(sectionLabel);
+    const endRow = endLabel ? findLabelRow(sheet, endLabel) : null;
+    if (!startRow || !endRow || endRow <= startRow) return;
+    for (let col = 5; col <= sheet.columnCount; col += 1) {
+      const annualHeader = cellDisplay(sheet.getCell(headerRow, col));
+      if (!/^20\d{2}$/.test(annualHeader)) continue;
+      const quarterHeaders = [col - 4, col - 3, col - 2, col - 1].map((quarterCol) => cellDisplay(sheet.getCell(headerRow, quarterCol)));
+      if (!["1Q", "2Q", "3Q", "4Q"].every((quarter, index) => quarterHeaders[index].startsWith(quarter))) continue;
+      for (let rowNumber = startRow; rowNumber < endRow; rowNumber += 1) {
+        const formula = `SUM(${columnLetter(col - 4)}${rowNumber}:${columnLetter(col - 1)}${rowNumber})`;
+        const result = sumNumericCells(sheet, rowNumber, [col - 4, col - 3, col - 2, col - 1]) ?? 0;
+        sheet.getCell(rowNumber, col).value = { formula, result };
+        filledCells += 1;
+      }
+    }
+  });
+  return filledCells;
 }
 
 function fillSegmentResidualRowsFromStatement(
@@ -5842,14 +5906,16 @@ function selectSegmentFamilyForTemplate(
   const candidates = segmentFamilyCandidates(segments, maxRows);
   const scored = candidates
     .map((candidate) => ({ candidate, score: scoreSegmentFamilyCandidate(candidate.segments, periods, ctx, candidate.family) }))
-    .filter(({ score }) => score.tieCount > 0 && score.badCount === 0)
+    .filter(({ score }) => score.tieCount > 0)
     .sort((a, b) => {
       if (a.score.disclosurePriority !== b.score.disclosurePriority) return a.score.disclosurePriority - b.score.disclosurePriority;
+      if (a.score.badCount !== b.score.badCount) return a.score.badCount - b.score.badCount;
       if (b.score.tieCount !== a.score.tieCount) return b.score.tieCount - a.score.tieCount;
       if (b.score.detailRows !== a.score.detailRows) return b.score.detailRows - a.score.detailRows;
       return a.score.totalError - b.score.totalError;
     });
-  return scored[0] ? orderRevenueDisclosureSegments(scored[0].candidate.segments, periods) : [];
+  const reconciled = scored.filter(({ score }) => score.tieCount > 0 && score.badCount === 0);
+  return reconciled[0] || scored[0] ? orderRevenueDisclosureSegments((reconciled[0] ?? scored[0]).candidate.segments, periods) : [];
 }
 
 function selectSegmentFamilyForMetric(
@@ -6223,7 +6289,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
 
     const cell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(cell) ?? 0) + expected - actual;
-    if (/revenue/i.test(suffix) && expected - actual < -0.05) {
+    if (/revenue/i.test(suffix) && expected - actual < -0.05 && Math.abs(expected - actual) > Math.max(0.5, Math.abs(expected) * 0.005)) {
       warnings.push(`Segment Analysis ${period}: revenue breakout summed above consolidated EDGAR revenue; leaving detail rows unchanged instead of using a negative reconciliation plug.`);
       return;
     }
