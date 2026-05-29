@@ -5,6 +5,7 @@ export type LiabilityTemplateRow = {
 };
 
 export type TemplateMappingContext = {
+  hasCurrentInvestmentRow: boolean;
   hasCurrentDebtRow: boolean;
   hasDebtInclCurrentPortionRow: boolean;
   hasNonCurrentLeaseLiabilityRow: boolean;
@@ -31,6 +32,13 @@ export const PENSION_LIABILITY_CONCEPTS = [
 ];
 
 const CURRENT_DEBT_CONCEPTS = ["DebtCurrent", "LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings", "ShortTermBorrowingsCurrent"];
+const CURRENT_INVESTMENT_CONCEPTS = [
+  "MarketableSecuritiesCurrent",
+  "ShortTermInvestments",
+  "OtherShortTermInvestments",
+  "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+  "DebtSecuritiesAvailableForSaleCurrent"
+];
 
 function normalizeLiabilityLabel(input: string) {
   return input.toLowerCase().replace(/[^a-z0-9]/g, "");
@@ -51,6 +59,16 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
   const hasAnyLabel = (patterns: RegExp[]) => balanceRows.some((row) => rowMatchesLabel(row, patterns));
 
   return {
+    hasCurrentInvestmentRow:
+      hasAnyConcept(CURRENT_INVESTMENT_CONCEPTS) ||
+      hasAnyLabel([
+        /^shortterminvestments$/,
+        /^marketablesecurities$/,
+        /^currentmarketablesecurities$/,
+        /^investmentsecurities$/,
+        /^availableforsalesecurities$/,
+        /^treasurysecurities$/
+      ]),
     hasCurrentDebtRow:
       hasAnyConcept(CURRENT_DEBT_CONCEPTS) ||
       hasAnyLabel([

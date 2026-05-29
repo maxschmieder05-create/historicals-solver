@@ -639,6 +639,25 @@ const BROKER_DEALER_OTHER_CURRENT_LIABILITIES = [
   "AccountsPayableAndAccruedLiabilitiesCurrentAndNoncurrent"
 ];
 
+const OTHER_CURRENT_ASSET_CONCEPTS = [
+  "OtherAssetsCurrent",
+  "OtherCurrentAssets",
+  "PrepaidExpenseAndOtherAssetsCurrent",
+  "PrepaidExpenseCurrent",
+  "PrepaidExpensesAndOtherCurrentAssets"
+];
+
+const CURRENT_INVESTMENT_ROW_LABELS = [
+  "Short-Term Investments",
+  "Short Term Investments",
+  "Marketable Securities",
+  "Current Marketable Securities",
+  "Investment Securities",
+  "Available-for-Sale Securities",
+  "Treasury Securities"
+];
+
+
 const NON_COMPENSATION_EXPENSE_CONCEPTS = [
   "FloorBrokerageExchangeAndClearanceFees",
   "UnderwritingCosts",
@@ -989,7 +1008,8 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   }
   if (has("Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
   if (has("Card Member Receivables", "Card Member Recievables")) return row(rowNumber, label, "balance", "instant", C.cardReceivables);
-  if (has("Inventory")) return row(rowNumber, label, "balance", "instant", C.inventory);
+  if (has("Inventory")) return plug(rowNumber, label, "balance", "instant", resolveInventory, "direct");
+  if (has(...CURRENT_INVESTMENT_ROW_LABELS)) return row(rowNumber, label, "balance", "instant", C.currentInvestments);
   if (has("Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets")) {
     return plug(rowNumber, label, "balance", "instant", resolvePrepaidAndOtherCurrentAssets);
   }
@@ -2395,6 +2415,7 @@ function shouldCombineCashAndCurrentInvestments(
   cash: FactSource,
   currentInvestments: ResolvedValue | null
 ) {
+  if (ctx.template?.hasCurrentInvestmentRow) return false;
   if (!currentInvestments || currentInvestments.value === null || currentInvestments.value === 0) return false;
   if (!currentInvestments.sources.some((source) => CASH_ROW_COMBINABLE_CURRENT_INVESTMENT_CONCEPTS.has(source.concept))) return false;
   const currentAssets = first(period, ctx.instant, C.currentAssets);
@@ -2425,19 +2446,37 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 
 function resolveInventory(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.inventory);
-  return direct ? { value: direct.value, sources: [direct] } : { value: 0, sources: [zeroSource(C.inventory[0])] };
+  return direct
+    ? { value: direct.value, sources: [direct] }
+    : {
+        value: null,
+        sources: [],
+        note: "No explicit SEC inventory balance was reported for this period. The row was left unresolved instead of defaulting to zero."
+      };
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   const cashAndInvestments = resolveCashAndCurrentInvestments(period, ctx);
   const receivables = resolveAccountsReceivable(period, ctx);
-  const inventory = first(period, ctx.instant, C.inventory) ?? zeroSource(C.inventory[0]);
-  if (currentAssets && cashAndInvestments.value !== null && receivables.value !== null) {
+  const inventory = balanceSheetComponentForResidual(period, ctx, resolveInventory, C.inventory[0]);
+  const currentInvestments = sum(period, ctx.instant, C.currentInvestments);
+  const directOtherCurrentAssets = sumWithNote(
+    period,
+    ctx.instant,
+    OTHER_CURRENT_ASSET_CONCEPTS,
+    "Mapped to directly reported prepaid expense / other current asset concepts."
+  );
+  if (directOtherCurrentAssets.value !== null) return directOtherCurrentAssets;
+  if (currentAssets && cashAndInvestments.value !== null && receivables.value !== null && inventory.value !== null) {
+    const lessCurrentInvestments = currentInvestments?.value ?? 0;
+    const inventoryValue = inventory.value ?? 0;
     return {
-      value: currentAssets.value - cashAndInvestments.value - receivables.value - inventory.value,
-      sources: compactSources([currentAssets, cashAndInvestments, receivables, inventory]),
-      note: "Included current assets less separately modeled cash/current investments, receivables, and inventory."
+      value: currentAssets.value - cashAndInvestments.value - receivables.value - inventoryValue - lessCurrentInvestments,
+      sources: compactSources([currentAssets, cashAndInvestments, receivables, inventory, currentInvestments]),
+      note: currentInvestments && currentInvestments.value
+        ? "Included current assets less separately classified cash, marketable securities / short-term investments, receivables, and inventory. Current investments are not included in this other-current-assets bucket."
+        : "Included current assets less separately modeled cash, receivables, and inventory."
     };
   }
   const segregatedCash =
@@ -2488,13 +2527,10 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
 function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.intangibles);
   if (direct) return { value: direct.value, sources: [direct] };
-  if (first(period, ctx.instant, ["PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization"])) {
-    return { value: 0, sources: [zeroSource("IntangibleAssetsNet")], note: "No separate intangible assets line item was reported in the SEC balance sheet for this period." };
-  }
   return {
-    value: 0,
-    sources: [zeroSource(C.intangibles[0])],
-    note: "No separate intangible assets line item was reported in the SEC balance sheet for this period, so stale template values were cleared."
+    value: null,
+    sources: [],
+    note: "No explicit SEC intangible assets balance was reported for this period. The row was left unresolved instead of defaulting to zero."
   };
 }
 
@@ -2503,9 +2539,9 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
   return direct
     ? { value: direct.value, sources: [direct] }
     : {
-        value: 0,
-        sources: [zeroSource(C.goodwill[0])],
-        note: "No separate goodwill line item was reported in the SEC balance sheet for this period, so stale template values were cleared."
+        value: null,
+        sources: [],
+        note: "No explicit SEC goodwill balance was reported for this period. The row was left unresolved instead of defaulting to zero."
       };
 }
 
@@ -2516,8 +2552,8 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
   const assets = first(period, ctx.instant, C.assets);
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   const ppe = resolvePpe(period, ctx);
-  const intangibles = resolveIntangibleAssets(period, ctx);
-  const goodwill = resolveGoodwill(period, ctx);
+  const intangibles = balanceSheetComponentForResidual(period, ctx, resolveIntangibleAssets, C.intangibles[0]);
+  const goodwill = balanceSheetComponentForResidual(period, ctx, resolveGoodwill, C.goodwill[0]);
   if (assets && currentAssets && currentAssets.value !== null && ppe.value !== null && intangibles.value !== null && goodwill.value !== null) {
     const residual = assets.value - currentAssets.value - (ppe.value ?? 0) - intangibles.value - goodwill.value;
     const operatingLeaseAssetValue = operatingLeaseAssets?.value ?? null;
@@ -2575,13 +2611,14 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
 
 function resolveCurrentAssetsFromModeledRows(period: string, ctx: ResolveContext): ResolvedValue {
   const cash = resolveCashAndCurrentInvestments(period, ctx);
+  const currentInvestments = ctx.template?.hasCurrentInvestmentRow ? sum(period, ctx.instant, C.currentInvestments) : null;
   const receivables = resolveAccountsReceivable(period, ctx);
-  const inventory = first(period, ctx.instant, C.inventory) ?? zeroSource(C.inventory[0]);
+  const inventory = resolveInventory(period, ctx);
   const prepaidAndOther = resolvePrepaidAndOtherCurrentAssets(period, ctx);
   if (cash.value === null || receivables.value === null || prepaidAndOther.value === null) return { value: null, sources: [] };
   return {
-    value: cash.value + receivables.value + inventory.value + prepaidAndOther.value,
-    sources: compactSources([cash, receivables, inventory, prepaidAndOther]),
+    value: cash.value + (currentInvestments?.value ?? 0) + receivables.value + (inventory.value ?? 0) + prepaidAndOther.value,
+    sources: compactSources([cash, currentInvestments, receivables, inventory, prepaidAndOther]),
     note: "Calculated from modeled current-asset rows because SEC did not report a separate current assets subtotal."
   };
 }
@@ -3515,7 +3552,7 @@ export async function POST(request: NextRequest) {
       commentsAdded += balanceSheetTotalResult.commentsAdded;
       warnings.push(...balanceSheetTotalResult.warnings);
 
-      const balanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, auditRows);
+      const balanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
       filledCells += balanceSheetCheckResult.filledCells;
       commentsAdded += balanceSheetCheckResult.commentsAdded;
       warnings.push(...balanceSheetCheckResult.warnings);
@@ -3557,7 +3594,7 @@ export async function POST(request: NextRequest) {
       filledCells += finalPartialBalanceSheetCheckResult.filledCells;
       commentsAdded += finalPartialBalanceSheetCheckResult.commentsAdded;
       warnings.push(...finalPartialBalanceSheetCheckResult.warnings);
-      const unsupportedTotalBalanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, auditRows, (period) => {
+      const unsupportedTotalBalanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows, (period) => {
         const lookupPeriod = balanceSheetInstantLookupPeriod(period);
         return !first(lookupPeriod, ctx.instant, C.assets);
       });
@@ -7535,6 +7572,7 @@ function reconcileBalanceSheetCheck(
   sheet: ExcelJS.Worksheet,
   periods: string[],
   columns: number[],
+  ctx: ResolveContext,
   auditRows: MappingAuditRow[],
   shouldReconcilePeriod: (period: string) => boolean = () => true
 ) {
@@ -7577,6 +7615,11 @@ function reconcileBalanceSheetCheck(
     const residualRow = findWritableBalanceSheetResidualRow(sheet, residualRows, col);
     if (!residualRow) {
       warnings.push(`Balance Sheet ${period}: check is ${roundModelValue(check)} and no writable residual balance-sheet row was available.`);
+      return;
+    }
+    const blockReason = balanceSheetResidualWriteBlockReason(sheet, residualRow, period, ctx);
+    if (blockReason) {
+      warnings.push(`Balance Sheet ${period}: check is ${roundModelValue(check)} and ${rowLabel(sheet, residualRow)} was not used as a residual. ${blockReason}`);
       return;
     }
     const residualCell = sheet.getCell(residualRow, col);
@@ -7661,6 +7704,11 @@ function reconcilePartialBalanceSheetCheck(
       warnings.push(`Balance Sheet ${period}: check is ${roundModelValue(check)} and no partial other-bucket row was available for a final section-level reconciliation.`);
       return;
     }
+    const blockReason = balanceSheetResidualWriteBlockReason(sheet, residualRow, period, ctx);
+    if (blockReason) {
+      warnings.push(`Balance Sheet ${period}: check is ${roundModelValue(check)} and ${rowLabel(sheet, residualRow)} was not used as a residual. ${blockReason}`);
+      return;
+    }
 
     const residualCell = sheet.getCell(residualRow, col);
     const value = (numericCellValue(residualCell) ?? 0) + Math.abs(check);
@@ -7709,6 +7757,80 @@ function balanceSheetResidualResolverForLabel(normalizedLabel: string) {
     return resolveOtherNonCurrentAssets;
   }
   return null;
+}
+
+function balanceSheetResidualWriteBlockReason(sheet: ExcelJS.Worksheet, residualRow: number, period: string, ctx: ResolveContext) {
+  const normalizedLabel = normalize(rowLabel(sheet, residualRow));
+  const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+  const currentInvestments = sum(lookupPeriod, ctx.instant, C.currentInvestments);
+  const hasInvestmentRow = ctx.template?.hasCurrentInvestmentRow || Boolean(findBalanceSheetRow(sheet, CURRENT_INVESTMENT_ROW_LABELS));
+  if (
+    /^(prepaidothercurrentassets|prepaidandothercurrentassets|othercurrentassets|prepaidsandothercurrentassets|othernoncurrentassets|otherlongtermassets|otherltassets|otherassetsandloans)$/.test(
+      normalizedLabel
+    ) &&
+    currentInvestments?.value &&
+    Math.abs(currentInvestments.value) > 5_000_000 &&
+    !hasInvestmentRow
+  ) {
+    return "EDGAR reports current marketable securities / short-term investments separately, and the template has no separate investment row. Classification accuracy takes precedence over forcing the balance sheet to tie.";
+  }
+
+  if (/^(othernoncurrentassets|otherlongtermassets|otherltassets|otherassetsandloans)$/.test(normalizedLabel)) {
+    const continuityGaps = [
+      criticalBalanceSheetContinuityGap(sheet, lookupPeriod, ctx, ["Intangible Assets, Net", "Intangibles, Net"], resolveIntangibleAssets, "intangible assets"),
+      criticalBalanceSheetContinuityGap(sheet, lookupPeriod, ctx, ["Goodwill"], resolveGoodwill, "goodwill")
+    ].filter(Boolean);
+    if (continuityGaps.length) {
+      return `${continuityGaps.join(" ")} The amount was not moved into other non-current assets as a balancing residual.`;
+    }
+  }
+
+  return "";
+}
+
+function criticalBalanceSheetContinuityGap(
+  sheet: ExcelJS.Worksheet,
+  period: string,
+  ctx: ResolveContext,
+  labels: string[],
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue,
+  displayName: string
+) {
+  if (!findBalanceSheetRow(sheet, labels)) return "";
+  const resolved = resolver(period, ctx);
+  if (resolved.value !== null) return "";
+  const prior = mostRecentPriorResolvedBalanceSheetValue(period, ctx, resolver);
+  if (!prior || Math.abs(prior.value ?? 0) <= 5_000_000) return "";
+  return `Prior filings reported ${displayName}, but this period has no explicit SEC balance for that row.`;
+}
+
+function mostRecentPriorResolvedBalanceSheetValue(
+  period: string,
+  ctx: ResolveContext,
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue
+) {
+  const priorPeriods = Array.from(ctx.instant.keys())
+    .filter((candidate) => isSupportedPeriodKey(candidate) && comparePeriods(candidate, period) < 0)
+    .sort(comparePeriods)
+    .reverse();
+  for (const priorPeriod of priorPeriods) {
+    const resolved = resolver(priorPeriod, ctx);
+    if (resolved.value !== null) return resolved;
+  }
+  return null;
+}
+
+function balanceSheetComponentForResidual(
+  period: string,
+  ctx: ResolveContext,
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue,
+  zeroConcept: string
+) {
+  const resolved = resolver(period, ctx);
+  if (resolved.value !== null) return resolved;
+  const prior = mostRecentPriorResolvedBalanceSheetValue(period, ctx, resolver);
+  if (prior && Math.abs(prior.value ?? 0) > 5_000_000) return resolved;
+  return zeroResolved(zeroConcept);
 }
 
 function reconcileBalanceSheetStatementTotalsToEdgar(
@@ -7798,6 +7920,11 @@ function reconcileBalanceSheetStatementTotalsToEdgar(
       const residualRow = findWritableBalanceSheetResidualRow(sheet, residualRows, col);
       if (!residualRow) {
         warnings.push(`Balance Sheet ${period}: ${metric.name} does not tie to EDGAR and no writable residual row was available.`);
+        return;
+      }
+      const blockReason = balanceSheetResidualWriteBlockReason(sheet, residualRow, period, ctx);
+      if (blockReason) {
+        warnings.push(`Balance Sheet ${period}: ${metric.name} does not tie to EDGAR and ${rowLabel(sheet, residualRow)} was not used as a residual. ${blockReason}`);
         return;
       }
 
@@ -8887,6 +9014,15 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     columns,
     ctx,
     auditRows,
+    CURRENT_INVESTMENT_ROW_LABELS,
+    (period) => sumWithNote(period, ctx.instant, C.currentInvestments, "Mapped to separately reported current marketable securities / short-term investments.")
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
     ["PP&E, Net", "Property Plant and Equipment Net", "Property and Equipment, Net", "Property, Plant and Equipment, Net"],
     resolvePpe
   );
@@ -9952,6 +10088,7 @@ function validateBalanceSheetStatementTotals(
     )
   );
   errors.push(...validateBalanceSheetOtherBucketMetrics(sheet, periods, columns, ctx, evaluator, warnings));
+  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator));
   errors.push(...validateBalanceSheetFourthQuarterAnnualTies(sheet, periods, columns, evaluator));
   errors.push(
     ...validateBalanceSheetSubtotalEqualsComponents(
@@ -9963,6 +10100,7 @@ function validateBalanceSheetStatementTotals(
       ["Total Current Assets"],
       [
         ["Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash"],
+        CURRENT_INVESTMENT_ROW_LABELS,
         ["Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables", "Fees Receivable"],
         ["Inventory"],
         ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets"]
@@ -10007,6 +10145,78 @@ function validateBalanceSheetStatementTotals(
     )
   );
   return errors;
+}
+
+function validateBalanceSheetClassificationCompleteness(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator
+) {
+  const errors: string[] = [];
+  const investmentRow = findBalanceSheetRow(sheet, CURRENT_INVESTMENT_ROW_LABELS);
+
+  periods.forEach((period, index) => {
+    const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+    const currentInvestments = sum(lookupPeriod, ctx.instant, C.currentInvestments);
+    if (currentInvestments?.value && Math.abs(currentInvestments.value) > 5_000_000 && !investmentRow) {
+      errors.push(
+        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no separate investment row; this balance was not allowed to be dumped into other current assets.`
+      );
+    }
+  });
+
+  const criticalChecks: Array<{
+    labels: string[];
+    metricName: string;
+    resolver: (period: string, ctx: ResolveContext) => ResolvedValue;
+  }> = [
+    { labels: ["Inventory"], metricName: "inventory", resolver: resolveInventory },
+    { labels: ["Intangible Assets, Net", "Intangibles, Net"], metricName: "intangible assets", resolver: resolveIntangibleAssets },
+    { labels: ["Goodwill"], metricName: "goodwill", resolver: resolveGoodwill },
+    { labels: ["Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities", "Pharmacy Costs Payable"], metricName: "accounts payable", resolver: resolveAccountsPayable },
+    { labels: ["Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other", "Accrued Expenses and Other Current Liabilities"], metricName: "accrued liabilities", resolver: resolveAccruedLiabilities },
+    { labels: ["Other Current Liabilities", "Other Current Liabs"], metricName: "other current liabilities", resolver: resolveOtherCurrentLiabilities },
+    { labels: ["LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt", "Senior Notes", "Borrowings"], metricName: "debt", resolver: resolveLongTermDebtInclCurrentPortion },
+    { labels: ["Total Debt"], metricName: "total debt", resolver: resolveTotalDebt },
+    { labels: ["Lease Liabilities", "Operating Lease Liabilities", "Finance Lease Liabilities", "Lease Obligations"], metricName: "lease liabilities", resolver: resolveNonCurrentLeaseLiabilities }
+  ];
+
+  for (const check of criticalChecks) {
+    const rowNumber = findBalanceSheetRow(sheet, check.labels);
+    if (!rowNumber) continue;
+    periods.forEach((period, index) => {
+      const col = columns[index];
+      if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
+      const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+      const resolved = check.resolver(lookupPeriod, ctx);
+      const modelValue = evaluatedCellNumber(sheet.getCell(rowNumber, col), evaluator);
+      if (resolved.value === null) {
+        const prior = mostRecentPriorResolvedBalanceSheetValue(lookupPeriod, ctx, check.resolver);
+        if (prior && Math.abs(prior.value ?? 0) > 5_000_000 && (modelValue === null || Math.abs(modelValue) <= 0.5)) {
+          errors.push(
+            `Balance Sheet ${period}: ${check.metricName} disappeared after prior SEC filings reported ${roundModelValue((prior.value ?? 0) / 1_000_000)}. The row must be remapped or explicitly sourced as zero before writing output.`
+          );
+        } else if (modelValue !== null && Math.abs(modelValue) > 0.5) {
+          errors.push(
+            `Balance Sheet ${period}: ${check.metricName} has model value ${roundModelValue(modelValue)} but no explicit SEC source was identified.`
+          );
+        }
+        return;
+      }
+
+      if (modelValue === null) return;
+      const expected = resolved.value / 1_000_000;
+      if (!statementMetricTies(modelValue, expected)) {
+        errors.push(
+          `Balance Sheet ${columnLetter(col)}${rowNumber} ${period}: ${check.metricName} ${roundModelValue(modelValue)} does not match SEC-sourced value ${roundModelValue(expected)}.`
+        );
+      }
+    });
+  }
+
+  return unique(errors);
 }
 
 function validateBalanceSheetFourthQuarterAnnualTies(
