@@ -896,7 +896,9 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Operating Income", "Operating Income (Loss)", "Income From Operations")) {
     return row(rowNumber, label, "income", "duration", C.operatingIncome, 1, 1_000_000, "Mapped to SEC operating income/loss or nearest pre-tax operating profit concept.");
   }
-  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales", "Property Taxes and Insurance")) return row(rowNumber, label, "income", "duration", C.cogs, -1, 1_000_000, "Mapped to SEC cost of revenue / cost of sales.");
+  if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales", "Property Taxes and Insurance")) {
+    return plug(rowNumber, label, "income", "duration", resolveCostOfRevenue, "direct");
+  }
   if (has("Pharmacy and Other Service Costs", "Medical Costs and Other")) return row(rowNumber, label, "income", "duration", C.healthCareCosts, -1, 1_000_000, "Mapped to reported healthcare, claims, pharmacy, or service cost concepts.");
   if (
     has(
@@ -1176,6 +1178,44 @@ function resolveTotalRevenue(period: string, ctx: ResolveContext): ResolvedValue
   };
 }
 
+const PRIMARY_COST_OF_REVENUE_CONCEPTS = [
+  "CostOfRevenue",
+  "CostOfGoodsAndServicesSold",
+  "CostOfGoodsSold",
+  "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
+  "CostOfGoodsAndServiceExcludingDepreciationDepletionAndAmortization"
+];
+
+function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.duration, PRIMARY_COST_OF_REVENUE_CONCEPTS);
+  if (direct) {
+    return {
+      value: -Math.abs(direct.value),
+      sources: [direct],
+      note: "Mapped to the consolidated SEC cost of revenue / cost of sales line. Cost subcomponents are not used when this line exists.",
+      classification: "direct"
+    };
+  }
+
+  const component = sumWithNote(
+    period,
+    ctx.duration,
+    ["CostOfProductsSold", "CostOfServicesRevenue"],
+    "Grouped from consolidated product and service cost-of-revenue lines because no broader consolidated cost of revenue line was reported."
+  );
+  if (component.value !== null) return { ...(signed(component, -1) ?? component), classification: "grouped" };
+
+  const fallback = first(period, ctx.duration, C.cogs);
+  return fallback
+    ? {
+        value: -Math.abs(fallback.value),
+        sources: [fallback],
+        note: "Mapped to the closest consolidated SEC cost of revenue / cost of sales concept.",
+        classification: "direct"
+      }
+    : { value: null, sources: [], note: "No consolidated cost of revenue / cost of sales line was available for this period." };
+}
+
 function selectPrimaryStatementRevenueSource(period: string, ctx: ResolveContext) {
   const facts = ctx.duration.get(period);
   if (!facts) return null;
@@ -1299,11 +1339,30 @@ function interestExpenseScore(source: FactSource) {
 }
 
 function isCombinedInterestAndOtherIncomeSource(source: FactSource) {
+  if (isExplicitInterestIncomeSource(source)) return false;
+  if (isExplicitInterestExpenseSource(source)) return false;
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
   if (/interestexpense|interestcost|interestpaid|cashflow|cashflowstatement/.test(compact)) return false;
   if (/interestandother(?:income|expense|net)?|interestincomeandother|otherincomeandinterest|otherinterestincome/.test(compact)) return true;
   return /\binterest\b/.test(text) && /\bother\b/.test(text) && /\b(?:income|expense|gain|loss|net)\b/.test(text);
+}
+
+function isExplicitInterestIncomeSource(source: FactSource) {
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/interestexpense|interestcost|interestpaid/.test(compact)) return false;
+  if (/\binterest\b\s*(?:and|&)\s*other\b|\bother\b\s*(?:and|&)\s*interest\b/.test(text)) return false;
+  if (/^interestincome(other)?$|investmentincomeinterest/.test(compact)) return true;
+  return /\binterest\b.*\bincome\b|\bincome\b.*\binterest\b|\binterest\b.*\bearned\b/.test(text);
+}
+
+function isExplicitInterestExpenseSource(source: FactSource) {
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/interestincome|investmentincome/.test(compact)) return false;
+  if (/\binterest\b\s*(?:and|&)\s*other\b|\bother\b\s*(?:and|&)\s*interest\b/.test(text)) return false;
+  return /\binterest\b.*\bexpense\b|\bexpense\b.*\binterest\b|\binterest\b.*\bdebt\b|\bdebt\b.*\binterest\b/.test(text);
 }
 
 function goodwillImpairmentScore(source: FactSource) {
@@ -1512,6 +1571,16 @@ function resolveAssetImpairment(period: string, ctx: ResolveContext): ResolvedVa
 function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = firstSemanticDurationSource(period, ctx, C.otherNonOp, otherNonOperatingScore);
   if (direct) {
+    if (otherIncomeExpenseLineShouldBeSplit(period, ctx, direct)) {
+      const residual = resolveOtherNonOperatingResidual(period, ctx);
+      if (residual.value !== null) {
+        return {
+          ...residual,
+          note:
+            "Derived from the reported below-operating bridge after separately mapping disclosed interest income and interest expense; the broad other income/expense line was not reused wholesale."
+        };
+      }
+    }
     return {
       value: otherNonOperatingValue(direct),
       sources: [direct],
@@ -1528,6 +1597,23 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     sources: residual.sources,
     note: "No explicit EDGAR other non-operating line was reported, and the income statement bridge did not require a supported residual."
   };
+}
+
+function otherIncomeExpenseLineShouldBeSplit(period: string, ctx: ResolveContext, source: FactSource) {
+  if (!isBroadOtherIncomeExpenseLine(source)) return false;
+  const interestIncome = resolveInterestIncome(period, ctx);
+  const interestExpense = resolveInterestExpense(period, ctx);
+  return [interestIncome, interestExpense].some((item) =>
+    item.value !== null &&
+    Math.abs(item.value) > 0 &&
+    item.sources.some((itemSource) => itemSource.sourceLayer !== "model")
+  );
+}
+
+function isBroadOtherIncomeExpenseLine(source: FactSource) {
+  const compact = sourceCompactText(source);
+  if (isCombinedInterestAndOtherIncomeSource(source)) return true;
+  return /^(other)?nonoperatingincomeexpense$|^otherincome(expense)?net$|^otherincome$|^otherexpense$/.test(compact);
 }
 
 function resolveOtherNonOperatingResidual(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1880,11 +1966,21 @@ function resolveIncomeTaxExpense(period: string, ctx: ResolveContext): ResolvedV
 }
 
 function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue {
+  const derivedFromNetIncomeAndTax = resolvePreTaxIncomeFromNetIncomeAndTax(period, ctx);
   const direct = first(period, ctx.duration, [
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
   ]);
-  if (direct) return { value: direct.value, sources: [direct], classification: "direct" };
+  if (direct) {
+    if (derivedFromNetIncomeAndTax.value !== null && !statementMetricTies(direct.value / 1_000_000, derivedFromNetIncomeAndTax.value / 1_000_000)) {
+      return {
+        ...derivedFromNetIncomeAndTax,
+        note:
+          "Derived from EDGAR net income and income tax expense because the available pre-tax concept did not reconcile the consolidated income statement subtotal."
+      };
+    }
+    return { value: direct.value, sources: [direct], classification: "direct" };
+  }
 
   const beforeEquity = first(period, ctx.duration, [
     "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"
@@ -1906,6 +2002,13 @@ function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue
 
   const semanticDirect = semanticPreTaxIncomeSource(period, ctx);
   if (semanticDirect) {
+    if (derivedFromNetIncomeAndTax.value !== null && !statementMetricTies(semanticDirect.value / 1_000_000, derivedFromNetIncomeAndTax.value / 1_000_000)) {
+      return {
+        ...derivedFromNetIncomeAndTax,
+        note:
+          "Derived from EDGAR net income and income tax expense because the semantic pre-tax match did not reconcile the consolidated income statement subtotal."
+      };
+    }
     return {
       value: semanticDirect.value,
       sources: [semanticDirect],
@@ -1914,7 +2017,6 @@ function resolvePreTaxIncome(period: string, ctx: ResolveContext): ResolvedValue
     };
   }
 
-  const derivedFromNetIncomeAndTax = resolvePreTaxIncomeFromNetIncomeAndTax(period, ctx);
   if (derivedFromNetIncomeAndTax.value !== null) return derivedFromNetIncomeAndTax;
 
   const fallback = first(period, ctx.duration, PRETAX_INCOME_CONCEPTS);
@@ -2966,7 +3068,7 @@ function buildNormalizedHistoricalsPackage(
   }> = [
     { key: "revenue", statement: "income", periodType: "duration", resolver: resolveTotalRevenue, rationale: "Total company revenue normalized from consolidated EDGAR revenue concepts, with reviewed component fallback when needed." },
     { key: "net_revenue", statement: "income", periodType: "duration", concepts: C.netRevenue, rationale: "Financial-company net revenue normalized from EDGAR revenues net of interest expense." },
-    { key: "cogs", statement: "income", periodType: "duration", concepts: C.cogs, rationale: "Cost of revenue normalized from EDGAR cost concepts." },
+    { key: "cogs", statement: "income", periodType: "duration", resolver: resolveCostOfRevenue, rationale: "Cost of revenue normalized from consolidated EDGAR cost concepts." },
     { key: "gross_profit", statement: "income", periodType: "duration", concepts: C.grossProfit, rationale: "Gross profit normalized from EDGAR gross profit." },
     { key: "sga", statement: "income", periodType: "duration", resolver: resolveSellingGeneralAdministrativeExpense, rationale: "SG&A normalized directly or from EDGAR operating-income bridge inputs." },
     { key: "rd", statement: "income", periodType: "duration", resolver: resolveResearchDevelopmentExpense, rationale: "R&D normalized from EDGAR research, development, technology, or technology/content operating expense concepts." },
@@ -6692,16 +6794,16 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (/IncomeBeforeTaxesDerived|BeforeIncomeTaxesIncluding/i.test(concept)) return "pretax_income";
   if (/NetIncomeLossDerived/i.test(concept)) return "net_income";
 
-  if (isCombinedInterestAndOtherIncomeSource(source)) return "other_non_operating_income_expense";
   if (INTEREST_EXPENSE_CONCEPTS.includes(concept) || interestExpenseScore(source) >= 5) return "interest_expense";
   if (INTEREST_INCOME_CONCEPTS.includes(concept) || interestIncomeScore(source) >= 5) return "interest_income";
+  if (isCombinedInterestAndOtherIncomeSource(source)) return "other_non_operating_income_expense";
   if (PRETAX_INCOME_CONCEPTS.includes(concept) || preTaxIncomeScore(source) >= 5) return "pretax_income";
   if (INCOME_TAX_CONCEPTS.includes(concept) || incomeTaxScore(source) >= 5) return "income_tax";
   if (CONTINUING_NET_INCOME_CONCEPTS.includes(concept) || netIncomeScore(source) >= 5) return "net_income";
   if (C.operatingIncome.includes(concept) || /\boperating\b.*\b(income|profit|loss)\b|\b(income|profit|loss)\b.*\boperations?\b/.test(text)) return "operating_income";
-  if (TOTAL_REVENUE_CONCEPTS.includes(concept) || (!isRevenueComponentSource(source) && /\b(net )?(sales|revenues?)\b|\btotal net sales\b/.test(text))) return "revenue";
-  if (isRevenueComponentSource(source)) return "revenue";
   if ([...C.cogs, ...C.healthCareCosts].includes(concept) || /\bcost\b.*\b(revenue|sales|goods|operations?|services?|products?)\b|\bmerchandise costs?\b|\bfulfillment costs?\b/.test(text)) return "cost_of_revenue";
+  if (TOTAL_REVENUE_CONCEPTS.includes(concept) || (!isRevenueComponentSource(source) && !/\bcost\b/.test(text) && /\b(net )?(sales|revenues?)\b|\btotal net sales\b/.test(text))) return "revenue";
+  if (isRevenueComponentSource(source)) return "revenue";
   if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(concept) || /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b/.test(text)) return "research_and_development";
   if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(concept) || /\bselling\b.*\bgeneral\b.*\badministrative\b|\bsg&a\b|\bgeneral and administrative\b|\bselling and marketing\b|\bcorporate overhead\b|\badministrative expense\b/.test(text)) return "selling_general_administrative";
   if (INCOME_STATEMENT_DA_CONCEPTS.includes(concept) || /\bdepreciation\b|\bamortization\b|\bdepletion\b/.test(text)) return "income_statement_depreciation_amortization";
@@ -8554,7 +8656,7 @@ class FormulaEvaluator {
     const withRefs = withoutSums.replace(/((?:'[^']+'|[A-Za-z0-9_ ]+)!)?\$?([A-Z]{1,3})\$?(\d+)/g, (reference, sheetPrefix: string, col: string, row: string) => {
       const target = referencedCell(cell, sheetPrefix, col, row);
       if (!target) return "0";
-      const value = this.options.useCachedFormulaResults ? numericCellValue(target) : this.evaluateCell(target, visited);
+      const value = this.options.useCachedFormulaResults && target.worksheet !== cell.worksheet ? numericCellValue(target) : this.evaluateCell(target, visited);
       return value === null ? "0" : `(${value})`;
     });
 
@@ -8637,7 +8739,7 @@ class FormulaEvaluator {
         for (let row = Math.min(startRow, endRow); row <= Math.max(startRow, endRow); row += 1) {
           for (let col = Math.min(startCol, endCol); col <= Math.max(startCol, endCol); col += 1) {
             const targetCell = targetSheet.getCell(row, col);
-            const value = this.options.useCachedFormulaResults ? numericCellValue(targetCell) : this.evaluateCell(targetCell, visited);
+            const value = this.options.useCachedFormulaResults && targetSheet !== cell.worksheet ? numericCellValue(targetCell) : this.evaluateCell(targetCell, visited);
             total += value ?? 0;
           }
         }
@@ -9626,8 +9728,7 @@ function statementMetricTies(actual: number, expected: number) {
 }
 
 function recordIncomeStatementBridgeMismatch(errors: string[], warnings: string[], targetCell: ExcelJS.Cell, message: string) {
-  if (hasFormula(targetCell)) warnings.unshift(message);
-  else errors.push(message);
+  errors.push(message);
 }
 
 function validateIncomeStatementEbitdaFormula(
