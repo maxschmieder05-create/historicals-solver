@@ -23,6 +23,14 @@ const checks = [
   { row: 158, label: "balance sheet check", resolver: () => 0 }
 ];
 
+const flowChecks = [
+  {
+    row: 28,
+    label: "revenue",
+    concepts: ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax", "SalesRevenueNet"]
+  }
+];
+
 function cellValue(cell) {
   const value = cell.value;
   if (typeof value === "number") return value;
@@ -48,6 +56,15 @@ async function main() {
 
   const errors = [];
   for (const { period, col } of modelQuarterPeriods(model)) {
+    for (const check of flowChecks) {
+      const expected = expectedDurationConceptValue(facts, period, check.concepts);
+      if (expected === null) continue;
+      const actual = cellValue(model.getCell(check.row, col));
+      if (!valuesMatch(actual, expected)) {
+        errors.push(`${period} ${check.label} Model!${columnLetter(col)}${check.row}: expected ${expected}, got ${actual ?? "[blank]"}.`);
+      }
+    }
+
     for (const check of checks) {
       const expected =
         check.resolver?.(facts, period) ??
@@ -120,6 +137,44 @@ function expectedConceptValue(payload, period, concepts) {
     if (fact) return fact.val / 1_000_000;
   }
   return null;
+}
+
+function expectedDurationConceptValue(payload, period, concepts) {
+  for (const concept of concepts) {
+    const fact = expectedDurationFact(payload, period, concept);
+    if (fact) return fact.val / 1_000_000;
+    if (/^4Q\d{2}$/i.test(period)) {
+      const fourthQuarter = expectedFourthQuarterDurationValue(payload, period, concept);
+      if (fourthQuarter !== null) return fourthQuarter;
+    }
+  }
+  return null;
+}
+
+function expectedFourthQuarterDurationValue(payload, period, concept) {
+  const year = period.slice(2);
+  const annual = expectedDurationFact(payload, `FY${year}`, concept);
+  const q1 = expectedDurationFact(payload, `1Q${year}`, concept);
+  const q2 = expectedDurationFact(payload, `2Q${year}`, concept);
+  const q3 = expectedDurationFact(payload, `3Q${year}`, concept);
+  if (!annual || !q1 || !q2 || !q3) return null;
+  return (annual.val - q1.val - q2.val - q3.val) / 1_000_000;
+}
+
+function expectedDurationFact(payload, period, concept) {
+  const unitFacts = payload.facts?.["us-gaap"]?.[concept]?.units?.USD;
+  if (!Array.isArray(unitFacts)) return null;
+  const candidates = unitFacts.filter((fact) => durationFactMatchesPeriod(fact, period) && fact.start && fact.end && (fact.form === "10-Q" || fact.form === "10-K"));
+  return candidates.sort(compareExpectedFactPreference)[0] ?? null;
+}
+
+function durationFactMatchesPeriod(fact, period) {
+  const fiscalYear = 2000 + Number(period.slice(2));
+  if (fact.fy !== fiscalYear) return false;
+  if (/^FY\d{2}$/i.test(period)) return fact.fp === "FY";
+  const quarter = Number(period[0]);
+  if (quarter === 4) return fact.fp === "Q4";
+  return fact.fp === `Q${quarter}`;
 }
 
 function expectedFact(payload, period, concept) {

@@ -231,6 +231,7 @@ type InlineContext = {
   instant: boolean;
   start?: string;
   end?: string;
+  periodType?: FactSource["periodType"];
   hasDimensions?: boolean;
 };
 
@@ -3951,6 +3952,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
     if (["AssetsCurrent", "OtherAssets"].includes(concept)) continue;
     const context = contexts.get(contextRef);
     if (!context?.period || !wanted.has(context.period)) continue;
+    if (!context.instant && context.periodType === "annual") continue;
     if (context.instant && /^(?:us-gaap|dei|srt)$/i.test(taxonomy)) continue;
     if (context.instant && !INLINE_INSTANT_EXTENSION_CONCEPTS.has(concept)) continue;
     if (context.hasDimensions) continue;
@@ -3970,7 +3972,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
       start: context.start,
       end: context.end,
       periodKey: context.period,
-      periodType: context.instant ? "instant" as const : "quarterly" as const,
+      periodType: context.periodType ?? (context.instant ? "instant" as const : "quarterly" as const),
       reportDate: filing.reportDate,
       isAmendment: filing.form.endsWith("/A")
     };
@@ -4171,7 +4173,14 @@ function parseInlineContexts(html: string, form: string) {
     const end = body.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
     if (start && end) {
       if (!isSupportedInlineDuration(start, end)) continue;
-      contexts.set(match[1], { period: contextPeriod(body, form, fiscalFocus) ?? periodKeyFromDate(end), instant: false, start, end, hasDimensions: hasInlineDimensions(body) });
+      contexts.set(match[1], {
+        period: contextPeriod(body, form, fiscalFocus) ?? periodKeyFromDate(end),
+        instant: false,
+        start,
+        end,
+        periodType: inlineDurationPeriodType(start, end, form),
+        hasDimensions: hasInlineDimensions(body)
+      });
     }
   }
   return contexts;
@@ -4198,6 +4207,14 @@ function isSupportedInlineDuration(start: string, end: string) {
   const isQuarter = days >= 80 && days <= 100;
   const isFiscalYear = start.endsWith("-01-01") && end.endsWith("-12-31");
   return isQuarter || isFiscalYear;
+}
+
+function inlineDurationPeriodType(start: string, end: string, form: string): FactSource["periodType"] {
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return "quarterly";
+  const days = Math.round((endDate.getTime() - startDate.getTime()) / 86_400_000) + 1;
+  return isTenK(form) && days >= 330 ? "annual" : "quarterly";
 }
 
 function hasInlineDimensions(contextBody: string) {
@@ -8389,9 +8406,16 @@ function first(period: string, map: Map<string, Map<string, FactSource>>, concep
   if (!facts) return null;
   for (const concept of concepts) {
     const source = facts.get(concept);
+    if (source && !sourceUsableForLookupPeriod(period, source)) continue;
     if (source) return source;
   }
   return null;
+}
+
+function sourceUsableForLookupPeriod(period: string, source: FactSource) {
+  if (source.derivedTotalValue !== undefined) return true;
+  if (!isQuarterPeriod(period)) return true;
+  return source.periodType !== "annual";
 }
 
 function firstWithPriorInstant(period: string, map: Map<string, Map<string, FactSource>>, concepts: string[]) {
