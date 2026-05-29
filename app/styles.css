@@ -222,6 +222,7 @@ input::placeholder {
 }
 
 .dropzone {
+  position: relative;
   min-height: 218px;
   border: 1.5px dashed #8da8bf;
   border-radius: 8px;
@@ -239,7 +240,13 @@ input::placeholder {
 }
 
 .dropzone input {
-  display: none;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .dropIcon {

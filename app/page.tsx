@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, useMemo, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, CheckCircle2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -19,6 +19,7 @@ export default function Home() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const canSubmit = useMemo(() => Boolean(file && ticker.trim() && !isSubmitting), [file, ticker, isSubmitting]);
 
@@ -27,20 +28,35 @@ export default function Home() {
     setSummary(null);
     if (!nextFile) return;
     if (!nextFile.name.toLowerCase().endsWith(".xlsx")) {
-      setError("Upload an .xlsx workbook.");
+      setFile(null);
+      setError(`${nextFile.name} is not an .xlsx workbook.`);
       return;
     }
     setFile(nextFile);
   }
 
-  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+  function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
+    event.stopPropagation();
+    if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
+    if (event.type === "dragleave" || event.type === "drop") setIsDragging(false);
+  }
+
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
+    event.preventDefault();
+    event.stopPropagation();
     setIsDragging(false);
     pickFile(event.dataTransfer.files?.[0]);
   }
 
   function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
     pickFile(event.target.files?.[0]);
+  }
+
+  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    fileInputRef.current?.click();
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -140,22 +156,24 @@ export default function Home() {
             </div>
           </div>
 
-          <label
+          <div
             className={isDragging ? "dropzone dragging" : "dropzone"}
-            onDragOver={(event) => {
-              event.preventDefault();
-              setIsDragging(true);
-            }}
-            onDragLeave={() => setIsDragging(false)}
+            role="button"
+            tabIndex={0}
+            onClick={() => fileInputRef.current?.click()}
+            onKeyDown={handleDropzoneKeyDown}
+            onDragEnter={handleDrag}
+            onDragOver={handleDrag}
+            onDragLeave={handleDrag}
             onDrop={handleDrop}
           >
-            <input type="file" accept=".xlsx" onChange={handleFileChange} />
+            <input ref={fileInputRef} type="file" accept=".xlsx" onChange={handleFileChange} />
             <span className="dropIcon">
               <UploadCloud aria-hidden="true" size={30} />
             </span>
             <span className="dropTitle">{file ? file.name : "Drop Excel model here"}</span>
             <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB selected` : "Click to browse or drag in an .xlsx file"}</small>
-          </label>
+          </div>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
