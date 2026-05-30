@@ -3760,6 +3760,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
 
   const annual = new Map<string, Map<string, SegmentMetrics>>();
   const quarterly = new Map<string, Map<string, SegmentMetrics>>();
+  const cumulative = new Map<string, Map<string, SegmentMetrics>>();
 
   for (const filing of filings) {
     try {
@@ -3769,16 +3770,16 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
       const html = await fetchSecArchiveHtml(url, true);
       if (!html) continue;
       const parsed = parseInlineSegmentRevenue(html, filing.form);
-      for (const [period, values] of parsed.entries()) {
-        if (isTenK(filing.form)) annual.set(period, values);
-        else quarterly.set(period, values);
-      }
+      mergeSegmentPeriodMaps(annual, parsed.annual);
+      mergeSegmentPeriodMaps(quarterly, parsed.quarterly);
+      mergeSegmentPeriodMaps(cumulative, parsed.year_to_date);
     } catch (error) {
       if (error instanceof SecArchiveRateLimitError) throw error;
       // Segment data is supplemental; model-level company facts still fill the workbook.
     }
   }
 
+  mergeSegmentPeriodMaps(quarterly, segmentQuarterliesFromCumulative(cumulative, quarterly));
   deriveSegmentFourthQuarters(quarterly, annual);
 
   const wanted = new Set(periods);
@@ -3826,6 +3827,37 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
     });
   coalesceRenamedOtherRevenueBuckets(segments, periods);
   return segments.sort((a, b) => segmentSort(a.label, b.label));
+}
+
+function mergeSegmentPeriodMaps(
+  target: Map<string, Map<string, SegmentMetrics>>,
+  source: Map<string, Map<string, SegmentMetrics>>
+) {
+  source.forEach((sourceValues, period) => {
+    const targetValues = target.get(period) ?? new Map<string, SegmentMetrics>();
+    sourceValues.forEach((sourceMetrics, label) => {
+      const existing = targetValues.get(label);
+      targetValues.set(label, existing ? mergeSegmentMetrics(existing, sourceMetrics) : { ...sourceMetrics });
+    });
+    if (targetValues.size) target.set(period, targetValues);
+  });
+}
+
+function mergeSegmentMetrics(existing: SegmentMetrics, next: SegmentMetrics): SegmentMetrics {
+  const preferNext = (next.sourcePeriodPriority ?? 0) > (existing.sourcePeriodPriority ?? 0);
+  return {
+    label: existing.label ?? next.label,
+    revenue: preferNext ? next.revenue ?? existing.revenue : existing.revenue ?? next.revenue,
+    operatingIncome: preferNext ? next.operatingIncome ?? existing.operatingIncome : existing.operatingIncome ?? next.operatingIncome,
+    depreciationAmortization: preferNext
+      ? next.depreciationAmortization ?? existing.depreciationAmortization
+      : existing.depreciationAmortization ?? next.depreciationAmortization,
+    family: existing.family ?? next.family,
+    disclosureKind: existing.disclosureKind ?? next.disclosureKind,
+    disclosurePriority: existing.disclosurePriority ?? next.disclosurePriority,
+    sourcePeriodPriority: Math.max(existing.sourcePeriodPriority ?? 0, next.sourcePeriodPriority ?? 0),
+    aggregate: Boolean(existing.aggregate || next.aggregate)
+  };
 }
 
 function coalesceRenamedOtherRevenueBuckets(segments: SegmentRevenue[], periods: string[]) {
@@ -4322,15 +4354,22 @@ type SegmentMetrics = {
   family?: string;
   disclosureKind?: RevenueDisclosureKind;
   disclosurePriority?: number;
+  sourcePeriodPriority?: number;
   aggregate?: boolean;
 };
 
 type SegmentMetricMapKey = "values" | "operatingIncome" | "depreciationAmortization";
+type SegmentDurationBucket = "quarterly" | "year_to_date" | "annual";
 
 type InlineSegmentContext = {
   period: string | null;
   members: string[];
+  periodType?: FactSource["periodType"];
+  sourcePeriodPriority?: number;
 };
+
+type ParsedInlineSegmentRevenue = Record<SegmentDurationBucket, Map<string, Map<string, SegmentMetrics>>>;
+type ParsedInlineSegmentTotals = Record<SegmentDurationBucket, Map<string, { value: number; priority: number }>>;
 
 type InlineFiscalFocus = {
   fy: number;
@@ -4343,13 +4382,21 @@ function parseInlineSegmentRevenue(html: string, form: string) {
   const contexts = new Map<string, InlineSegmentContext>();
   for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
     const body = match[0];
-    const period = contextPeriod(body, form, fiscalFocus);
-    const members = Array.from(body.matchAll(/<xbrldi:explicitMember\b[^>]*>([^<]+)<\/xbrldi:explicitMember>/g)).map((member) => member[1]);
-    contexts.set(match[1], { period, members });
+    const periodInfo = inlineSegmentDurationPeriod(body, form, fiscalFocus);
+    const members = Array.from(body.matchAll(/<xbrldi:explicitMember\b([^>]*)>([^<]+)<\/xbrldi:explicitMember>/g)).map((member) => {
+      const dimension = member[1].match(/\bdimension="([^"]+)"/)?.[1];
+      return dimension ? `${dimension}=${member[2]}` : member[2];
+    });
+    contexts.set(match[1], {
+      period: periodInfo?.period ?? null,
+      members,
+      periodType: periodInfo?.periodType,
+      sourcePeriodPriority: periodInfo?.sourcePeriodPriority
+    });
   }
 
-  const byPeriod = new Map<string, Map<string, SegmentMetrics>>();
-  const totalRevenueByPeriod = new Map<string, { value: number; priority: number }>();
+  const parsed = emptyParsedInlineSegmentRevenue();
+  const totalRevenueByPeriod = emptyParsedInlineSegmentTotals();
   const seenFacts = new Set<string>();
 
   for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
@@ -4359,16 +4406,18 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     const contextRef = attrs.match(/\bcontextRef="([^"]+)"/)?.[1];
     if (!contextRef) continue;
     const context = contexts.get(contextRef);
-    if (!context?.period) continue;
+    const bucket = segmentDurationBucket(context?.periodType);
+    if (!context?.period || !bucket) continue;
 
     const value = ixNumber(match[2], attrs);
     if (value === null) continue;
 
     const totalPriority = totalRevenuePriority(concept, context.members);
     if (totalPriority) {
-      const existing = totalRevenueByPeriod.get(context.period);
+      const periodTotals = totalRevenueByPeriod[bucket];
+      const existing = periodTotals.get(context.period);
       if (!existing || totalPriority > existing.priority || (totalPriority === existing.priority && Math.abs(value) > Math.abs(existing.value))) {
-        totalRevenueByPeriod.set(context.period, { value, priority: totalPriority });
+        periodTotals.set(context.period, { value, priority: totalPriority });
       }
     }
 
@@ -4385,11 +4434,12 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     if (metric === "revenue" && !disclosureKind) continue;
     const label =
       metric === "revenue"
-        ? revenueBreakoutLabel(rowLabel, context.members)
+        ? revenueBreakoutLabel(rowLabel, context.members, disclosureKind ?? undefined)
         : segmentLabelFromMembers(context.members);
     if (!label) continue;
     if (metric === "revenue" && isAggregateRevenueBreakoutLabel(label)) continue;
 
+    const byPeriod = parsed[bucket];
     const periodValues = byPeriod.get(context.period) ?? new Map<string, SegmentMetrics>();
     const family =
       metric === "revenue" && disclosureKind
@@ -4399,6 +4449,7 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     const metrics = periodValues.get(key) ?? {};
     metrics.label = metrics.label ?? label;
     metrics.family = metrics.family ?? family;
+    metrics.sourcePeriodPriority = Math.max(metrics.sourcePeriodPriority ?? 0, context.sourcePeriodPriority ?? 0);
     if (disclosureKind) {
       metrics.disclosureKind = disclosureKind;
       metrics.disclosurePriority = revenueDisclosurePriority(disclosureKind);
@@ -4412,9 +4463,34 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     byPeriod.set(context.period, periodValues);
   }
 
-  removeUnreconciledRevenueDisclosureGroups(byPeriod, totalRevenueByPeriod);
+  removeUnreconciledRevenueDisclosureGroups(parsed.quarterly, totalRevenueByPeriod.quarterly);
+  removeUnreconciledRevenueDisclosureGroups(parsed.year_to_date, totalRevenueByPeriod.year_to_date);
+  removeUnreconciledRevenueDisclosureGroups(parsed.annual, totalRevenueByPeriod.annual);
 
-  return byPeriod;
+  return parsed;
+}
+
+function emptyParsedInlineSegmentRevenue(): ParsedInlineSegmentRevenue {
+  return {
+    quarterly: new Map<string, Map<string, SegmentMetrics>>(),
+    year_to_date: new Map<string, Map<string, SegmentMetrics>>(),
+    annual: new Map<string, Map<string, SegmentMetrics>>()
+  };
+}
+
+function emptyParsedInlineSegmentTotals(): ParsedInlineSegmentTotals {
+  return {
+    quarterly: new Map<string, { value: number; priority: number }>(),
+    year_to_date: new Map<string, { value: number; priority: number }>(),
+    annual: new Map<string, { value: number; priority: number }>()
+  };
+}
+
+function segmentDurationBucket(periodType?: FactSource["periodType"]): SegmentDurationBucket | null {
+  if (periodType === "annual") return "annual";
+  if (periodType === "year_to_date") return "year_to_date";
+  if (periodType === "quarterly") return "quarterly";
+  return null;
 }
 
 function totalRevenuePriority(concept: string, members: string[]) {
@@ -4535,6 +4611,9 @@ function revenueDisclosureKind(
 
   const joinedMembers = members.join(" ");
   const text = `${tableInfo.text} ${rowLabel ?? ""} ${joinedMembers}`;
+  if (members.some(isReportableSegmentMember)) {
+    return "segment";
+  }
   if (/\b(geographic|geographical|region|country|domestic|international|foreign|americas|europe|asia pacific)\b/i.test(text)) {
     return "geographic";
   }
@@ -4547,17 +4626,20 @@ function revenueDisclosureKind(
   if (/\b(business line|line of business|service line|category|market|division|brand|channel|solution)\b/i.test(text)) {
     return "business_line";
   }
-  if (members.some(isReportableSegmentMember) || /\b(reportable segment|operating segment|segment revenue|segments)\b/i.test(text)) {
+  if (/\b(reportable segment|operating segment|segment revenue|segments)\b/i.test(text)) {
     return "segment";
   }
   return "other";
 }
 
-function revenueBreakoutLabel(rowLabel: string | null, members: string[]) {
+function revenueBreakoutLabel(rowLabel: string | null, members: string[], disclosureKind?: RevenueDisclosureKind) {
+  const memberLabels = members.map(cleanSegmentMember).filter((label): label is string => Boolean(label));
+  const memberLabel = memberLabels.find(isUsefulRevenueBreakoutLabel) ?? null;
+  if (disclosureKind === "segment" && memberLabel) return memberLabel;
+
   const reported = cleanRevenueBreakoutLabel(rowLabel ?? "");
   if (isUsefulRevenueBreakoutLabel(reported)) return reported;
-  const memberLabels = members.map(cleanSegmentMember).filter((label): label is string => Boolean(label));
-  return memberLabels.find(isUsefulRevenueBreakoutLabel) ?? null;
+  return memberLabel;
 }
 
 function cleanRevenueBreakoutLabel(label: string) {
@@ -4565,7 +4647,8 @@ function cleanRevenueBreakoutLabel(label: string) {
     .replace(/\s+/g, " ")
     .replace(/^["'`]+|["'`]+$/g, "")
     .replace(/^[•*\-–]\s*/, "")
-    .replace(/\s*\(?\$?\d[\d,]*(?:\.\d+)?\)?\s*$/g, "")
+    .replace(/(?:\s*\$?\s*\(?-?\d[\d,]*(?:\.\d+)?\)?\s*\$?)+\s*$/g, "")
+    .replace(/\s+\$/g, "")
     .replace(/\s*(?:revenue|revenues|net sales|sales)\s*$/i, "")
     .replace(/\s*:\s*$/g, "")
     .trim();
@@ -4576,12 +4659,25 @@ function isUsefulRevenueBreakoutLabel(label: string | null | undefined): label i
   if (label.length < 2 || label.length > 90) return false;
   if (!/[A-Za-z]/.test(label)) return false;
   if (/^\(?\$?\d[\d,]*(?:\.\d+)?\)?$/.test(label)) return false;
+  if (isNumericOrCurrencyHeavySegmentLabel(label)) return false;
   if (isAggregateRevenueBreakoutLabel(label)) return false;
   if (/^(group\s*\d+(?:\s*segment)?|segment\s*\d+|operating segments?|reportable segments?|geographic areas?)$/i.test(label)) return false;
   if (/^(gross|net|intercompany|intersegment|elimination|reconciliation)$/i.test(label)) return false;
   if (/\b(gross|net|intercompany|intersegment|elimination|reconciliation)\s+revenue\b/i.test(label)) return false;
   if (/\b(table of contents|unaudited|in millions|fiscal year|three months|nine months|year ended)\b/i.test(label)) return false;
   return true;
+}
+
+function isNumericOrCurrencyHeavySegmentLabel(label: string) {
+  const letters = label.match(/[A-Za-z]/g)?.length ?? 0;
+  const numericCurrency = label.match(/[\d$\u20ac\u00a3\u00a5,.()\-]/g)?.length ?? 0;
+  if (/\d/.test(label) && /[$\u20ac\u00a3\u00a5]/.test(label)) return true;
+  if (/\d/.test(label) && numericCurrency > letters) return true;
+  const meaningfulWords = label
+    .replace(/[$\u20ac\u00a3\u00a5()0-9,.\-]/g, " ")
+    .split(/\s+/)
+    .filter((word) => word && !/^(revenue|revenues|sales|net|total|gross|operating|income|loss|profit|external|customer|customers)$/i.test(word));
+  return letters < 3 || meaningfulWords.length === 0;
 }
 
 function isAggregateRevenueBreakoutLabel(label: string) {
@@ -4642,6 +4738,11 @@ function inlineDocumentFact(html: string, localName: string) {
 function inlineDocumentPeriodEndDate(html: string) {
   const tag = html.match(/<ix:nonNumeric\b[^>]*\bname=["']dei:DocumentPeriodEndDate["'][^>]*>/i);
   if (!tag || tag.index === undefined) return null;
+  const windowText = inlineText(html.slice(tag.index, tag.index + 1200));
+  const dateMatch = windowText.match(
+    /\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}\s*,?\s+\d{4}\b|\b\d{4}-\d{2}-\d{2}\b/i
+  );
+  if (dateMatch) return dateMatch[0].replace(/\s+,/, ",");
   const body = html.slice(tag.index + tag[0].length, tag.index + tag[0].length + 600);
   const firstClose = body.indexOf("</ix:nonNumeric>");
   if (firstClose < 0) return null;
@@ -4678,6 +4779,38 @@ function contextPeriod(contextXml: string, form: string, fiscalFocus?: InlineFis
   const quarter = Math.floor(endDate.getUTCMonth() / 3) + 1;
   if (isTenK(form)) return `4Q${String(year).slice(-2)}`;
   return `${quarter}Q${String(year).slice(-2)}`;
+}
+
+function inlineSegmentDurationPeriod(
+  contextXml: string,
+  form: string,
+  fiscalFocus?: InlineFiscalFocus | null
+): { period: string; periodType: FactSource["periodType"]; sourcePeriodPriority?: number } | null {
+  const start = contextXml.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
+  const end = contextXml.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
+  if (!start || !end) return null;
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return null;
+
+  const days = Math.round((endDate.getTime() - startDate.getTime()) / 86_400_000) + 1;
+  const fiscalPeriod = fiscalFocus ? periodKeyFromFiscalFocus(end, fiscalFocus) : null;
+  const calendarPeriod = periodKeyFromDate(end);
+  const period = fiscalPeriod ?? calendarPeriod;
+  if (!period) return null;
+
+  if (isTenK(form)) {
+    if (days < 330) return null;
+    const annualPeriod = `4Q${periodYearSuffix(period)}`;
+    return {
+      period: annualPeriod,
+      periodType: "annual",
+      sourcePeriodPriority: fiscalFocus && periodYear(annualPeriod) === fiscalFocus.fy ? 2 : 1
+    };
+  }
+  if (days <= 115) return { period, periodType: "quarterly" };
+  if (days < 330) return { period, periodType: "year_to_date" };
+  return null;
 }
 
 function periodKeyFromFiscalFocus(end: string, focus: InlineFiscalFocus) {
@@ -4765,6 +4898,7 @@ function cleanSegmentMember(member: string) {
     .replace(/\s+/g, " ")
     .trim();
   if (!local || /Consolidated|Corporate|Geographic|Operating Segments/i.test(local) || /^Group\s*\d+$/i.test(local)) return null;
+  if (isNumericOrCurrencyHeavySegmentLabel(local)) return null;
   if (/^IPhone$/i.test(local)) return "iPhone";
   if (/^IPad$/i.test(local)) return "iPad";
   if (/^Service$/i.test(local)) return "Services";
@@ -4815,6 +4949,36 @@ function isAggregateSegmentLabel(label: string) {
   return /^(Operating Segments|OperatingSegments|Total|Consolidated)$/i.test(label.trim());
 }
 
+function segmentQuarterliesFromCumulative(
+  cumulative: Map<string, Map<string, SegmentMetrics>>,
+  existingQuarterly: Map<string, Map<string, SegmentMetrics>> = new Map()
+) {
+  const quarterly = new Map<string, Map<string, SegmentMetrics>>();
+  cumulative.forEach((currentValues, period) => {
+    const quarter = Number(period[0]);
+    const year = period.slice(2);
+    if (quarter === 1) {
+      quarterly.set(period, cloneSegmentMetricsMap(currentValues));
+      return;
+    }
+    if (quarter !== 2 && quarter !== 3) return;
+
+    const priorPeriod = `${quarter - 1}Q${year}`;
+    const priorValues = cumulative.get(priorPeriod) ?? existingQuarterly.get(priorPeriod);
+    if (!priorValues) return;
+
+    const derivedValues = new Map<string, SegmentMetrics>();
+    currentValues.forEach((currentMetrics, label) => {
+      const priorMetrics = priorValues.get(label);
+      if (!priorMetrics) return;
+      const derived = deriveSegmentMetricDifference(currentMetrics, priorMetrics);
+      if (derived) derivedValues.set(label, derived);
+    });
+    if (derivedValues.size) quarterly.set(period, derivedValues);
+  });
+  return quarterly;
+}
+
 function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, SegmentMetrics>>, annual: Map<string, Map<string, SegmentMetrics>>) {
   for (const [period, annualValues] of annual.entries()) {
     const year = period.slice(2);
@@ -4828,13 +4992,42 @@ function deriveSegmentFourthQuarters(quarterly: Map<string, Map<string, SegmentM
       (["revenue", "operatingIncome", "depreciationAmortization"] as const).forEach((metric) => {
         const annualValue = metrics[metric];
         if (annualValue === undefined) return;
-        q4Metrics[metric] =
-          annualValue - (q1.get(label)?.[metric] ?? 0) - (q2.get(label)?.[metric] ?? 0) - (q3.get(label)?.[metric] ?? 0);
+        const q1Value = q1.get(label)?.[metric];
+        const q2Value = q2.get(label)?.[metric];
+        const q3Value = q3.get(label)?.[metric];
+        if (q1Value === undefined || q2Value === undefined || q3Value === undefined) return;
+        q4Metrics[metric] = annualValue - q1Value - q2Value - q3Value;
       });
-      q4.set(label, q4Metrics);
+      if (Object.keys(q4Metrics).length) q4.set(label, { ...metrics, ...q4Metrics });
     });
-    quarterly.set(period, q4);
+    if (q4.size) quarterly.set(period, q4);
   }
+}
+
+function cloneSegmentMetricsMap(values: Map<string, SegmentMetrics>) {
+  const cloned = new Map<string, SegmentMetrics>();
+  values.forEach((metrics, label) => cloned.set(label, { ...metrics }));
+  return cloned;
+}
+
+function deriveSegmentMetricDifference(current: SegmentMetrics, prior: SegmentMetrics) {
+  const derived: SegmentMetrics = {
+    label: current.label ?? prior.label,
+    family: current.family ?? prior.family,
+    disclosureKind: current.disclosureKind ?? prior.disclosureKind,
+    disclosurePriority: current.disclosurePriority ?? prior.disclosurePriority,
+    sourcePeriodPriority: current.sourcePeriodPriority ?? prior.sourcePeriodPriority,
+    aggregate: Boolean(current.aggregate || prior.aggregate)
+  };
+  let hasValue = false;
+  (["revenue", "operatingIncome", "depreciationAmortization"] as const).forEach((metric) => {
+    const currentValue = current[metric];
+    const priorValue = prior[metric];
+    if (currentValue === undefined || priorValue === undefined) return;
+    derived[metric] = currentValue - priorValue;
+    hasValue = true;
+  });
+  return hasValue ? derived : null;
 }
 
 function segmentSort(a: string, b: string) {
@@ -5334,6 +5527,7 @@ function isProjectedBalanceSheetCell(sheet: ExcelJS.Worksheet, rowNumber: number
 function isHistoricalReportedPeriod(period: string, isEstimate: boolean, ctx: ResolveContext) {
   if (!isSupportedPeriodKey(period) || isEstimate) return false;
   if (hasReportedFinancialStatementPeriod(period, ctx)) return true;
+  if (isFourthQuarterPeriod(period) && hasReportedFinancialStatementPeriod(`FY${periodYearSuffix(period)}`, ctx)) return true;
   return isAnnualPeriod(period) && hasReportedFinancialStatementPeriod(balanceSheetInstantLookupPeriod(period), ctx);
 }
 
@@ -5723,7 +5917,7 @@ function fillSegmentAnalysis(
 
   const revenueClearPairs = allHistoricalPeriodColumnPairs(sheet);
   const revenueResult = usableSegments.length
-    ? fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows)
+    ? fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows, { forceOrderedAssignment: true })
     : clearSegmentMetricRows(
         sheet,
         revenueClearPairs.map((item) => item.period),
@@ -5753,18 +5947,9 @@ function fillSegmentAnalysis(
   const revenueReconciliation = usableSegments.length
     ? reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, rows, "Revenue", revenueConcepts, ctx, auditRows, resolveTotalRevenue)
     : { filledCells: 0, commentsAdded: 0, warnings: [] };
-  const operatingIncomeReconciliation = reconcileSegmentMetricRowsToStatementTotal(
-    sheet,
-    periods,
-    columns,
-    operatingIncomeRows,
-    "Operating Income",
-    C.operatingIncome,
-    ctx,
-    auditRows,
-    undefined,
-    { allowFourthQuarterResidual: true }
-  );
+  const operatingIncomeReconciliation = hasOperatingIncomeSegments
+    ? reconcileSegmentMetricRowsToStatementTotal(sheet, periods, columns, operatingIncomeRows, "Operating Income", C.operatingIncome, ctx, auditRows)
+    : { filledCells: 0, commentsAdded: 0, warnings: [] };
   const operatingIncomeFallback = hasOperatingIncomeSegments
     ? { filledCells: 0, commentsAdded: 0, warnings: [] as string[] }
     : {
@@ -5776,7 +5961,9 @@ function fillSegmentAnalysis(
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded + operatingIncomeFallback.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings, ...operatingIncomeFallback.warnings);
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Revenue", "Revenue Mix", auditRows, { overwriteHardcoded: true });
-  filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
+  if (hasOperatingIncomeSegments) {
+    filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
+  }
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total D&A", "D&A Check", auditRows);
   filledCells += usableSegments.length
     ? fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue, resolveTotalRevenue)
@@ -6246,8 +6433,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
   concepts: string[],
   ctx: ResolveContext,
   auditRows: MappingAuditRow[],
-  resolver?: (period: string, ctx: ResolveContext) => ResolvedValue,
-  options: { allowFourthQuarterResidual?: boolean } = {}
+  resolver?: (period: string, ctx: ResolveContext) => ResolvedValue
 ) {
   let filledCells = 0;
   let commentsAdded = 0;
@@ -6267,66 +6453,28 @@ function reconcileSegmentMetricRowsToStatementTotal(
     const actual = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     if (segmentStatementMetricTies(actual, expected)) return;
 
-    if (!options.allowFourthQuarterResidual && isFourthQuarterPeriod(period) && Math.abs(actual) <= 0.0001 && Math.abs(expected) > 0.0001) {
-      warnings.push(
-        `Segment Analysis ${period}: ${suffix} detail did not tie to EDGAR because no reliable 4Q breakout was available; leaving the residual unallocated for review.`
-      );
-      auditRows.push({
-        sheetName: sheet.name,
-        cell: `${columnLetter(col)}${rows[0]}`,
-        modelRowLabel: `${suffix} segment detail`,
-        period,
-        valueWritten: 0,
-        mappingType: "skipped",
-        conceptsUsed: concepts.join(", "),
-        sourceStatement: "segment",
-        accession: expectedSource.accn ?? "",
-        sourceUrl: "",
-        cellWritable: false,
-        formulaPreserved: false,
-        writeBlockedReason: "missing reliable 4Q segment breakout",
-        signConvention: "not written",
-        confidence: "low",
-        validationStatus: "needs_review",
-        notes: lineItemSentence(`${suffix} segment detail`, [sourceLineItemLabel(expectedSource)], "includes")
-      });
-      return;
-    }
-
-    const residualRow = findSegmentResidualRow(sheet, rows, col, suffix);
-    if (!residualRow) {
-      warnings.push(`Segment Analysis ${period}: ${suffix} rows do not tie to EDGAR total and no residual segment row was available for reconciliation.`);
-      return;
-    }
-
-    const cell = sheet.getCell(residualRow, col);
-    const value = (numericCellValue(cell) ?? 0) + expected - actual;
-    if (/revenue/i.test(suffix) && expected - actual < -0.05 && Math.abs(expected - actual) > Math.max(0.5, Math.abs(expected) * 0.005)) {
-      warnings.push(`Segment Analysis ${period}: revenue breakout summed above consolidated EDGAR revenue; leaving detail rows unchanged instead of using a negative reconciliation plug.`);
-      return;
-    }
-    cell.value = value;
-    filledCells += 1;
-    const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(expectedSource) || `Consolidated ${suffix}`], "includes");
-    if (addComment(cell, note)) commentsAdded += 1;
+    const gap = expected - actual;
+    warnings.push(
+      `Segment Analysis ${period}: ${suffix} rows sum to ${roundModelValue(actual)}, but consolidated EDGAR ${suffix.toLowerCase()} is ${roundModelValue(expected)}; leaving the gap unallocated instead of using Other / Reconciliation as a plug.`
+    );
     auditRows.push({
       sheetName: sheet.name,
-      cell: cell.address,
-      modelRowLabel: rowLabel(sheet, residualRow),
+      cell: `${columnLetter(col)}${rows[0]}`,
+      modelRowLabel: `${suffix} segment detail`,
       period,
-      valueWritten: value,
-      mappingType: "calculated",
+      valueWritten: gap,
+      mappingType: "skipped",
       conceptsUsed: concepts.join(", "),
       sourceStatement: "segment",
       accession: expectedSource.accn ?? "",
       sourceUrl: "",
-      cellWritable: true,
+      cellWritable: false,
       formulaPreserved: false,
-      writeBlockedReason: "",
-      signConvention: "residual",
-      confidence: "medium",
-      validationStatus: "OK!",
-      notes: note
+      writeBlockedReason: "segment rows did not tie to consolidated EDGAR total",
+      signConvention: "not written",
+      confidence: "low",
+      validationStatus: "needs_review",
+      notes: lineItemSentence(`${suffix} segment detail`, [sourceLineItemLabel(expectedSource)], "includes")
     });
   });
 
@@ -6448,7 +6596,7 @@ function fillSegmentMetricRows(
   metric: SegmentMetricMapKey,
   suffix: string,
   auditRows: MappingAuditRow[],
-  options: { preserveLinkedBaseLabels?: boolean } = {}
+  options: { preserveLinkedBaseLabels?: boolean; forceOrderedAssignment?: boolean } = {}
 ) {
   let filledCells = 0;
   let commentsAdded = 0;
@@ -6501,18 +6649,20 @@ function assignSegmentsToMetricRows(
   suffix: string,
   periods: string[],
   usedSegments: Set<number>,
-  options: { preserveLinkedBaseLabels?: boolean } = {}
+  options: { preserveLinkedBaseLabels?: boolean; forceOrderedAssignment?: boolean } = {}
 ) {
   const assignments = new Map<number, number>();
 
-  rows.forEach((rowNumber) => {
-    const existingLabel = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
-    if (isGenericSegmentPlaceholder(existingLabel)) return;
-    const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments);
-    if (segmentIndex === null) return;
-    assignments.set(rowNumber, segmentIndex);
-    usedSegments.add(segmentIndex);
-  });
+  if (!options.forceOrderedAssignment) {
+    rows.forEach((rowNumber) => {
+      const existingLabel = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
+      if (isGenericSegmentPlaceholder(existingLabel)) return;
+      const segmentIndex = segmentIndexForRow(existingLabel, segments, usedSegments);
+      if (segmentIndex === null) return;
+      assignments.set(rowNumber, segmentIndex);
+      usedSegments.add(segmentIndex);
+    });
+  }
 
   rows.forEach((rowNumber) => {
     if (assignments.has(rowNumber)) return;
@@ -6590,6 +6740,7 @@ function clearUnmatchedSegmentRow(
       notes
     });
   });
+  if (shouldClearUnusedSegmentLabel(modelLabel)) clearSegmentMetricRowLabel(sheet, rowNumber);
   return { filledCells, commentsAdded };
 }
 
@@ -6659,11 +6810,30 @@ function segmentBaseLabel(label: string, suffix: string) {
 function isGenericSegmentPlaceholder(label: string) {
   return (
     !label ||
+    isNumericOrCurrencyHeavySegmentLabel(label) ||
     /^segment\s*\d+$/i.test(label) ||
     /^group\s*\d+$/i.test(label) ||
     /^group\s*\d+\s*segment$/i.test(label.replace(/\s+/g, "")) ||
     /^(revenue|operating income|d&a|total company)$/i.test(label.trim())
   );
+}
+
+function shouldClearUnusedSegmentLabel(label: string) {
+  if (!label) return false;
+  return isGenericSegmentPlaceholder(label) || isReconciliationSegmentLabel(label);
+}
+
+function clearSegmentMetricRowLabel(sheet: ExcelJS.Worksheet, rowNumber: number) {
+  const labelCellForRow = labelCell(sheet, rowNumber);
+  const formula = cellFormula(labelCellForRow);
+  const reference = formula?.match(/^=?\$?([A-Z]+)\$?(\d+)\s*(?:&|$)/i);
+  if (reference && formula) {
+    const baseCell = sheet.getCell(`${reference[1]}${reference[2]}`);
+    baseCell.value = "";
+    labelCellForRow.value = { formula, result: "" };
+    return;
+  }
+  labelCellForRow.value = "";
 }
 
 function segmentIndexForRow(label: string, segments: SegmentRevenue[], used: Set<number>) {
@@ -11281,7 +11451,9 @@ function validateSegmentStatementTieOut(
     }
     if (!segmentStatementMetricTies(segmentTotal, expected)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} rows sum to ${roundModelValue(segmentTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`;
-      if (metricName === "D&A" && Math.abs(expected) <= 0.0001) {
+      if (/operating income/i.test(metricName)) {
+        warnings.unshift(`${message} Segment operating income was disclosed by segment, but no disclosed reconciliation row tied it to consolidated operating income; no Other / Reconciliation plug was created.`);
+      } else if (metricName === "D&A" && Math.abs(expected) <= 0.0001) {
         warnings.unshift(`${message} The model has no standalone income-statement D&A total for this period, so segment/cash-flow D&A detail is reported as a review warning rather than forced into EBIT.`);
       } else if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
       else if (metricName === "D&A") warnings.unshift(`${message} Segment-level D&A can differ from the linked model D&A line, so this is reported as a review warning.`);
@@ -11291,7 +11463,8 @@ function validateSegmentStatementTieOut(
     }
     if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, expected)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`;
-      if (isMissingFourthQuarterSegmentDetail(period, sheetTotal, expected)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
+      if (/operating income/i.test(metricName)) warnings.unshift(`${message} Segment operating income was left as disclosed rather than forced into a residual reconciliation row.`);
+      else if (isMissingFourthQuarterSegmentDetail(period, sheetTotal, expected)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
       else if (hasFormula(totalCell)) warnings.unshift(message);
       else errors.push(message);
     }
