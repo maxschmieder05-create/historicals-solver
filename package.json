@@ -15,6 +15,7 @@
     "test:syk-random-validation": "node scripts/syk-random-validation-check.js",
     "test:mck-random-validation": "node scripts/mck-random-validation-check.js",
     "test:msft-random-validation": "node scripts/msft-random-validation-check.js",
+    "test:msft-liability-classification": "node scripts/msft-liability-classification-check.js",
     "test:mcd-segment-validation": "node scripts/mcd-segment-validation-check.js",
     "test:aapl-segment-validation": "node scripts/aapl-segment-validation-check.js",
     "test:rsg-segment-operating-income": "node scripts/rsg-segment-operating-income-check.js",

@@ -7,7 +7,9 @@ export type LiabilityTemplateRow = {
 export type TemplateMappingContext = {
   hasCurrentInvestmentRow: boolean;
   hasCurrentDebtRow: boolean;
+  hasCurrentLiabilitiesExcludingDebtRow: boolean;
   hasDebtInclCurrentPortionRow: boolean;
+  hasDeferredTaxLiabilityRow: boolean;
   hasNonCurrentLeaseLiabilityRow: boolean;
   hasPensionLiabilityRow: boolean;
 };
@@ -29,6 +31,12 @@ export const PENSION_LIABILITY_CONCEPTS = [
   "PensionAndOtherPostretirementDefinedBenefitPlansLiabilityNoncurrent",
   "DefinedBenefitPensionPlanLiabilitiesNoncurrent",
   "OtherPostretirementDefinedBenefitPlanLiabilitiesNoncurrent"
+];
+
+export const DEFERRED_TAX_LIABILITY_CONCEPTS = [
+  "DeferredIncomeTaxLiabilitiesNet",
+  "DeferredTaxLiabilitiesNoncurrent",
+  "DeferredTaxLiabilities"
 ];
 
 const CURRENT_DEBT_CONCEPTS = ["DebtCurrent", "LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings", "ShortTermBorrowingsCurrent"];
@@ -78,6 +86,12 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
         /^currentportionoflongtermdebt$/,
         /^currentmaturitiesoflongtermdebt$/
       ]),
+    hasCurrentLiabilitiesExcludingDebtRow: hasAnyLabel([
+      /^totalcurrentliabilitiesexcldebt$/,
+      /^totalcurrentliabilitiesexcludingdebt$/,
+      /^currentliabilitiesexcldebt$/,
+      /^currentliabilitiesexcludingdebt$/
+    ]),
     hasDebtInclCurrentPortionRow: hasAnyLabel([
       /^ltdebtinclcurrentportion$/,
       /^longtermdebtinclcurrentportion$/,
@@ -86,6 +100,14 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
       /^borrowingsincludingcurrentportion$/,
       /^totaldebt$/
     ]),
+    hasDeferredTaxLiabilityRow:
+      hasAnyConcept(DEFERRED_TAX_LIABILITY_CONCEPTS) ||
+      hasAnyLabel([
+        /^deferredincometaxes$/,
+        /^deferredincometaxliabilities$/,
+        /^deferredtaxliabilities$/,
+        /^deferredtaxes$/
+      ]),
     hasNonCurrentLeaseLiabilityRow:
       hasAnyConcept(NONCURRENT_LEASE_LIABILITY_CONCEPTS) ||
       hasAnyLabel([/^(operating|finance)?leaseliabilities$/, /^(operating|finance)?leaseobligations$/]),
@@ -96,14 +118,14 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
 }
 
 export function currentDebtBelongsInAccruedLiabilities(context: TemplateMappingContext) {
-  return !context.hasCurrentDebtRow;
+  return !context.hasCurrentDebtRow && !(context.hasCurrentLiabilitiesExcludingDebtRow && context.hasDebtInclCurrentPortionRow);
 }
 
 export function otherNonCurrentLiabilityResidualExclusions(context: TemplateMappingContext) {
   return {
     alwaysExcludeCurrentLiabilities: true,
     alwaysExcludeNonCurrentDebt: true,
-    alwaysExcludeDeferredTaxLiabilities: true,
+    excludeDeferredTaxLiabilities: context.hasDeferredTaxLiabilityRow,
     excludeLeaseLiabilities: context.hasNonCurrentLeaseLiabilityRow,
     excludePensionLiabilities: context.hasPensionLiabilityRow
   };

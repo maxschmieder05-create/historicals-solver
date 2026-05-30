@@ -3,6 +3,7 @@ import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import {
   COMBINED_NONCURRENT_DEBT_AND_LEASE_CONCEPTS,
+  DEFERRED_TAX_LIABILITY_CONCEPTS,
   NONCURRENT_DEBT_CONCEPTS,
   NONCURRENT_LEASE_LIABILITY_CONCEPTS,
   PENSION_LIABILITY_CONCEPTS,
@@ -609,7 +610,7 @@ const C = {
     "DebtAndCapitalLeaseObligations",
     "DebtInstrumentCarryingAmount"
   ],
-  deferredTaxLiability: ["DeferredTaxLiabilitiesNoncurrent"],
+  deferredTaxLiability: DEFERRED_TAX_LIABILITY_CONCEPTS,
   liabilities: ["Liabilities"],
   equity: ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"],
   commonApic: ["CommonStocksIncludingAdditionalPaidInCapital", "AdditionalPaidInCapitalCommonStocks"],
@@ -2338,8 +2339,8 @@ function reportedCurrentDebt(period: string, ctx: ResolveContext): ResolvedValue
 
 function debtRowUsesCombinedCurrentDebt(period: string, ctx: ResolveContext) {
   if (!ctx.template?.hasDebtInclCurrentPortionRow || ctx.template.hasCurrentDebtRow === true) return false;
-  if (currentDebtBelongsInAccruedLiabilities(ctx.template)) return false;
-  return Boolean(first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS));
+  if (!ctx.template.hasCurrentLiabilitiesExcludingDebtRow) return false;
+  return Boolean(first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS) || (first(period, ctx.instant, NONCURRENT_DEBT_CONCEPTS) && reportedCurrentDebt(period, ctx)));
 }
 
 function resolveTotalDebt(period: string, ctx: ResolveContext): ResolvedValue {
@@ -2366,6 +2367,15 @@ function resolveLongTermDebtInclCurrentPortion(period: string, ctx: ResolveConte
         value: aggregate.value,
         sources: [aggregate],
         note: "Used total reported debt because the template debt row includes the current portion and no separate current debt row is present."
+      };
+    }
+    const noncurrent = first(period, ctx.instant, NONCURRENT_DEBT_CONCEPTS);
+    const current = reportedCurrentDebt(period, ctx);
+    if (noncurrent && current && current.value !== null) {
+      return {
+        value: noncurrent.value + current.value,
+        sources: compactSources([noncurrent, current]),
+        note: "Included current portion of long-term debt in the debt row because the template's current-liability subtotal explicitly excludes debt."
       };
     }
   }
@@ -2742,7 +2752,7 @@ function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext):
   const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
   const debt = resolveLongTermDebtInclCurrentPortion(period, ctx);
   const currentDebt = debtRowUsesCombinedCurrentDebt(period, ctx) ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
-  const dtl = resolveDeferredTaxLiability(period, ctx);
+  const dtl = ctx.template?.hasDeferredTaxLiabilityRow ? resolveDeferredTaxLiability(period, ctx) : zeroResolved(C.deferredTaxLiability[0]);
   const leases = ctx.template?.hasNonCurrentLeaseLiabilityRow ? resolveNonCurrentLeaseLiabilities(period, ctx) : zeroResolved(NONCURRENT_LEASE_LIABILITY_CONCEPTS[0]);
   const pension = ctx.template?.hasPensionLiabilityRow ? resolvePensionLiabilities(period, ctx) : zeroResolved(PENSION_LIABILITY_CONCEPTS[0]);
   if (
@@ -2765,6 +2775,7 @@ function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext):
   }
 
   const directConcepts = ["OtherLiabilitiesNoncurrent"];
+  if (!ctx.template?.hasDeferredTaxLiabilityRow) directConcepts.push(...C.deferredTaxLiability);
   if (!ctx.template?.hasNonCurrentLeaseLiabilityRow) directConcepts.push(...NONCURRENT_LEASE_LIABILITY_CONCEPTS);
   if (!ctx.template?.hasPensionLiabilityRow) directConcepts.push(...PENSION_LIABILITY_CONCEPTS);
   const direct = sum(period, ctx.instant, directConcepts);
@@ -2794,13 +2805,14 @@ function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext):
 function resolveModeledCurrentLiabilitiesSubtotal(period: string, ctx: ResolveContext): ResolvedValue {
   const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
   if (!currentLiabilities) return { value: null, sources: [] };
-  const currentDebt = debtRowUsesCombinedCurrentDebt(period, ctx) ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
+  const excludesDebt = Boolean(ctx.template?.hasCurrentLiabilitiesExcludingDebtRow || debtRowUsesCombinedCurrentDebt(period, ctx));
+  const currentDebt = excludesDebt ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
   if (currentDebt.value === null) return { value: null, sources: [] };
   return {
     value: currentLiabilities.value - currentDebt.value,
     sources: compactSources([currentLiabilities, currentDebt]),
-    note: currentDebt.value
-      ? "Calculated as SEC current liabilities less current debt because the model's debt row includes the current portion."
+    note: excludesDebt
+      ? "Calculated as SEC current liabilities less current debt because the template's current-liability subtotal excludes debt."
       : "Mapped to SEC current liabilities."
   };
 }
@@ -9165,6 +9177,15 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     columns,
     ctx,
     auditRows,
+    ["Deferred Income Taxes", "Deferred Tax Liabilities", "Deferred Taxes"],
+    resolveDeferredTaxLiability
+  );
+  refreshBalanceSheetInputFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
     ["Other Non-Current Liabilities", "Other Long-Term Liabilities", "Other LT Liabilities"],
     resolveOtherNonCurrentLiabilities
   );
@@ -10093,7 +10114,7 @@ function validateBalanceSheetStatementTotals(
       evaluator,
       warnings,
       "modeled current liabilities",
-      ["Total Current Liabilities"],
+      ["Total Current Liabilities", "Total Current Liabilities (Excl. Debt)", "Total Current Liabilities Excl. Debt"],
       resolveModeledCurrentLiabilitiesSubtotal
     )
   );
@@ -10244,6 +10265,7 @@ function validateBalanceSheetClassificationCompleteness(
     { labels: ["Other Current Liabilities", "Other Current Liabs"], metricName: "other current liabilities", resolver: resolveOtherCurrentLiabilities },
     { labels: ["LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt", "Senior Notes", "Borrowings"], metricName: "debt", resolver: resolveLongTermDebtInclCurrentPortion },
     { labels: ["Total Debt"], metricName: "total debt", resolver: resolveTotalDebt },
+    { labels: ["Deferred Income Taxes", "Deferred Tax Liabilities", "Deferred Taxes"], metricName: "deferred income taxes", resolver: resolveDeferredTaxLiability },
     { labels: ["Lease Liabilities", "Operating Lease Liabilities", "Finance Lease Liabilities", "Lease Obligations"], metricName: "lease liabilities", resolver: resolveNonCurrentLeaseLiabilities }
   ];
 

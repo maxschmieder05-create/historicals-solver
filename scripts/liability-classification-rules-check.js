@@ -44,7 +44,7 @@ function otherNonCurrentLiabilityResidual(values, context) {
     values.totalLiabilities -
     (exclusions.alwaysExcludeCurrentLiabilities ? values.currentLiabilities : 0) -
     (exclusions.alwaysExcludeNonCurrentDebt ? values.nonCurrentDebt : 0) -
-    (exclusions.alwaysExcludeDeferredTaxLiabilities ? values.deferredTaxLiabilities : 0) -
+    (exclusions.excludeDeferredTaxLiabilities ? values.deferredTaxLiabilities : 0) -
     (exclusions.excludeLeaseLiabilities ? values.nonCurrentLeaseLiabilities : 0) -
     (exclusions.excludePensionLiabilities ? values.pensionLiabilities : 0)
   );
@@ -59,6 +59,7 @@ const baseRows = [
 
 const embeddedDebtContext = buildLiabilityTemplateMappingContext(baseRows);
 assert.equal(embeddedDebtContext.hasCurrentDebtRow, false);
+assert.equal(embeddedDebtContext.hasCurrentLiabilitiesExcludingDebtRow, false);
 assert.equal(embeddedDebtContext.hasDebtInclCurrentPortionRow, true);
 assert.equal(currentDebtBelongsInAccruedLiabilities(embeddedDebtContext), true);
 assert.equal(
@@ -67,6 +68,20 @@ assert.equal(
     embeddedDebtContext
   ),
   625
+);
+
+const currentLiabilitiesExDebtContext = buildLiabilityTemplateMappingContext([
+  ...baseRows,
+  { statement: "balance", label: "Total Current Liabilities (Excl. Debt)" }
+]);
+assert.equal(currentLiabilitiesExDebtContext.hasCurrentLiabilitiesExcludingDebtRow, true);
+assert.equal(currentDebtBelongsInAccruedLiabilities(currentLiabilitiesExDebtContext), false);
+assert.equal(
+  accruedLiabilityResidual(
+    { currentLiabilities: 1000, accountsPayable: 250, otherCurrentLiabilities: 125, currentDebt: 75 },
+    currentLiabilitiesExDebtContext
+  ),
+  550
 );
 
 const noDebtLineContext = buildLiabilityTemplateMappingContext([
@@ -101,13 +116,15 @@ assert.equal(
 
 const explicitLeaseAndPensionContext = buildLiabilityTemplateMappingContext([
   ...baseRows,
+  { statement: "balance", label: "Deferred Income Taxes" },
   { statement: "balance", label: "Operating Lease Liabilities" },
   { statement: "balance", label: "Pension and Other Postretirement Liabilities" }
 ]);
+assert.equal(explicitLeaseAndPensionContext.hasDeferredTaxLiabilityRow, true);
 assert.deepEqual(otherNonCurrentLiabilityResidualExclusions(explicitLeaseAndPensionContext), {
   alwaysExcludeCurrentLiabilities: true,
   alwaysExcludeNonCurrentDebt: true,
-  alwaysExcludeDeferredTaxLiabilities: true,
+  excludeDeferredTaxLiabilities: true,
   excludeLeaseLiabilities: true,
   excludePensionLiabilities: true
 });
@@ -127,10 +144,11 @@ assert.equal(
 );
 
 const groupedLeaseContext = buildLiabilityTemplateMappingContext(baseRows);
+assert.equal(groupedLeaseContext.hasDeferredTaxLiabilityRow, false);
 assert.deepEqual(otherNonCurrentLiabilityResidualExclusions(groupedLeaseContext), {
   alwaysExcludeCurrentLiabilities: true,
   alwaysExcludeNonCurrentDebt: true,
-  alwaysExcludeDeferredTaxLiabilities: true,
+  excludeDeferredTaxLiabilities: false,
   excludeLeaseLiabilities: false,
   excludePensionLiabilities: false
 });
@@ -146,15 +164,17 @@ assert.equal(
     },
     groupedLeaseContext
   ),
-  2250
+  2400
 );
 
 const conceptDrivenContext = buildLiabilityTemplateMappingContext([
   { statement: "income", label: "Current Debt", concepts: ["ShortTermBorrowings"] },
   { statement: "balance", label: "Debt Due Within One Year", concepts: ["ShortTermBorrowings"] },
+  { statement: "balance", label: "Income Tax Deferrals", concepts: ["DeferredIncomeTaxLiabilitiesNet"] },
   { statement: "balance", label: "Lease Liability Detail", concepts: ["OperatingLeaseLiabilityNoncurrent"] }
 ]);
 assert.equal(conceptDrivenContext.hasCurrentDebtRow, true);
+assert.equal(conceptDrivenContext.hasDeferredTaxLiabilityRow, true);
 assert.equal(conceptDrivenContext.hasNonCurrentLeaseLiabilityRow, true);
 
 console.log("Generic liability classification rules passed.");
