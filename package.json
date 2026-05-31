@@ -22,6 +22,7 @@
     "test:segment-first-run-reliability": "node scripts/segment-first-run-reliability-check.js",
     "test:goog-current-investments": "node scripts/goog-current-investments-regression-check.js",
     "test:goog-operating-income": "node scripts/goog-operating-income-regression-check.js",
+    "test:nvda-income-statement": "node scripts/nvda-income-statement-regression-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",
     "test:balance-sheet-conservation": "node scripts/balance-sheet-conservation-check.js",
     "test:cost-balance-sheet-regression": "npm run test:balance-sheet-instant-regression",

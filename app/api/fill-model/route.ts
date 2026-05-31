@@ -1213,6 +1213,17 @@ function resolveTotalRevenue(period: string, ctx: ResolveContext): ResolvedValue
   };
 }
 
+function resolveGrossProfit(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.duration, C.grossProfit);
+  if (!direct) return { value: null, sources: [], note: "No EDGAR gross profit fact was available for this period." };
+  return {
+    value: direct.value,
+    sources: [direct],
+    note: "Mapped to EDGAR gross profit from the primary consolidated income statement.",
+    classification: "direct"
+  };
+}
+
 const PRIMARY_COST_OF_REVENUE_CONCEPTS = [
   "CostOfRevenue",
   "CostOfGoodsAndServicesSold",
@@ -3366,6 +3377,13 @@ export async function POST(request: NextRequest) {
     balanceSheetPairs = uniquePeriodColumnPairs(balanceSheetPairs);
     const balanceSheetPeriods = balanceSheetPairs.map((pair) => pair.period);
     const balanceSheetColumns = balanceSheetPairs.map((pair) => pair.col);
+    const incomeStatementPairs = uniquePeriodColumnPairs(
+      (bestPeriodHeaderRow(sheet)?.infos ?? [])
+        .filter(({ period, isEstimate }) => isHistoricalReportedPeriod(period, isEstimate, ctx))
+        .map(({ period, col }) => ({ period, col }))
+    );
+    const incomeStatementPeriods = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.period) : periods;
+    const incomeStatementColumns = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.col) : columns;
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
     if (periods.some(isQuarterPeriod)) {
       const inlineCtx = await fetchInlineFactContext(company, periods, bulkSupport);
@@ -3577,8 +3595,8 @@ export async function POST(request: NextRequest) {
 
       const revenueFormulaResult = reconcileIncomeStatementFormulaMetricToEdgar(
         sheet,
-        periods,
-        columns,
+        incomeStatementPeriods,
+        incomeStatementColumns,
         ctx,
         auditRows,
         ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"],
@@ -3589,17 +3607,17 @@ export async function POST(request: NextRequest) {
       commentsAdded += revenueFormulaResult.commentsAdded;
       warnings.push(...revenueFormulaResult.warnings);
 
-      const incomeFormulaResult = reconcileIncomeStatementFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      const incomeFormulaResult = reconcileIncomeStatementFormulaRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
       filledCells += incomeFormulaResult.filledCells;
       commentsAdded += incomeFormulaResult.commentsAdded;
       warnings.push(...incomeFormulaResult.warnings);
 
-      const pretaxFormulaResult = reconcilePreTaxIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      const pretaxFormulaResult = reconcilePreTaxIncomeFormulaRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
       filledCells += pretaxFormulaResult.filledCells;
       commentsAdded += pretaxFormulaResult.commentsAdded;
       warnings.push(...pretaxFormulaResult.warnings);
 
-      const netIncomeFormulaResult = reconcileNetIncomeFormulaRowsToEdgar(sheet, periods, columns, ctx, auditRows);
+      const netIncomeFormulaResult = reconcileNetIncomeFormulaRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
       filledCells += netIncomeFormulaResult.filledCells;
       commentsAdded += netIncomeFormulaResult.commentsAdded;
       warnings.push(...netIncomeFormulaResult.warnings);
@@ -3615,15 +3633,15 @@ export async function POST(request: NextRequest) {
       warnings.push(...balanceSheetCheckResult.warnings);
     }
 
-    const formulaCacheColumns = uniqueNumbers([...columns, ...balanceSheetColumns]);
+    const formulaCacheColumns = uniqueNumbers([...columns, ...balanceSheetColumns, ...incomeStatementColumns]);
     restoreWorkbookLabels(workbook, workbookSnapshot);
     clearStaleFormulaErrorResults(workbook);
     refreshHistoricalFormulaCachedResults(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
-    refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+    refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
     ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
-    refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+    refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     const partialBalanceSheetCheckResult = reconcilePartialBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
     filledCells += partialBalanceSheetCheckResult.filledCells;
     commentsAdded += partialBalanceSheetCheckResult.commentsAdded;
@@ -3635,11 +3653,11 @@ export async function POST(request: NextRequest) {
     refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
     ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     if (isStandardModelSheet) {
-      const finalIncomeConsistencyResult = reconcileFinalIncomeStatementConsistency(sheet, periods, columns, ctx, auditRows);
+      const finalIncomeConsistencyResult = reconcileFinalIncomeStatementConsistency(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
       filledCells += finalIncomeConsistencyResult.filledCells;
       commentsAdded += finalIncomeConsistencyResult.commentsAdded;
       warnings.push(...finalIncomeConsistencyResult.warnings);
-      refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+      refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
 
       const finalBalanceSheetTotalResult = reconcileBalanceSheetStatementTotalsToEdgar(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
       filledCells += finalBalanceSheetTotalResult.filledCells;
@@ -3659,10 +3677,22 @@ export async function POST(request: NextRequest) {
       commentsAdded += unsupportedTotalBalanceSheetCheckResult.commentsAdded;
       warnings.push(...unsupportedTotalBalanceSheetCheckResult.warnings);
       ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
-      refreshFinalIncomeStatementKeyMetrics(sheet, periods, columns, ctx, auditRows);
+      refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     }
 
-    const validationErrors = validateWorkbookBeforeReturn(workbook, periods, columns, ctx, warnings, sheet.name, profile, balanceSheetPeriods, balanceSheetColumns);
+    const validationErrors = validateWorkbookBeforeReturn(
+      workbook,
+      periods,
+      columns,
+      ctx,
+      warnings,
+      sheet.name,
+      profile,
+      balanceSheetPeriods,
+      balanceSheetColumns,
+      incomeStatementPeriods,
+      incomeStatementColumns
+    );
     validationErrors.push(...validateWorkbookPreservation(workbook, workbookSnapshot));
     if (validationErrors.length) {
       return jsonError(`Validation failed: ${validationErrors.slice(0, 6).join(" | ")}`, 422);
@@ -7691,6 +7721,30 @@ function reconcileFinalIncomeStatementConsistency(
 }
 
 function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods: string[], columns: number[], ctx: ResolveContext, auditRows: MappingAuditRow[]) {
+  const revenueRow = findIncomeStatementMetricRow(sheet, ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"]);
+  const grossProfitRow = findIncomeStatementMetricRow(sheet, ["Gross Profit"]);
+  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]);
+  const pretaxRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"]);
+  const taxRow = findIncomeStatementMetricRow(sheet, ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"]);
+  const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
+  const preTaxAdjustmentsRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Adjustments"]);
+  const postTaxAdjustmentsRow = findIncomeStatementMetricRow(sheet, ["Post-Tax Adjustments", "Preferred Stock Dividend"]);
+  const discontinuedOperationsRow = findIncomeStatementMetricRow(sheet, ["Discontinued Operations"]);
+  const noncontrollingIncomeRow = findIncomeStatementMetricRow(sheet, ["Income (Loss) due to Non-Controlling Interest", "Income (Loss) due to Noncontrolling Interest"]);
+  const adjustedNetIncomeRow = findIncomeStatementMetricRow(sheet, ["Adj. Net Income (Loss)", "Adjusted Net Income", "Adj. Net Income"]);
+
+  if (revenueRow) refreshFormulaRowCachedResults(sheet, revenueRow, columns);
+  if (grossProfitRow) refreshFormulaRowCachedResults(sheet, grossProfitRow, columns);
+  if (ebitRow) refreshFormulaRowCachedResults(sheet, ebitRow, columns);
+  if (pretaxRow) refreshFormulaRowCachedResults(sheet, pretaxRow, columns);
+  if (taxRow) refreshFormulaRowCachedResults(sheet, taxRow, columns);
+  if (netIncomeRow) refreshFormulaRowCachedResults(sheet, netIncomeRow, columns);
+  if (preTaxAdjustmentsRow) refreshFormulaRowCachedResults(sheet, preTaxAdjustmentsRow, columns);
+  if (postTaxAdjustmentsRow) refreshFormulaRowCachedResults(sheet, postTaxAdjustmentsRow, columns);
+  if (discontinuedOperationsRow) refreshFormulaRowCachedResults(sheet, discontinuedOperationsRow, columns);
+  if (noncontrollingIncomeRow) refreshFormulaRowCachedResults(sheet, noncontrollingIncomeRow, columns);
+  if (adjustedNetIncomeRow) refreshFormulaRowCachedResults(sheet, adjustedNetIncomeRow, columns);
+
   refreshFormulaMetricResultsFromResolver(
     sheet,
     periods,
@@ -7701,6 +7755,7 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     resolveTotalRevenue,
     "revenue"
   );
+  refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Gross Profit"], resolveGrossProfit, "gross profit");
   refreshFormulaMetricResultsFromResolver(
     sheet,
     periods,
@@ -7721,39 +7776,18 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     resolvePreTaxIncome,
     "pre-tax income"
   );
-  refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], resolveNetIncome, "net income");
-  refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Net Income Available to Common Shareholders", "Net Income Available to Common Stockholders"], COMMON_SHAREHOLDER_INCOME_CONCEPTS, "net income available to common shareholders");
-
-  const revenueRow = findIncomeStatementMetricRow(sheet, ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"]);
-  const grossProfitRow = findIncomeStatementMetricRow(sheet, ["Gross Profit"]);
-  const ebitRow = findIncomeStatementMetricRow(sheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]);
-  const pretaxRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"]);
-  const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
-  const preTaxAdjustmentsRow = findIncomeStatementMetricRow(sheet, ["Pre-Tax Adjustments"]);
-  const postTaxAdjustmentsRow = findIncomeStatementMetricRow(sheet, ["Post-Tax Adjustments", "Preferred Stock Dividend"]);
-  const discontinuedOperationsRow = findIncomeStatementMetricRow(sheet, ["Discontinued Operations"]);
-  const noncontrollingIncomeRow = findIncomeStatementMetricRow(sheet, ["Income (Loss) due to Non-Controlling Interest", "Income (Loss) due to Noncontrolling Interest"]);
-  const adjustedNetIncomeRow = findIncomeStatementMetricRow(sheet, ["Adj. Net Income (Loss)", "Adjusted Net Income", "Adj. Net Income"]);
-  if (revenueRow) refreshFormulaRowCachedResults(sheet, revenueRow, columns);
-  if (grossProfitRow) refreshFormulaRowCachedResults(sheet, grossProfitRow, columns);
-  if (ebitRow) refreshFormulaRowCachedResults(sheet, ebitRow, columns);
-  if (pretaxRow) refreshFormulaRowCachedResults(sheet, pretaxRow, columns);
-  if (netIncomeRow) refreshFormulaRowCachedResults(sheet, netIncomeRow, columns);
-  if (preTaxAdjustmentsRow) refreshFormulaRowCachedResults(sheet, preTaxAdjustmentsRow, columns);
-  if (postTaxAdjustmentsRow) refreshFormulaRowCachedResults(sheet, postTaxAdjustmentsRow, columns);
-  if (discontinuedOperationsRow) refreshFormulaRowCachedResults(sheet, discontinuedOperationsRow, columns);
-  if (noncontrollingIncomeRow) refreshFormulaRowCachedResults(sheet, noncontrollingIncomeRow, columns);
-  if (adjustedNetIncomeRow) refreshFormulaRowCachedResults(sheet, adjustedNetIncomeRow, columns);
   refreshFormulaMetricResultsFromResolver(
     sheet,
     periods,
     columns,
     ctx,
     auditRows,
-    ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"],
-    resolveModeledOperatingProfit,
-    "operating profit"
+    ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"],
+    resolveIncomeTaxExpense,
+    "income tax expense"
   );
+  refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], resolveNetIncome, "net income");
+  refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Net Income Available to Common Shareholders", "Net Income Available to Common Stockholders"], COMMON_SHAREHOLDER_INCOME_CONCEPTS, "net income available to common shareholders");
 }
 
 function refreshFormulaMetricResultsFromEdgar(
@@ -7808,13 +7842,21 @@ function refreshFormulaMetricResultsFromResolver(
     const source = resolvedAuditSource(period, `${metricName}Resolved`, `Resolved EDGAR ${metricName}`, resolved);
     const cell = sheet.getCell(rowNumber, columns[index]);
     const formula = formulaForCell(cell);
-    if (!formula) return;
     const value = resolved.value / 1_000_000;
-    const forceReportedSubtotal = /^operating profit$/i.test(metricName);
-    if (!forceReportedSubtotal && numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
-    cell.value = { formula, result: value };
-    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} formula result from EDGAR after dependent formula caches were updated.`, "formula result refreshed"));
+    if (!formula) {
+      if (numericCellValue(cell) !== null && exactModelValueTies(numericCellValue(cell)!, value)) return;
+      cell.value = value;
+      auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} from EDGAR after dependent formula caches were updated.`, "formula replaced with EDGAR-supported value"));
+      return;
+    }
+    if (numericCellValue(cell) !== null && exactModelValueTies(numericCellValue(cell)!, value)) return;
+    cell.value = value;
+    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Replaced ${metricName} formula with the reported EDGAR value so the primary income statement remains authoritative.`, "formula replaced with EDGAR-supported value"));
   });
+}
+
+function exactModelValueTies(actual: number, expected: number) {
+  return Math.abs(actual - expected) <= 0.0001;
 }
 
 function isAnnualDurationSource(source: FactSource) {
@@ -9059,7 +9101,9 @@ function validateWorkbookBeforeReturn(
   modelSheetName = MODEL_SHEET,
   profile: TemplateProfile = { kind: "generic", confidence: "low", rationale: [], sheetName: modelSheetName, hasSegmentAnalysis: Boolean(workbook.getWorksheet(SEGMENT_SHEET)) },
   balanceSheetPeriods = periods,
-  balanceSheetColumns = columns
+  balanceSheetColumns = columns,
+  incomeStatementPeriods = periods,
+  incomeStatementColumns = columns
 ) {
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
@@ -9097,7 +9141,7 @@ function validateWorkbookBeforeReturn(
   if (modelSheet) {
     const evaluator = new FormulaEvaluator(modelSheet, { useCachedFormulaResults: true });
     const isFinancialCompanyStatementContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
-    errors.push(...validateIncomeStatementKeyMetrics(modelSheet, periods, columns, ctx, evaluator, warnings, profile));
+    errors.push(...validateIncomeStatementKeyMetrics(modelSheet, incomeStatementPeriods, incomeStatementColumns, ctx, evaluator, warnings, profile));
     if (!isFinancialCompanyStatementContext) {
       errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
     }
@@ -9848,7 +9892,9 @@ function validateIncomeStatementKeyMetrics(
         warnings,
         "net revenue",
         ["Net Revenue", "Revenue Net of Interest Expense", "Revenues Net of Interest Expense", "Total Net Revenue"],
-        C.netRevenue
+        C.netRevenue,
+        undefined,
+        { hard: true }
       )
     );
   } else {
@@ -9863,7 +9909,8 @@ function validateIncomeStatementKeyMetrics(
         "Revenue",
         ["Revenue", "Revenues", "Total Revenue", "Total Revenues"],
         C.revenue,
-        resolveTotalRevenue
+        resolveTotalRevenue,
+        { hard: true }
       )
     );
   }
@@ -9880,7 +9927,23 @@ function validateIncomeStatementKeyMetrics(
         "pre-tax income",
         ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"],
         PRETAX_INCOME_CONCEPTS,
-        resolvePreTaxIncome
+        resolvePreTaxIncome,
+        { hard: true }
+      )
+    );
+    errors.push(
+      ...validateIncomeStatementMetricAgainstEdgar(
+        sheet,
+        periods,
+        columns,
+        ctx,
+        evaluator,
+        warnings,
+        "income tax expense",
+        ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"],
+        C.taxes,
+        resolveIncomeTaxExpense,
+        { hard: true }
       )
     );
     errors.push(
@@ -9893,12 +9956,29 @@ function validateIncomeStatementKeyMetrics(
         warnings,
         "net income",
         ["Net Income (Loss)", "Net Income"],
-        CONTINUING_NET_INCOME_CONCEPTS
+        CONTINUING_NET_INCOME_CONCEPTS,
+        undefined,
+        { hard: true }
       )
     );
     return errors;
   }
 
+  errors.push(
+    ...validateIncomeStatementMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "gross profit",
+      ["Gross Profit", "Gross Margin"],
+      C.grossProfit,
+      resolveGrossProfit,
+      { hard: true }
+    )
+  );
   errors.push(...validateIncomeStatementGrossProfitBridge(sheet, periods, columns, evaluator, warnings));
   errors.push(
     ...validateIncomeStatementMetricAgainstEdgar(
@@ -9911,7 +9991,8 @@ function validateIncomeStatementKeyMetrics(
       "EBIT",
       ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"],
       C.operatingIncome,
-      resolveModeledOperatingProfit
+      resolveModeledOperatingProfit,
+      { hard: true }
     )
   );
   errors.push(...validateIncomeStatementOperatingExpenseBridge(sheet, periods, columns, evaluator, warnings));
@@ -9926,10 +10007,26 @@ function validateIncomeStatementKeyMetrics(
       "pre-tax income",
       ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"],
       PRETAX_INCOME_CONCEPTS,
-      resolvePreTaxIncome
+      resolvePreTaxIncome,
+      { hard: true }
     )
   );
   errors.push(...validateIncomeStatementPreTaxBridge(sheet, periods, columns, evaluator, warnings));
+  errors.push(
+    ...validateIncomeStatementMetricAgainstEdgar(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "income tax expense",
+      ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"],
+      C.taxes,
+      resolveIncomeTaxExpense,
+      { hard: true }
+    )
+  );
   errors.push(...validateIncomeStatementTaxBridge(sheet, periods, columns, evaluator, warnings));
   errors.push(
     ...validateIncomeStatementMetricAgainstEdgar(
@@ -9941,7 +10038,9 @@ function validateIncomeStatementKeyMetrics(
       warnings,
       "net income",
       ["Net Income (Loss)", "Net Income"],
-      CONTINUING_NET_INCOME_CONCEPTS
+      CONTINUING_NET_INCOME_CONCEPTS,
+      undefined,
+      { hard: true }
     )
   );
   errors.push(
@@ -10235,7 +10334,8 @@ function validateIncomeStatementMetricAgainstEdgar(
   metricName: string,
   labels: string[],
   concepts: string[],
-  resolver?: (period: string, ctx: ResolveContext) => ResolvedValue
+  resolver?: (period: string, ctx: ResolveContext) => ResolvedValue,
+  options: { hard?: boolean } = {}
 ) {
   const errors: string[] = [];
   const rowNumber = findIncomeStatementMetricRow(sheet, labels);
@@ -10254,7 +10354,8 @@ function validateIncomeStatementMetricAgainstEdgar(
 
     const cell = sheet.getCell(rowNumber, columns[index]);
     const expected = expectedRaw / 1_000_000;
-    const modelValue = statementMetricCellValue(cell, evaluator, expected);
+    const displayedValue = numericCellValue(cell);
+    const modelValue = options.hard && displayedValue !== null ? displayedValue : statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`;
       if (hasFormula(cell)) warnings.unshift(message);
@@ -10264,7 +10365,7 @@ function validateIncomeStatementMetricAgainstEdgar(
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
-      if (hasFormula(cell)) warnings.unshift(message);
+      if (hasFormula(cell) && !options.hard) warnings.unshift(message);
       else errors.push(message);
     }
   });
@@ -11092,6 +11193,7 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
     return true;
   }
   if (!actual && isSegmentAnalysisLabelRewriteCell(cell)) return true;
+  if (!actual && isIncomeStatementReportedAnchorCell(cell)) return true;
   if (!actual && isIncomeStatementConstantFormulaReplacement(cell, expected)) return true;
   if (!actual && isIncomeStatementDepreciationAmortizationCell(cell)) return true;
   if (!actual && isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)))) return true;
@@ -11115,6 +11217,18 @@ function isIncomeStatementConstantFormulaReplacement(cell: ExcelJS.Cell, expecte
 function isIncomeStatementDepreciationAmortizationCell(cell: ExcelJS.Cell) {
   const rowNumber = Number(cell.row);
   return findIncomeStatementMetricRow(cell.worksheet, ["Depreciation & Amortization", "Depreciation and Amortization", "D&A"]) === rowNumber;
+}
+
+function isIncomeStatementReportedAnchorCell(cell: ExcelJS.Cell) {
+  const rowNumber = Number(cell.row);
+  return (
+    findIncomeStatementMetricRow(cell.worksheet, ["Revenue", "Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"]) === rowNumber ||
+    findIncomeStatementMetricRow(cell.worksheet, ["Gross Profit", "Gross Margin"]) === rowNumber ||
+    findIncomeStatementMetricRow(cell.worksheet, ["EBIT", "Operating Income", "Operating Income (Loss)", "Income From Operations"]) === rowNumber ||
+    findIncomeStatementMetricRow(cell.worksheet, ["Pre-Tax Income (Loss)", "Pre-Tax Income", "Income Before Taxes", "Income Before Income Taxes"]) === rowNumber ||
+    findIncomeStatementMetricRow(cell.worksheet, ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"]) === rowNumber ||
+    findIncomeStatementMetricRow(cell.worksheet, ["Net Income (Loss)", "Net Income"]) === rowNumber
+  );
 }
 
 function isSegmentAnalysisLabelRewriteCell(cell: ExcelJS.Cell) {
