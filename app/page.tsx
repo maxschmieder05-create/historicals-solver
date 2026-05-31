@@ -80,8 +80,15 @@ export default function Home() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const selectedFile = file ?? fileInputRef.current?.files?.item(0) ?? null;
-    if (!ticker.trim()) {
+    const form = event.currentTarget;
+    const nativeFormData = new FormData(form);
+    const query = String(nativeFormData.get("ticker") ?? ticker).trim();
+    const nativeFile = nativeFormData.get("file");
+    const selectedFile =
+      nativeFile instanceof File && nativeFile.size > 0
+        ? nativeFile
+        : file ?? fileInputRef.current?.files?.item(0) ?? null;
+    if (!query) {
       setError("Enter a ticker or company name before filling.");
       return;
     }
@@ -99,7 +106,7 @@ export default function Home() {
     setSummary(null);
 
     const formData = new FormData();
-    formData.append("ticker", ticker.trim());
+    formData.append("ticker", query);
     formData.append("file", selectedFile);
 
     try {
@@ -122,7 +129,7 @@ export default function Home() {
       const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = downloadUrl;
-      a.download = response.headers.get("x-output-filename") ?? `${ticker.toUpperCase()}_historicals_filled.xlsx`;
+      a.download = response.headers.get("x-output-filename") ?? `${query.toUpperCase()}_historicals_filled.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -164,7 +171,7 @@ export default function Home() {
           </div>
         </div>
 
-        <form className="tool" onSubmit={handleSubmit}>
+        <form className="tool" action="/api/fill-model" method="post" encType="multipart/form-data" onSubmit={handleSubmit}>
           <div className="toolHeader">
             <FileSpreadsheet aria-hidden="true" size={22} />
             <div>
@@ -179,6 +186,7 @@ export default function Home() {
               <Search aria-hidden="true" size={20} />
               <input
                 id="ticker"
+                name="ticker"
                 value={ticker}
                 onChange={(event) => setTicker(event.target.value)}
                 placeholder="AAPL, Microsoft, Costco..."
@@ -206,7 +214,7 @@ export default function Home() {
               ref={fileInputRef}
               className="filePicker"
               type="file"
-              name="model-template-file"
+              name="file"
               accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               aria-label="Upload Excel model template"
               onClick={(event) => {
