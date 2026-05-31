@@ -179,14 +179,13 @@ export default function Home() {
             className={isDragging ? "dropzone dragging" : "dropzone"}
             role="button"
             tabIndex={0}
-            onClick={() => fileInputRef.current?.click()}
             onKeyDown={handleDropzoneKeyDown}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}
             onDrop={handleDrop}
           >
-            <input ref={fileInputRef} type="file" accept=".xlsx" onChange={handleFileChange} />
+            <input ref={fileInputRef} type="file" accept=".xlsx" tabIndex={-1} onChange={handleFileChange} />
             <span className="dropIcon">
               <UploadCloud aria-hidden="true" size={30} />
             </span>
