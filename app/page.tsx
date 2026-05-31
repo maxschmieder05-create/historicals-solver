@@ -21,7 +21,7 @@ export default function Home() {
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  const canSubmit = useMemo(() => Boolean(file && ticker.trim() && !isSubmitting), [file, ticker, isSubmitting]);
+  const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
   useEffect(() => {
     function preventBrowserFileOpen(event: globalThis.DragEvent) {
@@ -80,7 +80,19 @@ export default function Home() {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!file || !ticker.trim()) return;
+    const selectedFile = file ?? fileInputRef.current?.files?.item(0) ?? null;
+    if (!ticker.trim()) {
+      setError("Enter a ticker or company name before filling.");
+      return;
+    }
+    if (!selectedFile) {
+      setError("Choose an .xlsx workbook before filling.");
+      return;
+    }
+    if (!selectedFile.name.toLowerCase().endsWith(".xlsx")) {
+      setError(`${selectedFile.name} is not an .xlsx workbook.`);
+      return;
+    }
 
     setIsSubmitting(true);
     setError("");
@@ -88,7 +100,7 @@ export default function Home() {
 
     const formData = new FormData();
     formData.append("ticker", ticker.trim());
-    formData.append("file", file);
+    formData.append("file", selectedFile);
 
     try {
       const response = await fetch("/api/fill-model", {
