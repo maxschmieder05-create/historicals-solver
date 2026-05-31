@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, CheckCircle2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -23,6 +23,20 @@ export default function Home() {
 
   const canSubmit = useMemo(() => Boolean(file && ticker.trim() && !isSubmitting), [file, ticker, isSubmitting]);
 
+  useEffect(() => {
+    function preventBrowserFileOpen(event: globalThis.DragEvent) {
+      if (!event.dataTransfer?.types.includes("Files")) return;
+      event.preventDefault();
+    }
+
+    window.addEventListener("dragover", preventBrowserFileOpen);
+    window.addEventListener("drop", preventBrowserFileOpen);
+    return () => {
+      window.removeEventListener("dragover", preventBrowserFileOpen);
+      window.removeEventListener("drop", preventBrowserFileOpen);
+    };
+  }, []);
+
   function pickFile(nextFile?: File) {
     setError("");
     setSummary(null);
@@ -39,7 +53,12 @@ export default function Home() {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
-    if (event.type === "dragleave" || event.type === "drop") setIsDragging(false);
+    if (event.type === "dragleave") {
+      const nextTarget = event.relatedTarget;
+      if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
+      setIsDragging(false);
+    }
+    if (event.type === "drop") setIsDragging(false);
   }
 
   function handleDrop(event: DragEvent<HTMLDivElement>) {
