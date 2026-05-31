@@ -27,6 +27,34 @@ const expectedAnchors = {
   }
 };
 
+const expectedFiscalPeriodAnchors = {
+  "1Q26": {
+    Revenue: 44062,
+    "Total Assets": 125254,
+    "Total Liabilities & Shareholder's Equity": 125254
+  },
+  "3Q26": {
+    Revenue: 57006,
+    "Total Assets": 161148,
+    "Total Liabilities & Shareholder's Equity": 161148
+  },
+  "4Q26": {
+    Revenue: 68127,
+    "Total Assets": 206803,
+    "Total Liabilities & Shareholder's Equity": 206803
+  },
+  FY26: {
+    Revenue: 215938,
+    "Total Assets": 206803,
+    "Total Liabilities & Shareholder's Equity": 206803
+  },
+  "1Q27": {
+    Revenue: 81615,
+    "Total Assets": 259474,
+    "Total Liabilities & Shareholder's Equity": 259474
+  }
+};
+
 function cellValue(cell) {
   const value = cell.value;
   if (typeof value === "number" || typeof value === "string") return value;
@@ -50,10 +78,22 @@ function findPeriodColumn(sheet, period) {
   if (!headerRow) return null;
   for (let col = 1; col <= Math.min(sheet.columnCount, 160); col += 1) {
     const label = String(cellValue(sheet.getCell(headerRow, col)) ?? "").trim();
-    if (period === "FY25" && label === "2025") return col;
-    if (label.toUpperCase() === period) return col;
+    if (normalizePeriodLabel(label) === period.toUpperCase()) return col;
   }
   return null;
+}
+
+function normalizePeriodLabel(label) {
+  const compact = String(label ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/[’']/g, "")
+    .replace(/(?:E|EST|ESTIMATE)$/i, "");
+  const direct = compact.match(/^([1-4])Q(\d{2}|\d{4})$/i);
+  if (direct) return `${direct[1]}Q${direct[2].slice(-2)}`.toUpperCase();
+  const fiscalYear = compact.match(/^(?:FY(\d{2}|\d{4})|(\d{4}))A?$/i);
+  if (fiscalYear) return `FY${(fiscalYear[1] ?? fiscalYear[2]).slice(-2)}`.toUpperCase();
+  return compact.toUpperCase();
 }
 
 function bestPeriodHeaderRow(sheet) {
@@ -96,7 +136,7 @@ async function main() {
   if (!model) throw new Error("Output workbook does not contain a Model sheet.");
 
   const errors = [];
-  for (const [period, anchors] of Object.entries(expectedAnchors)) {
+  for (const [period, anchors] of Object.entries({ ...expectedAnchors, ...expectedFiscalPeriodAnchors })) {
     const col = findPeriodColumn(model, period);
     if (!col) {
       errors.push(`Could not find ${period} column in Model sheet.`);
@@ -114,6 +154,36 @@ async function main() {
         errors.push(`${period} ${label}: expected ${expected}, got ${actual ?? "[blank]"}.`);
       }
     }
+  }
+
+  const segment = workbook.getWorksheet("Segment Analysis");
+  if (!segment) {
+    errors.push("Output workbook does not contain a Segment Analysis sheet.");
+  } else {
+    const segmentRevenueRow = findRow(segment, "Total Company Revenue");
+    const modelRevenueRow = findRow(model, "Revenue");
+    if (!segmentRevenueRow || !modelRevenueRow) {
+      errors.push("Could not find Segment Analysis Total Company Revenue or Model Revenue row.");
+    } else {
+      for (const period of Object.keys(expectedFiscalPeriodAnchors)) {
+        const col = findPeriodColumn(model, period);
+        if (!col) continue;
+        const modelRevenue = cellValue(model.getCell(modelRevenueRow, col));
+        const segmentRevenue = cellValue(segment.getCell(segmentRevenueRow, col));
+        if (!valuesMatch(segmentRevenue, modelRevenue)) {
+          errors.push(`${period} Segment Analysis Total Company Revenue should tie to Model Revenue: expected ${modelRevenue}, got ${segmentRevenue ?? "[blank]"}.`);
+        }
+      }
+    }
+  }
+
+  const fy26AssetsCol = findPeriodColumn(model, "FY26");
+  const q426AssetsCol = findPeriodColumn(model, "4Q26");
+  const assetsRow = findRow(model, "Total Assets");
+  if (fy26AssetsCol && q426AssetsCol && assetsRow) {
+    const fy26Assets = cellValue(model.getCell(assetsRow, fy26AssetsCol));
+    const q426Assets = cellValue(model.getCell(assetsRow, q426AssetsCol));
+    if (!valuesMatch(fy26Assets, q426Assets)) errors.push(`FY26 balance sheet should equal 4Q26 year-end balance sheet: expected ${q426Assets}, got ${fy26Assets}.`);
   }
 
   if (errors.length) {

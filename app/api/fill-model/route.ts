@@ -161,6 +161,7 @@ type ResolveContext = {
   instant: Map<string, Map<string, FactSource>>;
   commentary?: Map<string, FilingCommentaryEvidence[]>;
   template?: TemplateMappingContext;
+  fiscalPeriods?: FiscalPeriodMap;
 };
 
 type PipelineLayer =
@@ -258,8 +259,32 @@ type FilingRef = {
   sourceLayer?: "sec_bulk_submissions" | "sec_live_submissions";
 };
 
+type FiscalPeriodEntry = {
+  accessionNumber: string;
+  accessionKey: string;
+  form: string;
+  filingDate: string;
+  reportDate: string;
+  fiscalYear: number;
+  fiscalQuarter: 1 | 2 | 3 | 4;
+  quarterPeriod: string;
+  annualPeriod?: string;
+  fiscalYearEndMonth?: number;
+  fiscalYearEndDay?: number;
+};
+
+type FiscalPeriodMap = {
+  entries: FiscalPeriodEntry[];
+  byAccession: Map<string, FiscalPeriodEntry>;
+  byReportDate: Map<string, FiscalPeriodEntry>;
+  reportedPeriods: Set<string>;
+  fiscalYearEndMonth: number | null;
+  fiscalYearEndDay: number | null;
+};
+
 type FactContextOptions = {
   filingMetadata?: Map<string, FilingRef>;
+  fiscalPeriods?: FiscalPeriodMap;
   sourceLayer?: FactSource["sourceLayer"];
 };
 
@@ -3032,6 +3057,12 @@ function findCoverRow(sheet: ExcelJS.Worksheet, label: string) {
 }
 
 function latestFiscalYearEndDate(ctx: ResolveContext) {
+  const mapped = ctx.fiscalPeriods?.entries
+    .filter((entry) => entry.annualPeriod)
+    .map((entry) => entry.reportDate)
+    .sort()
+    .at(-1);
+  if (mapped) return mapped;
   const candidates: string[] = [];
   for (const periodFacts of [...ctx.duration.values(), ...ctx.instant.values()]) {
     for (const source of periodFacts.values()) {
@@ -3312,8 +3343,10 @@ export async function POST(request: NextRequest) {
     const liveFacts = await fetchCompanyFacts(company.cik).catch(() => null);
     const baseFacts = bulkSupport.companyFacts ?? liveFacts;
     if (!baseFacts) throw new Error("Could not load SEC company facts for that company from bulk files or live SEC APIs.");
+    const fiscalPeriods = buildFiscalPeriodMap(Array.from(filingMetadata.values()), baseFacts);
     const ctx = buildFactContext(baseFacts, company, {
       filingMetadata,
+      fiscalPeriods,
       sourceLayer: bulkSupport.companyFacts ? "sec_bulk_companyfacts" : "sec_live_companyfacts"
     });
     if (bulkSupport.companyFacts && liveFacts) {
@@ -3321,6 +3354,7 @@ export async function POST(request: NextRequest) {
         ctx,
         buildFactContext(liveFacts, company, {
           filingMetadata,
+          fiscalPeriods,
           sourceLayer: "sec_live_companyfacts"
         })
       );
@@ -3384,13 +3418,15 @@ export async function POST(request: NextRequest) {
     );
     const incomeStatementPeriods = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.period) : periods;
     const incomeStatementColumns = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.col) : columns;
+    markReportedPeriodColumns(sheet, uniquePeriodColumnPairs([...periods.map((period, index) => ({ period, col: columns[index] })), ...balanceSheetPairs, ...incomeStatementPairs]));
+    normalizeSharedFormulas(workbook);
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
     if (periods.some(isQuarterPeriod)) {
-      const inlineCtx = await fetchInlineFactContext(company, periods, bulkSupport);
+      const inlineCtx = await fetchInlineFactContext(company, periods, bulkSupport, fiscalPeriods);
       mergeContexts(ctx, inlineCtx);
     }
     const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
-    const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods, bulkSupport) : [];
+    const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods, bulkSupport, fiscalPeriods) : [];
     const profile = detectTemplateProfile(workbook, sheet, ctx);
     const normalizedPackage = buildNormalizedHistoricalsPackage(company, profile, periods, ctx, segmentRevenue);
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
@@ -3404,6 +3440,7 @@ export async function POST(request: NextRequest) {
     let commentsAdded = 0;
     warnings.push(...coverWarnings);
     warnings.push(...bulkSupport.warnings);
+    warnings.push(...missingReportedFilingPeriodWarnings(sheet, ctx));
     if (bulkSupport.latestRefreshAt) warnings.push(`SEC bulk support latest archive timestamp: ${bulkSupport.latestRefreshAt}.`);
     warnings.push(...normalizedPackage.diagnostics.filter((item) => item.severity !== "info").map((item) => `${item.layer}: ${item.message}`));
 
@@ -3680,6 +3717,10 @@ export async function POST(request: NextRequest) {
       refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     }
 
+    refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
+    const balanceSheetAnnualCopyResult = copyBalanceSheetFourthQuarterToAnnualColumns(sheet, balanceSheetPeriods, balanceSheetColumns, auditRows);
+    filledCells += balanceSheetAnnualCopyResult.filledCells;
+
     const validationErrors = validateWorkbookBeforeReturn(
       workbook,
       periods,
@@ -3786,7 +3827,123 @@ async function fetchFilingMetadata(company: CompanyMatch, bulkSupport?: SecBulkS
   return new Map(filings.map((filing) => [normalizeAccession(filing.accessionNumber), filing]));
 }
 
-async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: string[], bulkSupport?: SecBulkSupport) {
+function buildFiscalPeriodMap(filings: FilingRef[], payload?: any): FiscalPeriodMap {
+  const fiscalYearEnd = inferFiscalYearEndFromFilings(filings) ?? {
+    month: inferFiscalYearEndMonth(payload),
+    day: null
+  };
+  const fiscalYearEndMonth = fiscalYearEnd.month ?? null;
+  const fiscalYearEndDay = fiscalYearEnd.day ?? null;
+  const byAccession = new Map<string, FiscalPeriodEntry>();
+  const byReportDate = new Map<string, FiscalPeriodEntry>();
+  const reportedPeriods = new Set<string>();
+
+  for (const filing of filings) {
+    const reportDate = filingReportDateFromRef(filing);
+    if (!reportDate) continue;
+    const quarterPeriod = fiscalQuarterPeriodForFiling(filing, reportDate, fiscalYearEndMonth);
+    if (!quarterPeriod) continue;
+    const fiscalQuarter = periodQuarter(quarterPeriod) as FiscalPeriodEntry["fiscalQuarter"];
+    if (![1, 2, 3, 4].includes(fiscalQuarter)) continue;
+    const entry: FiscalPeriodEntry = {
+      accessionNumber: filing.accessionNumber,
+      accessionKey: normalizeAccession(filing.accessionNumber),
+      form: filing.form,
+      filingDate: filing.filingDate,
+      reportDate,
+      fiscalYear: periodYear(quarterPeriod),
+      fiscalQuarter,
+      quarterPeriod,
+      annualPeriod: isTenK(filing.form) ? `FY${periodYearSuffix(quarterPeriod)}` : undefined,
+      fiscalYearEndMonth: fiscalYearEndMonth ?? undefined,
+      fiscalYearEndDay: fiscalYearEndDay ?? undefined
+    };
+    byAccession.set(entry.accessionKey, entry);
+    const existingForDate = byReportDate.get(reportDate);
+    if (!existingForDate || fiscalPeriodEntryPreference(entry) > fiscalPeriodEntryPreference(existingForDate)) {
+      byReportDate.set(reportDate, entry);
+    }
+    reportedPeriods.add(entry.quarterPeriod);
+    if (entry.annualPeriod) reportedPeriods.add(entry.annualPeriod);
+  }
+
+  const entries = Array.from(byAccession.values()).sort((a, b) => comparePeriods(a.quarterPeriod, b.quarterPeriod) || a.filingDate.localeCompare(b.filingDate));
+  return { entries, byAccession, byReportDate, reportedPeriods, fiscalYearEndMonth, fiscalYearEndDay };
+}
+
+function inferFiscalYearEndFromFilings(filings: FilingRef[]) {
+  const annualDates = filings
+    .filter((filing) => isTenK(filing.form))
+    .map(filingReportDateFromRef)
+    .filter((date): date is string => Boolean(date))
+    .sort();
+  const latest = annualDates.at(-1);
+  if (!latest) return null;
+  const parsed = parseIsoDateParts(latest);
+  return parsed ? { month: parsed.month, day: parsed.day } : null;
+}
+
+function filingReportDateFromRef(filing: FilingRef) {
+  const explicit = normalizeIsoDate(filing.reportDate ?? "");
+  if (explicit) return explicit;
+  const fileDate = filing.primaryDocument?.match(/(\d{4})(\d{2})(\d{2})/)?.slice(1, 4);
+  return fileDate ? `${fileDate[0]}-${fileDate[1]}-${fileDate[2]}` : null;
+}
+
+function fiscalQuarterPeriodForFiling(filing: FilingRef, reportDate: string, fiscalYearEndMonth: number | null) {
+  const fiscalPeriod = fiscalYearEndMonth ? fiscalPeriodKeyFromDate(reportDate, fiscalYearEndMonth) : null;
+  const fallback = periodKeyFromDate(reportDate);
+  const quarterPeriod = fiscalPeriod ?? fallback;
+  if (!quarterPeriod) return null;
+  if (isTenK(filing.form)) return `4Q${periodYearSuffix(quarterPeriod)}`;
+  return quarterPeriod;
+}
+
+function fiscalPeriodEntryPreference(entry: FiscalPeriodEntry) {
+  let score = isTenK(entry.form) ? 4 : 2;
+  if (entry.form.endsWith("/A")) score += 1;
+  if (entry.reportDate) score += 1;
+  return score;
+}
+
+function parseIsoDateParts(value: string) {
+  const match = value.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return null;
+  return { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+}
+
+function normalizeIsoDate(value: string) {
+  if (!value) return null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
+}
+
+function fiscalPeriodEntryForFiling(filing: FilingRef, fiscalPeriods?: FiscalPeriodMap) {
+  return fiscalPeriods?.byAccession.get(normalizeAccession(filing.accessionNumber)) ?? null;
+}
+
+function fiscalPeriodEntryForFact(fact: SecFact, options: FactContextOptions) {
+  if (fact.accn) {
+    const byAccession = options.fiscalPeriods?.byAccession.get(normalizeAccession(fact.accn));
+    if (byAccession) return byAccession;
+  }
+  if (fact.end) {
+    const byDate = options.fiscalPeriods?.byReportDate.get(fact.end);
+    if (byDate) return byDate;
+  }
+  return null;
+}
+
+function fiscalQuarterPeriodForDate(date: string, fiscalPeriods?: FiscalPeriodMap) {
+  return fiscalPeriods?.byReportDate.get(date)?.quarterPeriod ?? (fiscalPeriods?.fiscalYearEndMonth ? fiscalPeriodKeyFromDate(date, fiscalPeriods.fiscalYearEndMonth) : null) ?? periodKeyFromDate(date);
+}
+
+function hasReportedFilingPeriod(period: string, ctx: ResolveContext) {
+  return Boolean(ctx.fiscalPeriods?.reportedPeriods.has(period));
+}
+
+async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: string[], bulkSupport?: SecBulkSupport, fiscalPeriods?: FiscalPeriodMap) {
   const filings = await fetchFilingRefs(company, filingScanLimit(periods), bulkSupport);
 
   const annual = new Map<string, Map<string, SegmentMetrics>>();
@@ -3800,7 +3957,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
       const html = await fetchSecArchiveHtml(url, true);
       if (!html) continue;
-      const parsed = parseInlineSegmentRevenue(html, filing.form);
+      const parsed = parseInlineSegmentRevenue(html, filing.form, fiscalPeriods);
       mergeSegmentPeriodMaps(annual, parsed.annual);
       mergeSegmentPeriodMaps(quarterly, parsed.quarterly);
       mergeSegmentPeriodMaps(cumulative, parsed.year_to_date);
@@ -3940,7 +4097,7 @@ function firstSegmentMetricsForLabel(periods: Map<string, Map<string, SegmentMet
   return null;
 }
 
-async function fetchInlineFactContext(company: CompanyMatch, periods: string[], bulkSupport?: SecBulkSupport): Promise<ResolveContext> {
+async function fetchInlineFactContext(company: CompanyMatch, periods: string[], bulkSupport?: SecBulkSupport, fiscalPeriods?: FiscalPeriodMap): Promise<ResolveContext> {
   const duration = new Map<string, Map<string, FactSource>>();
   const instant = new Map<string, Map<string, FactSource>>();
   const commentary = new Map<string, FilingCommentaryEvidence[]>();
@@ -3954,15 +4111,15 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[], 
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
       const html = await fetchSecArchiveHtml(url);
       if (!html) continue;
-      mergeInlineFacts(html, filing, wanted, { duration, instant }, url);
-      mergeNarrativeOperatingExpenseFacts(html, filing, wanted, { duration, instant }, url);
-      mergeFilingCommentaryEvidence(html, filing, wanted, { duration, instant, commentary }, url);
+      mergeInlineFacts(html, filing, wanted, { duration, instant, fiscalPeriods }, url);
+      mergeNarrativeOperatingExpenseFacts(html, filing, wanted, { duration, instant, fiscalPeriods }, url);
+      mergeFilingCommentaryEvidence(html, filing, wanted, { duration, instant, commentary, fiscalPeriods }, url);
     } catch {
       // Inline facts are a supplement to SEC companyfacts; keep filling with the facts already available.
     }
   }
 
-  return { duration, instant, commentary };
+  return { duration, instant, commentary, fiscalPeriods };
 }
 
 function filingScanLimit(periods: string[]) {
@@ -4083,7 +4240,7 @@ function filingRefPreference(filing: FilingRef) {
 }
 
 function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext, sourceUrl = "") {
-  const contexts = parseInlineContexts(html, filing.form);
+  const contexts = parseInlineContexts(html, filing.form, ctx.fiscalPeriods);
   for (const match of html.matchAll(/<ix:nonFraction\b([^>]*)>([\s\S]*?)<\/ix:nonFraction>/g)) {
     const attrs = match[1];
     const unitRef = attrs.match(/\bunitRef="([^"]+)"/)?.[1] ?? "";
@@ -4126,7 +4283,7 @@ function mergeInlineFacts(html: string, filing: FilingRef, wanted: Set<string>, 
 
 function mergeNarrativeOperatingExpenseFacts(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext, sourceUrl = "") {
   const periodEnd = filingPeriodEndDate(filing, html);
-  const period = periodEnd ? periodKeyFromDate(periodEnd) : null;
+  const period = periodEnd ? fiscalQuarterPeriodForDate(periodEnd, ctx.fiscalPeriods) : null;
   if (!periodEnd || !period || !wanted.has(period) || isTenK(filing.form)) return;
 
   const text = htmlText(html);
@@ -4190,7 +4347,7 @@ function mergeNarrativeOperatingExpenseFacts(html: string, filing: FilingRef, wa
 }
 
 function mergeFilingCommentaryEvidence(html: string, filing: FilingRef, wanted: Set<string>, ctx: ResolveContext, sourceUrl = "") {
-  const period = filingCommentaryPeriod(filing, html);
+  const period = filingCommentaryPeriod(filing, html, ctx.fiscalPeriods);
   if (!period || !wanted.has(period)) return;
 
   const text = htmlText(html);
@@ -4200,11 +4357,13 @@ function mergeFilingCommentaryEvidence(html: string, filing: FilingRef, wanted: 
   ctx.commentary?.set(period, uniqueCommentaryEvidence([...existing, ...evidence]).slice(0, 18));
 }
 
-function filingCommentaryPeriod(filing: FilingRef, html: string) {
+function filingCommentaryPeriod(filing: FilingRef, html: string, fiscalPeriods?: FiscalPeriodMap) {
+  const filingEntry = fiscalPeriodEntryForFiling(filing, fiscalPeriods);
+  if (filingEntry) return filingEntry.quarterPeriod;
   const focus = parseInlineFiscalFocus(html);
   if (focus) return focus.fp === "FY" ? `4Q${String(focus.fy).slice(-2)}` : `${focus.fp.slice(1)}Q${String(focus.fy).slice(-2)}`;
   const periodEnd = filingPeriodEndDate(filing, html) ?? filing.reportDate;
-  return periodEnd ? periodKeyFromDate(periodEnd) : null;
+  return periodEnd ? fiscalQuarterPeriodForDate(periodEnd, fiscalPeriods) : null;
 }
 
 function extractFilingCommentaryEvidence(text: string, period: string, filing: FilingRef, sourceUrl = ""): FilingCommentaryEvidence[] {
@@ -4298,7 +4457,7 @@ function operatingExpenseTableCurrentQuarterValue(numbers: number[], period: str
   return numbers[0] ?? null;
 }
 
-function parseInlineContexts(html: string, form: string) {
+function parseInlineContexts(html: string, form: string, fiscalPeriods?: FiscalPeriodMap) {
   const fiscalFocus = supportedInlineFactFiscalFocus(parseInlineFiscalFocus(html));
   const contexts = new Map<string, InlineContext>();
   for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
@@ -4306,7 +4465,7 @@ function parseInlineContexts(html: string, form: string) {
     const instant = body.match(/<xbrli:instant>([^<]+)<\/xbrli:instant>/)?.[1];
     if (instant) {
       contexts.set(match[1], {
-        period: fiscalFocus ? periodKeyFromFiscalFocus(instant, fiscalFocus) ?? periodKeyFromDate(instant) : periodKeyFromDate(instant),
+        period: fiscalFocus ? periodKeyFromFiscalFocus(instant, fiscalFocus) ?? fiscalQuarterPeriodForDate(instant, fiscalPeriods) : fiscalQuarterPeriodForDate(instant, fiscalPeriods),
         instant: true,
         end: instant,
         hasDimensions: hasInlineDimensions(body)
@@ -4318,7 +4477,7 @@ function parseInlineContexts(html: string, form: string) {
     if (start && end) {
       if (!isSupportedInlineDuration(start, end)) continue;
       contexts.set(match[1], {
-        period: contextPeriod(body, form, fiscalFocus) ?? periodKeyFromDate(end),
+        period: contextPeriod(body, form, fiscalFocus, fiscalPeriods) ?? fiscalQuarterPeriodForDate(end, fiscalPeriods),
         instant: false,
         start,
         end,
@@ -4366,6 +4525,7 @@ function hasInlineDimensions(contextBody: string) {
 }
 
 function mergeContexts(target: ResolveContext, source: ResolveContext) {
+  if (!target.fiscalPeriods && source.fiscalPeriods) target.fiscalPeriods = source.fiscalPeriods;
   source.instant.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.instant, period, concept, fact)));
   source.duration.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.duration, period, concept, fact)));
   source.commentary?.forEach((items, period) => {
@@ -4411,12 +4571,12 @@ type InlineFiscalFocus = {
   end: string;
 };
 
-function parseInlineSegmentRevenue(html: string, form: string) {
+function parseInlineSegmentRevenue(html: string, form: string, fiscalPeriods?: FiscalPeriodMap) {
   const fiscalFocus = parseInlineFiscalFocus(html);
   const contexts = new Map<string, InlineSegmentContext>();
   for (const match of html.matchAll(/<xbrli:context\b[^>]*id="([^"]+)"[\s\S]*?<\/xbrli:context>/g)) {
     const body = match[0];
-    const periodInfo = inlineSegmentDurationPeriod(body, form, fiscalFocus);
+    const periodInfo = inlineSegmentDurationPeriod(body, form, fiscalFocus, fiscalPeriods);
     const members = Array.from(body.matchAll(/<xbrldi:explicitMember\b([^>]*)>([^<]+)<\/xbrldi:explicitMember>/g)).map((member) => {
       const dimension = member[1].match(/\bdimension="([^"]+)"/)?.[1];
       return dimension ? `${dimension}=${member[2]}` : member[2];
@@ -4799,7 +4959,7 @@ function normalizeInlineDate(value: string) {
   return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString().slice(0, 10);
 }
 
-function contextPeriod(contextXml: string, form: string, fiscalFocus?: InlineFiscalFocus | null) {
+function contextPeriod(contextXml: string, form: string, fiscalFocus?: InlineFiscalFocus | null, fiscalPeriods?: FiscalPeriodMap) {
   const start = contextXml.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
   const end = contextXml.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
   if (!start || !end) return null;
@@ -4810,6 +4970,8 @@ function contextPeriod(contextXml: string, form: string, fiscalFocus?: InlineFis
   if (!isTenK(form) && days > 115) return null;
   const fiscalPeriod = fiscalFocus ? periodKeyFromFiscalFocus(end, fiscalFocus) : null;
   if (fiscalPeriod) return fiscalPeriod;
+  const mappedPeriod = fiscalQuarterPeriodForDate(end, fiscalPeriods);
+  if (mappedPeriod) return isTenK(form) ? `4Q${periodYearSuffix(mappedPeriod)}` : mappedPeriod;
   const year = endDate.getUTCFullYear();
   const quarter = Math.floor(endDate.getUTCMonth() / 3) + 1;
   if (isTenK(form)) return `4Q${String(year).slice(-2)}`;
@@ -4819,7 +4981,8 @@ function contextPeriod(contextXml: string, form: string, fiscalFocus?: InlineFis
 function inlineSegmentDurationPeriod(
   contextXml: string,
   form: string,
-  fiscalFocus?: InlineFiscalFocus | null
+  fiscalFocus?: InlineFiscalFocus | null,
+  fiscalPeriods?: FiscalPeriodMap
 ): { period: string; periodType: FactSource["periodType"]; sourcePeriodPriority?: number } | null {
   const start = contextXml.match(/<xbrli:startDate>([^<]+)<\/xbrli:startDate>/)?.[1];
   const end = contextXml.match(/<xbrli:endDate>([^<]+)<\/xbrli:endDate>/)?.[1];
@@ -4830,8 +4993,8 @@ function inlineSegmentDurationPeriod(
 
   const days = Math.round((endDate.getTime() - startDate.getTime()) / 86_400_000) + 1;
   const fiscalPeriod = fiscalFocus ? periodKeyFromFiscalFocus(end, fiscalFocus) : null;
-  const calendarPeriod = periodKeyFromDate(end);
-  const period = fiscalPeriod ?? calendarPeriod;
+  const mappedPeriod = fiscalQuarterPeriodForDate(end, fiscalPeriods);
+  const period = fiscalPeriod ?? mappedPeriod;
   if (!period) return null;
 
   if (isTenK(form)) {
@@ -5081,8 +5244,8 @@ function buildFactContext(payload: any, company?: CompanyMatch, options: FactCon
   const instant = new Map<string, Map<string, FactSource>>();
   const cumulativeDuration = new Map<string, Map<string, FactSource>>();
   const annualDuration = new Map<string, Map<string, FactSource>>();
-  const fiscalYearEndMonth = inferFiscalYearEndMonth(payload);
-  const useFiscalDatePeriodKeys = fiscalYearEndMonth !== null && fiscalYearEndMonth !== 12;
+  const fiscalYearEndMonth = options.fiscalPeriods?.fiscalYearEndMonth ?? inferFiscalYearEndMonth(payload);
+  const useFiscalDatePeriodKeys = fiscalYearEndMonth !== null;
 
   for (const [taxonomyName, taxonomy] of Object.entries<any>(payload?.facts ?? {})) {
     for (const [concept, detail] of Object.entries<any>(taxonomy)) {
@@ -5092,8 +5255,9 @@ function buildFactContext(payload: any, company?: CompanyMatch, options: FactCon
       for (const fact of unitFacts) {
         if (!isUsableFact(fact)) continue;
         const instantFact = isInstantFact(fact);
+        const filingEntry = fiscalPeriodEntryForFact(fact, options);
         const period =
-          (useFiscalDatePeriodKeys ? periodKeyForFactEndDate(fact, fiscalYearEndMonth) : null) ??
+          factPeriodKeyFromFiscalMap(fact, filingEntry, fiscalYearEndMonth, useFiscalDatePeriodKeys) ??
           (fact.end ? periodKeyFromDate(fact.end) : periodKey(fact));
         if (!period) continue;
         const filing = fact.accn ? options.filingMetadata?.get(normalizeAccession(fact.accn)) : undefined;
@@ -5119,14 +5283,14 @@ function buildFactContext(payload: any, company?: CompanyMatch, options: FactCon
         };
         if (!instantFact && isAnnualDurationFact(fact)) {
           setSource(annualDuration, period, concept, source);
-          const annualPeriod = annualPeriodKey(fact, useFiscalDatePeriodKeys ? fiscalYearEndMonth : null);
+          const annualPeriod = annualPeriodKeyForFact(fact, filingEntry, useFiscalDatePeriodKeys ? fiscalYearEndMonth : null);
           if (annualPeriod) setSource(duration, annualPeriod, concept, { ...source, periodKey: annualPeriod });
         } else if (!instantFact && isYearToDateFact(fact)) {
           setSource(cumulativeDuration, period, concept, source);
         } else if (instantFact || isQuarterDurationFact(fact)) {
           setSource(instantFact ? instant : duration, period, concept, source);
           if (instantFact && isAnnualInstantFact(fact)) {
-            const annualPeriod = annualPeriodKey(fact, useFiscalDatePeriodKeys ? fiscalYearEndMonth : null);
+            const annualPeriod = annualPeriodKeyForFact(fact, filingEntry, useFiscalDatePeriodKeys ? fiscalYearEndMonth : null);
             if (annualPeriod) setSource(instant, annualPeriod, concept, { ...source, periodKey: annualPeriod });
           }
         }
@@ -5136,7 +5300,7 @@ function buildFactContext(payload: any, company?: CompanyMatch, options: FactCon
 
   deriveQuarterlies(duration, cumulativeDuration, annualDuration);
 
-  return { duration, instant };
+  return { duration, instant, fiscalPeriods: options.fiscalPeriods };
 }
 
 function sourceUrlForAccession(cik: string | number | undefined, accn?: string) {
@@ -5270,6 +5434,22 @@ function isAnnualDurationFact(fact: SecFact) {
 
 function isAnnualInstantFact(fact: SecFact) {
   return Boolean(fact.end && fact.fp === "FY" && isTenK(fact.form));
+}
+
+function factPeriodKeyFromFiscalMap(
+  fact: SecFact,
+  filingEntry: FiscalPeriodEntry | null,
+  fiscalYearEndMonth: number | null,
+  useFiscalDatePeriodKeys: boolean
+) {
+  if (!fact.end) return null;
+  if (filingEntry?.reportDate === fact.end) return filingEntry.quarterPeriod;
+  return useFiscalDatePeriodKeys ? periodKeyForFactEndDate(fact, fiscalYearEndMonth) : null;
+}
+
+function annualPeriodKeyForFact(fact: SecFact, filingEntry: FiscalPeriodEntry | null, fiscalYearEndMonth?: number | null) {
+  if (filingEntry && filingEntry.reportDate === fact.end && filingEntry.annualPeriod) return filingEntry.annualPeriod;
+  return annualPeriodKey(fact, fiscalYearEndMonth);
 }
 
 function annualPeriodKey(fact: SecFact, fiscalYearEndMonth?: number | null) {
@@ -5406,7 +5586,8 @@ function isTenQ(form?: string) {
 }
 
 function choosePeriods(ctx: ResolveContext, maxColumns: number) {
-  const periods = unique([...ctx.duration.keys(), ...ctx.instant.keys()]).sort(comparePeriods);
+  const filingPeriods = ctx.fiscalPeriods?.entries.map((entry) => entry.quarterPeriod) ?? [];
+  const periods = unique([...filingPeriods, ...ctx.duration.keys(), ...ctx.instant.keys()]).sort(comparePeriods);
   return periods.filter((period) => !isAnnualPeriod(period)).slice(-maxColumns);
 }
 
@@ -5541,12 +5722,19 @@ function bestPeriodHeaderRow(sheet: ExcelJS.Worksheet) {
 }
 
 const projectedPeriodColumnsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
+const reportedPeriodColumnsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
 const balanceSheetRowsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
+
+function markReportedPeriodColumns(sheet: ExcelJS.Worksheet, pairs: Array<{ col: number }>) {
+  reportedPeriodColumnsBySheet.set(sheet, new Set(pairs.map((pair) => pair.col)));
+  projectedPeriodColumnsBySheet.delete(sheet);
+}
 
 function projectedPeriodColumns(sheet: ExcelJS.Worksheet) {
   const cached = projectedPeriodColumnsBySheet.get(sheet);
   if (cached) return cached;
-  const columns = new Set(bestPeriodHeaderRow(sheet)?.infos.filter((info) => info.isEstimate).map((info) => info.col) ?? []);
+  const reportedColumns = reportedPeriodColumnsBySheet.get(sheet) ?? new Set<number>();
+  const columns = new Set(bestPeriodHeaderRow(sheet)?.infos.filter((info) => info.isEstimate && !reportedColumns.has(info.col)).map((info) => info.col) ?? []);
   projectedPeriodColumnsBySheet.set(sheet, columns);
   return columns;
 }
@@ -5564,7 +5752,9 @@ function isProjectedBalanceSheetCell(sheet: ExcelJS.Worksheet, rowNumber: number
 }
 
 function isHistoricalReportedPeriod(period: string, isEstimate: boolean, ctx: ResolveContext) {
-  if (!isSupportedPeriodKey(period) || isEstimate) return false;
+  if (!isSupportedPeriodKey(period)) return false;
+  if (hasReportedFilingPeriod(period, ctx)) return true;
+  if (isEstimate) return false;
   if (hasReportedFinancialStatementPeriod(period, ctx)) return true;
   if (isFourthQuarterPeriod(period) && hasReportedFinancialStatementPeriod(`FY${periodYearSuffix(period)}`, ctx)) return true;
   return isAnnualPeriod(period) && hasReportedFinancialStatementPeriod(balanceSheetInstantLookupPeriod(period), ctx);
@@ -5606,6 +5796,27 @@ function allHistoricalPeriodColumnPairs(sheet: ExcelJS.Worksheet) {
   return header.infos
     .filter((info) => !info.isEstimate && isSupportedPeriodKey(info.period))
     .map(({ col, period }) => ({ col, period }));
+}
+
+function missingReportedFilingPeriodWarnings(sheet: ExcelJS.Worksheet, ctx: ResolveContext) {
+  const fiscalPeriods = ctx.fiscalPeriods;
+  const header = bestPeriodHeaderRow(sheet);
+  if (!fiscalPeriods || !header) return [];
+  const modelPeriods = new Set(header.infos.map((info) => info.period));
+  const modelQuarterPeriods = header.infos.filter((info) => isQuarterPeriod(info.period)).map((info) => info.period);
+  if (!modelQuarterPeriods.length) return [];
+  const minModelPeriod = modelQuarterPeriods.slice().sort(comparePeriods)[0];
+  const maxModelPeriod = modelQuarterPeriods.slice().sort(comparePeriods).at(-1);
+  if (!minModelPeriod || !maxModelPeriod) return [];
+
+  const missing = fiscalPeriods.entries
+    .flatMap((entry) => [entry.quarterPeriod, entry.annualPeriod].filter(Boolean) as string[])
+    .filter((period) => {
+      const comparable = isAnnualPeriod(period) ? balanceSheetInstantLookupPeriod(period) : period;
+      return comparePeriods(comparable, minModelPeriod) >= 0 && comparePeriods(comparable, maxModelPeriod) <= 0 && !modelPeriods.has(period);
+    });
+
+  return unique(missing).map((period) => `SEC filing period ${period} exists, but the model has no matching period column; no value was written into a neighboring fiscal period.`);
 }
 
 function isEstimatePeriodLabel(label: string) {
@@ -5777,10 +5988,16 @@ function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
   workbook.eachSheet((sheet) => {
     sheet.eachRow({ includeEmpty: false }, (row) => {
       row.eachCell({ includeEmpty: false }, (cell) => {
-        if (isProjectedBalanceSheetCell(sheet, Number(cell.row), Number(cell.col))) return;
         const value = cell.value;
         if (!value || typeof value !== "object" || !("sharedFormula" in value)) return;
-        const formula = formulaForCell(cell);
+        let formula: string | null = null;
+        try {
+          formula = formulaForCell(cell);
+        } catch {
+          const result = "result" in value ? value.result : undefined;
+          cell.value = (result ?? null) as ExcelJS.CellValue;
+          return;
+        }
         if (!formula) return;
         const result = "result" in value ? value.result : undefined;
         cell.value = result === undefined ? { formula } : { formula, result };
@@ -6809,7 +7026,7 @@ function fillSegmentMetricRows(
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
       const value = (segment[metric].get(period) ?? 0) / 1_000_000;
-      if (!writeSegmentMetricCell(cell, value)) return;
+      if (!writeSegmentMetricCell(cell, value, { overwriteFormula: true })) return;
       filledCells += 1;
       const resolved = segmentResolvedValue(segment, metric, period);
       const comment = mappingCommentForSegment(sheet, cell, existingLabel, segment, period, value, suffix);
@@ -6821,7 +7038,11 @@ function fillSegmentMetricRows(
   return { filledCells, commentsAdded };
 }
 
-function writeSegmentMetricCell(cell: ExcelJS.Cell, value: number) {
+function writeSegmentMetricCell(cell: ExcelJS.Cell, value: number, options: { overwriteFormula?: boolean } = {}) {
+  if (options.overwriteFormula && hasFormula(cell)) {
+    cell.value = value;
+    return true;
+  }
   if (isSegmentMetricInputCell(cell)) {
     cell.value = value;
     return true;
@@ -6907,7 +7128,7 @@ function clearUnmatchedSegmentRow(
     if (!canClearCell) return;
     const existing = numericCellValue(cell);
     if (existing === 0 || existing === null) return;
-    if (!writeSegmentMetricCell(cell, 0)) cell.value = 0;
+    if (!writeSegmentMetricCell(cell, 0, { overwriteFormula: true })) cell.value = 0;
     filledCells += 1;
     const notes = "Needs review: Segment Analysis row was not filled because the template label is blank, generic, or does not confidently match an EDGAR reportable segment.";
     if (addComment(cell, notes)) commentsAdded += 1;
@@ -9621,6 +9842,27 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
   const totalAssetsRow = findRowInSection(sheet, "Balance Sheet", ["Total Assets"], (label) =>
     /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
   );
+  const totalCurrentAssetsRow = findRowInSection(sheet, "Balance Sheet", ["Total Current Assets"], (label) =>
+    /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  const totalNonCurrentAssetsRow = findRowInSection(
+    sheet,
+    "Balance Sheet",
+    ["Total Non-Current Assets", "Total Noncurrent Assets", "Total Long-Term Assets", "Total Long Term Assets"],
+    (label) => /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  const totalCurrentLiabilitiesRow = findRowInSection(
+    sheet,
+    "Balance Sheet",
+    ["Total Current Liabilities", "Total Current Liabilities (Excl. Debt)", "Total Current Liabilities Excl. Debt"],
+    (label) => /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
+  const totalNonCurrentLiabilitiesRow = findRowInSection(
+    sheet,
+    "Balance Sheet",
+    ["Total Non-Current Liabilities", "Total Noncurrent Liabilities", "Total Long-Term Liabilities", "Total Long Term Liabilities"],
+    (label) => /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+  );
   const totalLiabilitiesRow = findRowInSection(sheet, "Balance Sheet", ["Total Liabilities"], (label) =>
     /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
   );
@@ -9644,7 +9886,18 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
   );
 
   const skipProjectedBalanceSheetCell = (rowNumber: number, col: number) => isProjectedBalanceSheetCell(sheet, rowNumber, col);
-  for (const rowNumber of [totalAssetsRow, totalLiabilitiesRow, totalEquityRow, totalEquityIncludingNciRow, totalLiabilitiesAndEquityRow, balanceSheetCheckRow]) {
+  for (const rowNumber of [
+    totalAssetsRow,
+    totalCurrentAssetsRow,
+    totalNonCurrentAssetsRow,
+    totalCurrentLiabilitiesRow,
+    totalNonCurrentLiabilitiesRow,
+    totalLiabilitiesRow,
+    totalEquityRow,
+    totalEquityIncludingNciRow,
+    totalLiabilitiesAndEquityRow,
+    balanceSheetCheckRow
+  ]) {
     if (rowNumber) refreshFormulaRowCachedResults(sheet, rowNumber, columns, false, skipProjectedBalanceSheetCell);
   }
 
@@ -9652,10 +9905,30 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     const col = columns[index];
     const lookupPeriod = balanceSheetInstantLookupPeriod(period);
     const assets = first(lookupPeriod, ctx.instant, C.assets);
+    const currentAssets = resolveTotalCurrentAssets(lookupPeriod, ctx);
+    const nonCurrentAssets = resolveTotalNonCurrentAssets(lookupPeriod, ctx);
+    const currentLiabilities = resolveModeledCurrentLiabilitiesSubtotal(lookupPeriod, ctx);
+    const nonCurrentLiabilities = resolveModeledNonCurrentLiabilitiesSubtotal(lookupPeriod, ctx);
     const stockholdersEquity = resolveStockholdersEquity(lookupPeriod, ctx);
     const totalEquity = resolveTotalEquityIncludingNci(lookupPeriod, ctx);
     const liabilities = resolveTotalLiabilities(lookupPeriod, ctx);
     if (totalAssetsRow && assets) refreshBalanceSheetTotalFormulaResult(sheet, totalAssetsRow, col, period, assets.value / 1_000_000, assets, "total assets", auditRows);
+    if (totalCurrentAssetsRow && currentAssets.value !== null) {
+      const source = resolvedAuditSource(period, "TotalCurrentAssetsResolved", "Resolved EDGAR total current assets", currentAssets);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalCurrentAssetsRow, col, period, currentAssets.value / 1_000_000, source, "total current assets", auditRows);
+    }
+    if (totalNonCurrentAssetsRow && nonCurrentAssets.value !== null) {
+      const source = resolvedAuditSource(period, "TotalNonCurrentAssetsResolved", "Resolved EDGAR total non-current assets", nonCurrentAssets);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalNonCurrentAssetsRow, col, period, nonCurrentAssets.value / 1_000_000, source, "total non-current assets", auditRows);
+    }
+    if (totalCurrentLiabilitiesRow && currentLiabilities.value !== null) {
+      const source = resolvedAuditSource(period, "TotalCurrentLiabilitiesResolved", "Resolved EDGAR current liabilities subtotal", currentLiabilities);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalCurrentLiabilitiesRow, col, period, currentLiabilities.value / 1_000_000, source, "total current liabilities", auditRows);
+    }
+    if (totalNonCurrentLiabilitiesRow && nonCurrentLiabilities.value !== null) {
+      const source = resolvedAuditSource(period, "TotalNonCurrentLiabilitiesResolved", "Resolved EDGAR non-current liabilities subtotal", nonCurrentLiabilities);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalNonCurrentLiabilitiesRow, col, period, nonCurrentLiabilities.value / 1_000_000, source, "total non-current liabilities", auditRows);
+    }
     if (totalEquityRow && stockholdersEquity.value !== null) {
       const source = resolvedAuditSource(period, "StockholdersEquityResolved", "Resolved EDGAR stockholders' equity", stockholdersEquity);
       refreshBalanceSheetTotalFormulaResult(sheet, totalEquityRow, col, period, stockholdersEquity.value / 1_000_000, source, "shareholders' equity", auditRows);
@@ -9667,6 +9940,9 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     if (totalLiabilitiesRow && liabilities.value !== null) {
       const source = resolvedAuditSource(period, "LiabilitiesResolved", "Resolved EDGAR total liabilities", liabilities);
       refreshBalanceSheetTotalFormulaResult(sheet, totalLiabilitiesRow, col, period, liabilities.value / 1_000_000, source, "total liabilities", auditRows);
+    }
+    if (totalLiabilitiesAndEquityRow && assets) {
+      refreshBalanceSheetTotalFormulaResult(sheet, totalLiabilitiesAndEquityRow, col, period, assets.value / 1_000_000, assets, "total liabilities plus shareholders' equity", auditRows);
     }
   });
 
@@ -9771,6 +10047,62 @@ function refreshBalanceSheetTotalFormulaResult(
   if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
   cell.value = { formula, result: value };
   auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} formula result from EDGAR.`, "formula result refreshed"));
+}
+
+function copyBalanceSheetFourthQuarterToAnnualColumns(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  const rows = balanceSheetSectionRows(sheet);
+  if (!rows.length) return { filledCells };
+  const byPeriod = new Map(periods.map((period, index) => [period, columns[index]]));
+  const evaluator = new FormulaEvaluator(sheet, { skipCrossSheetFormulas: true });
+
+  for (const period of periods) {
+    if (!isAnnualPeriod(period)) continue;
+    const year = periodYearSuffix(period);
+    const fourthQuarterCol = byPeriod.get(`4Q${year}`);
+    const annualCol = byPeriod.get(period);
+    if (!fourthQuarterCol || !annualCol) continue;
+
+    for (const rowNumber of rows) {
+      if (isProjectedBalanceSheetCell(sheet, rowNumber, annualCol)) continue;
+      const sourceCell = sheet.getCell(rowNumber, fourthQuarterCol);
+      const value = numericCellValue(sourceCell) ?? evaluator.evaluateCell(sourceCell);
+      if (value === null) continue;
+      const targetCell = sheet.getCell(rowNumber, annualCol);
+      if (!hasFormula(targetCell) && numericCellValue(targetCell) !== null && exactModelValueTies(numericCellValue(targetCell)!, value)) continue;
+      targetCell.value = value;
+      filledCells += 1;
+      auditRows.push({
+        sheetName: sheet.name,
+        cell: targetCell.address,
+        modelRowLabel: rowLabel(sheet, rowNumber),
+        section: "Balance Sheet",
+        period,
+        valueWritten: value,
+        mappingType: "calculated",
+        conceptsUsed: `Copied ${columnLetter(fourthQuarterCol)}${rowNumber} year-end balance sheet value`,
+        secLabels: "",
+        sourceStatement: "balance",
+        accession: "",
+        sourceUrl: "",
+        cellWritable: true,
+        formulaPreserved: false,
+        formulaStatus: "annual balance sheet copied from 4Q year-end value",
+        writeBlockedReason: "",
+        signConvention: "copied",
+        confidence: "high",
+        validationStatus: "OK!",
+        notes: "Annual balance sheet columns are point-in-time balances and were copied from the matching 4Q year-end balance sheet column."
+      });
+    }
+  }
+
+  return { filledCells };
 }
 
 function ensureFormulaDisplayCaches(workbook: ExcelJS.Workbook, columns: number[], sheetNames = [MODEL_SHEET, SEGMENT_SHEET]) {
