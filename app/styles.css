@@ -235,29 +235,20 @@ input::placeholder {
   gap: 10px;
   padding: 28px;
   text-align: center;
+  color: var(--ink);
+  font-weight: 400;
   cursor: pointer;
   transition: border-color 160ms ease, background 160ms ease, transform 160ms ease, box-shadow 160ms ease;
 }
 
-.filePicker {
-  width: min(100%, 300px);
-  min-height: 34px;
-  border: 1px solid var(--line);
-  border-radius: 8px;
-  background: var(--surface);
-  color: var(--muted);
-  cursor: pointer;
-}
-
-.filePicker::file-selector-button {
-  min-height: 34px;
-  border: 0;
-  border-right: 1px solid var(--line);
-  background: var(--accent);
-  color: #ffffff;
-  padding: 0 12px;
-  font-weight: 800;
-  cursor: pointer;
+.fileInput {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .dropIcon {
