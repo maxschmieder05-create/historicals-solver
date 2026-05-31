@@ -19,6 +19,7 @@
     "test:mcd-segment-validation": "node scripts/mcd-segment-validation-check.js",
     "test:aapl-segment-validation": "node scripts/aapl-segment-validation-check.js",
     "test:rsg-segment-operating-income": "node scripts/rsg-segment-operating-income-check.js",
+    "test:segment-first-run-reliability": "node scripts/segment-first-run-reliability-check.js",
     "test:goog-current-investments": "node scripts/goog-current-investments-regression-check.js",
     "test:goog-operating-income": "node scripts/goog-operating-income-regression-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",

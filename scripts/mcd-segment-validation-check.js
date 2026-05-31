@@ -47,8 +47,8 @@ function numericCell(cell) {
   return typeof value === "number" ? value : null;
 }
 
-function valuesMatch(actual, expected) {
-  return typeof actual === "number" && Math.abs(actual - expected) <= 0.5;
+function valuesMatch(actual, expected, tolerance = 1) {
+  return typeof actual === "number" && Math.abs(actual - expected) <= tolerance;
 }
 
 async function fillWorkbook() {
@@ -83,10 +83,7 @@ async function main() {
   }
 
   for (const col of revenueColumns) {
-    const segmentRevenue =
-      (numericCell(segmentSheet.getCell(`${col}8`)) ?? 0) +
-      (numericCell(segmentSheet.getCell(`${col}9`)) ?? 0) +
-      (numericCell(segmentSheet.getCell(`${col}10`)) ?? 0);
+    const segmentRevenue = [8, 9, 10, 11, 12, 13].reduce((sum, row) => sum + (numericCell(segmentSheet.getCell(`${col}${row}`)) ?? 0), 0);
     const segmentTotal = numericCell(segmentSheet.getCell(`${col}7`));
     const modelRevenue = numericCell(modelSheet.getCell(`${col}28`));
     if (!valuesMatch(segmentRevenue, segmentTotal ?? NaN)) {

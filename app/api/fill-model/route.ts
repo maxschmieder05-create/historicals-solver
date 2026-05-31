@@ -241,6 +241,7 @@ type SegmentRevenue = {
   family?: string;
   disclosureKind?: RevenueDisclosureKind;
   disclosurePriority?: number;
+  sourceOrder?: number;
   aggregate?: boolean;
   values: Map<string, number>;
   annualValues?: Map<string, number>;
@@ -3797,6 +3798,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
         family: metrics?.family,
         disclosureKind: metrics?.disclosureKind,
         disclosurePriority: metrics?.disclosurePriority,
+        sourceOrder: metrics?.sourceOrder,
         aggregate: metrics?.aggregate,
         values: new Map(
           periods.map((period) => [
@@ -3856,6 +3858,7 @@ function mergeSegmentMetrics(existing: SegmentMetrics, next: SegmentMetrics): Se
     disclosureKind: existing.disclosureKind ?? next.disclosureKind,
     disclosurePriority: existing.disclosurePriority ?? next.disclosurePriority,
     sourcePeriodPriority: Math.max(existing.sourcePeriodPriority ?? 0, next.sourcePeriodPriority ?? 0),
+    sourceOrder: Math.min(existing.sourceOrder ?? Number.MAX_SAFE_INTEGER, next.sourceOrder ?? Number.MAX_SAFE_INTEGER),
     aggregate: Boolean(existing.aggregate || next.aggregate)
   };
 }
@@ -4355,6 +4358,7 @@ type SegmentMetrics = {
   disclosureKind?: RevenueDisclosureKind;
   disclosurePriority?: number;
   sourcePeriodPriority?: number;
+  sourceOrder?: number;
   aggregate?: boolean;
 };
 
@@ -4449,6 +4453,7 @@ function parseInlineSegmentRevenue(html: string, form: string) {
     const metrics = periodValues.get(key) ?? {};
     metrics.label = metrics.label ?? label;
     metrics.family = metrics.family ?? family;
+    metrics.sourceOrder = Math.min(metrics.sourceOrder ?? Number.MAX_SAFE_INTEGER, factIndex);
     metrics.sourcePeriodPriority = Math.max(metrics.sourcePeriodPriority ?? 0, context.sourcePeriodPriority ?? 0);
     if (disclosureKind) {
       metrics.disclosureKind = disclosureKind;
@@ -4635,8 +4640,6 @@ function revenueDisclosureKind(
 function revenueBreakoutLabel(rowLabel: string | null, members: string[], disclosureKind?: RevenueDisclosureKind) {
   const memberLabels = members.map(cleanSegmentMember).filter((label): label is string => Boolean(label));
   const memberLabel = memberLabels.find(isUsefulRevenueBreakoutLabel) ?? null;
-  if (disclosureKind === "segment" && memberLabel) return memberLabel;
-
   const reported = cleanRevenueBreakoutLabel(rowLabel ?? "");
   if (isUsefulRevenueBreakoutLabel(reported)) return reported;
   return memberLabel;
@@ -4645,6 +4648,7 @@ function revenueBreakoutLabel(rowLabel: string | null, members: string[], disclo
 function cleanRevenueBreakoutLabel(label: string) {
   return label
     .replace(/\s+/g, " ")
+    .replace(/\s*&\s*/g, " and ")
     .replace(/^["'`]+|["'`]+$/g, "")
     .replace(/^[•*\-–]\s*/, "")
     .replace(/(?:\s*\$?\s*\(?-?\d[\d,]*(?:\.\d+)?\)?\s*\$?)+\s*$/g, "")
@@ -4708,7 +4712,8 @@ function revenueDisclosureCanReconcile(actual: number, expected: number) {
   if (segmentRevenueTies(actual, expected)) return true;
   const residual = expected - actual;
   if (residual < 0) return false;
-  return residual <= Math.max(100_000_000, Math.abs(expected) * 0.05);
+  const absoluteTolerance = Math.abs(expected) >= 1_000_000 ? 100_000_000 : 100;
+  return residual <= Math.max(absoluteTolerance, Math.abs(expected) * 0.05);
 }
 
 function segmentMetric(concept: string): SegmentMetricKey | null {
@@ -4894,6 +4899,8 @@ function cleanSegmentMember(member: string) {
     .pop()
     ?.replace(/(Member|Segment|OperatingSegments|BusinessSegments|ServiceLine)$/gi, "")
     .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .replace(/^US(?=[A-Z])/, "U.S. ")
+    .replace(/\s*&\s*/g, " and ")
     .replace(/\bAnd\b/g, "and")
     .replace(/\s+/g, " ")
     .trim();
@@ -4942,7 +4949,8 @@ function sumSegmentRevenue(values: Map<string, SegmentMetrics>) {
 }
 
 function segmentRevenueTies(actual: number, expected: number) {
-  return Math.abs(actual - expected) <= Math.max(100_000, Math.abs(expected) * 0.0005);
+  const absoluteTolerance = Math.abs(expected) >= 1_000_000 ? 100_000 : 0.1;
+  return Math.abs(actual - expected) <= Math.max(absoluteTolerance, Math.abs(expected) * 0.0005);
 }
 
 function isAggregateSegmentLabel(label: string) {
@@ -5017,6 +5025,7 @@ function deriveSegmentMetricDifference(current: SegmentMetrics, prior: SegmentMe
     disclosureKind: current.disclosureKind ?? prior.disclosureKind,
     disclosurePriority: current.disclosurePriority ?? prior.disclosurePriority,
     sourcePeriodPriority: current.sourcePeriodPriority ?? prior.sourcePeriodPriority,
+    sourceOrder: Math.min(current.sourceOrder ?? Number.MAX_SAFE_INTEGER, prior.sourceOrder ?? Number.MAX_SAFE_INTEGER),
     aggregate: Boolean(current.aggregate || prior.aggregate)
   };
   let hasValue = false;
@@ -5909,22 +5918,30 @@ function fillSegmentAnalysis(
   const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns).slice(0, 6);
   const depreciationRows = segmentMetricRows(sheet, "Total D&A", "D&A Check", columns).slice(0, 6);
   const selectedSegments = selectSegmentFamilyForTemplate(segments, periods, ctx, Math.max(rows.length, 1));
-  const usableSegments = selectedSegments;
+  const reconciledSegments = reconcileRevenueSegmentsToStatement(selectedSegments, periods, ctx, Math.max(rows.length, 1));
+  const fallbackSegment = reconciledSegments.length ? null : reportedRevenueFallbackSegment(periods, ctx);
+  const usableSegments = reconciledSegments.length ? reconciledSegments : fallbackSegment ? [fallbackSegment] : [];
 
   if (!usableSegments.length) {
-    warnings.push("No disclosed revenue breakout table reconciled to consolidated EDGAR revenue; Segment Analysis revenue detail rows were left blank.");
+    warnings.push("No consolidated EDGAR revenue was available for Segment Analysis fallback; revenue detail rows were left blank.");
+  } else if (!reconciledSegments.length) {
+    warnings.push("No disclosed revenue breakout table reliably reconciled to consolidated EDGAR revenue; Segment Analysis used a Reported Revenue fallback.");
   }
 
   const revenueClearPairs = allHistoricalPeriodColumnPairs(sheet);
   const revenueResult = usableSegments.length
-    ? fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows, { forceOrderedAssignment: true })
+    ? fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows, {
+        forceOrderedAssignment: true,
+        clearUnmatchedLabels: true
+      })
     : clearSegmentMetricRows(
         sheet,
         revenueClearPairs.map((item) => item.period),
         revenueClearPairs.map((item) => item.col),
         rows,
         "Revenue",
-        auditRows
+        auditRows,
+        { clearLabels: true, clearReferencedBaseLabels: true }
       );
   const operatingIncomeSegments = hasSegmentMetricData(usableSegments, "operatingIncome", periods)
     ? usableSegments
@@ -5934,14 +5951,22 @@ function fillSegmentAnalysis(
   const hasDepreciationSegments = hasSegmentMetricData(depreciationSegments, "depreciationAmortization", periods);
   const operatingIncomeResult = hasOperatingIncomeSegments
     ? fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, operatingIncomeSegments, "operatingIncome", "Operating Income", auditRows, {
-        preserveLinkedBaseLabels: operatingIncomeSegments !== usableSegments
+        preserveLinkedBaseLabels: operatingIncomeSegments !== usableSegments,
+        clearUnmatchedLabels: true
       })
-    : clearSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, "Operating Income", auditRows);
+    : clearSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, "Operating Income", auditRows, {
+        clearLabels: true,
+        clearReferencedBaseLabels: false
+      });
   const depreciationResult = hasDepreciationSegments
     ? fillSegmentMetricRows(sheet, periods, columns, depreciationRows, depreciationSegments, "depreciationAmortization", "D&A", auditRows, {
-        preserveLinkedBaseLabels: depreciationSegments !== usableSegments
+        preserveLinkedBaseLabels: depreciationSegments !== usableSegments,
+        clearUnmatchedLabels: true
       })
-    : clearSegmentMetricRows(sheet, periods, columns, depreciationRows, "D&A", auditRows);
+    : clearSegmentMetricRows(sheet, periods, columns, depreciationRows, "D&A", auditRows, {
+        clearLabels: true,
+        clearReferencedBaseLabels: false
+      });
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
   commentsAdded += revenueResult.commentsAdded + operatingIncomeResult.commentsAdded + depreciationResult.commentsAdded;
   const revenueReconciliation = usableSegments.length
@@ -5961,14 +5986,12 @@ function fillSegmentAnalysis(
   commentsAdded += revenueReconciliation.commentsAdded + operatingIncomeReconciliation.commentsAdded + operatingIncomeFallback.commentsAdded;
   warnings.push(...revenueReconciliation.warnings, ...operatingIncomeReconciliation.warnings, ...operatingIncomeFallback.warnings);
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Revenue", "Revenue Mix", auditRows, { overwriteHardcoded: true });
-  if (hasOperatingIncomeSegments) {
-    filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
-  }
   filledCells += restoreSegmentTotalFormula(sheet, periods, columns, "Total D&A", "D&A Check", auditRows);
   filledCells += usableSegments.length
     ? fillSegmentTotalRow(sheet, periods, columns, usableSegments, "values", "Total Company Revenue", auditRows, ctx, C.revenue, resolveTotalRevenue)
     : 0;
-  filledCells += fillSegmentTotalRow(sheet, periods, columns, operatingIncomeSegments, "operatingIncome", "Total Company Operating Income", auditRows, ctx, C.operatingIncome);
+  filledCells += fillSegmentStatementTotalRow(sheet, periods, columns, "Total Company Operating Income", auditRows, ctx, resolveModeledOperatingProfit);
+  filledCells += restoreSegmentCheckFormula(sheet, periods, columns, "Total Company Operating Income", "Operating Income Check", auditRows);
   if (hasDepreciationSegments) {
     filledCells += fillSegmentTotalRow(sheet, periods, columns, depreciationSegments, "depreciationAmortization", "Total D&A", auditRows);
   }
@@ -6070,6 +6093,115 @@ function fillSegmentStatementTotalRow(
   return filledCells;
 }
 
+function reconcileRevenueSegmentsToStatement(
+  segments: SegmentRevenue[],
+  periods: string[],
+  ctx: ResolveContext,
+  maxRows: number
+) {
+  if (!segments.length) return [];
+
+  const residualValues = new Map<string, number>(periods.map((period) => [period, 0]));
+  let hasExpectedRevenue = false;
+  let needsResidual = false;
+  let hasUnreliablePeriod = false;
+
+  periods.forEach((period) => {
+    const expected = resolveTotalRevenue(period, ctx).value;
+    if (expected === null) return;
+    hasExpectedRevenue = true;
+
+    const actual = segments.reduce((sum, segment) => sum + (segment.values.get(period) ?? 0), 0);
+    if (Math.abs(actual) <= 0.0001 && Math.abs(expected) > 0.0001) {
+      hasUnreliablePeriod = true;
+      return;
+    }
+    if (segmentStatementMetricTies(segmentComparableModelAmount(actual, expected), segmentComparableModelAmount(expected, expected))) return;
+
+    const residual = expected - actual;
+    const negativeResidualTolerance = Math.abs(expected) >= 1_000_000 ? Math.max(1_000_000, Math.abs(expected) * 0.005) : Math.max(1, Math.abs(expected) * 0.005);
+    const canReconcileResidual =
+      residual >= 0
+        ? revenueDisclosureCanReconcile(actual, expected)
+        : Math.abs(residual) <= negativeResidualTolerance;
+    if (!canReconcileResidual) {
+      hasUnreliablePeriod = true;
+      return;
+    }
+
+    residualValues.set(period, residual);
+    if (Math.abs(residual) > 0.0001) needsResidual = true;
+  });
+
+  if (!hasExpectedRevenue || hasUnreliablePeriod) return [];
+  if (!needsResidual) return segments;
+  if (segments.length >= maxRows) return [];
+
+  return [...segments, reconciliationRevenueSegment(periods, residualValues, segments[0]?.family)];
+}
+
+function segmentComparableModelAmount(value: number, expected: number) {
+  return Math.abs(expected) >= 1_000_000 ? value / 1_000_000 : value;
+}
+
+function reconciliationRevenueSegment(periods: string[], values: Map<string, number>, family?: string): SegmentRevenue {
+  return {
+    label: "Other / Reconciliation",
+    family: family ? `${family}:reconciliation` : "reconciliation",
+    disclosureKind: "other",
+    disclosurePriority: 99,
+    sourceOrder: Number.MAX_SAFE_INTEGER - 1,
+    values,
+    annualValues: annualValuesFromQuarterlyValues(periods, values),
+    operatingIncome: zeroMetricMap(periods),
+    depreciationAmortization: zeroMetricMap(periods)
+  };
+}
+
+function reportedRevenueFallbackSegment(periods: string[], ctx: ResolveContext): SegmentRevenue | null {
+  const values = new Map<string, number>();
+  periods.forEach((period) => {
+    const resolved = resolveTotalRevenue(period, ctx);
+    if (resolved.value !== null) values.set(period, resolved.value);
+  });
+  if (!Array.from(values.values()).some((value) => Math.abs(value) > 0.0001)) return null;
+
+  return {
+    label: "Reported",
+    family: "reported_revenue_fallback",
+    disclosureKind: "other",
+    disclosurePriority: 100,
+    sourceOrder: Number.MAX_SAFE_INTEGER,
+    values,
+    annualValues: reportedAnnualRevenueValues(periods, ctx, values),
+    operatingIncome: zeroMetricMap(periods),
+    depreciationAmortization: zeroMetricMap(periods)
+  };
+}
+
+function reportedAnnualRevenueValues(periods: string[], ctx: ResolveContext, quarterlyValues: Map<string, number>) {
+  const annualValues = annualValuesFromQuarterlyValues(periods, quarterlyValues);
+  unique(periods.map((period) => periodYearSuffix(period))).forEach((year) => {
+    const resolved = resolveTotalRevenue(`FY${year}`, ctx);
+    if (resolved.value !== null) annualValues.set(`FY${year}`, resolved.value);
+  });
+  return annualValues;
+}
+
+function annualValuesFromQuarterlyValues(periods: string[], values: Map<string, number>) {
+  const annualValues = new Map<string, number>();
+  periods.forEach((period) => {
+    if (!isQuarterPeriod(period)) return;
+    const annualPeriod = `FY${periodYearSuffix(period)}`;
+    annualValues.set(annualPeriod, (annualValues.get(annualPeriod) ?? 0) + (values.get(period) ?? 0));
+  });
+  return annualValues;
+}
+
+function zeroMetricMap(periods: string[]) {
+  return new Map(periods.map((period) => [period, 0]));
+}
+
 function hasSegmentMetricData(
   segments: SegmentRevenue[],
   metric: SegmentMetricMapKey,
@@ -6084,11 +6216,12 @@ function clearSegmentMetricRows(
   columns: number[],
   rows: number[],
   suffix: string,
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  options: { clearLabels?: boolean; clearReferencedBaseLabels?: boolean } = {}
 ) {
   return rows.reduce(
     (total, rowNumber) => {
-      const result = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, segmentRowLabel(sheet, rowNumber, suffix), auditRows);
+      const result = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, segmentRowLabel(sheet, rowNumber, suffix), auditRows, options);
       return { filledCells: total.filledCells + result.filledCells, commentsAdded: total.commentsAdded + result.commentsAdded };
     },
     { filledCells: 0, commentsAdded: 0 }
@@ -6114,7 +6247,7 @@ function selectSegmentFamilyForTemplate(
       return a.score.totalError - b.score.totalError;
     });
   const reconciled = scored.filter(({ score }) => score.tieCount > 0 && score.badCount === 0);
-  return reconciled[0] || scored[0] ? orderRevenueDisclosureSegments((reconciled[0] ?? scored[0]).candidate.segments, periods) : [];
+  return reconciled[0] ? orderRevenueDisclosureSegments(reconciled[0].candidate.segments, periods) : [];
 }
 
 function selectSegmentFamilyForMetric(
@@ -6249,6 +6382,9 @@ function orderRevenueDisclosureSegments(segments: SegmentRevenue[], periods: str
       const aIsResidual = isReconciliationSegmentLabel(a.label);
       const bIsResidual = isReconciliationSegmentLabel(b.label);
       if (aIsResidual !== bIsResidual) return aIsResidual ? 1 : -1;
+      const ao = a.sourceOrder ?? Number.MAX_SAFE_INTEGER;
+      const bo = b.sourceOrder ?? Number.MAX_SAFE_INTEGER;
+      if (ao !== bo && Number.isFinite(ao) && Number.isFinite(bo)) return ao - bo;
       const av = revenueSegmentSortValue(a, sortPeriod);
       const bv = revenueSegmentSortValue(b, sortPeriod);
       if (bv !== av) return bv - av;
@@ -6454,6 +6590,21 @@ function reconcileSegmentMetricRowsToStatementTotal(
     if (segmentStatementMetricTies(actual, expected)) return;
 
     const gap = expected - actual;
+    if (/^revenue$/i.test(suffix) && canUseSegmentResidualForStatementGap(gap, expected)) {
+      const residualRow = findSegmentResidualRow(sheet, rows, col, suffix);
+      if (residualRow) {
+        const cell = sheet.getCell(residualRow, col);
+        if (writeSegmentMetricCell(cell, gap)) {
+          filledCells += 1;
+          evaluator.clear();
+          const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(expectedSource)], "includes");
+          if (addComment(cell, note)) commentsAdded += 1;
+          auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, residualRow), period, gap, expectedSource, "segment", note, "residual"));
+          return;
+        }
+      }
+    }
+
     warnings.push(
       `Segment Analysis ${period}: ${suffix} rows sum to ${roundModelValue(actual)}, but consolidated EDGAR ${suffix.toLowerCase()} is ${roundModelValue(expected)}; leaving the gap unallocated instead of using Other / Reconciliation as a plug.`
     );
@@ -6479,6 +6630,12 @@ function reconcileSegmentMetricRowsToStatementTotal(
   });
 
   return { filledCells, commentsAdded, warnings };
+}
+
+function canUseSegmentResidualForStatementGap(gap: number, expected: number) {
+  if (Math.abs(gap) <= 0.05) return false;
+  if (gap >= 0) return gap <= Math.max(100, Math.abs(expected) * 0.05);
+  return Math.abs(gap) <= Math.max(1, Math.abs(expected) * 0.005);
 }
 
 function segmentMetricRowsTotal(sheet: ExcelJS.Worksheet, rows: number[], col: number, evaluator?: FormulaEvaluator) {
@@ -6596,7 +6753,7 @@ function fillSegmentMetricRows(
   metric: SegmentMetricMapKey,
   suffix: string,
   auditRows: MappingAuditRow[],
-  options: { preserveLinkedBaseLabels?: boolean; forceOrderedAssignment?: boolean } = {}
+  options: { preserveLinkedBaseLabels?: boolean; forceOrderedAssignment?: boolean; clearUnmatchedLabels?: boolean } = {}
 ) {
   let filledCells = 0;
   let commentsAdded = 0;
@@ -6608,7 +6765,10 @@ function fillSegmentMetricRows(
     const existingLabel = segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix);
     const segmentIndex = assignedSegments.get(rowNumber) ?? null;
     if (segmentIndex === null) {
-      const cleared = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, existingLabel, auditRows);
+      const cleared = clearUnmatchedSegmentRow(sheet, rowNumber, periods, columns, existingLabel, auditRows, {
+        clearLabels: options.clearUnmatchedLabels,
+        clearReferencedBaseLabels: /^revenue$/i.test(suffix)
+      });
       filledCells += cleared.filledCells;
       commentsAdded += cleared.commentsAdded;
       continue;
@@ -6694,7 +6854,7 @@ function setSegmentMetricRowLabel(sheet: ExcelJS.Worksheet, rowNumber: number, s
       const baseCell = sheet.getCell(`${reference[1]}${reference[2]}`);
       baseCell.value = segmentLabel;
     }
-    labelCellForRow.value = { formula, result: displayLabel };
+    labelCellForRow.value = displayLabel;
     return;
   }
   labelCellForRow.value = displayLabel;
@@ -6706,7 +6866,8 @@ function clearUnmatchedSegmentRow(
   periods: string[],
   columns: number[],
   modelLabel: string,
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  options: { clearLabels?: boolean; clearReferencedBaseLabels?: boolean } = {}
 ) {
   let filledCells = 0;
   let commentsAdded = 0;
@@ -6740,7 +6901,9 @@ function clearUnmatchedSegmentRow(
       notes
     });
   });
-  if (shouldClearUnusedSegmentLabel(modelLabel)) clearSegmentMetricRowLabel(sheet, rowNumber);
+  if (options.clearLabels || shouldClearUnusedSegmentLabel(modelLabel)) {
+    clearSegmentMetricRowLabel(sheet, rowNumber, { clearReferencedBaseLabel: options.clearReferencedBaseLabels ?? true });
+  }
   return { filledCells, commentsAdded };
 }
 
@@ -6823,14 +6986,16 @@ function shouldClearUnusedSegmentLabel(label: string) {
   return isGenericSegmentPlaceholder(label) || isReconciliationSegmentLabel(label);
 }
 
-function clearSegmentMetricRowLabel(sheet: ExcelJS.Worksheet, rowNumber: number) {
+function clearSegmentMetricRowLabel(sheet: ExcelJS.Worksheet, rowNumber: number, options: { clearReferencedBaseLabel?: boolean } = {}) {
   const labelCellForRow = labelCell(sheet, rowNumber);
   const formula = cellFormula(labelCellForRow);
   const reference = formula?.match(/^=?\$?([A-Z]+)\$?(\d+)\s*(?:&|$)/i);
   if (reference && formula) {
-    const baseCell = sheet.getCell(`${reference[1]}${reference[2]}`);
-    baseCell.value = "";
-    labelCellForRow.value = { formula, result: "" };
+    if (options.clearReferencedBaseLabel ?? true) {
+      const baseCell = sheet.getCell(`${reference[1]}${reference[2]}`);
+      baseCell.value = "";
+    }
+    labelCellForRow.value = "";
     return;
   }
   labelCellForRow.value = "";
@@ -6879,10 +7044,14 @@ function segmentResolvedValue(
   period: string
 ): ResolvedValue {
   const value = segment[metric].get(period) ?? null;
+  const isReportedRevenueFallback = metric === "values" && segment.family === "reported_revenue_fallback";
+  const label = isReportedRevenueFallback ? "Reported Revenue" : segment.label;
   return {
     value,
-    sources: value === null ? [] : [{ concept: `segment:${metric}`, label: segment.label, value }],
-    note: `Matched reportable segment "${segment.label}" from filing segment tables.`,
+    sources: value === null ? [] : [{ concept: isReportedRevenueFallback ? "ReportedRevenueFallback" : `segment:${metric}`, label, value }],
+    note: isReportedRevenueFallback
+      ? "Fallback to consolidated EDGAR revenue because no reliable disclosed revenue breakout reconciled by period."
+      : `Matched reportable segment "${segment.label}" from filing segment tables.`,
     classification: "direct"
   };
 }
@@ -10922,6 +11091,7 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
   if (!actual && balanceSheetRows(cell.worksheet).has(Number(cell.row)) && !isProjectedBalanceSheetCell(cell.worksheet, Number(cell.row), Number(cell.col))) {
     return true;
   }
+  if (!actual && isSegmentAnalysisLabelRewriteCell(cell)) return true;
   if (!actual && isIncomeStatementConstantFormulaReplacement(cell, expected)) return true;
   if (!actual && isIncomeStatementDepreciationAmortizationCell(cell)) return true;
   if (!actual && isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)))) return true;
@@ -11429,24 +11599,33 @@ function validateSegmentStatementTieOut(
   periods.forEach((period, index) => {
     const col = columns[index];
     const linkedExpected = metricName === "D&A" ? linkedSegmentStatementTargetValue(sheet, totalLabel, endLabel, col, evaluator) : null;
-    const edgarValue = first(period, ctx.duration, concepts);
-    if (!edgarValue && linkedExpected === null) {
+    const resolvedStatementMetric = /operating income/i.test(metricName) ? resolveModeledOperatingProfit(period, ctx) : null;
+    const edgarValue =
+      resolvedStatementMetric && resolvedStatementMetric.value !== null ? resolvedStatementMetric.sources[0] : first(period, ctx.duration, concepts);
+    const expectedStatementValue = resolvedStatementMetric?.value ?? edgarValue?.value ?? null;
+    if (expectedStatementValue === null && linkedExpected === null) {
       warnings.unshift(`${sheet.name} ${period}: ${metricName} tie-out skipped because EDGAR ${concepts.join("/")} was unavailable.`);
       return;
     }
     const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
     const totalCell = sheet.getCell(totalRow, col);
     const sheetTotal = evaluator.evaluateCell(totalCell);
-    const expected = linkedExpected ?? (edgarValue!.value / 1_000_000);
-    const sourceName = linkedExpected === null ? "EDGAR" : "the linked model total";
+    const expected = linkedExpected ?? (expectedStatementValue! / 1_000_000);
+    const sourceName = linkedExpected === null ? (/operating income/i.test(metricName) ? "reported EBIT / operating income" : "EDGAR") : "the linked model total";
     if (metricName !== "Revenue" && Math.abs(segmentTotal) <= 1 && Math.abs(expected) > 0.0001) {
+      if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, expected)) {
+        errors.push(
+          `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`
+        );
+      }
       warnings.unshift(`${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName.toLowerCase()} detail was unavailable; leaving the segment breakout blank for review.`);
       return;
     }
 
     if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, segmentTotal)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but detail rows sum to ${roundModelValue(segmentTotal)}.`;
-      if (hasFormula(totalCell)) warnings.unshift(message);
+      if (/operating income/i.test(metricName)) warnings.unshift(`${message} Segment operating income detail is disclosed separately and was not forced to reconcile with an estimated plug.`);
+      else if (hasFormula(totalCell)) warnings.unshift(message);
       else errors.push(message);
     }
     if (!segmentStatementMetricTies(segmentTotal, expected)) {
