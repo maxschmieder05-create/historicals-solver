@@ -49,7 +49,7 @@ export default function Home() {
     setFile(nextFile);
   }
 
-  function handleDrag(event: DragEvent<HTMLDivElement>) {
+  function handleDrag(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
@@ -61,18 +61,18 @@ export default function Home() {
     if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLDivElement>) {
+  function handleDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
     pickFile(event.dataTransfer.files?.[0]);
   }
 
-  function handleFileChange(event: ChangeEvent<HTMLInputElement>) {
-    pickFile(event.target.files?.[0]);
+  function handleFileSelect(event: ChangeEvent<HTMLInputElement> | FormEvent<HTMLInputElement>) {
+    pickFile(event.currentTarget.files?.item(0) ?? undefined);
   }
 
-  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLLabelElement>) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
     fileInputRef.current?.click();
@@ -175,7 +175,8 @@ export default function Home() {
             </div>
           </div>
 
-          <div
+          <label
+            htmlFor="model-template-file"
             className={isDragging ? "dropzone dragging" : "dropzone"}
             role="button"
             tabIndex={0}
@@ -185,13 +186,26 @@ export default function Home() {
             onDragLeave={handleDrag}
             onDrop={handleDrop}
           >
-            <input ref={fileInputRef} type="file" accept=".xlsx" tabIndex={-1} onChange={handleFileChange} />
+            <input
+              id="model-template-file"
+              ref={fileInputRef}
+              type="file"
+              name="model-template-file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              tabIndex={-1}
+              aria-label="Upload Excel model template"
+              onClick={(event) => {
+                event.currentTarget.value = "";
+              }}
+              onInput={handleFileSelect}
+              onChange={handleFileSelect}
+            />
             <span className="dropIcon">
               <UploadCloud aria-hidden="true" size={30} />
             </span>
             <span className="dropTitle">{file ? file.name : "Drop Excel model here"}</span>
             <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB selected` : "Click to browse or drag in an .xlsx file"}</small>
-          </div>
+          </label>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
