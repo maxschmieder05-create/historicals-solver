@@ -7,6 +7,8 @@ export type LiabilityTemplateRow = {
 export type TemplateMappingContext = {
   hasCurrentInvestmentRow: boolean;
   hasCurrentDebtRow: boolean;
+  hasCurrentDebtMaturitiesRow: boolean;
+  hasShortTermBorrowingsRow: boolean;
   hasCurrentLiabilitiesExcludingDebtRow: boolean;
   hasDebtInclCurrentPortionRow: boolean;
   hasDeferredTaxLiabilityRow: boolean;
@@ -39,7 +41,44 @@ export const DEFERRED_TAX_LIABILITY_CONCEPTS = [
   "DeferredTaxLiabilities"
 ];
 
-const CURRENT_DEBT_CONCEPTS = ["DebtCurrent", "LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings", "ShortTermBorrowingsCurrent", "NotesPayableCurrent"];
+export const CURRENT_DEBT_CONCEPTS = [
+  "DebtCurrent",
+  "LongTermDebtCurrent",
+  "CurrentPortionOfLongTermDebt",
+  "CurrentMaturitiesOfLongTermDebt",
+  "ShortTermBorrowings",
+  "ShortTermBorrowingsCurrent",
+  "OtherShortTermBorrowings",
+  "NotesPayableCurrent",
+  "LoansPayableCurrent",
+  "CommercialPaper",
+  "CommercialPaperCurrent",
+  "LineOfCreditFacilityCurrentBorrowings",
+  "LongTermDebtAndFinanceLeaseObligationsCurrent",
+  "LongTermDebtAndCapitalLeaseObligationsCurrent",
+  "FinanceLeaseLiabilityCurrent",
+  "CapitalLeaseObligationsCurrent"
+];
+const CURRENT_DEBT_MATURITY_CONCEPTS = [
+  "DebtCurrent",
+  "LongTermDebtCurrent",
+  "CurrentPortionOfLongTermDebt",
+  "CurrentMaturitiesOfLongTermDebt",
+  "NotesPayableCurrent",
+  "LoansPayableCurrent",
+  "LongTermDebtAndFinanceLeaseObligationsCurrent",
+  "LongTermDebtAndCapitalLeaseObligationsCurrent",
+  "FinanceLeaseLiabilityCurrent",
+  "CapitalLeaseObligationsCurrent"
+];
+const SHORT_TERM_BORROWING_CONCEPTS = [
+  "ShortTermBorrowings",
+  "ShortTermBorrowingsCurrent",
+  "OtherShortTermBorrowings",
+  "CommercialPaper",
+  "CommercialPaperCurrent",
+  "LineOfCreditFacilityCurrentBorrowings"
+];
 const CURRENT_INVESTMENT_CONCEPTS = [
   "MarketableSecuritiesCurrent",
   "ShortTermInvestments",
@@ -65,6 +104,30 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
   const balanceRows = rows.filter((row) => !row.statement || row.statement === "balance");
   const hasAnyConcept = (concepts: string[]) => balanceRows.some((row) => rowHasConcept(row, concepts));
   const hasAnyLabel = (patterns: RegExp[]) => balanceRows.some((row) => rowMatchesLabel(row, patterns));
+  const hasCurrentDebtMaturitiesRow =
+    hasAnyConcept(CURRENT_DEBT_MATURITY_CONCEPTS) ||
+    hasAnyLabel([
+      /^currentdebt$/,
+      /^debtcurrent$/,
+      /^currentportionoflongtermdebt$/,
+      /^currentmaturitiesoflongtermdebt$/,
+      /^debtduewithinoneyear$/,
+      /^notespayablecurrent$/,
+      /^currentnotespayable$/,
+      /^currentfinanceleaseliabilities$/,
+      /^financeleaseliabilitiescurrent$/
+    ]);
+  const hasShortTermBorrowingsRow =
+    hasAnyConcept(SHORT_TERM_BORROWING_CONCEPTS) ||
+    hasAnyLabel([
+      /^shorttermdebt$/,
+      /^shorttermborrowings$/,
+      /^commercialpaper$/,
+      /^revolver$/,
+      /^revolvingcreditfacility$/,
+      /^lineofcredit$/,
+      /^lineofcreditborrowings$/
+    ]);
 
   return {
     hasCurrentInvestmentRow:
@@ -77,20 +140,20 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
         /^availableforsalesecurities$/,
         /^treasurysecurities$/
       ]),
-    hasCurrentDebtRow:
-      hasAnyConcept(CURRENT_DEBT_CONCEPTS) ||
-      hasAnyLabel([
-        /^currentdebt$/,
-        /^shorttermdebt$/,
-        /^shorttermborrowings$/,
-        /^currentportionoflongtermdebt$/,
-        /^currentmaturitiesoflongtermdebt$/
-      ]),
+    hasCurrentDebtRow: hasCurrentDebtMaturitiesRow || hasShortTermBorrowingsRow,
+    hasCurrentDebtMaturitiesRow,
+    hasShortTermBorrowingsRow,
     hasCurrentLiabilitiesExcludingDebtRow: hasAnyLabel([
       /^totalcurrentliabilitiesexcldebt$/,
       /^totalcurrentliabilitiesexcludingdebt$/,
+      /^totalcurrentliabilitieslessdebt$/,
+      /^totalcurrentliabilitiesnetofdebt$/,
+      /^totalcurrentliabilitieswithoutdebt$/,
       /^currentliabilitiesexcldebt$/,
-      /^currentliabilitiesexcludingdebt$/
+      /^currentliabilitiesexcludingdebt$/,
+      /^currentliabilitieslessdebt$/,
+      /^currentliabilitiesnetofdebt$/,
+      /^currentliabilitieswithoutdebt$/
     ]),
     hasDebtInclCurrentPortionRow: hasAnyLabel([
       /^ltdebtinclcurrentportion$/,

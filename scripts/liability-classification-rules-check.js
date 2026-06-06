@@ -84,6 +84,13 @@ assert.equal(
   550
 );
 
+const currentLiabilitiesLessDebtContext = buildLiabilityTemplateMappingContext([
+  ...baseRows,
+  { statement: "balance", label: "Total Current Liabilities Less Debt" }
+]);
+assert.equal(currentLiabilitiesLessDebtContext.hasCurrentLiabilitiesExcludingDebtRow, true);
+assert.equal(currentDebtBelongsInAccruedLiabilities(currentLiabilitiesLessDebtContext), false);
+
 const noDebtLineContext = buildLiabilityTemplateMappingContext([
   { statement: "balance", label: "Accounts Payable" },
   { statement: "balance", label: "Accrued Expenses and Other" },
@@ -170,6 +177,7 @@ assert.equal(
 const conceptDrivenContext = buildLiabilityTemplateMappingContext([
   { statement: "income", label: "Current Debt", concepts: ["ShortTermBorrowings"] },
   { statement: "balance", label: "Debt Due Within One Year", concepts: ["ShortTermBorrowings"] },
+  { statement: "balance", label: "Current Finance Lease Liabilities", concepts: ["FinanceLeaseLiabilityCurrent"] },
   { statement: "balance", label: "Income Tax Deferrals", concepts: ["DeferredIncomeTaxLiabilitiesNet"] },
   { statement: "balance", label: "Lease Liability Detail", concepts: ["OperatingLeaseLiabilityNoncurrent"] }
 ]);

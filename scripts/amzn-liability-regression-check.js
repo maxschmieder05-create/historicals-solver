@@ -9,8 +9,9 @@ const outputWorkbook = process.env.AMZN_LIABILITY_OUTPUT_WORKBOOK || path.join(r
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
 const expectedCells = [
-  ["Model", "F135", 66382, "1Q23 accrued liabilities"],
-  ["Model", "F140", 67084, "1Q23 LT debt"],
+  ["Model", "F135", 59606, "1Q23 accrued liabilities excluding current debt"],
+  ["Model", "F139", 1100, "1Q23 short-term borrowings / revolver"],
+  ["Model", "F140", 72760, "1Q23 LT debt including current maturities"],
   ["Model", "F142", 95198, "1Q23 other non-current liabilities"],
   ["Model", "F145", 309852, "1Q23 total liabilities"],
   ["Model", "F158", 0, "1Q23 balance sheet check"]
@@ -54,14 +55,17 @@ async function main() {
     for (let row = 1; row <= audit.rowCount; row += 1) {
       const cell = String(cellValue(audit.getCell(row, 2)) ?? "");
       const concepts = String(cellValue(audit.getCell(row, 8)) ?? "");
-      if (cell === "F135" && /(?:LongTermDebtCurrent|ShortTermBorrowings)=(?!0(?:\.0+)?mm)/.test(concepts)) {
-        errors.push("Model!F135 should not be reduced by debt concepts when current debt is embedded in accrued expenses and other.");
+      if (cell === "F135" && !/(?:LongTermDebtCurrent|FinanceLeaseLiabilityCurrent|ShortTermBorrowings)=/.test(concepts)) {
+        errors.push("Model!F135 should exclude separately disclosed current debt from current liabilities excluding debt.");
       }
-      if (cell === "F140" && /LongTermDebtCurrent|ShortTermBorrowings/.test(concepts)) {
-        errors.push("Model!F140 should map to non-current long-term debt only.");
+      if (cell === "F139" && !/ShortTermBorrowings=1100mm/.test(concepts)) {
+        errors.push("Model!F139 should map short-term borrowings to the revolver / short-term debt row.");
       }
-      if (cell === "F142" && /LongTermDebtCurrent|ShortTermBorrowings/.test(concepts)) {
-        errors.push("Model!F142 should not use current debt concepts in the other non-current liability residual.");
+      if (cell === "F140" && !/LongTermDebtCurrent=2000mm/.test(concepts)) {
+        errors.push("Model!F140 should include current maturities of long-term debt.");
+      }
+      if (cell === "F140" && /ShortTermBorrowings=1100mm/.test(concepts)) {
+        errors.push("Model!F140 should not absorb short-term borrowings when a revolver / short-term debt row is available.");
       }
     }
   }
