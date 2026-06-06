@@ -14,7 +14,7 @@ export type TemplateMappingContext = {
   hasPensionLiabilityRow: boolean;
 };
 
-export const NONCURRENT_DEBT_CONCEPTS = ["LongTermDebtNoncurrent", "LongTermDebt"];
+export const NONCURRENT_DEBT_CONCEPTS = ["LongTermDebtNoncurrent", "LongTermDebt", "LongTermNotesAndLoans", "LongTermNotesPayable"];
 
 export const COMBINED_NONCURRENT_DEBT_AND_LEASE_CONCEPTS = [
   "LongTermDebtAndFinanceLeaseObligationsNoncurrent",
@@ -39,7 +39,7 @@ export const DEFERRED_TAX_LIABILITY_CONCEPTS = [
   "DeferredTaxLiabilities"
 ];
 
-const CURRENT_DEBT_CONCEPTS = ["DebtCurrent", "LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings", "ShortTermBorrowingsCurrent"];
+const CURRENT_DEBT_CONCEPTS = ["DebtCurrent", "LongTermDebtCurrent", "CurrentPortionOfLongTermDebt", "ShortTermBorrowings", "ShortTermBorrowingsCurrent", "NotesPayableCurrent"];
 const CURRENT_INVESTMENT_CONCEPTS = [
   "MarketableSecuritiesCurrent",
   "ShortTermInvestments",
