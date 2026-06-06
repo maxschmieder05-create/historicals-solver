@@ -35,6 +35,13 @@ const cases = [
     ticker: "SYK",
     cik: "0000310764",
     inputWorkbook: process.env.SYK_INPUT_WORKBOOK || "/Users/maxschmieder/Downloads/Stryker Corp (SYK)_Valuation Workbook (13-Mar-2026).xlsx"
+  },
+  {
+    key: "ORCL",
+    ticker: "ORCL",
+    cik: "0001341439",
+    inputWorkbook:
+      process.env.ORCL_INPUT_WORKBOOK || "/Users/maxschmieder/Downloads/Owl Fund Integrated Model Template (03-Sep-2025)_v25 (3).xlsx"
   }
 ];
 
