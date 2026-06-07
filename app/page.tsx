@@ -1,7 +1,7 @@
 "use client";
 
 import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowDownToLine, CheckCircle2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
+import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
   companyName: string;
@@ -37,16 +37,34 @@ export default function Home() {
     };
   }, []);
 
-  function pickFile(nextFile?: File) {
+  function syncFileInput(nextFile: File | null) {
+    if (!fileInputRef.current) return;
+    if (!nextFile) {
+      fileInputRef.current.value = "";
+      return;
+    }
+    const dataTransfer = new DataTransfer();
+    dataTransfer.items.add(nextFile);
+    fileInputRef.current.files = dataTransfer.files;
+  }
+
+  function formatFileSize(bytes: number) {
+    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+  }
+
+  function pickFile(nextFile?: File, options: { syncInput?: boolean } = {}) {
     setError("");
     setSummary(null);
     if (!nextFile) return;
     if (!nextFile.name.toLowerCase().endsWith(".xlsx")) {
       setFile(null);
+      syncFileInput(null);
       setError(`${nextFile.name} is not an .xlsx workbook.`);
       return;
     }
     setFile(nextFile);
+    if (options.syncInput) syncFileInput(nextFile);
   }
 
   function handleDrag(event: DragEvent<HTMLLabelElement>) {
@@ -65,7 +83,7 @@ export default function Home() {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
-    pickFile(event.dataTransfer.files?.[0]);
+    pickFile(event.dataTransfer.files?.[0], { syncInput: true });
   }
 
   function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
@@ -207,7 +225,7 @@ export default function Home() {
 
           <label
             htmlFor="model-template-file"
-            className={isDragging ? "dropzone dragging" : "dropzone"}
+            className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
             role="button"
             tabIndex={0}
             onKeyDown={handleDropzoneKeyDown}
@@ -217,10 +235,18 @@ export default function Home() {
             onDrop={handleDrop}
           >
             <span className="dropIcon">
-              <UploadCloud aria-hidden="true" size={30} />
+              {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
             </span>
-            <span className="dropTitle">{file ? file.name : "Drop Excel model here"}</span>
-            <small>{file ? `${(file.size / 1024 / 1024).toFixed(2)} MB selected` : "Click to browse or drag in an .xlsx file"}</small>
+            <span className="dropTitle">{file ? "Workbook selected" : "Drop Excel model here"}</span>
+            {file ? (
+              <span className="selectedFile" aria-live="polite">
+                <FileSpreadsheet aria-hidden="true" size={18} />
+                <span>{file.name}</span>
+                <small>{formatFileSize(file.size)}</small>
+              </span>
+            ) : (
+              <small>Click to browse or drag in an .xlsx file</small>
+            )}
           </label>
 
           <button className="primary" type="submit" disabled={!canSubmit}>

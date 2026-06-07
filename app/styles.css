@@ -261,6 +261,19 @@ input::placeholder {
   color: var(--accent);
 }
 
+.dropzone.hasFile {
+  border-style: solid;
+  border-color: rgba(12, 122, 85, 0.52);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0.4)),
+    #eef8f4;
+}
+
+.dropzone.hasFile .dropIcon {
+  background: rgba(12, 122, 85, 0.1);
+  color: var(--good);
+}
+
 .dropTitle {
   max-width: 100%;
   overflow-wrap: anywhere;
@@ -273,6 +286,41 @@ input::placeholder {
 .dropzone small {
   color: var(--muted);
   font-size: 13px;
+}
+
+.selectedFile {
+  max-width: min(100%, 560px);
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  border: 1px solid rgba(12, 122, 85, 0.22);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.74);
+  color: #203040;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 760;
+  box-shadow: 0 8px 18px rgba(12, 122, 85, 0.08);
+}
+
+.selectedFile svg {
+  color: var(--good);
+  flex: 0 0 auto;
+}
+
+.selectedFile span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.selectedFile small {
+  color: var(--good);
+  font-weight: 800;
+  white-space: nowrap;
 }
 
 .dropzone.dragging,
@@ -416,6 +464,15 @@ input::placeholder {
   .primary {
     width: 100%;
     min-width: 0;
+  }
+
+  .selectedFile {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .selectedFile small {
+    grid-column: 2;
+    justify-self: start;
   }
 }
 
