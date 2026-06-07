@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, MouseEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -67,7 +67,13 @@ export default function Home() {
     if (options.syncInput) syncFileInput(nextFile);
   }
 
-  function handleDrag(event: DragEvent<HTMLLabelElement>) {
+  function openFilePicker() {
+    if (!fileInputRef.current) return;
+    fileInputRef.current.value = "";
+    fileInputRef.current.click();
+  }
+
+  function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
@@ -79,7 +85,7 @@ export default function Home() {
     if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
@@ -90,10 +96,15 @@ export default function Home() {
     pickFile(event.currentTarget.files?.item(0) ?? undefined);
   }
 
-  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLLabelElement>) {
+  function handleDropzoneClick(event: MouseEvent<HTMLDivElement>) {
+    event.preventDefault();
+    openFilePicker();
+  }
+
+  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     if (event.key !== "Enter" && event.key !== " ") return;
     event.preventDefault();
-    fileInputRef.current?.click();
+    openFilePicker();
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -220,14 +231,17 @@ export default function Home() {
             type="file"
             name="file"
             accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            aria-hidden="true"
+            tabIndex={-1}
             onChange={handleFileSelect}
           />
 
-          <label
-            htmlFor="model-template-file"
+          <div
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
             role="button"
             tabIndex={0}
+            aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
+            onClick={handleDropzoneClick}
             onKeyDown={handleDropzoneKeyDown}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
@@ -247,7 +261,8 @@ export default function Home() {
             ) : (
               <small>Click to browse or drag in an .xlsx file</small>
             )}
-          </label>
+            <span className="browseCue">Choose workbook</span>
+          </div>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
