@@ -8,6 +8,7 @@ import {
   NONCURRENT_DEBT_CONCEPTS,
   NONCURRENT_LEASE_LIABILITY_CONCEPTS,
   PENSION_LIABILITY_CONCEPTS,
+  LiabilityTemplateRow,
   TemplateMappingContext,
   buildLiabilityTemplateMappingContext,
   currentDebtBelongsInAccruedLiabilities
@@ -887,6 +888,21 @@ function discoverFillRows(sheet: ExcelJS.Worksheet, columns: number[], periodInf
   }
 
   return rows;
+}
+
+function templateMappingRows(sheet: ExcelJS.Worksheet, fillRows: FillRow[]): LiabilityTemplateRow[] {
+  const rows = new Map<number, LiabilityTemplateRow>();
+  for (const fillRow of fillRows) {
+    rows.set(fillRow.row, { label: fillRow.label, statement: fillRow.statement, concepts: fillRow.concepts });
+  }
+  for (const rowNumber of balanceSheetSectionRows(sheet)) {
+    if (rows.has(rowNumber)) continue;
+    const label = rowLabel(sheet, rowNumber);
+    if (!label) continue;
+    const fillRow = fillRowForLabel(rowNumber, label);
+    rows.set(rowNumber, { label, statement: "balance", concepts: fillRow?.concepts });
+  }
+  return Array.from(rows.values());
 }
 
 function isCashFlowStatementBlockRow(sheet: ExcelJS.Worksheet, rowNumber: number) {
@@ -3685,7 +3701,7 @@ export async function POST(request: NextRequest) {
     const normalizedPackage = buildNormalizedHistoricalsPackage(company, profile, periods, ctx, segmentRevenue);
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
-    ctx.template = buildLiabilityTemplateMappingContext(fillRows);
+    ctx.template = buildLiabilityTemplateMappingContext(templateMappingRows(sheet, fillRows));
 
     const warnings: string[] = [];
     const auditRows: MappingAuditRow[] = [];
@@ -9930,7 +9946,7 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     columns,
     ctx,
     auditRows,
-    ["Accrued Liabilities"],
+    ["Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other", "Accrued Expenses and Other Current Liabilities"],
     resolveAccruedLiabilities
   );
   refreshBalanceSheetInputFromResolver(
@@ -10072,7 +10088,7 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
   const totalEquityRow = findRowInSection(
     sheet,
     "Balance Sheet",
-    ["Total Shareholder's Equity", "Total Shareholders' Equity", "Total Shareholders Equity", "Total Stockholders' Equity", "Total Stockholders Equity", "Total Equity"],
+    ["Total Shareholder's Equity", "Total Shareholders' Equity", "Total Shareholders Equity", "Total Stockholders' Equity", "Total Stockholders Equity"],
     (label) => /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
   );
   const totalEquityIncludingNciRow = findRowInSection(sheet, "Balance Sheet", ["Total Equity"], (label) =>
@@ -10250,10 +10266,22 @@ function refreshBalanceSheetTotalFormulaResult(
   const cell = sheet.getCell(rowNumber, col);
   if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
   const formula = formulaForCell(cell);
-  if (!formula) return;
-  if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
-  cell.value = { formula, result: value };
-  auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} formula result from EDGAR.`, "formula result refreshed"));
+  const currentValue = numericCellValue(cell);
+  if (currentValue !== null && incomeStatementFormulaTies(currentValue, value)) return;
+  if (formula) {
+    const refreshedFormula = formulaBridgeForTargetValue(cell, value);
+    if (refreshedFormula) {
+      cell.value = { formula: refreshedFormula, result: value };
+      auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} formula bridge from EDGAR.`, "formula bridge updated"));
+      return;
+    }
+    cell.value = value;
+    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Replaced ${metricName} formula with the EDGAR-supported value.`, "formula replaced with EDGAR-supported value"));
+    return;
+  }
+  if (!isHardcodedFinancialInput(cell)) return;
+  cell.value = value;
+  auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} from EDGAR.`, "formula replaced with EDGAR-supported value"));
 }
 
 function copyBalanceSheetFourthQuarterToAnnualColumns(
@@ -11102,7 +11130,7 @@ function validateBalanceSheetStatementTotals(
     ...validateBalanceSheetMetricAgainstEdgar(sheet, periods, columns, ctx, evaluator, warnings, "total liabilities", ["Total Liabilities"], C.liabilities)
   );
   errors.push(
-    ...validateBalanceSheetMetricAgainstEdgar(
+    ...validateBalanceSheetMetricAgainstResolver(
       sheet,
       periods,
       columns,
@@ -11115,11 +11143,13 @@ function validateBalanceSheetStatementTotals(
         "Total Shareholders' Equity",
         "Total Shareholders Equity",
         "Total Stockholders' Equity",
-        "Total Stockholders Equity",
-        "Total Equity"
+        "Total Stockholders Equity"
       ],
-      C.equity
+      resolveStockholdersEquity
     )
+  );
+  errors.push(
+    ...validateBalanceSheetMetricAgainstResolver(sheet, periods, columns, ctx, evaluator, warnings, "total equity", ["Total Equity"], resolveTotalEquityIncludingNci)
   );
   errors.push(
     ...validateBalanceSheetMetricAgainstEdgar(
@@ -11323,6 +11353,7 @@ function validateBalanceSheetSubtotalEqualsComponents(
   const totalRow = findBalanceSheetRow(sheet, totalLabels);
   if (!totalRow) return errors;
   const totalLabel = rowLabel(sheet, totalRow);
+  if (/current liabilities/i.test(metricName) && currentLiabilitiesSubtotalExcludesDebtLabel(totalLabel)) return errors;
   const componentRows = componentLabelGroups
     .map((labels) => findBalanceSheetRow(sheet, labels))
     .filter((rowNumber): rowNumber is number => rowNumber !== null && rowNumber !== totalRow);
@@ -11454,7 +11485,8 @@ function balanceSheetDiagnosticResolverForLabel(label: string): ((period: string
   if (/^(treasurystock|treasurypreferredstock|preferredstock)$/.test(normalizedLabel)) return resolveTreasuryAndPreferredStock;
   if (/^(accumulatedothercomprehensiveincomeaoci|accumulatedothercomprehensiveincome|accumulatedothercomprehensiveincomeloss|aoci)$/.test(normalizedLabel)) return resolveAoci;
   if (/^noncontrollinginterests$/.test(normalizedLabel)) return resolveNoncontrollingInterests;
-  if (/^(totalshareholdersequity|totalstockholdersequity|totalequity)$/.test(normalizedLabel)) return resolveTotalEquityIncludingNci;
+  if (/^(totalshareholdersequity|totalstockholdersequity)$/.test(normalizedLabel)) return resolveStockholdersEquity;
+  if (/^totalequity$/.test(normalizedLabel)) return resolveTotalEquityIncludingNci;
   if (/^(totalliabilitiesshareholdersequity|totalliabilitiesandshareholdersequity|totalliabilitiesstockholdersequity)$/.test(normalizedLabel)) return resolveTotalLiabilitiesAndEquity;
   return null;
 }

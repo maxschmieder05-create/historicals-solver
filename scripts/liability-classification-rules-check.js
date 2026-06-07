@@ -91,6 +91,22 @@ const currentLiabilitiesLessDebtContext = buildLiabilityTemplateMappingContext([
 assert.equal(currentLiabilitiesLessDebtContext.hasCurrentLiabilitiesExcludingDebtRow, true);
 assert.equal(currentDebtBelongsInAccruedLiabilities(currentLiabilitiesLessDebtContext), false);
 
+const currentLiabilitiesExDebtWithoutRecognizedDebtRowContext = buildLiabilityTemplateMappingContext([
+  { statement: "balance", label: "Accounts Payable" },
+  { statement: "balance", label: "Accrued Expenses and Other" },
+  { statement: "balance", label: "Total Current Liabilities (Excl. Debt)" },
+  { statement: "balance", label: "Other Non-Current Liabilities" }
+]);
+assert.equal(currentLiabilitiesExDebtWithoutRecognizedDebtRowContext.hasCurrentLiabilitiesExcludingDebtRow, true);
+assert.equal(currentDebtBelongsInAccruedLiabilities(currentLiabilitiesExDebtWithoutRecognizedDebtRowContext), false);
+assert.equal(
+  accruedLiabilityResidual(
+    { currentLiabilities: 1000, accountsPayable: 250, otherCurrentLiabilities: 125, currentDebt: 75 },
+    currentLiabilitiesExDebtWithoutRecognizedDebtRowContext
+  ),
+  550
+);
+
 const noDebtLineContext = buildLiabilityTemplateMappingContext([
   { statement: "balance", label: "Accounts Payable" },
   { statement: "balance", label: "Accrued Expenses and Other" },

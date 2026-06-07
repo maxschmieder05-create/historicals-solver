@@ -181,7 +181,8 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
 }
 
 export function currentDebtBelongsInAccruedLiabilities(context: TemplateMappingContext) {
-  return !context.hasCurrentDebtRow && !(context.hasCurrentLiabilitiesExcludingDebtRow && context.hasDebtInclCurrentPortionRow);
+  if (context.hasCurrentLiabilitiesExcludingDebtRow) return false;
+  return !context.hasCurrentDebtRow;
 }
 
 export function otherNonCurrentLiabilityResidualExclusions(context: TemplateMappingContext) {
