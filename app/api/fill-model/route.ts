@@ -487,6 +487,9 @@ const OTHER_NON_OPERATING_CONCEPTS = [
   "GainLossOnSaleOfInvestments"
 ];
 
+const BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS = ["OtherExpenseAndIncome"];
+const OTHER_OPERATING_INCOME_CONCEPTS = ["IntellectualPropertyAndCustomDevelopmentIncome"];
+
 const INCOME_TAX_CONCEPTS = ["IncomeTaxExpenseBenefit", "IncomeTaxExpenseBenefitContinuingOperations"];
 
 const C = {
@@ -988,7 +991,9 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   }
   if (has("Gross Profit", "Gross Margin Dollars")) return row(rowNumber, label, "income", "duration", C.grossProfit, 1, 1_000_000, "Mapped to SEC gross profit.");
   if (has("Operating Income", "Operating Income (Loss)", "Income From Operations")) {
-    return row(rowNumber, label, "income", "duration", C.operatingIncome, 1, 1_000_000, "Mapped to SEC operating income/loss or nearest pre-tax operating profit concept.");
+    return plug(rowNumber, label, "income", "duration", resolveOperatingIncome, "direct", {
+      comment: "Mapped to SEC operating income when reported; otherwise derived from reported pre-tax income less separately classified below-operating items."
+    });
   }
   if (has("Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales", "Property Taxes and Insurance")) {
     return plug(rowNumber, label, "income", "duration", resolveCostOfRevenue, "direct");
@@ -1521,7 +1526,13 @@ function conceptScore(source: FactSource, concepts: string[], score = 12) {
 function interestIncomeScore(source: FactSource) {
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
-  if (/netinterestincome|noninterestincome|interestexpense|interestcost|interestpaid|cashflow|cashflowstatement|noncontrollinginterest|minorityinterest|beforeincometax|beforetax|pretax/.test(compact)) return 0;
+  if (
+    /netinterestincome|noninterestincome|interestincomeexpense|interestexpenseincome|operatingandnonoperating|salestype|directfinancing|financingleases|lease|interestexpense|interestcost|interestpaid|cashflow|cashflowstatement|noncontrollinginterest|minorityinterest|beforeincometax|beforetax|pretax/.test(
+      compact
+    )
+  ) {
+    return 0;
+  }
   let score = conceptScore(source, INTEREST_INCOME_CONCEPTS);
   if (/\binterest\b.*\bincome\b|\bincome\b.*\binterest\b|\binterest\b.*\bearned\b/.test(text)) score += 7;
   if (/\binterest\b.*\binvestment\b|\binvestment\b.*\bincome\b/.test(text)) score += 5;
@@ -1555,7 +1566,7 @@ function isCombinedInterestAndOtherIncomeSource(source: FactSource) {
 function isExplicitInterestIncomeSource(source: FactSource) {
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
-  if (/interestexpense|interestcost|interestpaid/.test(compact)) return false;
+  if (/interestincomeexpense|interestexpenseincome|operatingandnonoperating|salestype|directfinancing|financingleases|lease|interestexpense|interestcost|interestpaid/.test(compact)) return false;
   if (/\binterest\b\s*(?:and|&)\s*other\b|\bother\b\s*(?:and|&)\s*interest\b/.test(text)) return false;
   if (/^interestincome(other)?$|investmentincomeinterest/.test(compact)) return true;
   return /\binterest\b.*\bincome\b|\bincome\b.*\binterest\b|\binterest\b.*\bearned\b/.test(text);
@@ -1597,6 +1608,7 @@ function otherNonOperatingScore(source: FactSource) {
   if (/interestincome|interestexpense|goodwillimpairment/.test(compact) || interestIncomeScore(source) >= 4) return 0;
 
   let score = conceptScore(source, OTHER_NON_OPERATING_CONCEPTS);
+  score += conceptScore(source, BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS);
   if (/\bother\b.*\b(?:income|expense|loss|gain)\b|\b(?:income|expense|loss|gain)\b.*\bother\b/.test(text)) score += 6;
   if (/\bnon[-\s]?operating\b|\bnonoperating\b/.test(text)) score += 6;
   if (/\bforeign currency\b|\bforeign exchange\b|\bfx\b/.test(text)) score += 5;
@@ -1642,7 +1654,12 @@ function expenseAsModelReduction(value: number) {
   return value < 0 ? value : -Math.abs(value);
 }
 
+function broadOtherExpenseAndIncomeValue(source: FactSource) {
+  return -source.value;
+}
+
 function otherNonOperatingValue(source: FactSource) {
+  if (BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(source.concept)) return broadOtherExpenseAndIncomeValue(source);
   const text = sourceSearchText(source);
   if (/\bother\b.*\bexpense\b|\bexpense\b.*\bother\b/.test(text) && !/\bincome\b|\bgain\b|\bloss\b|\bnet\b/.test(text)) {
     return expenseAsModelReduction(source.value);
@@ -1650,22 +1667,94 @@ function otherNonOperatingValue(source: FactSource) {
   return source.value;
 }
 
+function resolveOperatingIncome(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.duration, ["OperatingIncomeLoss"]);
+  if (direct) {
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to EDGAR operating income/loss.",
+      classification: "direct"
+    };
+  }
+
+  const pretax = resolvePreTaxIncome(period, ctx);
+  if (pretax.value !== null) {
+    const interestIncome = resolveInterestIncome(period, ctx);
+    const interestExpense = resolveInterestExpense(period, ctx);
+    const goodwillImpairment = resolveGoodwillImpairment(period, ctx);
+    const otherNonOperating = resolveOtherNonOperatingIncomeExpense(period, ctx);
+    const belowOperatingItems = [interestIncome, interestExpense, goodwillImpairment, otherNonOperating].filter(
+      (item) => item.value !== null && Math.abs(item.value) > 0
+    );
+    if (belowOperatingItems.length) {
+      const value = pretax.value - belowOperatingItems.reduce((total, item) => total + (item.value ?? 0), 0);
+      return {
+        value,
+        sources: [
+          bridgeSource(period, "OperatingIncomeDerivedFromPreTaxBridge", "Operating income derived from reported pre-tax bridge", value, [
+            pretax,
+            interestIncome,
+            interestExpense,
+            goodwillImpairment,
+            otherNonOperating
+          ]),
+          ...compactSources([pretax, interestIncome, interestExpense, goodwillImpairment, otherNonOperating])
+        ],
+        note:
+          "Derived from EDGAR pre-tax income less separately classified below-operating income/expense lines because no standalone operating income subtotal was reported.",
+        classification: "grouped"
+      };
+    }
+  }
+
+  const fallback = first(period, ctx.duration, ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest"]);
+  return fallback
+    ? {
+        value: fallback.value,
+        sources: [fallback],
+        note: "Mapped to EDGAR pre-tax income because no operating income subtotal or below-operating bridge lines were reported.",
+        classification: "grouped"
+      }
+    : { value: null, sources: [], note: "No operating income subtotal or derivable pre-tax bridge was available in SEC facts." };
+}
+
 function resolveInterestIncome(period: string, ctx: ResolveContext): ResolvedValue {
+  if (BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.some((concept) => first(period, ctx.duration, [concept]))) {
+    return {
+      value: 0,
+      sources: [zeroSource("InterestIncomeNotReported")],
+      note:
+        "Set to zero because the company reports a broad other income/expense statement line and no standalone income-statement interest income line.",
+      classification: "grouped"
+    };
+  }
+
   const direct = firstSemanticDurationSource(period, ctx, C.interestIncome, interestIncomeScore);
   if (!direct) {
     return {
-      value: null,
-      sources: [],
-      note: "No EDGAR interest income, investment income, or interest earned line was reported for this period."
+      value: 0,
+      sources: [zeroSource("InterestIncomeNotReported")],
+      note: "Set to zero because no standalone income-statement interest income line was reported for this period.",
+      classification: "grouped"
+    };
+  }
+  if (!isExplicitInterestIncomeSource(direct)) {
+    return {
+      value: 0,
+      sources: [zeroSource("InterestIncomeNotReported")],
+      note:
+        "Set to zero because the EDGAR interest line is a combined or adjusted interest income/expense disclosure, not a reported standalone income-statement interest income line.",
+      classification: "grouped"
     };
   }
   if (interestIncomeAlreadyIncludedInOtherIncomeBridge(period, ctx, direct)) {
     return {
-      value: null,
-      sources: [direct],
+      value: 0,
+      sources: [zeroSource("InterestIncomeNotReported")],
       note:
-        "Not mapped as standalone interest income because the EDGAR line combines interest with other income/expense; combined lines belong in other non-operating unless separately disclosed.",
-      classification: "partial"
+        "Set to zero because the EDGAR line combines interest with other income/expense; combined lines belong in other non-operating unless separately disclosed.",
+      classification: "grouped"
     };
   }
   return {
@@ -1771,6 +1860,20 @@ function resolveAssetImpairment(period: string, ctx: ResolveContext): ResolvedVa
 }
 
 function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  const broadOtherExpenseAndIncome = first(period, ctx.duration, BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS);
+  if (broadOtherExpenseAndIncome) {
+    return {
+      value: otherNonOperatingValue(broadOtherExpenseAndIncome),
+      sources: [broadOtherExpenseAndIncome],
+      note:
+        "Mapped to the company's reported other income/expense line. Note-level details validate classification but do not create a residual split.",
+      classification: BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(broadOtherExpenseAndIncome.concept) ? "direct" : "grouped"
+    };
+  }
+
+  const splitFromPreTaxBridge = resolveOtherNonOperatingFromPreTaxBridge(period, ctx);
+  if (splitFromPreTaxBridge.value !== null) return splitFromPreTaxBridge;
+
   const direct = firstSemanticDurationSource(period, ctx, C.otherNonOp, otherNonOperatingScore);
   if (direct) {
     if (otherIncomeExpenseLineShouldBeSplit(period, ctx, direct)) {
@@ -1788,6 +1891,72 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     value: null,
     sources: [],
     note: "No explicit EDGAR other non-operating line was reported. Pre-tax tie-outs are validation checks and do not create a residual other non-operating row."
+  };
+}
+
+function resolveOtherNonOperatingFromPreTaxBridge(period: string, ctx: ResolveContext): ResolvedValue {
+  const reportedOther = first(period, ctx.duration, [
+    "NonoperatingIncomeExpense",
+    "OtherNonoperatingIncomeExpense",
+    "OtherIncome",
+    "OtherExpense",
+    "OtherIncomeExpenseNet",
+    "OtherNonOperatingIncomeExpense"
+  ]);
+  if (!reportedOther) {
+    return {
+      value: null,
+      sources: [],
+      note: "No reported non-operating or other income/expense line was available for a pre-tax bridge split.",
+      classification: "grouped"
+    };
+  }
+
+  const operating = first(period, ctx.duration, ["OperatingIncomeLoss"]);
+  const pretax = resolvePreTaxIncome(period, ctx);
+  if (!operating || pretax.value === null) {
+    return {
+      value: null,
+      sources: [reportedOther],
+      note: "Could not split reported non-operating income/expense because operating income or pre-tax income was unavailable.",
+      classification: "grouped"
+    };
+  }
+
+  const interestIncome = resolveInterestIncome(period, ctx);
+  const interestExpense = resolveInterestExpense(period, ctx);
+  const goodwillImpairment = resolveGoodwillImpairment(period, ctx);
+  const separatelyClassified = [interestIncome, interestExpense, goodwillImpairment].filter(
+    (item) => item.value !== null && Math.abs(item.value) > 0
+  );
+  if (!separatelyClassified.length) {
+    return {
+      value: null,
+      sources: [reportedOther, operating, ...compactSources([pretax])],
+      note: "Reported non-operating income/expense was not split because no separately classified below-operating items were reported.",
+      classification: "grouped"
+    };
+  }
+
+  const value = (pretax.value ?? 0) - operating.value - separatelyClassified.reduce((total, item) => total + (item.value ?? 0), 0);
+  return {
+    value,
+    sources: [
+      bridgeSource(period, "OtherNonOperatingIncomeExpenseFromPreTaxBridge", "Other non-operating income/expense from reported pre-tax bridge", value, [
+        pretax,
+        operating,
+        reportedOther,
+        interestIncome,
+        interestExpense,
+        goodwillImpairment
+      ]),
+      reportedOther,
+      operating,
+      ...compactSources([pretax, interestIncome, interestExpense, goodwillImpairment])
+    ],
+    note:
+      "Derived from reported pre-tax income less reported operating income and separately classified below-operating items. This splits a reported non-operating bridge, not an unanchored residual plug.",
+    classification: "grouped"
   };
 }
 
@@ -1980,9 +2149,15 @@ function selectOperatingBridgeRevenueSourceWithoutOtherOperating(period: string,
 }
 
 function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext): ResolvedValue {
+  const operatingIncomeItems = OTHER_OPERATING_INCOME_CONCEPTS.map((concept) => first(period, ctx.duration, [concept])).filter(
+    (source): source is FactSource => Boolean(source)
+  );
   const accretion = first(period, ctx.duration, ["AssetRetirementObligationAccretionExpense", "AccretionExpense"]);
   const restructuring = first(period, ctx.duration, ["RestructuringCharges", "RestructuringAndRelatedCost"]);
-  const items = compactSources([accretion, restructuring]);
+  const expenseItems = BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.some((concept) => first(period, ctx.duration, [concept]))
+    ? compactSources([accretion])
+    : compactSources([accretion, restructuring]);
+  const items = uniqueFactSources([...operatingIncomeItems, ...expenseItems]);
   if (!items.length) {
     return {
       value: null,
@@ -1991,11 +2166,14 @@ function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext)
       classification: "grouped"
     };
   }
-  const value = -items.reduce((total, source) => total + Math.abs(source.value), 0);
+  const value =
+    operatingIncomeItems.reduce((total, source) => total + Math.abs(source.value), 0) -
+    expenseItems.reduce((total, source) => total + Math.abs(source.value), 0);
   return {
     value,
     sources: items,
-    note: "Grouped from explicit EDGAR operating expense lines that do not have dedicated model rows.",
+    note:
+      "Grouped from explicit EDGAR operating income/expense lines that do not have dedicated model rows. Broad other income/expense statement lines remain non-operating and are not double-counted here.",
     classification: "grouped"
   };
 }
@@ -7874,10 +8052,10 @@ function expectedReportedLineItemCategory(fillRow: FillRow): ReportedLineItemCat
   if (fillRow.resolver === resolveOtherNonOperatingIncomeExpense || hasConcept(C.otherNonOp) || /othernonoperating|otherincome|otherexpense|foreignexchange|equitymethod|investmentgain|investmentloss|miscellaneousnonoperating/.test(label)) {
     return "other_non_operating_income_expense";
   }
+  if (fillRow.resolver === resolveOperatingIncome || hasConcept(C.operatingIncome) || /ebit|operatingincome|operatingprofit|operatingloss/.test(label)) return "operating_income";
   if (fillRow.resolver === resolvePreTaxIncome || hasConcept(PRETAX_INCOME_CONCEPTS) || /pretax|pre-tax|incomebeforetax|incomebeforeincometax/.test(labelText) || /incomebeforetax|incomebeforeincometax/.test(label)) return "pretax_income";
   if (fillRow.resolver === resolveIncomeTaxExpense || hasConcept(C.taxes) || /incometax|taxexpense|taxbenefit|provisionfortax/.test(label)) return "income_tax";
   if (fillRow.resolver === resolveNetIncome || hasConcept(C.netIncome) || /netincome|netloss|profitloss/.test(label)) return "net_income";
-  if (hasConcept(C.operatingIncome) || /ebit|operatingincome|operatingprofit|operatingloss/.test(label)) return "operating_income";
 
   if (fillRow.statement === "balance") {
     if (hasConcept(C.assets) || /^totalassets$|^assets$/.test(label)) return "total_assets";
@@ -7902,7 +8080,8 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (source.sourceLayer === "model") return "cash_flow_or_support";
   if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
 
-  if (/OtherNonOperatingIncomeExpense(?:Residual|FromReportedLine)/i.test(concept)) return "other_non_operating_income_expense";
+  if (/OtherNonOperatingIncomeExpense(?:Residual|FromReportedLine|FromPreTaxBridge)/i.test(concept)) return "other_non_operating_income_expense";
+  if (/OperatingIncomeDerivedFromPreTaxBridge/i.test(concept)) return "operating_income";
   if (/IncomeTaxExpenseBenefitDerived/i.test(concept)) return "income_tax";
   if (/IncomeBeforeTaxesDerived|BeforeIncomeTaxesIncluding/i.test(concept)) return "pretax_income";
   if (/NetIncomeLossDerived/i.test(concept)) return "net_income";
@@ -7920,6 +8099,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(concept) || /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b/.test(text)) return "research_and_development";
   if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(concept) || /\bselling\b.*\bgeneral\b.*\badministrative\b|\bsg&a\b|\bgeneral and administrative\b|\bselling and marketing\b|\bcorporate overhead\b|\badministrative expense\b/.test(text)) return "selling_general_administrative";
   if (INCOME_STATEMENT_DA_CONCEPTS.includes(concept) || /\bdepreciation\b|\bamortization\b|\bdepletion\b/.test(text)) return "income_statement_depreciation_amortization";
+  if (OTHER_OPERATING_INCOME_CONCEPTS.includes(concept) || /\bintellectual property\b.*\bcustom development\b/.test(text)) return "other_operating_income_expense";
   if (
     concept === "OtherOperatingIncomeExpenseNet" ||
     ["AssetRetirementObligationAccretionExpense", "AccretionExpense", "RestructuringCharges", "RestructuringAndRelatedCost", "LitigationSettlementExpense"].includes(concept) ||
@@ -7928,7 +8108,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   ) {
     return "other_operating_income_expense";
   }
-  if (OTHER_NON_OPERATING_CONCEPTS.includes(concept) || otherNonOperatingScore(source) >= 5) return "other_non_operating_income_expense";
+  if (BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(concept) || OTHER_NON_OPERATING_CONCEPTS.includes(concept) || otherNonOperatingScore(source) >= 5) return "other_non_operating_income_expense";
 
   if ([...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory, ...C.currentAssets].includes(concept)) return "current_assets";
   if ([...C.ppe, ...C.intangibles, ...C.goodwill].includes(concept) || /\bnoncurrent assets?\b|\bproperty\b.*\bplant\b|\bgoodwill\b|\bintangibles?\b/.test(text)) return "non_current_assets";
@@ -7961,6 +8141,7 @@ function derivedSourceCategoryCompatible(expected: ReportedLineItemCategory, sou
   if (actual === expected) return true;
   return /Bridge|Derived|Residual/i.test(source.concept) && [
     "other_non_operating_income_expense",
+    "operating_income",
     "pretax_income",
     "income_tax",
     "net_income",
@@ -8206,9 +8387,7 @@ function reconcileIncomeStatementFormulaRowsToEdgar(
 }
 
 function resolveModeledOperatingProfit(period: string, ctx: ResolveContext): ResolvedValue {
-  const operating = first(period, ctx.duration, ["OperatingIncomeLoss"]);
-  if (operating) return { value: operating.value, sources: [operating], classification: "direct" };
-  return resolvePreTaxIncome(period, ctx);
+  return resolveOperatingIncome(period, ctx);
 }
 
 function reconcileIncomeStatementFormulaMetricToEdgar(
