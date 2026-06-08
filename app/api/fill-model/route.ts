@@ -19,6 +19,17 @@ import {
   type SecFilingPackageRequest,
   type SecFilingStatementStructure
 } from "./sec-filing-package";
+import {
+  cleanLineItemLabel,
+  humanList,
+  isTechnicalLineItemLabel,
+  lineItemMappingSentence,
+  lineItemSentence,
+  normalizedLineItemComment,
+  sourceLineItemLabel,
+  sourceLineItemLabels,
+  uniqueByNormalizedLabel
+} from "./audit-notes";
 
 export const runtime = "nodejs";
 export const maxDuration = 900;
@@ -8472,65 +8483,6 @@ function groupedLineItemLabels(resolved: ResolvedValue) {
   return sourceLineItemLabels(resolved);
 }
 
-function lineItemMappingSentence(modelRow: string, resolved: ResolvedValue, mode?: "maps" | "includes") {
-  const labels = sourceLineItemLabels(resolved);
-  return lineItemSentence(modelRow, labels, mode ?? (labels.length === 1 && (resolved.classification ?? "direct") === "direct" ? "maps" : "includes"));
-}
-
-function lineItemSentence(modelRow: string, labels: string[], mode: "maps" | "includes" = labels.length === 1 ? "maps" : "includes") {
-  const cleanModelRow = cleanLineItemLabel(modelRow) || "Model row";
-  const cleanLabels = uniqueByNormalizedLabel(labels.map(cleanLineItemLabel).filter((label) => label && !isTechnicalLineItemLabel(label)));
-  if (!cleanLabels.length) return "";
-  const effectiveMode = mode === "includes" ? "includes" : cleanLabels.length === 1 ? "maps" : mode;
-  const verb = effectiveMode === "maps" ? "maps directly to" : "includes";
-  return `${cleanModelRow} ${verb} ${humanList(cleanLabels)}.`;
-}
-
-function humanList(items: string[]) {
-  if (items.length <= 1) return items[0] ?? "";
-  if (items.length === 2) return `${items[0]} and ${items[1]}`;
-  return `${items.slice(0, -1).join(", ")}, and ${items.at(-1)}`;
-}
-
-function uniqueByNormalizedLabel(labels: string[]) {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const label of labels) {
-    const key = normalize(label);
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    result.push(label);
-  }
-  return result;
-}
-
-function sourceLineItemLabels(resolved: ResolvedValue) {
-  if (resolved.includedLineItems?.length) {
-    return uniqueByNormalizedLabel(resolved.includedLineItems.map(cleanLineItemLabel).filter((label) => label && !isTechnicalLineItemLabel(label)));
-  }
-
-  const labels: string[] = [];
-  const seen = new Set<string>();
-  for (const source of resolved.sources) {
-    if (source.value === 0 || source.sourceLayer === "model") continue;
-    const label = sourceLineItemLabel(source);
-    if (!label) continue;
-    const key = normalize(label);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    labels.push(label);
-  }
-  return labels;
-}
-
-function sourceLineItemLabel(source: FactSource) {
-  const preferred = cleanLineItemLabel(source.label || "");
-  if (preferred && preferred !== source.concept && !isTechnicalLineItemLabel(preferred)) return preferred;
-  const fallback = cleanLineItemLabel(source.note || "");
-  if (fallback && !isTechnicalLineItemLabel(fallback)) return fallback;
-  return "";
-}
-
 function lineItemExclusionLabel(total: FactSource | ResolvedValue, exclusions: Array<FactSource | ResolvedValue | null | undefined>, fallback: string) {
   const totalLabel = "sources" in total ? sourceLineItemLabels(total)[0] : sourceLineItemLabel(total);
   const exclusionLabels = uniqueByNormalizedLabel(
@@ -8541,19 +8493,6 @@ function lineItemExclusionLabel(total: FactSource | ResolvedValue, exclusions: A
   );
   if (!totalLabel || !exclusionLabels.length) return fallback;
   return `${totalLabel} excluding ${humanList(exclusionLabels)}`;
-}
-
-function cleanLineItemLabel(label: string) {
-  return label
-    .replace(/\s+/g, " ")
-    .replace(/^["'`]+|["'`]+$/g, "")
-    .replace(/^\s*EDGAR\s*[:\-]\s*/i, "")
-    .replace(/\s*\((?:in\s+)?(?:millions|thousands|USD \$|shares|except per share data)\)\s*$/i, "")
-    .trim();
-}
-
-function isTechnicalLineItemLabel(label: string) {
-  return /\b(parser|mapped|calculated|derived|validation|accession|period|formula|residual|resolved|carried forward|SEC validation|LLM-assisted|Balance Sheet Check|Segment Analysis)\b/i.test(label);
 }
 
 function humanizeConcept(concept: string) {
@@ -9411,13 +9350,6 @@ function rowAnnotationSummary(notes: string[]) {
 
 function rowAnnotationNote(note: string) {
   return normalizedLineItemComment(note);
-}
-
-function normalizedLineItemComment(text: string) {
-  const normalized = text.replace(/\r\n/g, "\n").trim();
-  if (!normalized || hasLegacyCommentDetail(normalized)) return "";
-  if (!/^[^\n]+ (?:includes|maps directly to)(?::\n- |\s+).+/i.test(normalized)) return "";
-  return normalized;
 }
 
 function formulaHasCellReference(formula: string) {
@@ -13976,10 +13908,6 @@ function addComment(cell: ExcelJS.Cell, text: string) {
 
 function userFacingCommentText(_cell: ExcelJS.Cell, text: string) {
   return normalizedLineItemComment(text);
-}
-
-function hasLegacyCommentDetail(text: string) {
-  return /\b(?:EDGAR:|Period:|Value:|Confidence:|parser|timestamp|accession|fragment|Filing says:|LLM-assisted|SEC validation|formula|residual|calculated|needs review|mapped to directly)\b/i.test(text);
 }
 
 function commentText(note: ExcelJS.Cell["note"]) {
