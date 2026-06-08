@@ -22,6 +22,7 @@
     "test:segment-first-run-reliability": "node scripts/segment-first-run-reliability-check.js",
     "test:goog-current-investments": "node scripts/goog-current-investments-regression-check.js",
     "test:goog-operating-income": "node scripts/goog-operating-income-regression-check.js",
+    "test:intc-income-statement-classification": "node scripts/intc-income-statement-classification-check.js",
     "test:nvda-income-statement": "node scripts/nvda-income-statement-regression-check.js",
     "test:ibm-income-statement-classification": "node scripts/ibm-income-statement-classification-check.js",
     "test:lly-income-statement-classification": "node scripts/lly-income-statement-classification-check.js",

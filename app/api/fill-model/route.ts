@@ -450,6 +450,7 @@ const REVENUE_COMPONENT_CONCEPTS = [
 
 const INTEREST_INCOME_CONCEPTS = [
   "InterestIncomeNonOperating",
+  "InterestIncomeOther",
   "InvestmentIncomeInterest",
   "InterestAndDividendIncomeOperating",
   "InterestIncomeExpenseNonOperatingNet",
@@ -469,6 +470,7 @@ const INTEREST_EXPENSE_CONCEPTS = [
 ];
 
 const GOODWILL_IMPAIRMENT_CONCEPTS = [
+  "GoodwillImpairmentLoss",
   "GoodwillImpairmentLosses",
   "ImpairmentOfGoodwillAndIntangibleAssets",
   "GoodwillAndIntangibleAssetImpairment"
@@ -515,6 +517,9 @@ const OTHER_NON_OPERATING_CONCEPTS = [
   "OtherExpense",
   "OtherIncomeExpenseNet",
   "OtherNonOperatingIncomeExpense",
+  "EquitySecuritiesFvNiGainLoss",
+  "EquitySecuritiesFvNiRealizedGainLoss",
+  "EquitySecuritiesFvNiUnrealizedGainLoss",
   "OtherIncomeLossFromContinuingOperationsBeforeIncomeTaxes",
   "ForeignCurrencyTransactionGainLossBeforeTax",
   "ForeignCurrencyTransactionGainLoss",
@@ -574,7 +579,7 @@ const C = {
   goodwillImpairment: GOODWILL_IMPAIRMENT_CONCEPTS,
   otherNonOp: OTHER_NON_OPERATING_CONCEPTS,
   taxes: INCOME_TAX_CONCEPTS,
-  netIncome: ["NetIncomeLoss", "ProfitLoss"],
+  netIncome: ["ProfitLoss", "NetIncomeLoss"],
   creditLossProvision: [
     "ProvisionForLoanLeaseAndOtherLosses",
     "ProvisionForCreditLosses",
@@ -829,7 +834,7 @@ const POST_TAX_ADJUSTMENT_CONCEPTS = [
 
 const COMMON_SHAREHOLDER_INCOME_CONCEPTS = ["NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLossAvailableToCommonStockholdersDiluted"];
 
-const CONTINUING_NET_INCOME_CONCEPTS = ["NetIncomeLoss", "ProfitLoss", "IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest"];
+const CONTINUING_NET_INCOME_CONCEPTS = ["ProfitLoss", "NetIncomeLoss", "IncomeLossFromContinuingOperationsIncludingPortionAttributableToNoncontrollingInterest"];
 
 const PRETAX_INCOME_CONCEPTS = [
   "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
@@ -1575,11 +1580,15 @@ function isSegmentLikeRevenueSource(source: FactSource) {
 function uniqueFactSources(sources: FactSource[]) {
   const seen = new Set<string>();
   return sources.filter((source) => {
-    const key = `${source.concept}|${source.accn ?? ""}|${source.start ?? ""}|${source.end ?? ""}|${source.value}`;
+    const key = factSourceIdentity(source);
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
   });
+}
+
+function factSourceIdentity(source: FactSource) {
+  return `${source.concept}|${source.accn ?? ""}|${source.start ?? ""}|${source.end ?? ""}|${source.value}`;
 }
 
 function resolveCompensationExpense(period: string, ctx: ResolveContext): ResolvedValue {
@@ -1733,9 +1742,18 @@ function primaryIncomeStatementRowIsAboveOperatingIncome(statement: SecFilingSta
   return !isBelowOperatingLineLabel(row.rowLabel);
 }
 
+function primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement: SecFilingStatementStructure, row: SecFilingStatementStructure["rows"][number]) {
+  const operatingOrder = primaryStatementOperatingIncomeOrder(statement);
+  const pretaxOrder = primaryStatementPreTaxIncomeOrder(statement);
+  if (operatingOrder !== null && row.rowOrder <= operatingOrder) return false;
+  if (pretaxOrder !== null && row.rowOrder >= pretaxOrder) return false;
+  if (operatingOrder !== null && pretaxOrder !== null) return true;
+  return isBelowOperatingLineLabel(row.rowLabel);
+}
+
 function isBelowOperatingLineLabel(label: string) {
   const text = label.toLowerCase();
-  return /\b(non[-\s]?operating|interest|investment gains?|investment losses?|equity method|foreign exchange|foreign currency|other income|other expense|other-net|debt extinguishment)\b/.test(text);
+  return /\b(non[-\s]?operating|interest|investment gains?|investment losses?|equity investments?|equity securities?|equity method|foreign exchange|foreign currency|other income|other expense|other-net|debt extinguishment)\b/.test(text);
 }
 
 function isStandaloneIncomeStatementDaRow(row: SecFilingStatementStructure["rows"][number]) {
@@ -1763,11 +1781,34 @@ function sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period: string, c
   return rows.some(({ statement, row }) => primaryIncomeStatementRowIsAboveOperatingIncome(statement, row));
 }
 
+function sourceReportedBelowOperatingOnPrimaryIncomeStatement(period: string, ctx: ResolveContext, source: FactSource) {
+  if (isComprehensiveIncomeSource(source)) return false;
+  const rows = primaryIncomeStatementRowsForSource(period, ctx, source);
+  if (!rows.length) return !ctx.filingPackageStatements?.length && explicitBelowOperatingLineFallback(source);
+  return rows.some(({ statement, row }) => primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row));
+}
+
+function primaryIncomeStatementBelowOperatingRowKeysForSource(period: string, ctx: ResolveContext, source: FactSource) {
+  return primaryIncomeStatementRowsForSource(period, ctx, source)
+    .filter(({ statement, row }) => primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row))
+    .map(({ statement, row }) => `${normalizeAccession(statement.accession)}|${row.rowOrder}|${normalize(row.rowLabel)}|${row.xbrlConcept ?? ""}`);
+}
+
 function explicitOperatingLineFallback(source: FactSource) {
   return (
     OTHER_OPERATING_INCOME_CONCEPTS.includes(source.concept) ||
     isAcquiredInProcessResearchDevelopmentSource(source) ||
     isOperatingSpecialChargeSource(source)
+  );
+}
+
+function explicitBelowOperatingLineFallback(source: FactSource) {
+  return (
+    isCombinedInterestAndOtherIncomeSource(source) ||
+    isExplicitInterestIncomeSource(source) ||
+    isExplicitInterestExpenseSource(source) ||
+    otherNonOperatingScore(source) >= 5 ||
+    goodwillImpairmentScore(source) >= 9
   );
 }
 
@@ -1854,27 +1895,60 @@ function isExplicitInterestIncomeSource(source: FactSource) {
 
 function isExplicitInterestIncomeText(text: string, compact = normalize(text)) {
   if (/interestincomeexpense|interestexpenseincome|operatingandnonoperating|salestype|directfinancing|financingleases|lease|interestexpense|interestcost|interestpaid/.test(compact)) return false;
-  if (/interestincomeother|otherinterestincome/.test(compact)) return false;
   if (/\binterest\b\s*(?:and|&)\s*other\b|\bother\b\s*(?:and|&)\s*interest\b/.test(text)) return false;
   if (/^interestincome$|investmentincomeinterest/.test(compact)) return true;
   return /\binterest\b.*\bincome\b|\bincome\b.*\binterest\b|\binterest\b.*\bearned\b/.test(text);
 }
 
 function sourceHasStandalonePrimaryIncomeStatementInterestIncomeLine(period: string, ctx: ResolveContext, source: FactSource) {
+  if (source.concept === "InterestIncomeOther" && first(period, ctx.duration, BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS)) return false;
   const rows = primaryIncomeStatementRowsForSource(period, ctx, source);
-  if (!rows.length) return !ctx.filingPackageStatements?.length && isExplicitInterestIncomeSource(source);
+  if (!rows.length) {
+    return (!ctx.filingPackageStatements?.length && isExplicitInterestIncomeSource(source)) || sourceHasDirectNonOperatingInterestSplitSupport(period, ctx, source, "income");
+  }
   return rows.some(({ statement, row }) => {
     const text = `${row.rowLabel} ${row.xbrlConcept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
-    return isExplicitInterestIncomeText(text) && !primaryIncomeStatementRowIsAboveOperatingIncome(statement, row);
+    return isExplicitInterestIncomeText(text) && primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row);
   });
 }
 
 function isExplicitInterestExpenseSource(source: FactSource) {
-  const text = sourceSearchText(source);
-  const compact = sourceCompactText(source);
+  return isExplicitInterestExpenseText(sourceSearchText(source), sourceCompactText(source));
+}
+
+function isExplicitInterestExpenseText(text: string, compact = normalize(text)) {
   if (/interestincome|investmentincome/.test(compact)) return false;
   if (/\binterest\b\s*(?:and|&)\s*other\b|\bother\b\s*(?:and|&)\s*interest\b/.test(text)) return false;
   return /\binterest\b.*\bexpense\b|\bexpense\b.*\binterest\b|\binterest\b.*\bdebt\b|\bdebt\b.*\binterest\b/.test(text);
+}
+
+function sourceHasStandalonePrimaryIncomeStatementInterestExpenseLine(period: string, ctx: ResolveContext, source: FactSource) {
+  const rows = primaryIncomeStatementRowsForSource(period, ctx, source);
+  if (!rows.length) {
+    return (!ctx.filingPackageStatements?.length && isExplicitInterestExpenseSource(source)) || sourceHasDirectNonOperatingInterestSplitSupport(period, ctx, source, "expense");
+  }
+  return rows.some(({ statement, row }) => {
+    const text = `${row.rowLabel} ${row.xbrlConcept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+    return isExplicitInterestExpenseText(text) && primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row);
+  });
+}
+
+function sourceHasDirectNonOperatingInterestSplitSupport(period: string, ctx: ResolveContext, source: FactSource, kind: "income" | "expense") {
+  const reportedOther = first(period, ctx.duration, [
+    "NonoperatingIncomeExpense",
+    "OtherNonoperatingIncomeExpense",
+    "OtherIncome",
+    "OtherExpense",
+    "OtherIncomeExpenseNet",
+    "OtherNonOperatingIncomeExpense"
+  ]);
+  if (!reportedOther || !sourceReportedBelowOperatingOnPrimaryIncomeStatement(period, ctx, reportedOther)) return false;
+  if (first(period, ctx.duration, BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS)) return false;
+  if (source.accn && reportedOther.accn && normalizeAccession(source.accn) !== normalizeAccession(reportedOther.accn)) return false;
+  if (source.start && reportedOther.start && source.start !== reportedOther.start) return false;
+  if (source.end && reportedOther.end && source.end !== reportedOther.end) return false;
+  if (kind === "income") return source.concept === "InterestIncomeOther";
+  return source.concept === "InterestExpense";
 }
 
 function goodwillImpairmentScore(source: FactSource) {
@@ -1884,6 +1958,22 @@ function goodwillImpairmentScore(source: FactSource) {
   if (/\bgoodwill\b/.test(text) && /\bimpairment\b|\bimpair\b/.test(text)) score += 9;
   if (/\bintangible\b/.test(text) && /\bimpairment\b/.test(text) && /\bgoodwill\b/.test(text)) score += 3;
   return score;
+}
+
+function isStandalonePrimaryIncomeStatementGoodwillImpairmentRow(row: SecFilingStatementStructure["rows"][number]) {
+  const text = `${row.rowLabel} ${row.xbrlConcept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  if (/\b(accumulated|cash flows?|operating activities|reconciliation|rollforward|changes? in goodwill|balance)\b/.test(text)) return false;
+  return /\bgoodwill\b/.test(text) && /\bimpair(?:ment|ed)?\b/.test(text);
+}
+
+function sourceHasStandalonePrimaryIncomeStatementGoodwillImpairmentLine(period: string, ctx: ResolveContext, source: FactSource) {
+  const rows = primaryIncomeStatementRowsForSource(period, ctx, source);
+  if (!rows.length) return !ctx.filingPackageStatements?.length && goodwillImpairmentScore(source) >= 9;
+  return rows.some(
+    ({ statement, row }) =>
+      isStandalonePrimaryIncomeStatementGoodwillImpairmentRow(row) &&
+      primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row)
+  );
 }
 
 function impairmentScore(source: FactSource) {
@@ -1911,6 +2001,7 @@ function otherNonOperatingScore(source: FactSource) {
   if (/\bnon[-\s]?operating\b|\bnonoperating\b/.test(text)) score += 6;
   if (/\bforeign currency\b|\bforeign exchange\b|\bfx\b/.test(text)) score += 5;
   if (/\bequity method\b|\bunconsolidated\b/.test(text)) score += 5;
+  if (/\bequity (?:securities|investments?)\b/.test(text) && /\bgains?\b|\bloss(?:es)?\b|\bincome\b/.test(text)) score += 5;
   if (/\bextinguishment\b|\bdebt extinguishment\b/.test(text)) score += 5;
   if (/\bsale\b|\bdisposition\b|\binvestments?\b/.test(text) && /\bgain\b|\bloss\b|\bincome\b/.test(text)) score += 4;
   return score;
@@ -2083,6 +2174,15 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   if (!facts) return fallback ?? { value: null, sources: [] };
   const source = firstSemanticDurationSource(period, ctx, C.interestExpense, interestExpenseScore);
   if (source && source.value !== 0) {
+    if (!sourceHasStandalonePrimaryIncomeStatementInterestExpenseLine(period, ctx, source)) {
+      return {
+        value: 0,
+        sources: [zeroSource("InterestExpenseNotReported")],
+        note:
+          "Set to zero because no standalone primary income-statement interest expense line was reported for this period. Combined interest-and-other lines remain in other non-operating income/expense.",
+        classification: "grouped"
+      };
+    }
     return {
       value: expenseAsModelReduction(source.value),
       sources: [source],
@@ -2130,15 +2230,25 @@ function resolveGoodwillImpairment(period: string, ctx: ResolveContext): Resolve
   const source = firstSemanticDurationSource(period, ctx, C.goodwillImpairment, goodwillImpairmentScore);
   if (!source) {
     return {
-      value: null,
-      sources: [],
-      note: "No EDGAR-supported goodwill impairment line was reported; generic impairment charges were not classified as goodwill impairment without goodwill-specific support."
+      value: 0,
+      sources: [zeroSource("GoodwillImpairmentNotReported")],
+      note: "Set to zero because no standalone goodwill impairment line was reported on the primary income statement.",
+      classification: "grouped"
+    };
+  }
+  if (!sourceHasStandalonePrimaryIncomeStatementGoodwillImpairmentLine(period, ctx, source)) {
+    return {
+      value: 0,
+      sources: [zeroSource("GoodwillImpairmentNotReported")],
+      note:
+        "Set to zero because the EDGAR goodwill impairment fact was not reported as a standalone below-operating primary income-statement line for this period.",
+      classification: "grouped"
     };
   }
   return {
     value: expenseAsModelReduction(source.value),
     sources: [source],
-    note: "Mapped only to goodwill-specific impairment evidence from EDGAR concepts or filing labels.",
+    note: "Mapped only to a standalone goodwill impairment line reported below operating income on the primary income statement.",
     classification: C.goodwillImpairment.includes(source.concept) ? "direct" : "grouped"
   };
 }
@@ -2156,6 +2266,131 @@ function resolveAssetImpairment(period: string, ctx: ResolveContext): ResolvedVa
   };
 }
 
+function resolveOtherNonOperatingFromPrimaryStatementRows(period: string, ctx: ResolveContext): ResolvedValue {
+  if (!ctx.filingPackageStatements?.length) {
+    return {
+      value: null,
+      sources: [],
+      note: "Primary income-statement structure was unavailable for reported below-operating row summing.",
+      classification: "grouped"
+    };
+  }
+
+  const facts = ctx.duration.get(period);
+  if (!facts) {
+    return {
+      value: null,
+      sources: [],
+      note: "No duration facts were available for reported below-operating row summing.",
+      classification: "grouped"
+    };
+  }
+
+  const dedicatedItems = [resolveInterestIncome(period, ctx), resolveInterestExpense(period, ctx), resolveGoodwillImpairment(period, ctx)];
+  const dedicatedSources = new Set(
+    compactSources(dedicatedItems)
+      .filter((source) => source.sourceLayer !== "model" && Math.abs(source.value) > 0)
+      .map(factSourceIdentity)
+  );
+  const sources = uniquePrimaryIncomeStatementLineSources(
+    period,
+    ctx,
+    Array.from(facts.values())
+      .filter((source) => sourceReportedBelowOperatingOnPrimaryIncomeStatement(period, ctx, source))
+      .filter((source) => isOtherNonOperatingPrimaryStatementSource(source))
+      .filter((source) => !dedicatedSources.has(factSourceIdentity(source)))
+  );
+
+  if (!sources.length) {
+    return {
+      value: null,
+      sources: [],
+      note: "No reported primary income-statement below-operating rows without dedicated model rows were available.",
+      classification: "grouped"
+    };
+  }
+
+  const reportedPrimaryValue = sources.reduce((total, source) => total + otherNonOperatingValue(source), 0);
+  const dedicatedValue = dedicatedItems
+    .filter((item) => item.value !== null && Math.abs(item.value) > 0 && item.sources.some((source) => source.sourceLayer !== "model"))
+    .reduce((total, item) => total + (item.value ?? 0), 0);
+  const shouldSplitBroadReportedLine = dedicatedValue !== 0 && sources.some(isBroadOtherIncomeExpenseLine);
+  const value = shouldSplitBroadReportedLine ? reportedPrimaryValue - dedicatedValue : reportedPrimaryValue;
+
+  return {
+    value,
+    sources: shouldSplitBroadReportedLine
+      ? [
+          bridgeSource(period, "OtherNonOperatingIncomeExpenseFromReportedLine", "Other non-operating income/expense from reported primary-statement line", value, [
+            ...sources,
+            ...dedicatedItems
+          ]),
+          ...sources,
+          ...compactSources(dedicatedItems)
+        ]
+      : sources,
+    note: shouldSplitBroadReportedLine
+      ? "Derived from the company's reported primary income-statement non-operating line after removing separately supported dedicated below-operating rows."
+      : "Summed the company's reported primary income-statement rows between operating income and pre-tax income that do not have dedicated model rows. Reported statement classification takes precedence over residual tie-outs.",
+    classification: sources.length === 1 && C.otherNonOp.includes(sources[0].concept) ? "direct" : "grouped"
+  };
+}
+
+function uniquePrimaryIncomeStatementLineSources(period: string, ctx: ResolveContext, sources: FactSource[]) {
+  const seenLineKeys = new Set<string>();
+  const seenFactKeys = new Set<string>();
+  const seenSemanticKeys = new Set<string>();
+  return uniqueFactSources(sources).filter((source) => {
+    const semanticKey = primaryBelowOperatingSemanticDuplicateKey(source);
+    if (semanticKey) {
+      if (seenSemanticKeys.has(semanticKey)) return false;
+      seenSemanticKeys.add(semanticKey);
+    }
+
+    const lineKeys = primaryIncomeStatementBelowOperatingRowKeysForSource(period, ctx, source);
+    const duplicateLine = lineKeys.some((key) => seenLineKeys.has(key));
+    lineKeys.forEach((key) => seenLineKeys.add(key));
+    if (lineKeys.length) return !duplicateLine;
+
+    const factKey = factSourceIdentity(source);
+    if (seenFactKeys.has(factKey)) return false;
+    seenFactKeys.add(factKey);
+    return true;
+  });
+}
+
+function primaryBelowOperatingSemanticDuplicateKey(source: FactSource) {
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  const periodKey = `${source.accn ?? ""}|${source.start ?? ""}|${source.end ?? ""}|${source.value}`;
+  if (/equitysecuritiesfvni|gainslossesonequityinvestments/.test(compact)) return `equity-investment-gain-loss|${periodKey}`;
+  if (/\bequity (?:securities|investments?)\b/.test(text) && /\bgains?\b|\bloss(?:es)?\b|\bincome\b/.test(text)) {
+    return `equity-investment-gain-loss|${periodKey}`;
+  }
+  return null;
+}
+
+function isOtherNonOperatingPrimaryStatementSource(source: FactSource) {
+  const concept = source.concept;
+  const text = sourceSearchText(source);
+  if (
+    C.operatingIncome.includes(concept) ||
+    PRETAX_INCOME_CONCEPTS.includes(concept) ||
+    INCOME_TAX_CONCEPTS.includes(concept) ||
+    CONTINUING_NET_INCOME_CONCEPTS.includes(concept)
+  ) {
+    return false;
+  }
+  if (GOODWILL_IMPAIRMENT_CONCEPTS.includes(concept) || goodwillImpairmentScore(source) >= 9) return false;
+  if (isExplicitInterestIncomeSource(source) || isExplicitInterestExpenseSource(source)) return false;
+  if (isCombinedInterestAndOtherIncomeSource(source)) return true;
+  if (BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(concept) || OTHER_NON_OPERATING_CONCEPTS.includes(concept)) return true;
+  if (otherNonOperatingScore(source) >= 5) return true;
+  return /\b(equity securities?|equity investments?|investment gains?|investment losses?|foreign exchange|foreign currency|debt extinguishment)\b/.test(
+    text
+  );
+}
+
 function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveContext): ResolvedValue {
   const broadOtherExpenseAndIncome = first(period, ctx.duration, BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS);
   if (broadOtherExpenseAndIncome) {
@@ -2167,6 +2402,9 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
       classification: BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(broadOtherExpenseAndIncome.concept) ? "direct" : "grouped"
     };
   }
+
+  const primaryStatementRows = resolveOtherNonOperatingFromPrimaryStatementRows(period, ctx);
+  if (primaryStatementRows.value !== null) return primaryStatementRows;
 
   const splitFromPreTaxBridge = resolveOtherNonOperatingFromPreTaxBridge(period, ctx);
   if (splitFromPreTaxBridge.value !== null) return splitFromPreTaxBridge;
@@ -2375,9 +2613,6 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
     return { value: direct.value, sources: [direct], note: "Mapped to EDGAR other operating income/expense, net.", classification: "direct" };
   }
 
-  const explicitItems = resolveExplicitOtherOperatingItems(period, ctx);
-  if (explicitItems.value !== null) return explicitItems;
-
   if (reportedOperatingIncomeTiesWithoutOtherOperating(period, ctx)) {
     return {
       value: 0,
@@ -2387,6 +2622,9 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
       classification: "grouped"
     };
   }
+
+  const explicitItems = resolveExplicitOtherOperatingItems(period, ctx);
+  if (explicitItems.value !== null) return explicitItems;
 
   const detail = sumWithNote(
     period,
@@ -8999,6 +9237,7 @@ function incomeStatementClassificationRows() {
     },
     { labels: ["Interest Income"], resolver: resolveInterestIncome, name: "interest income" },
     { labels: ["Interest (Expense)", "Interest Expense"], resolver: resolveInterestExpense, name: "interest expense" },
+    { labels: ["Goodwill Impairment", "Impairment of Goodwill", "Goodwill and Intangible Asset Impairment"], resolver: resolveGoodwillImpairment, name: "goodwill impairment" },
     {
       labels: ["Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)"],
       resolver: resolveOtherNonOperatingIncomeExpense,
@@ -12011,6 +12250,7 @@ function validateIncomeStatementLineItemClassifications(
     },
     { labels: ["Interest Income"], resolver: resolveInterestIncome, name: "interest income" },
     { labels: ["Interest (Expense)", "Interest Expense"], resolver: resolveInterestExpense, name: "interest expense" },
+    { labels: ["Goodwill Impairment", "Impairment of Goodwill", "Goodwill and Intangible Asset Impairment"], resolver: resolveGoodwillImpairment, name: "goodwill impairment" },
     {
       labels: ["Other Non-Operating Income (Expense)", "Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)"],
       resolver: resolveOtherNonOperatingIncomeExpense,
