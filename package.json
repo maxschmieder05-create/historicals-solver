@@ -24,6 +24,7 @@
     "test:goog-operating-income": "node scripts/goog-operating-income-regression-check.js",
     "test:nvda-income-statement": "node scripts/nvda-income-statement-regression-check.js",
     "test:ibm-income-statement-classification": "node scripts/ibm-income-statement-classification-check.js",
+    "test:lly-income-statement-classification": "node scripts/lly-income-statement-classification-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",
     "test:balance-sheet-conservation": "node scripts/balance-sheet-conservation-check.js",
     "test:first-run-balance-sheet": "BALANCE_SHEET_CONSERVATION_CASES=ORCL node scripts/balance-sheet-conservation-check.js",
