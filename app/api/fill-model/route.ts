@@ -14,6 +14,11 @@ import {
   currentDebtBelongsInAccruedLiabilities
 } from "./liability-classification";
 import { loadSecBulkSupport, readSecBulkSubmissionFile, type SecBulkSupport } from "./sec-bulk";
+import {
+  fetchSecFilingPackageSupport,
+  type SecFilingPackageRequest,
+  type SecFilingStatementStructure
+} from "./sec-filing-package";
 
 export const runtime = "nodejs";
 export const maxDuration = 900;
@@ -51,7 +56,7 @@ type FactSource = {
   cik?: string;
   unit?: string;
   taxonomy?: string;
-  sourceLayer?: "sec_bulk_companyfacts" | "sec_live_companyfacts" | "sec_inline_xbrl" | "derived" | "model";
+  sourceLayer?: "sec_bulk_companyfacts" | "sec_live_companyfacts" | "sec_inline_xbrl" | "sec_filing_package" | "derived" | "model";
   form?: string;
   fp?: string;
   filed?: string;
@@ -163,12 +168,14 @@ type ResolveContext = {
   duration: Map<string, Map<string, FactSource>>;
   instant: Map<string, Map<string, FactSource>>;
   commentary?: Map<string, FilingCommentaryEvidence[]>;
+  filingPackageStatements?: SecFilingStatementStructure[];
   template?: TemplateMappingContext;
   fiscalPeriods?: FiscalPeriodMap;
 };
 
 type PipelineLayer =
   | "edgar_extraction"
+  | "filing_package_parsing"
   | "concept_normalization"
   | "template_profile_detection"
   | "row_classification"
@@ -3786,6 +3793,17 @@ function buildNormalizedHistoricalsPackage(
       message: `${profile.kind} profile selected with ${profile.confidence} confidence: ${profile.rationale.join(" ")}`
     }
   ];
+  if (ctx.filingPackageStatements?.length) {
+    const packageAccessions = unique(ctx.filingPackageStatements.map((statement) => statement.accession));
+    const primaryStatementRows = ctx.filingPackageStatements
+      .filter((statement) => statement.sourceTableType === "primary_statement")
+      .reduce((sum, statement) => sum + statement.rows.length, 0);
+    diagnostics.push({
+      layer: "filing_package_parsing",
+      severity: "info",
+      message: `Parsed SEC filing packages for ${packageAccessions.length} selected accession(s), including ${primaryStatementRows} primary-statement row fact(s).`
+    });
+  }
 
   const rules: Array<{
     key: NormalizedMetricKey;
@@ -4013,6 +4031,11 @@ export async function POST(request: NextRequest) {
         422
       );
     }
+    const filingPackageSupport = await fetchSecFilingPackageSupport(
+      selectedFilingPackageRequests(company, modelPeriodMap.entries, filingMetadata),
+      SEC_HEADERS
+    );
+    ctx.filingPackageStatements = filingPackageSupport.statements;
     markReportedPeriodColumns(sheet, reportedPeriodPairs);
     normalizeSharedFormulas(workbook);
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
@@ -4035,6 +4058,7 @@ export async function POST(request: NextRequest) {
     let commentsAdded = 0;
     warnings.push(...coverWarnings);
     warnings.push(...bulkSupport.warnings);
+    warnings.push(...filingPackageSupport.warnings);
     warnings.push(...missingReportedFilingPeriodWarnings(sheet, ctx));
     if (bulkSupport.latestRefreshAt) warnings.push(`SEC bulk support latest archive timestamp: ${bulkSupport.latestRefreshAt}.`);
     warnings.push(...normalizedPackage.diagnostics.filter((item) => item.severity !== "info").map((item) => `${item.layer}: ${item.message}`));
@@ -5134,6 +5158,12 @@ function mergeContexts(target: ResolveContext, source: ResolveContext) {
   if (!target.fiscalPeriods && source.fiscalPeriods) target.fiscalPeriods = source.fiscalPeriods;
   source.instant.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.instant, period, concept, fact)));
   source.duration.forEach((facts, period) => facts.forEach((fact, concept) => setSource(target.duration, period, concept, fact)));
+  if (source.filingPackageStatements?.length) {
+    target.filingPackageStatements = [
+      ...(target.filingPackageStatements ?? []),
+      ...source.filingPackageStatements
+    ];
+  }
   source.commentary?.forEach((items, period) => {
     const existing = target.commentary?.get(period) ?? [];
     const merged = uniqueCommentaryEvidence([...existing, ...items]);
@@ -6427,6 +6457,27 @@ function buildModelPeriodMap(pairs: Array<{ period: string; col: number }>, ctx:
   }
 
   return { entries, missing };
+}
+
+function selectedFilingPackageRequests(
+  company: CompanyMatch,
+  modelPeriods: ModelPeriodMapEntry[],
+  filingMetadata: Map<string, FilingRef>
+): SecFilingPackageRequest[] {
+  const requests: SecFilingPackageRequest[] = [];
+  for (const entry of modelPeriods) {
+    const filing = filingMetadata.get(entry.accessionKey);
+    if (!filing?.primaryDocument) continue;
+    requests.push({
+      cik: company.cik,
+      accessionNumber: filing.accessionNumber,
+      form: filing.form,
+      filingDate: filing.filingDate,
+      reportDate: filing.reportDate,
+      primaryDocument: filing.primaryDocument
+    });
+  }
+  return requests;
 }
 
 function primaryFilingEntryForModelPeriod(period: string, ctx: ResolveContext) {
