@@ -10,6 +10,7 @@ export type TemplateMappingContext = {
   hasCurrentDebtMaturitiesRow: boolean;
   hasShortTermBorrowingsRow: boolean;
   hasCurrentLiabilitiesExcludingDebtRow: boolean;
+  hasOtherCurrentLiabilityRow: boolean;
   hasDebtInclCurrentPortionRow: boolean;
   hasDeferredTaxLiabilityRow: boolean;
   hasNonCurrentLeaseLiabilityRow: boolean;
@@ -49,10 +50,14 @@ export const CURRENT_DEBT_CONCEPTS = [
   "ShortTermBorrowings",
   "ShortTermBorrowingsCurrent",
   "OtherShortTermBorrowings",
+  "CurrentBorrowings",
   "NotesPayableCurrent",
   "LoansPayableCurrent",
   "CommercialPaper",
   "CommercialPaperCurrent",
+  "RevolvingCreditFacility",
+  "RevolvingCreditFacilityCurrent",
+  "CreditFacilityCurrent",
   "LineOfCreditFacilityCurrentBorrowings",
   "LongTermDebtAndFinanceLeaseObligationsCurrent",
   "LongTermDebtAndCapitalLeaseObligationsCurrent",
@@ -64,8 +69,6 @@ const CURRENT_DEBT_MATURITY_CONCEPTS = [
   "LongTermDebtCurrent",
   "CurrentPortionOfLongTermDebt",
   "CurrentMaturitiesOfLongTermDebt",
-  "NotesPayableCurrent",
-  "LoansPayableCurrent",
   "LongTermDebtAndFinanceLeaseObligationsCurrent",
   "LongTermDebtAndCapitalLeaseObligationsCurrent",
   "FinanceLeaseLiabilityCurrent",
@@ -75,9 +78,15 @@ const SHORT_TERM_BORROWING_CONCEPTS = [
   "ShortTermBorrowings",
   "ShortTermBorrowingsCurrent",
   "OtherShortTermBorrowings",
+  "CurrentBorrowings",
   "CommercialPaper",
   "CommercialPaperCurrent",
-  "LineOfCreditFacilityCurrentBorrowings"
+  "LineOfCreditFacilityCurrentBorrowings",
+  "RevolvingCreditFacility",
+  "RevolvingCreditFacilityCurrent",
+  "CreditFacilityCurrent",
+  "NotesPayableCurrent",
+  "LoansPayableCurrent"
 ];
 const CURRENT_INVESTMENT_CONCEPTS = [
   "MarketableSecuritiesCurrent",
@@ -112,8 +121,6 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
       /^currentportionoflongtermdebt$/,
       /^currentmaturitiesoflongtermdebt$/,
       /^debtduewithinoneyear$/,
-      /^notespayablecurrent$/,
-      /^currentnotespayable$/,
       /^currentfinanceleaseliabilities$/,
       /^financeleaseliabilitiescurrent$/
     ]);
@@ -122,11 +129,17 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
     hasAnyLabel([
       /^shorttermdebt$/,
       /^shorttermborrowings$/,
+      /^currentborrowings$/,
       /^commercialpaper$/,
       /^revolver$/,
       /^revolvingcreditfacility$/,
+      /^creditfacilitycurrent$/,
       /^lineofcredit$/,
-      /^lineofcreditborrowings$/
+      /^lineofcreditborrowings$/,
+      /^notespayablecurrent$/,
+      /^currentnotespayable$/,
+      /^loanspayablecurrent$/,
+      /^currentloanspayable$/
     ]);
 
   return {
@@ -155,6 +168,7 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
       /^currentliabilitiesnetofdebt$/,
       /^currentliabilitieswithoutdebt$/
     ]),
+    hasOtherCurrentLiabilityRow: hasAnyLabel([/^othercurrentliabilities$/, /^othercurrentliabs$/]),
     hasDebtInclCurrentPortionRow: hasAnyLabel([
       /^ltdebtinclcurrentportion$/,
       /^longtermdebtinclcurrentportion$/,

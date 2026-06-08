@@ -9,7 +9,8 @@ const outputWorkbook = process.env.AMZN_LIABILITY_OUTPUT_WORKBOOK || path.join(r
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
 const expectedCells = [
-  ["Model", "F135", 59606, "1Q23 accrued liabilities excluding current debt"],
+  ["Model", "F135", 51854, "1Q23 accrued liabilities excluding current debt and current operating lease liabilities"],
+  ["Model", "F136", 22033, "1Q23 other current liabilities including contract and current operating lease liabilities"],
   ["Model", "F139", 1100, "1Q23 short-term borrowings / revolver"],
   ["Model", "F140", 72760, "1Q23 LT debt including current maturities"],
   ["Model", "F142", 95198, "1Q23 other non-current liabilities"],
@@ -60,6 +61,12 @@ async function main() {
       }
       if (cell === "F139" && !/ShortTermBorrowings=1100mm/.test(concepts)) {
         errors.push("Model!F139 should map short-term borrowings to the revolver / short-term debt row.");
+      }
+      if (cell === "F136" && !/ContractWithCustomerLiabilityCurrent=14281mm/.test(concepts)) {
+        errors.push("Model!F136 should include current contract liabilities in other current liabilities.");
+      }
+      if (cell === "F136" && !/OperatingLeaseLiabilityCurrent=7752mm/.test(concepts)) {
+        errors.push("Model!F136 should include current operating lease liabilities in other current liabilities.");
       }
       if (cell === "F140" && !/LongTermDebtCurrent=2000mm/.test(concepts)) {
         errors.push("Model!F140 should include current maturities of long-term debt.");

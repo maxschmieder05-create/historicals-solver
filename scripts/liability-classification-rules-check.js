@@ -72,9 +72,11 @@ assert.equal(
 
 const currentLiabilitiesExDebtContext = buildLiabilityTemplateMappingContext([
   ...baseRows,
+  { statement: "balance", label: "Other Current Liabilities" },
   { statement: "balance", label: "Total Current Liabilities (Excl. Debt)" }
 ]);
 assert.equal(currentLiabilitiesExDebtContext.hasCurrentLiabilitiesExcludingDebtRow, true);
+assert.equal(currentLiabilitiesExDebtContext.hasOtherCurrentLiabilityRow, true);
 assert.equal(currentDebtBelongsInAccruedLiabilities(currentLiabilitiesExDebtContext), false);
 assert.equal(
   accruedLiabilityResidual(
@@ -136,6 +138,13 @@ assert.equal(
   ),
   550
 );
+
+const notesPayableCurrentContext = buildLiabilityTemplateMappingContext([
+  ...baseRows,
+  { statement: "balance", label: "Notes Payable, Current" }
+]);
+assert.equal(notesPayableCurrentContext.hasShortTermBorrowingsRow, true);
+assert.equal(notesPayableCurrentContext.hasCurrentDebtMaturitiesRow, false);
 
 const explicitLeaseAndPensionContext = buildLiabilityTemplateMappingContext([
   ...baseRows,
