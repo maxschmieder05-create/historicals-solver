@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -12,6 +12,10 @@ type FillSummary = {
   warnings: string[];
 };
 
+function hasTransferredFiles(dataTransfer: DataTransfer | null) {
+  return Array.from(dataTransfer?.types ?? []).includes("Files");
+}
+
 export default function Home() {
   const [ticker, setTicker] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -20,54 +24,85 @@ export default function Home() {
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedFileKeyRef = useRef("");
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
-  useEffect(() => {
-    function preventBrowserFileOpen(event: globalThis.DragEvent) {
-      if (!event.dataTransfer?.types.includes("Files")) return;
-      event.preventDefault();
-    }
-
-    window.addEventListener("dragover", preventBrowserFileOpen);
-    window.addEventListener("drop", preventBrowserFileOpen);
-    return () => {
-      window.removeEventListener("dragover", preventBrowserFileOpen);
-      window.removeEventListener("drop", preventBrowserFileOpen);
-    };
+  const clearFileInput = useCallback(() => {
+    if (!fileInputRef.current) return;
+    fileInputRef.current.value = "";
+    selectedFileKeyRef.current = "";
   }, []);
 
-  function syncFileInput(nextFile: File | null) {
-    if (!fileInputRef.current) return;
-    if (!nextFile) {
-      fileInputRef.current.value = "";
-      return;
-    }
-    const dataTransfer = new DataTransfer();
-    dataTransfer.items.add(nextFile);
-    fileInputRef.current.files = dataTransfer.files;
-  }
+  const fileKey = useCallback((nextFile: File) => `${nextFile.name}:${nextFile.size}:${nextFile.lastModified}`, []);
 
   function formatFileSize(bytes: number) {
     if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`;
     return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   }
 
-  function pickFile(nextFile?: File, options: { syncInput?: boolean } = {}) {
+  const pickFile = useCallback((nextFile?: File) => {
     setError("");
     setSummary(null);
     if (!nextFile) return;
     if (!nextFile.name.toLowerCase().endsWith(".xlsx")) {
       setFile(null);
-      syncFileInput(null);
+      clearFileInput();
       setError(`${nextFile.name} is not an .xlsx workbook.`);
       return;
     }
+    selectedFileKeyRef.current = fileKey(nextFile);
     setFile(nextFile);
-    if (options.syncInput) syncFileInput(nextFile);
-  }
+  }, [clearFileInput, fileKey]);
 
-  function handleDrag(event: DragEvent<HTMLDivElement>) {
+  useEffect(() => {
+    function syncInputSelection() {
+      const nextFile = fileInputRef.current?.files?.item(0) ?? undefined;
+      if (!nextFile || fileKey(nextFile) === selectedFileKeyRef.current) return;
+      pickFile(nextFile);
+    }
+
+    function syncInputSelectionSoon() {
+      syncInputSelection();
+      window.requestAnimationFrame(syncInputSelection);
+      window.setTimeout(syncInputSelection, 250);
+    }
+
+    function handleWindowDragOver(event: globalThis.DragEvent) {
+      if (!hasTransferredFiles(event.dataTransfer)) return;
+      event.preventDefault();
+      setIsDragging(true);
+    }
+
+    function handleWindowDrop(event: globalThis.DragEvent) {
+      const transfer = event.dataTransfer;
+      if (!hasTransferredFiles(transfer)) return;
+      event.preventDefault();
+      setIsDragging(false);
+      pickFile(transfer?.files?.[0]);
+    }
+
+    function handleWindowFocus() {
+      syncInputSelectionSoon();
+    }
+
+    function handleVisibilityChange() {
+      if (document.visibilityState === "visible") syncInputSelectionSoon();
+    }
+
+    window.addEventListener("dragover", handleWindowDragOver);
+    window.addEventListener("drop", handleWindowDrop);
+    window.addEventListener("focus", handleWindowFocus);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("dragover", handleWindowDragOver);
+      window.removeEventListener("drop", handleWindowDrop);
+      window.removeEventListener("focus", handleWindowFocus);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [fileKey, pickFile]);
+
+  function handleDrag(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
@@ -79,15 +114,29 @@ export default function Home() {
     if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLDivElement>) {
+  function handleDrop(event: DragEvent<HTMLLabelElement>) {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
-    pickFile(event.dataTransfer.files?.[0], { syncInput: true });
+    pickFile(event.dataTransfer.files?.[0]);
+  }
+
+  function pickInputFile(input: HTMLInputElement) {
+    pickFile(input.files?.item(0) ?? undefined);
   }
 
   function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
-    pickFile(event.currentTarget.files?.item(0) ?? undefined);
+    pickInputFile(event.currentTarget);
+  }
+
+  function handleFileInput(event: FormEvent<HTMLInputElement>) {
+    pickInputFile(event.currentTarget);
+  }
+
+  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLLabelElement>) {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    fileInputRef.current?.click();
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -207,8 +256,13 @@ export default function Home() {
             </div>
           </div>
 
-          <div
+          <label
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
+            htmlFor="model-template-file"
+            role="button"
+            tabIndex={0}
+            aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
+            onKeyDown={handleDropzoneKeyDown}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}
@@ -237,11 +291,12 @@ export default function Home() {
               accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               onChange={handleFileSelect}
+              onInput={handleFileInput}
               onClick={(event) => {
                 event.currentTarget.value = "";
               }}
             />
-          </div>
+          </label>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
