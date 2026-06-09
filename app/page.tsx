@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -73,7 +73,7 @@ export default function Home() {
     fileInputRef.current.click();
   }
 
-  function handleDrag(event: DragEvent<HTMLLabelElement>) {
+  function handleDrag(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
@@ -85,7 +85,7 @@ export default function Home() {
     if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+  function handleDrop(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
@@ -94,12 +94,6 @@ export default function Home() {
 
   function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
     pickFile(event.currentTarget.files?.item(0) ?? undefined);
-  }
-
-  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLLabelElement>) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    openFilePicker();
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -219,12 +213,20 @@ export default function Home() {
             </div>
           </div>
 
-          <label
+          <input
+            id="model-template-file"
+            ref={fileInputRef}
+            className="fileInput"
+            type="file"
+            name="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            onChange={handleFileSelect}
+          />
+          <button
+            type="button"
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
-            role="button"
-            tabIndex={0}
             aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
-            onKeyDown={handleDropzoneKeyDown}
+            onClick={openFilePicker}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}
@@ -244,18 +246,7 @@ export default function Home() {
               <small>Click to browse or drag in an .xlsx file</small>
             )}
             <span className="browseCue">Choose workbook</span>
-            <input
-              id="model-template-file"
-              ref={fileInputRef}
-              className="fileInput"
-              type="file"
-              name="file"
-              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              aria-hidden="true"
-              tabIndex={-1}
-              onChange={handleFileSelect}
-            />
-          </label>
+          </button>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}

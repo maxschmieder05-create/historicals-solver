@@ -222,6 +222,7 @@ input::placeholder {
 }
 
 .dropzone {
+  appearance: none;
   position: relative;
   min-height: 218px;
   border: 1.5px dashed #8da8bf;
@@ -236,6 +237,7 @@ input::placeholder {
   padding: 28px;
   text-align: center;
   color: var(--ink);
+  font: inherit;
   font-weight: 400;
   cursor: pointer;
   user-select: none;
