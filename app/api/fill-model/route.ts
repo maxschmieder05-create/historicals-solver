@@ -6152,6 +6152,15 @@ function revenueDisclosureCanReconcile(actual: number, expected: number) {
   return residual <= Math.max(absoluteTolerance, Math.abs(expected) * 0.05);
 }
 
+function revenueDisclosureCanRepairWithResidual(actual: number, expected: number, positiveDetailRows: number) {
+  if (revenueDisclosureCanReconcile(actual, expected)) return true;
+  if (Math.abs(expected) <= 0.0001) return Math.abs(actual) <= 0.0001;
+  const residual = expected - actual;
+  if (residual <= 0) return false;
+  const coverage = Math.abs(actual / expected);
+  return actual > 0 && (coverage >= 0.25 || positiveDetailRows >= 2);
+}
+
 function segmentMetric(concept: string): SegmentMetricKey | null {
   const local = concept.split(":").pop() ?? concept;
   if (/^(RevenueFromContractWithCustomerExcludingAssessedTax|Revenues|SalesRevenueNet)$/i.test(local)) return "revenue";
@@ -6252,8 +6261,13 @@ function inlineSegmentDurationPeriod(
       sourcePeriodPriority: fiscalFocus && periodYear(annualPeriod) === fiscalFocus.fy ? 2 : 1
     };
   }
-  if (days <= 115) return { period, periodType: "quarterly" };
-  if (days < 330) return { period, periodType: "year_to_date" };
+  const focusedPeriod =
+    fiscalFocus && fiscalFocus.fp !== "FY"
+      ? `${Number(fiscalFocus.fp.slice(1))}Q${String(fiscalFocus.fy).slice(-2)}`
+      : null;
+  const sourcePeriodPriority = focusedPeriod && period === focusedPeriod ? 2 : 1;
+  if (days <= 115) return { period, periodType: "quarterly", sourcePeriodPriority };
+  if (days < 330) return { period, periodType: "year_to_date", sourcePeriodPriority };
   return null;
 }
 
@@ -6343,13 +6357,17 @@ function cleanSegmentMember(member: string) {
     .replace(/\bAnd\b/g, "and")
     .replace(/\s+/g, " ")
     .trim();
-  if (!local || /Consolidated|Corporate|Geographic|Operating Segments/i.test(local) || /^Group\s*\d+$/i.test(local)) return null;
+  if (!local || isGenericInlineSegmentMemberLabel(local) || /^Group\s*\d+$/i.test(local)) return null;
   if (isNumericOrCurrencyHeavySegmentLabel(local)) return null;
   if (/^IPhone$/i.test(local)) return "iPhone";
   if (/^IPad$/i.test(local)) return "iPad";
   if (/^Service$/i.test(local)) return "Services";
   if (/^Wearables Homeand Accessories$/i.test(local)) return "Wearables, Home and Accessories";
   return local;
+}
+
+function isGenericInlineSegmentMemberLabel(label: string) {
+  return /^(Consolidated|Geographic|Operating Segments?|Reportable Segments?|Segments?|Total)$/i.test(label.trim());
 }
 
 function ixNumber(text: string, attrs: string) {
@@ -7664,6 +7682,7 @@ function reconcileRevenueSegmentsToStatement(
   let hasExpectedRevenue = false;
   let needsResidual = false;
   let hasUnreliablePeriod = false;
+  const hasAnySegmentRevenue = hasSegmentMetricData(segments, "values", periods);
 
   periods.forEach((period) => {
     const expected = resolveTotalRevenue(period, ctx).value;
@@ -7671,8 +7690,14 @@ function reconcileRevenueSegmentsToStatement(
     hasExpectedRevenue = true;
 
     const actual = segments.reduce((sum, segment) => sum + (segment.values.get(period) ?? 0), 0);
+    const positiveDetailRows = segments.filter((segment) => Math.abs(segment.values.get(period) ?? 0) > 0.0001).length;
     if (Math.abs(actual) <= 0.0001 && Math.abs(expected) > 0.0001) {
-      hasUnreliablePeriod = true;
+      if (!hasAnySegmentRevenue) {
+        hasUnreliablePeriod = true;
+        return;
+      }
+      residualValues.set(period, expected);
+      needsResidual = true;
       return;
     }
     if (segmentStatementMetricTies(segmentComparableModelAmount(actual, expected), segmentComparableModelAmount(expected, expected))) return;
@@ -7681,7 +7706,7 @@ function reconcileRevenueSegmentsToStatement(
     const negativeResidualTolerance = Math.abs(expected) >= 1_000_000 ? Math.max(1_000_000, Math.abs(expected) * 0.005) : Math.max(1, Math.abs(expected) * 0.005);
     const canReconcileResidual =
       residual >= 0
-        ? revenueDisclosureCanReconcile(actual, expected)
+        ? revenueDisclosureCanRepairWithResidual(actual, expected, positiveDetailRows)
         : Math.abs(residual) <= negativeResidualTolerance;
     if (!canReconcileResidual) {
       hasUnreliablePeriod = true;
@@ -7797,16 +7822,22 @@ function selectSegmentFamilyForTemplate(
   const candidates = segmentFamilyCandidates(segments, maxRows);
   const scored = candidates
     .map((candidate) => ({ candidate, score: scoreSegmentFamilyCandidate(candidate.segments, periods, ctx, candidate.family) }))
-    .filter(({ score }) => score.tieCount > 0)
+    .filter(({ score }) => score.tieCount > 0 || score.repairableCount > 0)
     .sort((a, b) => {
       if (a.score.disclosurePriority !== b.score.disclosurePriority) return a.score.disclosurePriority - b.score.disclosurePriority;
       if (a.score.badCount !== b.score.badCount) return a.score.badCount - b.score.badCount;
+      if (a.score.missingCount !== b.score.missingCount) return a.score.missingCount - b.score.missingCount;
+      if (b.score.familyPreference !== a.score.familyPreference) return b.score.familyPreference - a.score.familyPreference;
       if (b.score.tieCount !== a.score.tieCount) return b.score.tieCount - a.score.tieCount;
+      if (b.score.repairableCount !== a.score.repairableCount) return b.score.repairableCount - a.score.repairableCount;
+      if (b.score.coverageScore !== a.score.coverageScore) return b.score.coverageScore - a.score.coverageScore;
       if (b.score.detailRows !== a.score.detailRows) return b.score.detailRows - a.score.detailRows;
       return a.score.totalError - b.score.totalError;
     });
   const reconciled = scored.filter(({ score }) => score.tieCount > 0 && score.badCount === 0);
-  return reconciled[0] ? orderRevenueDisclosureSegments(reconciled[0].candidate.segments, periods) : [];
+  const repairable = scored.filter(({ score }) => score.badCount === 0 && score.repairableCount > 0);
+  const selected = reconciled[0] ?? repairable[0];
+  return selected ? orderRevenueDisclosureSegments(selected.candidate.segments, periods) : [];
 }
 
 function selectSegmentFamilyForMetric(
@@ -7895,28 +7926,38 @@ function scoreSegmentMetricCandidate(
 
 function scoreSegmentFamilyCandidate(segments: SegmentRevenue[], periods: string[], ctx: ResolveContext, family: string) {
   let tieCount = 0;
+  let repairableCount = 0;
   let badCount = 0;
+  let missingCount = 0;
   let totalError = 0;
+  let coverageScore = 0;
 
   periods.forEach((period) => {
     const expected = resolveTotalRevenue(period, ctx).value ?? undefined;
     if (expected === undefined) return;
     const actual = segments.reduce((sum, segment) => sum + (segment.values.get(period) ?? 0), 0);
+    const positiveDetailRows = segments.filter((segment) => Math.abs(segment.values.get(period) ?? 0) > 0.0001).length;
     if (Math.abs(actual) <= 0.0001) {
-      if (Math.abs(expected) > 0.0001) badCount += 1;
+      if (Math.abs(expected) > 0.0001) missingCount += 1;
       return;
     }
     const error = Math.abs(actual - expected);
     totalError += error;
+    coverageScore += Math.min(1, Math.max(0, actual / expected));
     if (revenueDisclosureCanReconcile(actual, expected)) tieCount += 1;
+    else if (revenueDisclosureCanRepairWithResidual(actual, expected, positiveDetailRows)) repairableCount += 1;
     else badCount += 1;
   });
 
   return {
     tieCount,
+    repairableCount,
     badCount,
+    missingCount,
     totalError,
+    coverageScore,
     detailRows: segments.filter((segment) => !segment.aggregate).length,
+    familyPreference: family === "all" ? 0 : 1,
     disclosurePriority: Math.min(...segments.map((segment) => segment.disclosurePriority ?? revenueDisclosurePriority(segment.disclosureKind)))
   };
 }
@@ -8153,7 +8194,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
       const residualRow = findSegmentResidualRow(sheet, rows, col, suffix);
       if (residualRow) {
         const cell = sheet.getCell(residualRow, col);
-        if (writeSegmentMetricCell(cell, gap)) {
+        if (writeSegmentMetricPreservingFormula(cell, gap)) {
           filledCells += 1;
           evaluator.clear();
           const note = lineItemSentence(rowLabel(sheet, residualRow), [sourceLineItemLabel(expectedSource)], "includes");
@@ -8193,7 +8234,7 @@ function reconcileSegmentMetricRowsToStatementTotal(
 
 function canUseSegmentResidualForStatementGap(gap: number, expected: number) {
   if (Math.abs(gap) <= 0.05) return false;
-  if (gap >= 0) return gap <= Math.max(100, Math.abs(expected) * 0.05);
+  if (gap >= 0) return expected > 0 && gap < Math.abs(expected);
   return Math.abs(gap) <= Math.max(1, Math.abs(expected) * 0.005);
 }
 
@@ -8205,7 +8246,7 @@ function segmentMetricRowsTotal(sheet: ExcelJS.Worksheet, rows: number[], col: n
 }
 
 function findSegmentResidualRow(sheet: ExcelJS.Worksheet, rows: number[], col: number, suffix: string) {
-  const writableRows = rows.filter((rowNumber) => isSegmentMetricInputCell(sheet.getCell(rowNumber, col)));
+  const writableRows = rows.filter((rowNumber) => isSegmentMetricWritableCell(sheet.getCell(rowNumber, col)));
   const nonGenericRows = writableRows.filter((rowNumber) => !isGenericSegmentPlaceholder(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix)));
   const preferred = nonGenericRows.slice().reverse().find((rowNumber) =>
     /other|corporate|unallocated|elimination|reconciliation|residual/i.test(segmentBaseLabel(segmentRowLabel(sheet, rowNumber, suffix), suffix))
@@ -8338,7 +8379,7 @@ function fillSegmentMetricRows(
     periods.forEach((period, periodIndex) => {
       const cell = sheet.getCell(rowNumber, columns[periodIndex]);
       const value = (segment[metric].get(period) ?? 0) / 1_000_000;
-      if (!writeSegmentMetricCell(cell, value, { overwriteFormula: true })) return;
+      if (!writeSegmentMetricPreservingFormula(cell, value, { sheet, rowNumber, columns, periods, periodIndex, segment, metric })) return;
       filledCells += 1;
       const resolved = segmentResolvedValue(segment, metric, period);
       const comment = mappingCommentForSegment(sheet, cell, existingLabel, segment, period, value, suffix);
@@ -8348,6 +8389,71 @@ function fillSegmentMetricRows(
   }
 
   return { filledCells, commentsAdded };
+}
+
+function writeSegmentMetricPreservingFormula(
+  cell: ExcelJS.Cell,
+  value: number,
+  bridgeContext?: {
+    sheet: ExcelJS.Worksheet;
+    rowNumber: number;
+    columns: number[];
+    periods: string[];
+    periodIndex: number;
+    segment: SegmentRevenue;
+    metric: SegmentMetricMapKey;
+  }
+) {
+  const wroteFormula =
+    writeSegmentExternalFormulaResult(cell, value) ||
+    (bridgeContext
+      ? writeSegmentFourthQuarterBridgeFormula(
+          bridgeContext.sheet,
+          bridgeContext.rowNumber,
+          bridgeContext.columns,
+          bridgeContext.periods,
+          bridgeContext.periodIndex,
+          bridgeContext.segment,
+          bridgeContext.metric,
+          value
+        )
+      : false);
+  return wroteFormula || writeSegmentMetricCell(cell, value, { overwriteFormula: true });
+}
+
+function writeSegmentExternalFormulaResult(cell: ExcelJS.Cell, value: number) {
+  const formula = formulaForCell(cell);
+  if (!formula || !formula.includes("!")) return false;
+  cell.value = { formula, result: value };
+  return true;
+}
+
+function writeSegmentFourthQuarterBridgeFormula(
+  sheet: ExcelJS.Worksheet,
+  rowNumber: number,
+  columns: number[],
+  periods: string[],
+  periodIndex: number,
+  segment: SegmentRevenue,
+  metric: SegmentMetricMapKey,
+  value: number
+) {
+  const period = periods[periodIndex];
+  if (metric !== "values" || !isFourthQuarterPeriod(period)) return false;
+  const cell = sheet.getCell(rowNumber, columns[periodIndex]);
+  const existingFormula = formulaForCell(cell);
+  if (!existingFormula || existingFormula.includes("!")) return false;
+  const year = periodYearSuffix(period);
+  const annualValue = segment.annualValues?.get(`FY${year}`);
+  if (annualValue === undefined || Math.abs(annualValue) <= 0.0001) return false;
+  const quarterColumns = [`1Q${year}`, `2Q${year}`, `3Q${year}`].map((quarter) => {
+    const quarterIndex = periods.indexOf(quarter);
+    return quarterIndex >= 0 ? columns[quarterIndex] : null;
+  });
+  if (!quarterColumns.every((col): col is number => col !== null)) return false;
+  const formula = `${roundModelValue(annualValue / 1_000_000)}-SUM(${columnLetter(quarterColumns[0])}${rowNumber}:${columnLetter(quarterColumns[2])}${rowNumber})`;
+  cell.value = { formula, result: value };
+  return true;
 }
 
 function writeSegmentMetricCell(cell: ExcelJS.Cell, value: number, options: { overwriteFormula?: boolean } = {}) {
@@ -8436,11 +8542,11 @@ function clearUnmatchedSegmentRow(
   let commentsAdded = 0;
   periods.forEach((period, periodIndex) => {
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-    const canClearCell = isSegmentMetricInputCell(cell) || Boolean(formulaBridgeForTargetValue(cell, 0)) || hasFormula(cell);
+    const canClearCell = isSegmentMetricWritableCell(cell) || hasFormula(cell);
     if (!canClearCell) return;
     const existing = numericCellValue(cell);
     if (existing === 0 || existing === null) return;
-    if (!writeSegmentMetricCell(cell, 0, { overwriteFormula: true })) cell.value = 0;
+    if (!writeSegmentMetricPreservingFormula(cell, 0)) cell.value = 0;
     filledCells += 1;
     const notes = "Needs review: Segment Analysis row was not filled because the template label is blank, generic, or does not confidently match an EDGAR reportable segment.";
     if (addComment(cell, notes)) commentsAdded += 1;
@@ -8498,17 +8604,31 @@ function segmentMetricRows(sheet: ExcelJS.Worksheet, startLabel: string, endLabe
   if (!startRow || !endRow || endRow <= startRow) return [];
   const rows: number[] = [];
   for (let rowNumber = startRow + 1; rowNumber < endRow; rowNumber += 1) {
-    if (rowLabel(sheet, rowNumber) && rowHasSegmentMetricInputs(sheet, rowNumber, columns)) rows.push(rowNumber);
+    if (rowHasSegmentMetricInputs(sheet, rowNumber, columns)) rows.push(rowNumber);
   }
-  return rows;
+  if (normalize(startLabel) === normalize("Total Company Revenue")) {
+    const rowCount = Math.min(segmentMixLabelRows(sheet).length, endRow - startRow - 1);
+    for (let offset = 1; offset <= rowCount; offset += 1) rows.push(startRow + offset);
+  }
+  return uniqueNumbers(rows).sort((a, b) => a - b);
 }
 
 function rowHasSegmentMetricInputs(sheet: ExcelJS.Worksheet, rowNumber: number, columns: number[]) {
-  return columns.some((col) => isSegmentMetricInputCell(sheet.getCell(rowNumber, col)));
+  return columns.some((col) => {
+    const cell = sheet.getCell(rowNumber, col);
+    if (hasFormula(cell)) return isSegmentMetricWritableCell(cell);
+    return isBlue(cell) || typeof cell.value === "number";
+  });
 }
 
 function isSegmentMetricInputCell(cell: ExcelJS.Cell) {
   return isHardcodedFinancialInput(cell);
+}
+
+function isSegmentMetricWritableCell(cell: ExcelJS.Cell) {
+  if (isSegmentMetricInputCell(cell)) return true;
+  const formula = formulaForCell(cell);
+  return Boolean(formula && (formula.includes("!") || formulaBridgeForTargetValue(cell, 0)));
 }
 
 function segmentMixLabelRows(sheet: ExcelJS.Worksheet) {
@@ -10857,7 +10977,7 @@ function validateWorkbookBeforeReturn(
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
   if (segmentSheet) {
-    const segmentEvaluator = new FormulaEvaluator(segmentSheet);
+    const segmentEvaluator = new FormulaEvaluator(segmentSheet, { useCachedFormulaResults: true, skipCrossSheetFormulas: true });
     const isFinancialCompanySegmentContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
     errors.push(...validateSegmentGenericRows(segmentSheet, periods, columns));
     if (isFinancialCompanySegmentContext) {
@@ -10964,7 +11084,11 @@ class FormulaEvaluator {
       result = value;
     } else if (value && typeof value === "object" && ("formula" in value || "sharedFormula" in value)) {
       const formula = formulaForCell(cell);
-      result = formula ? this.evaluateDisplayFormula(formula, cell, visited) : null;
+      if (formula && this.options.skipCrossSheetFormulas && formula.includes("!")) {
+        result = "result" in value && (typeof value.result === "number" || typeof value.result === "string") ? value.result : null;
+      } else {
+        result = formula ? this.evaluateDisplayFormula(formula, cell, visited) : null;
+      }
       if (result === null && "result" in value && (typeof value.result === "number" || typeof value.result === "string")) result = value.result;
     } else if (value && typeof value === "object" && "result" in value && (typeof value.result === "number" || typeof value.result === "string")) {
       result = value.result;
@@ -14238,7 +14362,10 @@ function insertWorkbookCalcPr(workbookXml: string, calcPr: string) {
 
 function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
   for (const sheet of workbook.worksheets) {
-    const evaluator = new FormulaEvaluator(sheet, { useCachedFormulaResults: false });
+    const evaluator =
+      sheet.name === SEGMENT_SHEET
+        ? new FormulaEvaluator(sheet, { useCachedFormulaResults: true, skipCrossSheetFormulas: true })
+        : new FormulaEvaluator(sheet, { useCachedFormulaResults: false });
     sheet.eachRow({ includeEmpty: false }, (row) => {
       row.eachCell({ includeEmpty: false }, (cell) => {
         if (!hasFormula(cell)) return;
