@@ -143,6 +143,12 @@ type LlmMappingDecision = {
   confidence: "high" | "medium" | "low";
   reason: string;
   requiresReview: boolean;
+  sourceLineItemLabel: string;
+  sourceStatement: "income" | "balance" | "cash_flow" | "segment" | "support" | "unknown";
+  sourceSection: string;
+  recommendedModelRow: string;
+  isSubtotalOrComponent: boolean;
+  excludeFromOtherBecauseDedicatedRowExists: boolean;
 };
 
 type LlmMappingState = {
@@ -462,6 +468,7 @@ const INTEREST_INCOME_CONCEPTS = [
 const INTEREST_EXPENSE_CONCEPTS = [
   "InterestExpenseOperating",
   "InterestExpenseNonOperating",
+  "InterestExpenseNonoperating",
   "InterestExpense",
   "InterestExpenseDebt",
   "InterestExpenseBorrowings",
@@ -660,7 +667,15 @@ const C = {
     "FinanceReceivablesNet",
     "FinancingReceivableRecordedInvestment"
   ],
-  inventory: ["InventoryNet"],
+  inventory: [
+    "AirlineRelatedInventoryNet",
+    "AirlineRelatedInventory",
+    "InventoryNet",
+    "InventoryFinishedGoods",
+    "InventoryWorkInProcess",
+    "InventoryRawMaterialsAndSupplies",
+    "InventoryPartsAndSupplies"
+  ],
   currentAssets: ["AssetsCurrent"],
   ppe: [
     "PropertyPlantAndEquipmentAndOperatingLeaseRightofUseAssetAfterAccumulatedDepreciationAndAmortization",
@@ -788,6 +803,21 @@ const FULFILLMENT_EXPENSE_CONCEPTS = [
   "FulfillmentAndShippingExpense"
 ];
 
+const DIRECT_OPERATING_COST_CONCEPTS = [
+  "FuelCosts",
+  "LaborAndRelatedExpense",
+  "SalariesWagesAndBenefits",
+  "SalariesAndWages",
+  "AirlineCapacityPurchaseArrangements",
+  "AircraftMaintenanceMaterialsAndRepairs",
+  "LandingFeesAndOtherRentals",
+  "AircraftRental",
+  "OtherCostAndExpenseOperating",
+  "OtherOperatingExpenses",
+  "OtherOperatingExpense",
+  ...FULFILLMENT_EXPENSE_CONCEPTS
+];
+
 const SALES_MARKETING_EXPENSE_CONCEPTS = [
   "SellingAndMarketingExpense",
   "SalesAndMarketingExpense",
@@ -816,6 +846,14 @@ const INCOME_STATEMENT_DA_CONCEPTS = [
   "DepreciationAndAmortizationExpense",
   "DepreciationDepletionAndAmortizationExpense",
   "DepreciationExpense"
+];
+
+const DIRECT_OTHER_NON_OPERATING_LINE_CONCEPTS = [
+  "OtherNonoperatingIncomeExpense",
+  "OtherIncome",
+  "OtherExpense",
+  "OtherIncomeExpenseNet",
+  "OtherNonOperatingIncomeExpense"
 ];
 
 const NONCONTROLLING_INCOME_CONCEPTS = [
@@ -889,6 +927,7 @@ const TOTAL_DEBT_AGGREGATE_CONCEPTS = [
 const TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS = [
   "DebtLongtermAndShorttermCombinedAmount",
   "LongTermDebtAndCapitalLeaseObligationsIncludingCurrentMaturities",
+  "LongTermDebtAndFinanceLeaseObligationsIncludingCurrentMaturities",
   "DebtAndCapitalLeaseObligations"
 ];
 
@@ -908,9 +947,9 @@ const SHORT_TERM_BORROWING_BALANCE_SHEET_CONCEPTS = [
 ];
 
 const CURRENT_DEBT_MATURITY_BALANCE_SHEET_CONCEPTS = [
-  "LongTermDebtCurrent",
   "CurrentPortionOfLongTermDebt",
   "CurrentMaturitiesOfLongTermDebt",
+  "LongTermDebtCurrent",
   "LongTermDebtAndFinanceLeaseObligationsCurrent",
   "LongTermDebtAndCapitalLeaseObligationsCurrent"
 ];
@@ -938,9 +977,13 @@ const BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS = [
   "OtherLiabilitiesNoncurrent",
   "AccruedIncomeTaxesNoncurrent",
   "LongTermIncomeTaxesPayable",
+  "FrequentFlierLiabilityNoncurrent",
+  "LoyaltyProgramLiabilityNoncurrent",
   "DeferredRevenueNoncurrent",
+  "DeferredRevenueAndCreditsNoncurrent",
   "DeferredIncomeNoncurrent",
   "ContractWithCustomerLiabilityNoncurrent",
+  "UnearnedRevenueNoncurrent",
   "CustomerAdvancesAndDepositsNoncurrent",
   "AssetRetirementObligationsNoncurrent"
 ];
@@ -1515,6 +1558,9 @@ function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValu
     };
   }
 
+  const directOperatingCosts = resolveDirectOperatingCostLines(period, ctx);
+  if (directOperatingCosts.value !== null) return directOperatingCosts;
+
   const component = sumWithNote(
     period,
     ctx.duration,
@@ -1531,7 +1577,83 @@ function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValu
         note: "Mapped to the closest consolidated SEC cost of revenue / cost of sales concept.",
         classification: "direct"
       }
-    : { value: null, sources: [], note: "No consolidated cost of revenue / cost of sales line was available for this period." };
+      : { value: null, sources: [], note: "No consolidated cost of revenue / cost of sales line was available for this period." };
+}
+
+function resolveDirectOperatingCostLines(period: string, ctx: ResolveContext): ResolvedValue {
+  const facts = ctx.duration.get(period);
+  if (!facts) {
+    return {
+      value: null,
+      sources: [],
+      note: "No duration facts were available for direct operating cost classification.",
+      classification: "grouped"
+    };
+  }
+
+  const sources = uniquePrimaryIncomeStatementLineSources(
+    period,
+    ctx,
+    Array.from(facts.values()).filter((source) => sourceIsDirectOperatingCostLine(period, ctx, source))
+  );
+  if (!sources.length) {
+    return {
+      value: null,
+      sources: [],
+      note: "No direct operating cost line items were available on the primary income statement.",
+      classification: "grouped"
+    };
+  }
+
+  return {
+    value: -sources.reduce((total, source) => total + Math.abs(source.value), 0),
+    sources,
+    note:
+      "Grouped from primary income-statement direct operating cost lines, excluding separately modeled SG&A, R&D, standalone income-statement D&A, and other operating income/expense.",
+    classification: "grouped"
+  };
+}
+
+function sourceIsDirectOperatingCostLine(period: string, ctx: ResolveContext, source: FactSource) {
+  if (!sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period, ctx, source)) return false;
+  if (isOperatingExpenseSubtotalSource(source)) return false;
+  if (sourceIsSeparatelyModeledOperatingExpense(source)) return false;
+
+  const text = sourceSearchText(source);
+  if (DIRECT_OPERATING_COST_CONCEPTS.includes(source.concept)) return true;
+  if (PRIMARY_COST_OF_REVENUE_CONCEPTS.includes(source.concept)) return true;
+  if (/\bcost\b.*\b(?:sales|revenue|operations?|services?|products?)\b|\b(?:sales|revenue|operations?|services?|products?)\b.*\bcost\b/.test(text)) return true;
+  if (/\bfuel\b|\baircraft\b.*\brent(?:al)?\b|\blanding fees?\b|\brentals?\b/.test(text)) return true;
+  if (/\bmaintenance\b.*\bmaterials?\b.*\brepairs?\b|\bmaterials?\b.*\brepairs?\b/.test(text)) return true;
+  if (/\bregional\b|\bcapacity purchase\b|\bcapacity purchase arrangements?\b/.test(text)) return true;
+  if (/\blabor\b|\bsalar(?:y|ies)\b|\bwages?\b|\bbenefits?\b/.test(text) && !/\bselling\b|\bmarketing\b|\badministrative\b/.test(text)) return true;
+  if (/\bother\b.*\b(?:cost|expense)s?\b.*\boperating\b|\bother operating expenses?\b/.test(text)) return true;
+  return false;
+}
+
+function isOperatingExpenseSubtotalSource(source: FactSource) {
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/costsandexpenses|operatingexpenses|operatingcostsandexpenses|totaloperatingexpenses|totalcostsandexpenses/.test(compact)) return true;
+  if (/\btotal\b.*\b(?:costs?|expenses?)\b|\b(?:costs?|expenses?)\b.*\btotal\b/.test(text)) return true;
+  return false;
+}
+
+function sourceIsSeparatelyModeledOperatingExpense(source: FactSource) {
+  if (isAcquiredInProcessResearchDevelopmentSource(source)) return true;
+  if (isOperatingSpecialChargeSource(source)) return true;
+  const text = sourceSearchText(source);
+  if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(source.concept)) return true;
+  if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(source.concept)) return true;
+  if (INCOME_STATEMENT_DA_CONCEPTS.includes(source.concept)) return true;
+  if (OTHER_OPERATING_INCOME_CONCEPTS.includes(source.concept) || source.concept === "OtherOperatingIncomeExpenseNet") return true;
+  if (/\bselling\b|\bmarketing\b|\bgeneral\b.*\badministrative\b|\bsg&a\b/.test(text)) return true;
+  if (/\bresearch\b|\bdevelopment\b|\br&d\b|\btechnology\b.*\bdevelopment\b|\bproduct development\b/.test(text)) return true;
+  if (/\bdepreciation\b|\bamortization\b|\bdepletion\b/.test(text)) return true;
+  if (/\brestructuring\b|\bimpairment\b|\bspecial items?\b|\bspecial charges?\b|\baccretion\b|\blitigation\b|\bsettlement\b|\bdivestitures?\b/.test(text)) {
+    return true;
+  }
+  return false;
 }
 
 function selectPrimaryStatementRevenueSource(period: string, ctx: ResolveContext) {
@@ -1796,9 +1918,19 @@ function primaryIncomeStatementBelowOperatingRowKeysForSource(period: string, ct
 
 function explicitOperatingLineFallback(source: FactSource) {
   return (
+    isExplicitDirectOperatingCostFallback(source) ||
     OTHER_OPERATING_INCOME_CONCEPTS.includes(source.concept) ||
     isAcquiredInProcessResearchDevelopmentSource(source) ||
     isOperatingSpecialChargeSource(source)
+  );
+}
+
+function isExplicitDirectOperatingCostFallback(source: FactSource) {
+  if (isOperatingExpenseSubtotalSource(source) || sourceIsSeparatelyModeledOperatingExpense(source)) return false;
+  const text = sourceSearchText(source);
+  if (DIRECT_OPERATING_COST_CONCEPTS.includes(source.concept) || PRIMARY_COST_OF_REVENUE_CONCEPTS.includes(source.concept)) return true;
+  return /\bfuel costs?\b|\blabor and related\b|\bsalar(?:y|ies)\b|\bwages?\b|\baircraft\b.*\brent(?:al)?\b|\blanding fees?\b|\bmaintenance\b.*\brepairs?\b|\bcapacity purchase\b|\bother\b.*\b(?:cost|expense)s?\b.*\boperating\b/.test(
+    text
   );
 }
 
@@ -1831,7 +1963,7 @@ function isOperatingSpecialChargeSource(source: FactSource) {
   if (isComprehensiveIncomeSource(source)) return false;
   if (OPERATING_SPECIAL_CHARGE_CONCEPTS.includes(source.concept)) return true;
   const text = sourceSearchText(source);
-  return /\b(restructuring|impairment|special charges?|integration costs?|business realignment|acquisition[-\s]?related charges?|litigation|settlement|accretion)\b/.test(text);
+  return /\b(restructuring|impairment|special items?|special charges?|integration costs?|business realignment|acquisition[-\s]?related charges?|litigation|settlement|accretion|business divestitures?)\b/.test(text);
 }
 
 function otherOperatingLineValue(source: FactSource) {
@@ -2403,6 +2535,16 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     };
   }
 
+  const directReportedLine = directReportedOtherNonOperatingLine(period, ctx);
+  if (directReportedLine) {
+    return {
+      value: otherNonOperatingValue(directReportedLine),
+      sources: [directReportedLine],
+      note: "Mapped to the explicit below-operating other income/expense line reported on the primary income statement.",
+      classification: DIRECT_OTHER_NON_OPERATING_LINE_CONCEPTS.includes(directReportedLine.concept) ? "direct" : "grouped"
+    };
+  }
+
   const primaryStatementRows = resolveOtherNonOperatingFromPrimaryStatementRows(period, ctx);
   if (primaryStatementRows.value !== null) return primaryStatementRows;
 
@@ -2427,6 +2569,38 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     sources: [],
     note: "No explicit EDGAR other non-operating line was reported. Pre-tax tie-outs are validation checks and do not create a residual other non-operating row."
   };
+}
+
+function directReportedOtherNonOperatingLine(period: string, ctx: ResolveContext) {
+  const facts = ctx.duration.get(period);
+  if (!facts) return null;
+  const candidates = uniqueFactSources(Array.from(facts.values()))
+    .filter((source) => sourceReportedBelowOperatingOnPrimaryIncomeStatement(period, ctx, source))
+    .filter(isDirectOtherNonOperatingLineSource)
+    .filter((source) => !isCombinedInterestAndOtherIncomeSource(source))
+    .filter((source) => !isExplicitInterestIncomeSource(source) && !isExplicitInterestExpenseSource(source))
+    .sort((a, b) => directOtherNonOperatingLineScore(b) - directOtherNonOperatingLineScore(a) || Math.abs(b.value) - Math.abs(a.value));
+  return candidates[0] ?? null;
+}
+
+function isDirectOtherNonOperatingLineSource(source: FactSource) {
+  if (DIRECT_OTHER_NON_OPERATING_LINE_CONCEPTS.includes(source.concept)) return true;
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/^nonoperatingincomeexpense$/.test(compact)) return false;
+  if (/\bspecial items?\b|\bequity securities?\b|\bequity investments?\b|\binvestment gains?\b|\binvestment losses?\b|\bforeign exchange\b|\bforeign currency\b/.test(text)) {
+    return false;
+  }
+  return /\bother\b.*\b(?:income|expense|gain|loss)\b.*\bnet\b|\bother\b.*\b(?:income|expense)\b|\b(?:income|expense)\b.*\bother\b/.test(text);
+}
+
+function directOtherNonOperatingLineScore(source: FactSource) {
+  const text = sourceSearchText(source);
+  let score = DIRECT_OTHER_NON_OPERATING_LINE_CONCEPTS.includes(source.concept) ? 10 : 0;
+  if (/\bother\b.*\b(?:income|expense)\b.*\bnet\b|\bother\b.*\bnet\b/.test(text)) score += 6;
+  if (/\bnon[-\s]?operating\b/.test(text)) score += 2;
+  if (/\bspecial items?\b|\bequity securities?\b|\bequity investments?\b|\binvestment\b|\bforeign exchange\b|\bforeign currency\b/.test(text)) score -= 6;
+  return score;
 }
 
 function resolveOtherNonOperatingFromPreTaxBridge(period: string, ctx: ResolveContext): ResolvedValue {
@@ -3244,27 +3418,68 @@ function reportedCurrentDebtForDebtInclCurrentPortion(period: string, ctx: Resol
 
 function reportedCurrentDebtMaturities(period: string, ctx: ResolveContext): ResolvedValue | null {
   const currentMaturities = first(period, ctx.instant, CURRENT_DEBT_MATURITY_BALANCE_SHEET_CONCEPTS);
+  const aggregateCurrentDebt = first(period, ctx.instant, ["DebtCurrent"]);
+  const presentedAggregateCurrentDebt = aggregateCurrentDebt ? withPrimaryBalanceSheetPresentationLabel(period, ctx, aggregateCurrentDebt) : null;
+  const standaloneShortTermBorrowings = reportedStandaloneShortTermBorrowingSource(period, ctx);
+  const aggregateCurrentMaturities =
+    !currentMaturities &&
+    presentedAggregateCurrentDebt &&
+    !sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(presentedAggregateCurrentDebt) &&
+    sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt)
+      ? presentedAggregateCurrentDebt
+      : null;
+  const residualCurrentMaturities =
+    !currentMaturities &&
+    !aggregateCurrentMaturities &&
+    presentedAggregateCurrentDebt &&
+    standaloneShortTermBorrowings &&
+    presentedAggregateCurrentDebt.value - standaloneShortTermBorrowings.value > 500_000
+      ? bridgeSource(
+          period,
+          "CurrentMaturitiesOfLongTermDebtDerived",
+          `Current maturities of long-term debt derived from ${sourceDisplayLabel(presentedAggregateCurrentDebt)} less ${sourceDisplayLabel(standaloneShortTermBorrowings)}`,
+          presentedAggregateCurrentDebt.value - standaloneShortTermBorrowings.value,
+          [presentedAggregateCurrentDebt, standaloneShortTermBorrowings]
+        )
+      : null;
+  const hasDebtMaturity = Boolean(currentMaturities || aggregateCurrentMaturities || residualCurrentMaturities);
   const currentLeases =
-    currentMaturities && /LeaseObligationsCurrent/i.test(currentMaturities.concept)
+    hasDebtMaturity && currentMaturities && /LeaseObligationsCurrent/i.test(currentMaturities.concept)
       ? null
-      : first(period, ctx.instant, ["FinanceLeaseLiabilityCurrent", "CapitalLeaseObligationsCurrent"]);
-  if (!currentMaturities && !currentLeases) return null;
+      : hasDebtMaturity
+        ? first(period, ctx.instant, ["FinanceLeaseLiabilityCurrent", "CapitalLeaseObligationsCurrent"])
+        : null;
+  if (!currentMaturities && !aggregateCurrentMaturities && !residualCurrentMaturities && !currentLeases) return null;
   return withPrimaryBalanceSheetPresentationLabels(period, ctx, {
-    value: (currentMaturities?.value ?? 0) + (currentLeases?.value ?? 0),
-    sources: compactSources([currentMaturities, currentLeases])
+    value: (currentMaturities?.value ?? aggregateCurrentMaturities?.value ?? residualCurrentMaturities?.value ?? 0) + (currentLeases?.value ?? 0),
+    sources: compactSources([currentMaturities, aggregateCurrentMaturities, residualCurrentMaturities, currentLeases])
   });
 }
 
-function reportedShortTermBorrowings(period: string, ctx: ResolveContext): ResolvedValue | null {
+function reportedStandaloneShortTermBorrowingSource(period: string, ctx: ResolveContext): FactSource | null {
   const source = first(period, ctx.instant, SHORT_TERM_BORROWING_BALANCE_SHEET_CONCEPTS);
-  if (source) return withPrimaryBalanceSheetPresentationLabels(period, ctx, { value: source.value, sources: [source] });
+  return source ? withPrimaryBalanceSheetPresentationLabel(period, ctx, source) : null;
+}
+
+function reportedShortTermBorrowings(period: string, ctx: ResolveContext): ResolvedValue | null {
+  const source = reportedStandaloneShortTermBorrowingSource(period, ctx);
+  if (source) return { value: source.value, sources: [source] };
 
   const aggregateCurrentDebt = first(period, ctx.instant, ["DebtCurrent"]);
-  if (aggregateCurrentDebt && sourceLooksLikeShortTermBorrowing(aggregateCurrentDebt)) {
+  const presentedAggregateCurrentDebt = aggregateCurrentDebt ? withPrimaryBalanceSheetPresentationLabel(period, ctx, aggregateCurrentDebt) : null;
+  if (
+    presentedAggregateCurrentDebt &&
+    ((!sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt) &&
+      (sourceLooksLikeShortTermBorrowing(presentedAggregateCurrentDebt) || genericCurrentDebtBelongsInShortTermBorrowings(period, ctx))) ||
+      (ctx.template?.hasShortTermBorrowingsRow &&
+        !ctx.template.hasCurrentDebtMaturitiesRow &&
+        sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(presentedAggregateCurrentDebt)))
+  ) {
     return withPrimaryBalanceSheetPresentationLabels(period, ctx, {
-      value: aggregateCurrentDebt.value,
-      sources: [aggregateCurrentDebt],
-      note: "Mapped current debt to short-term borrowings because the reported balance sheet label describes a short-term borrowing item rather than current maturities of long-term debt."
+      value: presentedAggregateCurrentDebt.value,
+      sources: [presentedAggregateCurrentDebt],
+      note:
+        "Mapped generic current debt to the current borrowing/revolver row because EDGAR did not report a current-maturities-of-long-term-debt concept for this period."
     });
   }
 
@@ -3272,25 +3487,15 @@ function reportedShortTermBorrowings(period: string, ctx: ResolveContext): Resol
 }
 
 function resolveRevolverCurrentDebt(period: string, ctx: ResolveContext): ResolvedValue {
-  if (ctx.template?.hasCurrentDebtMaturitiesRow) {
-    const shortTermBorrowings = reportedShortTermBorrowings(period, ctx);
-    if (shortTermBorrowings) return shortTermBorrowings;
-    return {
-      value: 0,
-      sources: [zeroSource("ShortTermBorrowings")],
-      note: "No standalone short-term borrowing or revolver balance was reported; current maturities are mapped to the dedicated current debt row."
-    };
-  }
-
-  const currentDebt = reportedCurrentDebt(period, ctx);
-  if (!currentDebt) return reportedShortTermBorrowings(period, ctx) ?? zeroResolved("ShortTermBorrowings");
-  return withPrimaryBalanceSheetPresentationLabels(period, ctx, {
-    value: currentDebt.value,
-    sources: currentDebt.sources,
+  const shortTermBorrowings = reportedShortTermBorrowings(period, ctx);
+  if (shortTermBorrowings) return shortTermBorrowings;
+  return {
+    value: 0,
+    sources: [zeroSource("ShortTermBorrowings")],
     note:
-      "Mapped the reported current debt line to the revolver/current debt row because the template has no more precise current-debt split.",
-    classification: currentDebt.sources.length === 1 ? "direct" : "grouped"
-  });
+      "No standalone short-term borrowing, commercial paper, notes payable current, line-of-credit, or revolver balance was reported. Current maturities of long-term debt are excluded from this row.",
+    classification: "grouped"
+  };
 }
 
 function resolveShortTermBorrowings(period: string, ctx: ResolveContext): ResolvedValue {
@@ -3307,9 +3512,23 @@ function sourceLooksLikeShortTermBorrowing(source: FactSource) {
   return /short[-\s]?term|borrowings?|current borrowings?|commercial paper|revolver|revolving credit|credit facility|line of credit|notes payable|loans payable/.test(text);
 }
 
+function sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(source: FactSource) {
+  const text = `${source.label} ${source.concept}`.toLowerCase();
+  return /short[-\s]?term borrowings?/.test(text) && /current maturit|current portion|long[-\s]?term debt/.test(text);
+}
+
+function sourceLooksLikeCurrentDebtMaturity(source: FactSource) {
+  const text = `${source.label} ${source.concept}`.toLowerCase();
+  return /current portion|current maturit|long[-\s]?term debt.*current|current.*long[-\s]?term debt|debt due within one year|finance lease|capital lease/.test(text);
+}
+
+function genericCurrentDebtBelongsInShortTermBorrowings(period: string, ctx: ResolveContext) {
+  const explicitCurrentMaturity = first(period, ctx.instant, CURRENT_DEBT_MATURITY_BALANCE_SHEET_CONCEPTS);
+  return !explicitCurrentMaturity || explicitCurrentMaturity.value === 0;
+}
+
 function debtRowUsesCombinedCurrentDebt(period: string, ctx: ResolveContext) {
   if (!ctx.template?.hasDebtInclCurrentPortionRow || ctx.template.hasCurrentDebtMaturitiesRow === true) return false;
-  if (!ctx.template.hasCurrentLiabilitiesExcludingDebtRow) return false;
   return Boolean(first(period, ctx.instant, TOTAL_DEBT_INCLUDING_CURRENT_CONCEPTS) || first(period, ctx.instant, NONCURRENT_DEBT_CONCEPTS) || reportedCurrentDebtForDebtInclCurrentPortion(period, ctx));
 }
 
@@ -3490,12 +3709,52 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 
 function resolveInventory(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.inventory);
+  if (direct && direct.value !== 0) {
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to a reported inventory or inventory-like operating asset line.",
+      classification: C.inventory.includes(direct.concept) ? "direct" : "grouped"
+    };
+  }
+
+  const semanticInventory = semanticInventoryLikeCurrentAssetSource(period, ctx);
+  if (semanticInventory) {
+    return {
+      value: semanticInventory.value,
+      sources: [semanticInventory],
+      note: "Mapped to a reported inventory-like operating current asset line.",
+      classification: C.inventory.includes(semanticInventory.concept) ? "direct" : "grouped"
+    };
+  }
+
   if (direct) return { value: direct.value, sources: [direct] };
   return {
     value: 0,
     sources: [zeroSource(C.inventory[0])],
     note: "No SEC inventory balance was reported for this period, so stale template inventory was cleared."
   };
+}
+
+function semanticInventoryLikeCurrentAssetSource(period: string, ctx: ResolveContext) {
+  const facts = ctx.instant.get(period);
+  if (!facts) return null;
+  return Array.from(facts.values())
+    .filter((source) => inventoryLikeCurrentAssetScore(source) >= 5)
+    .sort((a, b) => inventoryLikeCurrentAssetScore(b) - inventoryLikeCurrentAssetScore(a) || Math.abs(b.value) - Math.abs(a.value))[0] ?? null;
+}
+
+function inventoryLikeCurrentAssetScore(source: FactSource) {
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/liabilit|expense|cashflow|increase(?:decrease)?|turnover|reserve|valuationallowance/.test(compact)) return 0;
+  let score = conceptScore(source, C.inventory, 10);
+  if (/\binventor(?:y|ies)\b/.test(text)) score += 7;
+  if (/\baircraft fuel\b|\bspare parts?\b|\bparts and supplies\b|\bsupplies inventory\b|\bmerchandise inventory\b/.test(text)) score += 7;
+  if (/\braw materials?\b|\bwork in process\b|\bfinished goods?\b/.test(text)) score += 5;
+  if (/\bcurrent\b/.test(text)) score += 1;
+  if (/\bnoncurrent\b|\bproperty\b|\bplant\b|\bequipment\b/.test(text)) score -= 5;
+  return score;
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
@@ -3909,6 +4168,20 @@ function resolveCurrentLiabilitiesForNonCurrentLiabilitySubtotal(period: string,
 
 function resolveModeledNonCurrentLiabilitiesSubtotal(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, ["LiabilitiesNoncurrent"]);
+  const currentMaturitiesIncludedInDebt = currentMaturitiesIncludedInDebtRow(period, ctx);
+  if (direct && currentMaturitiesIncludedInDebt) {
+    return {
+      value: direct.value + currentMaturitiesIncludedInDebt.value!,
+      sources: compactSources([direct, currentMaturitiesIncludedInDebt]),
+      note:
+        "Mapped to EDGAR non-current liabilities plus current maturities included in the model's LT Debt (Incl. Current Portion) row, so the modeled liability section ties without classifying current maturities as revolver debt.",
+      classification: "grouped",
+      includedLineItems: [
+        ...sourceLineItemLabels({ value: direct.value, sources: [direct] }),
+        ...sourceLineItemLabels(currentMaturitiesIncludedInDebt)
+      ]
+    };
+  }
   if (direct && ctx.template?.hasCurrentDebtRow) {
     return {
       value: direct.value,
@@ -3919,13 +4192,38 @@ function resolveModeledNonCurrentLiabilitiesSubtotal(period: string, ctx: Resolv
   const liabilities = resolveTotalLiabilities(period, ctx);
   const currentLiabilities = resolveCurrentLiabilitiesForNonCurrentLiabilitySubtotal(period, ctx);
   if (liabilities.value === null || currentLiabilities.value === null) return { value: null, sources: [] };
+  const baseValue = liabilities.value - currentLiabilities.value;
+  if (currentMaturitiesIncludedInDebt?.value !== null && currentMaturitiesIncludedInDebt) {
+    return {
+      value: baseValue + currentMaturitiesIncludedInDebt.value,
+      sources: compactSources([liabilities, currentLiabilities, currentMaturitiesIncludedInDebt]),
+      note:
+        "Calculated from SEC total liabilities less SEC current liabilities, plus current maturities included in the model's LT Debt (Incl. Current Portion) row.",
+      classification: "grouped",
+      includedLineItems: [
+        lineItemExclusionLabel(liabilities, [currentLiabilities], "Non-current liabilities from the primary consolidated balance sheet"),
+        ...sourceLineItemLabels(currentMaturitiesIncludedInDebt)
+      ]
+    };
+  }
   return {
-    value: liabilities.value - currentLiabilities.value,
+    value: baseValue,
     sources: compactSources([liabilities, currentLiabilities]),
     note: ctx.template?.hasCurrentDebtRow
       ? "Calculated from SEC total liabilities less SEC current liabilities because the template has a separate current debt row."
       : "Calculated from SEC total liabilities less the model's current-liability subtotal so modeled liability sections foot to total liabilities."
   };
+}
+
+function nonCurrentLiabilitySubtotalShouldIncludeCurrentDebtPortion(period: string, ctx: ResolveContext) {
+  return Boolean(currentMaturitiesIncludedInDebtRow(period, ctx));
+}
+
+function currentMaturitiesIncludedInDebtRow(period: string, ctx: ResolveContext): ResolvedValue | null {
+  if (!ctx.template?.hasDebtInclCurrentPortionRow || ctx.template.hasCurrentDebtMaturitiesRow) return null;
+  const currentMaturities = reportedCurrentDebtForDebtInclCurrentPortion(period, ctx);
+  if (!currentMaturities || currentMaturities.value === null || currentMaturities.value === 0) return null;
+  return currentMaturities.sources.some((source) => !sourceLooksLikeShortTermBorrowing(source)) ? currentMaturities : null;
 }
 
 function resolveCommonStockAndApic(period: string, ctx: ResolveContext): ResolvedValue {
@@ -8982,7 +9280,13 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (INCOME_TAX_CONCEPTS.includes(concept) || incomeTaxScore(source) >= 5) return "income_tax";
   if (CONTINUING_NET_INCOME_CONCEPTS.includes(concept) || netIncomeScore(source) >= 5) return "net_income";
   if (C.operatingIncome.includes(concept) || /\boperating\b.*\b(income|profit|loss)\b|\b(income|profit|loss)\b.*\boperations?\b/.test(text)) return "operating_income";
-  if ([...C.cogs, ...C.healthCareCosts].includes(concept) || /\bcost\b.*\b(revenue|sales|goods|operations?|services?|products?)\b|\bmerchandise costs?\b|\bfulfillment costs?\b/.test(text)) return "cost_of_revenue";
+  if (
+    [...C.cogs, ...C.healthCareCosts, ...DIRECT_OPERATING_COST_CONCEPTS].includes(concept) ||
+    /\bcost\b.*\b(revenue|sales|goods|operations?|services?|products?)\b|\bmerchandise costs?\b|\bfulfillment costs?\b/.test(text) ||
+    /\bfuel costs?\b|\blabor and related\b|\bsalar(?:y|ies)\b|\bwages?\b|\baircraft\b.*\brent(?:al)?\b|\blanding fees?\b|\bmaintenance\b.*\brepairs?\b|\bcapacity purchase\b/.test(text)
+  ) {
+    return "cost_of_revenue";
+  }
   if (TOTAL_REVENUE_CONCEPTS.includes(concept) || (!isRevenueComponentSource(source) && !/\bcost\b/.test(text) && /\b(net )?(sales|revenues?)\b|\btotal net sales\b/.test(text))) return "revenue";
   if (isRevenueComponentSource(source)) return "revenue";
   if (isAcquiredInProcessResearchDevelopmentSource(source)) return "research_and_development";
@@ -9345,6 +9649,30 @@ function reconcileFinalIncomeStatementConsistency(
 
 function incomeStatementClassificationRows() {
   return [
+    {
+      labels: ["Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales"],
+      resolver: resolveCostOfRevenue,
+      name: "COGS / cost of revenue"
+    },
+    {
+      labels: [
+        "Selling, General & Administration (SG&A)",
+        "Selling, Geneal & Administrative (SG&A)",
+        "Selling General & Administrative",
+        "Selling, General, and Administrative",
+        "SG&A",
+        "Sales and Marketing",
+        "Selling and Marketing",
+        "General and Administrative"
+      ],
+      resolver: resolveSellingGeneralAdministrativeExpense,
+      name: "SG&A"
+    },
+    {
+      labels: ["Research & Development (R&D)", "Research and Development"],
+      resolver: resolveResearchDevelopmentExpense,
+      name: "R&D"
+    },
     {
       labels: ["Depreciation & Amortization", "Depreciation and Amortization", "D&A"],
       resolver: resolveIncomeStatementDepreciationAmortization,
@@ -10197,6 +10525,9 @@ async function requestLlmMappingDecision(
   const system = [
     "You map financial model rows to SEC EDGAR XBRL facts.",
     "Use only the provided candidate concepts. Do not invent concepts or values.",
+    "Classify the source line item using the reported label, statement, section context, current/non-current status, operating/non-operating location, and whether it is a subtotal or component.",
+    "Use Other buckets only when no more dedicated model row exists for the source line item.",
+    "Never override hard validation from primary statement location, XBRL tag semantics, current/non-current section, subtotal/component relationships, reported EDGAR totals, or workbook validation checks.",
     "Treat every mapping correction as a reusable template rule: rely on row labels, section context, statement type, period kind, and SEC concept semantics, never ticker-specific or single-period exceptions.",
     "Prefer needs_review unless the row label, section context, and candidate label clearly match.",
     "Choose sign -1 only when the model row convention should invert the EDGAR value, such as expense rows shown as negatives.",
@@ -10281,7 +10612,20 @@ function llmMappingJsonSchema() {
     schema: {
       type: "object",
       additionalProperties: false,
-      required: ["operation", "selectedConcepts", "sign", "confidence", "reason", "requiresReview"],
+      required: [
+        "operation",
+        "selectedConcepts",
+        "sign",
+        "confidence",
+        "reason",
+        "requiresReview",
+        "sourceLineItemLabel",
+        "sourceStatement",
+        "sourceSection",
+        "recommendedModelRow",
+        "isSubtotalOrComponent",
+        "excludeFromOtherBecauseDedicatedRowExists"
+      ],
       properties: {
         operation: { type: "string", enum: ["direct", "sum", "difference", "needs_review"] },
         selectedConcepts: {
@@ -10291,7 +10635,13 @@ function llmMappingJsonSchema() {
         sign: { type: "integer", enum: [1, -1] },
         confidence: { type: "string", enum: ["high", "medium", "low"] },
         reason: { type: "string" },
-        requiresReview: { type: "boolean" }
+        requiresReview: { type: "boolean" },
+        sourceLineItemLabel: { type: "string" },
+        sourceStatement: { type: "string", enum: ["income", "balance", "cash_flow", "segment", "support", "unknown"] },
+        sourceSection: { type: "string" },
+        recommendedModelRow: { type: "string" },
+        isSubtotalOrComponent: { type: "boolean" },
+        excludeFromOtherBecauseDedicatedRowExists: { type: "boolean" }
       }
     }
   };
@@ -10320,6 +10670,8 @@ function responseOutputText(body: any) {
 
 function llmDecisionToFillRow(fillRow: FillRow, decision: LlmMappingDecision, candidates: LlmCandidateFact[], modelChoice: LlmMappingModelChoice): FillRow | null {
   if (decision.operation === "needs_review" || decision.requiresReview || decision.confidence === "low") return null;
+  if (decision.isSubtotalOrComponent && /other|misc|plug/i.test(fillRow.label)) return null;
+  if (decision.excludeFromOtherBecauseDedicatedRowExists && /other/i.test(fillRow.label)) return null;
   const allowed = new Set(candidates.map((candidate) => candidate.concept));
   const selected = unique(decision.selectedConcepts).filter((concept) => allowed.has(concept));
   if (!selected.length || selected.length !== decision.selectedConcepts.length) return null;
@@ -12362,6 +12714,30 @@ function validateIncomeStatementLineItemClassifications(
 ) {
   const errors: string[] = [];
   const checks: Array<{ labels: string[]; resolver: (period: string, ctx: ResolveContext) => ResolvedValue; name: string }> = [
+    {
+      labels: ["Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales"],
+      resolver: resolveCostOfRevenue,
+      name: "COGS / cost of revenue"
+    },
+    {
+      labels: [
+        "Selling, General & Administration (SG&A)",
+        "Selling, Geneal & Administrative (SG&A)",
+        "Selling General & Administrative",
+        "Selling, General, and Administrative",
+        "SG&A",
+        "Sales and Marketing",
+        "Selling and Marketing",
+        "General and Administrative"
+      ],
+      resolver: resolveSellingGeneralAdministrativeExpense,
+      name: "SG&A"
+    },
+    {
+      labels: ["Research & Development (R&D)", "Research and Development"],
+      resolver: resolveResearchDevelopmentExpense,
+      name: "R&D"
+    },
     {
       labels: ["Depreciation & Amortization", "Depreciation and Amortization", "D&A"],
       resolver: resolveIncomeStatementDepreciationAmortization,
