@@ -1,6 +1,6 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, KeyboardEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -102,7 +102,7 @@ export default function Home() {
     };
   }, [fileKey, pickFile]);
 
-  function handleDrag(event: DragEvent<HTMLLabelElement>) {
+  function handleDrag(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
@@ -114,7 +114,7 @@ export default function Home() {
     if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+  function handleDrop(event: DragEvent<HTMLButtonElement>) {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
@@ -133,9 +133,10 @@ export default function Home() {
     pickInputFile(event.currentTarget);
   }
 
-  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLLabelElement>) {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
+  function openFilePicker() {
+    if (isSubmitting) return;
+    if (!fileInputRef.current) return;
+    fileInputRef.current.value = "";
     fileInputRef.current?.click();
   }
 
@@ -256,17 +257,30 @@ export default function Home() {
             </div>
           </div>
 
-          <label
-            className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
-            htmlFor="model-template-file"
-            role="button"
-            tabIndex={0}
+          <input
+            id="model-template-file"
+            ref={fileInputRef}
+            className="fileInput"
+            type="file"
+            name="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
-            onKeyDown={handleDropzoneKeyDown}
+            onChange={handleFileSelect}
+            onInput={handleFileInput}
+            onClick={(event) => {
+              event.currentTarget.value = "";
+            }}
+          />
+          <button
+            type="button"
+            className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
+            aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
+            onClick={openFilePicker}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}
             onDrop={handleDrop}
+            disabled={isSubmitting}
           >
             <span className="dropIcon">
               {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
@@ -282,21 +296,7 @@ export default function Home() {
               <small>Click to browse or drag in an .xlsx file</small>
             )}
             <span className="browseCue">Choose workbook</span>
-            <input
-              id="model-template-file"
-              ref={fileInputRef}
-              className="fileInput"
-              type="file"
-              name="file"
-              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
-              onChange={handleFileSelect}
-              onInput={handleFileInput}
-              onClick={(event) => {
-                event.currentTarget.value = "";
-              }}
-            />
-          </label>
+          </button>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
