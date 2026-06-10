@@ -9,7 +9,7 @@ const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model
 const ticker = process.env.AAL_TICKER || "AAL";
 
 const expected1Q26 = {
-  "Cost of Goods Sold": -12957,
+  "Cost of Goods Sold": -16292,
   "Selling, General & Administration (SG&A)": -507,
   "Depreciation & Amortization": -475,
   "Other Operating Income (Expense)": -14,
@@ -18,8 +18,9 @@ const expected1Q26 = {
   "Interest (Expense)": -397,
   "Other Non-Operating Income (Expense)": -93,
   "Pre-Tax Income (Loss)": -476,
+  "Cash & Cash Equivalents": 7393,
   Inventory: 3131,
-  "Prepaid & Other Current Assets": 7843,
+  "Prepaid & Other Current Assets": 1452,
   "Total Current Assets": 13984,
   Revolver: 0,
   "LT Debt (Incl. Current Portion)": 27305,
@@ -107,6 +108,8 @@ function auditRowsFor(audit, cell, period) {
     if (String(cellValue(row.getCell(2)) ?? "") !== cell) return;
     if (String(cellValue(row.getCell(5)) ?? "").toUpperCase() !== period.toUpperCase()) return;
     rows.push({
+      value: cellValue(row.getCell(6)),
+      mappingType: String(cellValue(row.getCell(7)) ?? ""),
       concepts: String(cellValue(row.getCell(8)) ?? ""),
       labels: String(cellValue(row.getCell(9)) ?? ""),
       notes: String(cellValue(row.getCell(24)) ?? "")
@@ -142,8 +145,8 @@ async function main() {
   }
 
   const cogsRows = auditRowsFor(audit, "U29", "1Q26");
-  if (!cogsRows.some((row) => /FuelCosts=2928mm/.test(row.concepts) && /LaborAndRelatedExpense=4674mm/.test(row.concepts) && /OtherCostAndExpenseOperating=1770mm/.test(row.concepts))) {
-    errors.push("Mapping Audit U29 should build COGS from AAL direct operating cost lines.");
+  if (!cogsRows.some((row) => row.mappingType === "formula preserved" && Number(row.value) === -16292)) {
+    errors.push("Mapping Audit U29 should preserve the existing COGS formula cell instead of overwriting it.");
   }
   if (cogsRows.some((row) => /CostsAndExpenses=13953mm/.test(row.concepts))) {
     errors.push("Mapping Audit U29 should not use total operating expenses as COGS when expense details are mapped separately.");

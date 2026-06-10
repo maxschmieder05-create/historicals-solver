@@ -3425,7 +3425,8 @@ function reportedCurrentDebtMaturities(period: string, ctx: ResolveContext): Res
     !currentMaturities &&
     presentedAggregateCurrentDebt &&
     !sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(presentedAggregateCurrentDebt) &&
-    sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt)
+    (sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt) ||
+      genericCurrentDebtBelongsInCurrentMaturities(presentedAggregateCurrentDebt, standaloneShortTermBorrowings, ctx))
       ? presentedAggregateCurrentDebt
       : null;
   const residualCurrentMaturities =
@@ -3469,8 +3470,7 @@ function reportedShortTermBorrowings(period: string, ctx: ResolveContext): Resol
   const presentedAggregateCurrentDebt = aggregateCurrentDebt ? withPrimaryBalanceSheetPresentationLabel(period, ctx, aggregateCurrentDebt) : null;
   if (
     presentedAggregateCurrentDebt &&
-    ((!sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt) &&
-      (sourceLooksLikeShortTermBorrowing(presentedAggregateCurrentDebt) || genericCurrentDebtBelongsInShortTermBorrowings(period, ctx))) ||
+    ((!sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt) && sourceLooksLikeShortTermBorrowing(presentedAggregateCurrentDebt)) ||
       (ctx.template?.hasShortTermBorrowingsRow &&
         !ctx.template.hasCurrentDebtMaturitiesRow &&
         sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(presentedAggregateCurrentDebt)))
@@ -3522,9 +3522,11 @@ function sourceLooksLikeCurrentDebtMaturity(source: FactSource) {
   return /current portion|current maturit|long[-\s]?term debt.*current|current.*long[-\s]?term debt|debt due within one year|finance lease|capital lease/.test(text);
 }
 
-function genericCurrentDebtBelongsInShortTermBorrowings(period: string, ctx: ResolveContext) {
-  const explicitCurrentMaturity = first(period, ctx.instant, CURRENT_DEBT_MATURITY_BALANCE_SHEET_CONCEPTS);
-  return !explicitCurrentMaturity || explicitCurrentMaturity.value === 0;
+function genericCurrentDebtBelongsInCurrentMaturities(source: FactSource, standaloneShortTermBorrowings: FactSource | null, ctx: ResolveContext) {
+  if (source.concept !== "DebtCurrent") return false;
+  if (!ctx.template?.hasDebtInclCurrentPortionRow) return false;
+  if (standaloneShortTermBorrowings && Math.abs(standaloneShortTermBorrowings.value) > 0.5) return false;
+  return !sourceLooksLikeShortTermBorrowing(source);
 }
 
 function debtRowUsesCombinedCurrentDebt(period: string, ctx: ResolveContext) {
@@ -3645,8 +3647,7 @@ function resolvePpe(period: string, ctx: ResolveContext): ResolvedValue {
 }
 
 function resolveCash(period: string, ctx: ResolveContext): ResolvedValue {
-  const cash = first(period, ctx.instant, C.cash);
-  return cash ? { value: cash.value, sources: [cash] } : { value: null, sources: [] };
+  return resolveCashAndCurrentInvestments(period, ctx);
 }
 
 function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): ResolvedValue {
@@ -3662,7 +3663,8 @@ function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): 
     value: cash.value + (currentInvestments?.value ?? 0),
     sources: compactSources([cash, currentInvestments]),
     note:
-      "Included cash and current marketable securities because this model's cash row is used in the current-assets subtotal and EDGAR reports current investments as a current asset."
+      "Cash & Cash Equivalents includes cash and cash equivalents and short-term investments because the template has no dedicated current investment row.",
+    classification: "grouped"
   };
 }
 
@@ -3763,7 +3765,8 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
   const receivables = resolveAccountsReceivable(period, ctx);
   const inventory = balanceSheetComponentForResidual(period, ctx, resolveInventory, C.inventory[0]);
   const currentInvestments = sum(period, ctx.instant, C.currentInvestments);
-  const separateCurrentInvestments = ctx.template?.hasCurrentInvestmentRow && !currentInvestmentsAreModeledInCash(period, ctx) ? currentInvestments?.value ?? 0 : 0;
+  const currentInvestmentsModeledInCash = currentInvestmentsAreModeledInCash(period, ctx);
+  const separateCurrentInvestments = ctx.template?.hasCurrentInvestmentRow && !currentInvestmentsModeledInCash ? currentInvestments?.value ?? 0 : 0;
   const directOtherCurrentAssets = sumWithNote(
     period,
     ctx.instant,
@@ -3776,11 +3779,13 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
     if (directOtherCurrentAssets.value !== null && statementMetricTies(residualValue, directOtherCurrentAssets.value)) return directOtherCurrentAssets;
     return {
       value: residualValue,
-      sources: compactSources([currentAssets, cashAndInvestments, receivables, inventory, currentInvestments]),
+      sources: compactSources([currentAssets, cashAndInvestments, receivables, inventory, currentInvestmentsModeledInCash ? null : currentInvestments]),
       note: separateCurrentInvestments
         ? "Included current assets less separately classified cash, marketable securities / short-term investments, receivables, and inventory. Current investments are not included in this other-current-assets bucket."
-        : currentInvestments && currentInvestments.value
-          ? "Included current assets less the cash row, receivables, and inventory. Current investments are included in this broad other-current-assets bucket because the template has no separate current-investments row."
+        : currentInvestments && currentInvestments.value && currentInvestmentsModeledInCash
+          ? "Included current assets less cash and short-term investments, receivables, and inventory. Current investments are included in Cash & Cash Equivalents, not in this other-current-assets bucket."
+          : currentInvestments && currentInvestments.value
+            ? "Included current assets less the cash row, receivables, and inventory."
           : "Included current assets less separately modeled cash, receivables, and inventory."
     };
   }
@@ -4516,6 +4521,7 @@ function setCoverValue(sheet: ExcelJS.Worksheet, label: string, value: ExcelJS.C
   const row = findCoverRow(sheet, label);
   if (!row) return null;
   const cell = sheet.getCell(row, 6);
+  if (isProtectedFormulaOrCheckCell(cell)) return null;
   cell.value = value;
   return cell;
 }
@@ -4525,6 +4531,7 @@ function setCoverValueAny(sheet: ExcelJS.Worksheet, labels: string[], value: Exc
   const row = findAnyCoverRow(sheet, labels);
   if (!row) return null;
   const cell = sheet.getCell(row, 6);
+  if (isProtectedFormulaOrCheckCell(cell)) return null;
   cell.value = value;
   return cell;
 }
@@ -4997,61 +5004,6 @@ export async function POST(request: NextRequest) {
         const cell = sheet.getCell(effectiveFillRow.row, col);
         const writeDecision = historicalWriteDecision(effectiveFillRow, cell);
         if (!writeDecision.writable) {
-          const formula = formulaForCell(cell);
-          if (formula) {
-            const resolved = resolveFillRowForModelPeriod(effectiveFillRow, period, ctx, normalizedPackage);
-            if (resolved.value !== null && !Number.isNaN(resolved.value)) {
-              const value = resolved.value / (effectiveFillRow.scale ?? 1);
-              const validation = validateResolvedValueForWrite(company, effectiveFillRow, period, resolved);
-              if (validation.status === "blocked") {
-                unresolved += 1;
-                const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
-                if (addComment(cell, note)) commentsAdded += 1;
-                auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
-                continue;
-              }
-              const overwriteFormula = shouldOverwriteHistoricalFormulaWithDirectValue(effectiveFillRow, period, cell, value, resolved);
-              if (effectiveFillRow.statement === "balance" && effectiveFillRow.kind === "instant" && !overwriteFormula) {
-                continue;
-              }
-              const refreshedFormula = overwriteFormula
-                ? null
-                : formula.includes("!")
-                  ? formula
-                  : formulaBridgeForTargetValue(cell, value) ?? formula;
-              cell.value = refreshedFormula ? { formula: refreshedFormula, result: value } : value;
-              filledCells += 1;
-              const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
-              if (addComment(cell, note)) commentsAdded += 1;
-              auditRows.push({
-                sheetName: sheet.name,
-                cell: cell.address,
-                modelRowLabel: effectiveFillRow.label,
-                section: effectiveFillRow.modelContext?.sectionHeader,
-                period,
-                valueWritten: value,
-                mappingType: "formula updated",
-                conceptsUsed: resolved.sources.map((source) => `${source.concept}=${roundModelValue(source.value / (effectiveFillRow.scale ?? 1))}mm`).join("; "),
-                secLabels: resolved.sources.map((source) => source.label).join("; "),
-                sourceStatement: effectiveFillRow.statement,
-                accession: unique(resolved.sources.map((source) => source.accn ?? "").filter(Boolean)).join("; "),
-                sourceUrl: unique(resolved.sources.map((source) => source.sourceUrl ?? "").filter(Boolean)).join("; "),
-                filingForm: unique(resolved.sources.map((source) => source.form ?? "").filter(Boolean)).join("; "),
-                filedDate: unique(resolved.sources.map((source) => source.filed ?? "").filter(Boolean)).join("; "),
-                startDate: unique(resolved.sources.map((source) => source.start ?? "").filter(Boolean)).join("; "),
-                endDate: unique(resolved.sources.map((source) => source.end ?? "").filter(Boolean)).join("; "),
-                cellWritable: true,
-                formulaPreserved: Boolean(refreshedFormula),
-                formulaStatus: refreshedFormula ? (refreshedFormula === formula ? "formula cached result updated" : "formula bridge updated") : "formula replaced with EDGAR-supported value",
-                writeBlockedReason: "",
-                signConvention: "formula result refreshed",
-                confidence: validation.confidence,
-                validationStatus: validationStatusText(validation),
-                notes: note
-              });
-              continue;
-            }
-          }
           if (shouldAuditSkippedWrite(writeDecision)) {
             auditRows.push(skippedMappingAuditRow(sheet, cell, effectiveFillRow, period, writeDecision));
           }
@@ -7575,9 +7527,8 @@ function cellFormula(cell: ExcelJS.Cell) {
 }
 
 function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDecision {
-  if (hasFormula(cell)) {
-    return { writable: false, reason: "existing formula cell", formulaPreserved: true };
-  }
+  const protectedReason = protectedFormulaOrCheckCellReason(cell);
+  if (protectedReason) return { writable: false, reason: protectedReason, formulaPreserved: hasFormula(cell) };
   if (fillRow.onlyBlankHistoricalInput && cell.value !== null) {
     return { writable: false, reason: "existing model hardcode preserved", formulaPreserved: false };
   }
@@ -7593,23 +7544,24 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDec
   return { writable: true, formulaPreserved: false };
 }
 
-function shouldOverwriteHistoricalFormulaWithDirectValue(fillRow: FillRow, _period: string, cell: ExcelJS.Cell, _value: number, resolved: ResolvedValue) {
-  if (fillRow.statement === "balance" && fillRow.kind === "instant") {
-    return true;
-  }
-  if (fillRow.statement !== "income") return false;
-  if (isIncomeStatementDepreciationAmortizationFillRow(fillRow)) return true;
-  const formula = formulaForCell(cell);
-  if (formula && !formulaHasCellReference(formula)) return true;
-  const label = normalize(fillRow.label);
-  if (!/pretaxadjustments|posttaxadjustments|discontinuedoperations|noncontrollinginterest|noncontrollingincome/.test(label)) return false;
-  return resolved.sources.some((source) => /NotReported|Bridge/.test(source.concept));
+function protectedFormulaOrCheckCellReason(cell: ExcelJS.Cell) {
+  if (hasFormula(cell)) return "existing formula cell";
+  const rowNumber = Number(cell.row);
+  const col = Number(cell.col);
+  if (isProtectedCheckRowLabel(rowLabel(cell.worksheet, rowNumber))) return "protected formula/check row";
+  if (isProjectedBalanceSheetCell(cell.worksheet, rowNumber, col)) return "projected balance-sheet formula range";
+  return "";
 }
 
-function isIncomeStatementDepreciationAmortizationFillRow(fillRow: FillRow) {
-  if (fillRow.statement !== "income") return false;
-  const label = normalize(fillRow.label);
-  return label === "da" || /^depreciation(?:and)?amortization/.test(label) || /^depreciationexpense$/.test(label);
+function isProtectedFormulaOrCheckCell(cell: ExcelJS.Cell) {
+  return Boolean(protectedFormulaOrCheckCellReason(cell));
+}
+
+function isProtectedCheckRowLabel(label: string) {
+  const normalized = normalize(label);
+  if (!normalized) return false;
+  if (normalized === "ok" || normalized === "okcheck" || normalized === "balancesheetcheck") return true;
+  return /\bcheck\b/i.test(label);
 }
 
 function normalizeSharedFormulas(workbook: ExcelJS.Workbook) {
@@ -7670,7 +7622,12 @@ function isExternalWorkbookReference(reference: string) {
 }
 
 function shouldAuditSkippedWrite(decision: WriteDecision) {
-  return decision.reason === "existing formula cell" || decision.reason === "blank inactive/helper cell";
+  return (
+    decision.reason === "existing formula cell" ||
+    decision.reason === "protected formula/check row" ||
+    decision.reason === "projected balance-sheet formula range" ||
+    decision.reason === "blank inactive/helper cell"
+  );
 }
 
 function refreshDividendCachedResults(sheet: ExcelJS.Worksheet, periods: string[], columns: number[]) {
@@ -7889,9 +7846,11 @@ function refreshSegmentAnnualSumFormulas(sheet: ExcelJS.Worksheet, sectionLabels
       const quarterHeaders = [col - 4, col - 3, col - 2, col - 1].map((quarterCol) => cellDisplay(sheet.getCell(headerRow, quarterCol)));
       if (!["1Q", "2Q", "3Q", "4Q"].every((quarter, index) => quarterHeaders[index].startsWith(quarter))) continue;
       for (let rowNumber = startRow; rowNumber < endRow; rowNumber += 1) {
+        const cell = sheet.getCell(rowNumber, col);
+        if (isProtectedFormulaOrCheckCell(cell)) continue;
         const formula = `SUM(${columnLetter(col - 4)}${rowNumber}:${columnLetter(col - 1)}${rowNumber})`;
         const result = sumNumericCells(sheet, rowNumber, [col - 4, col - 3, col - 2, col - 1]) ?? 0;
-        sheet.getCell(rowNumber, col).value = { formula, result };
+        cell.value = { formula, result };
         filledCells += 1;
       }
     }
@@ -7957,7 +7916,9 @@ function fillSegmentStatementTotalRow(
     if (resolved.value === null) return;
     const value = resolved.value / 1_000_000;
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
+    if (isProtectedFormulaOrCheckCell(cell)) return;
     if (!writeSegmentMetricCell(cell, value)) {
+      if (!isHardcodedFinancialInput(cell)) return;
       cell.value = value;
     }
     filledCells += 1;
@@ -8397,6 +8358,7 @@ function restoreSegmentTotalFormula(
   periods.forEach((period, periodIndex) => {
     const col = columns[periodIndex];
     const cell = sheet.getCell(totalRow, col);
+    if (isProtectedFormulaOrCheckCell(cell)) return;
     if (!hasFormula(cell) && !options.overwriteHardcoded) return;
 
     const segmentTotal = segmentMetricRowsTotal(sheet, rows, col, evaluator);
@@ -8614,6 +8576,7 @@ function restoreSegmentCheckFormula(
   periods.forEach((period, periodIndex) => {
     const col = columns[periodIndex];
     const cell = sheet.getCell(checkRow, col);
+    if (isProtectedFormulaOrCheckCell(cell)) return;
     if (hasFormula(cell)) return;
     const formula = `${columnLetter(col)}${totalRow}-SUM(${columnLetter(col)}${totalRow + 1}:${columnLetter(col)}${checkRow - 1})`;
     cell.value = { formula, result: 0 };
@@ -8720,6 +8683,7 @@ function writeSegmentMetricPreservingFormula(
 }
 
 function writeSegmentExternalFormulaResult(cell: ExcelJS.Cell, value: number) {
+  if (isProtectedFormulaOrCheckCell(cell)) return false;
   const formula = formulaForCell(cell);
   if (!formula || !formula.includes("!")) return false;
   cell.value = { formula, result: value };
@@ -8739,6 +8703,7 @@ function writeSegmentFourthQuarterBridgeFormula(
   const period = periods[periodIndex];
   if (metric !== "values" || !isFourthQuarterPeriod(period)) return false;
   const cell = sheet.getCell(rowNumber, columns[periodIndex]);
+  if (isProtectedFormulaOrCheckCell(cell)) return false;
   const existingFormula = formulaForCell(cell);
   if (!existingFormula || existingFormula.includes("!")) return false;
   const year = periodYearSuffix(period);
@@ -8755,6 +8720,7 @@ function writeSegmentFourthQuarterBridgeFormula(
 }
 
 function writeSegmentMetricCell(cell: ExcelJS.Cell, value: number, options: { overwriteFormula?: boolean } = {}) {
+  if (isProtectedFormulaOrCheckCell(cell)) return false;
   if (options.overwriteFormula && hasFormula(cell)) {
     cell.value = value;
     return true;
@@ -8840,7 +8806,7 @@ function clearUnmatchedSegmentRow(
   let commentsAdded = 0;
   periods.forEach((period, periodIndex) => {
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-    const canClearCell = isSegmentMetricWritableCell(cell) || hasFormula(cell);
+    const canClearCell = isSegmentMetricWritableCell(cell);
     if (!canClearCell) return;
     const existing = numericCellValue(cell);
     if (existing === 0 || existing === null) return;
@@ -8924,6 +8890,7 @@ function isSegmentMetricInputCell(cell: ExcelJS.Cell) {
 }
 
 function isSegmentMetricWritableCell(cell: ExcelJS.Cell) {
+  if (isProtectedFormulaOrCheckCell(cell)) return false;
   if (isSegmentMetricInputCell(cell)) return true;
   const formula = formulaForCell(cell);
   return Boolean(formula && (formula.includes("!") || formulaBridgeForTargetValue(cell, 0)));
@@ -9095,7 +9062,7 @@ function isModelHistoricalInput(cell: ExcelJS.Cell) {
 }
 
 function canAddComment(cell: ExcelJS.Cell) {
-  return !hasFormula(cell);
+  return !isProtectedFormulaOrCheckCell(cell);
 }
 
 function hasFormula(cell: ExcelJS.Cell) {
@@ -9607,6 +9574,7 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
     const cell = sheet.getCell(rowNumber, columns[index]);
     const formula = formulaForCell(cell);
     if (!formula) return;
+    if (isProtectedFormulaOrCheckCell(cell)) return;
     const value = resolved.value / 1_000_000;
     const current = numericCellValue(cell);
     if (current !== null && incomeStatementFormulaTies(current, value)) return;
@@ -9720,6 +9688,7 @@ function reconcileIncomeStatementClassificationRowsToEdgar(
 
       const col = columns[index];
       const cell = sheet.getCell(rowNumber, col);
+      if (isProtectedFormulaOrCheckCell(cell)) return;
       const value = resolved.value / 1_000_000;
       const formula = formulaForCell(cell);
       const cached = numericCellValue(cell);
@@ -9821,41 +9790,6 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     "income tax expense"
   );
   refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], resolveNetIncome, "net income");
-  refreshFormulaMetricResultsFromEdgar(sheet, periods, columns, ctx, auditRows, ["Net Income Available to Common Shareholders", "Net Income Available to Common Stockholders"], COMMON_SHAREHOLDER_INCOME_CONCEPTS, "net income available to common shareholders");
-}
-
-function refreshFormulaMetricResultsFromEdgar(
-  sheet: ExcelJS.Worksheet,
-  periods: string[],
-  columns: number[],
-  ctx: ResolveContext,
-  auditRows: MappingAuditRow[],
-  labels: string[],
-  concepts: string[],
-  metricName: string
-) {
-  const rowNumber = findIncomeStatementMetricRow(sheet, labels);
-  if (!rowNumber) return;
-  periods.forEach((period, index) => {
-    const source = first(period, ctx.duration, concepts);
-    if (!source) return;
-    const cell = sheet.getCell(rowNumber, columns[index]);
-    const formula = formulaForCell(cell);
-    if (!formula) return;
-    let value = source.value / 1_000_000;
-    if (isFourthQuarterPeriod(period) && index >= 3 && isAnnualDurationSource(source) && source.derivedTotalValue === undefined) {
-      const priorPeriods = periods.slice(index - 3, index);
-      if (priorPeriods.length === 3 && priorPeriods.every((priorPeriod) => periodYear(priorPeriod) === periodYear(period))) {
-        const priorTotal = columns
-          .slice(index - 3, index)
-          .reduce((total, priorCol) => total + (numericCellValue(sheet.getCell(rowNumber, priorCol)) ?? 0), 0);
-        value -= priorTotal;
-      }
-    }
-    if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
-    cell.value = { formula, result: value };
-    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} formula result from EDGAR after dependent formula caches were updated.`, "formula result refreshed"));
-  });
 }
 
 function refreshFormulaMetricResultsFromResolver(
@@ -9877,24 +9811,18 @@ function refreshFormulaMetricResultsFromResolver(
     const cell = sheet.getCell(rowNumber, columns[index]);
     const formula = formulaForCell(cell);
     const value = resolved.value / 1_000_000;
+    if (isProtectedFormulaOrCheckCell(cell)) return;
     if (!formula) {
+      if (!isHardcodedFinancialInput(cell)) return;
       if (numericCellValue(cell) !== null && exactModelValueTies(numericCellValue(cell)!, value)) return;
       cell.value = value;
-      auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} from EDGAR after dependent formula caches were updated.`, "formula replaced with EDGAR-supported value"));
-      return;
+      auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} from EDGAR after dependent formula caches were updated.`));
     }
-    if (numericCellValue(cell) !== null && exactModelValueTies(numericCellValue(cell)!, value)) return;
-    cell.value = value;
-    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Replaced ${metricName} formula with the reported EDGAR value so the primary income statement remains authoritative.`, "formula replaced with EDGAR-supported value"));
   });
 }
 
 function exactModelValueTies(actual: number, expected: number) {
   return Math.abs(actual - expected) <= 0.0001;
-}
-
-function isAnnualDurationSource(source: FactSource) {
-  return Boolean(source.start?.endsWith("-01-01") && source.end?.endsWith("-12-31"));
 }
 
 function refreshFormulaRowCachedResults(
@@ -9912,6 +9840,7 @@ function refreshFormulaRowCachedResults(
     if (skipPeriodColumns && periodColumns.has(col)) continue;
     if (shouldSkipCell(rowNumber, col)) continue;
     const cell = sheet.getCell(rowNumber, col);
+    if (isProtectedFormulaOrCheckCell(cell)) continue;
     const formula = formulaForCell(cell);
     if (!formula || formula.includes("!")) continue;
     const result = evaluator.evaluateCell(cell);
@@ -10342,8 +10271,7 @@ function isReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
 }
 
 function isIncomeStatementReconciliationResidualCellWritable(cell: ExcelJS.Cell) {
-  if (isReconciliationResidualCellWritable(cell)) return true;
-  return isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)));
+  return isReconciliationResidualCellWritable(cell);
 }
 
 function createLlmMappingState(): LlmMappingState {
@@ -11014,6 +10942,7 @@ function handleUnsupportedHistoricalBalanceSheetInput(
   period: string,
   auditRows: MappingAuditRow[]
 ) {
+  if (isProtectedFormulaOrCheckCell(cell)) return { handled: false, changed: false };
   if (!isStrictPrimaryBalanceSheetInputRow(sheet, fillRow)) return { handled: false, changed: false };
   if (!isHardcodedFinancialInput(cell)) return { handled: false, changed: false };
 
@@ -11261,7 +11190,7 @@ function strictPrimaryBalanceSheetRebuild(options: WorkbookValidationRetryOption
         continue;
       }
 
-      if (!isHardcodedFinancialInput(cell)) continue;
+      if (isProtectedFormulaOrCheckCell(cell) || !isHardcodedFinancialInput(cell)) continue;
       const value = resolved.value / (fillRow.scale ?? 1);
       const existing = numericCellValue(cell);
       clearEdgarMapperComment(cell);
@@ -11990,10 +11919,11 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
       const col = columns[index];
       if (skipProjectedBalanceSheetCell(balanceSheetCheckRow, col)) return;
       const cell = sheet.getCell(balanceSheetCheckRow, col);
+      if (isProtectedFormulaOrCheckCell(cell)) return;
       const formula = formulaForCell(cell);
       if (!formula) return;
       const result = evaluator.evaluateCell(cell);
-      cell.value = { formula, result: persistedFormulaResult(result ?? 0) };
+      if (result !== null) cell.value = { formula, result: persistedFormulaResult(result) };
     });
   }
 }
@@ -12022,10 +11952,12 @@ function refreshBalanceSheetInputFromResolver(
     if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
     const cell = sheet.getCell(rowNumber, col);
     const formula = formulaForCell(cell);
+    if (formula || isProtectedFormulaOrCheckCell(cell)) return;
     const resolved = resolver(balanceSheetInstantLookupPeriod(period), ctx);
     if (resolved.value === null || resolved.classification === "partial") return;
     const value = resolved.value / 1_000_000;
-    if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value) && !formula) return;
+    if (numericCellValue(cell) !== null && incomeStatementFormulaTies(numericCellValue(cell)!, value)) return;
+    if (!isHardcodedFinancialInput(cell)) return;
     cell.value = value;
     auditRows.push({
       sheetName: sheet.name,
@@ -12033,7 +11965,7 @@ function refreshBalanceSheetInputFromResolver(
       modelRowLabel: rowLabel(sheet, rowNumber),
       period,
       valueWritten: value,
-      mappingType: "formula updated",
+      mappingType: resolved.classification || "direct",
       conceptsUsed: resolved.sources.map((source) => `${source.concept}=${roundModelValue(source.value / 1_000_000)}mm`).join("; "),
       secLabels: resolved.sources.map((source) => source.label).join("; "),
       sourceStatement: "balance",
@@ -12045,7 +11977,7 @@ function refreshBalanceSheetInputFromResolver(
       endDate: unique(resolved.sources.map((source) => source.end ?? "").filter(Boolean)).join("; "),
       cellWritable: true,
       formulaPreserved: false,
-      formulaStatus: formula ? "balance-sheet formula replaced with EDGAR period-end value" : "not a formula cell",
+      formulaStatus: "not a formula cell",
       writeBlockedReason: "",
       signConvention: "copied",
       confidence: "high",
@@ -12077,23 +12009,16 @@ function refreshBalanceSheetTotalFormulaResult(
 ) {
   const cell = sheet.getCell(rowNumber, col);
   if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
+  if (isProtectedFormulaOrCheckCell(cell)) return;
   const formula = formulaForCell(cell);
   const currentValue = numericCellValue(cell);
   if (currentValue !== null && incomeStatementFormulaTies(currentValue, value)) return;
   if (formula) {
-    const refreshedFormula = formulaBridgeForTargetValue(cell, value);
-    if (refreshedFormula) {
-      cell.value = { formula: refreshedFormula, result: value };
-      auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} formula bridge from EDGAR.`, "formula bridge updated"));
-      return;
-    }
-    cell.value = value;
-    auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Replaced ${metricName} formula with the EDGAR-supported value.`, "formula replaced with EDGAR-supported value"));
     return;
   }
   if (!isHardcodedFinancialInput(cell)) return;
   cell.value = value;
-  auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} from EDGAR.`, "formula replaced with EDGAR-supported value"));
+  auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} from EDGAR.`));
 }
 
 function copyBalanceSheetFourthQuarterToAnnualColumns(
@@ -12121,7 +12046,9 @@ function copyBalanceSheetFourthQuarterToAnnualColumns(
       const value = numericCellValue(sourceCell) ?? evaluator.evaluateCell(sourceCell);
       if (value === null) continue;
       const targetCell = sheet.getCell(rowNumber, annualCol);
+      if (isProtectedFormulaOrCheckCell(targetCell)) continue;
       if (!hasFormula(targetCell) && numericCellValue(targetCell) !== null && exactModelValueTies(numericCellValue(targetCell)!, value)) continue;
+      if (!isHardcodedFinancialInput(targetCell)) continue;
       targetCell.value = value;
       filledCells += 1;
       auditRows.push({
@@ -12168,7 +12095,6 @@ function ensureFormulaDisplayCaches(workbook: ExcelJS.Workbook, columns: number[
         if (!formula || !isNumericDisplayFormula(formula)) continue;
         const result = evaluator.evaluateCell(cell);
         if (result !== null) setFormulaResult(cell, result);
-        else if (!hasFormulaResult(cell)) setFormulaResult(cell, 0);
       }
     }
   }
@@ -12768,6 +12694,12 @@ function validateIncomeStatementLineItemClassifications(
       const col = columns[index];
       const cell = sheet.getCell(rowNumber, col);
       const formula = formulaForCell(cell);
+      if (isProtectedFormulaOrCheckCell(cell)) {
+        warnings.unshift(
+          `Income Statement ${cell.address} ${period}: ${check.name} classification check skipped because the cell is a protected formula/check cell.`
+        );
+        return;
+      }
       if (formula && !isBridgeFormula(formula) && !/^SUM\(/i.test(normalizeBridgeFormulaPrefix(formula))) {
         warnings.unshift(
           `Income Statement ${cell.address} ${period}: ${check.name} classification check skipped because the cell is a template support formula (${formula}).`
@@ -12822,19 +12754,21 @@ function validateIncomeStatementMetricAgainstEdgar(
     }
 
     const cell = sheet.getCell(rowNumber, columns[index]);
+    const protectedFormula = isProtectedFormulaOrCheckCell(cell);
     const expected = expectedRaw / 1_000_000;
     const displayedValue = numericCellValue(cell);
     const modelValue = options.hard && displayedValue !== null ? displayedValue : statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`;
-      if (hasFormula(cell)) warnings.unshift(message);
+      if (protectedFormula || hasFormula(cell)) warnings.unshift(message);
       else errors.push(message);
       return;
     }
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
-      if (hasFormula(cell) && !options.hard) warnings.unshift(message);
+      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      else if (hasFormula(cell) && !options.hard) warnings.unshift(message);
       else errors.push(message);
     }
   });
@@ -13068,7 +13002,7 @@ function validateBalanceSheetStatementTotals(
     )
   );
   errors.push(...validateBalanceSheetOtherBucketMetrics(sheet, periods, columns, ctx, evaluator, warnings));
-  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator));
+  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator, warnings));
   errors.push(...validateBalanceSheetFourthQuarterAnnualTies(sheet, periods, columns, evaluator));
   errors.push(
     ...validateBalanceSheetSubtotalEqualsComponents(
@@ -13076,6 +13010,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total current assets",
       ["Total Current Assets"],
       [
@@ -13093,6 +13028,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total non-current assets",
       ["Total Non-Current Assets", "Total Noncurrent Assets", "Total Long-Term Assets", "Total Long Term Assets"],
       [
@@ -13109,6 +13045,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total assets",
       ["Total Assets"],
       [
@@ -13123,6 +13060,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total current liabilities",
       ["Total Current Liabilities", "Total Current Liabilities (Excl. Debt)", "Total Current Liabilities Excl. Debt"],
       [
@@ -13138,6 +13076,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total non-current liabilities",
       ["Total Non-Current Liabilities", "Total Noncurrent Liabilities", "Total Long-Term Liabilities", "Total Long Term Liabilities"],
       [
@@ -13155,6 +13094,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total liabilities",
       ["Total Liabilities"],
       [
@@ -13169,6 +13109,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total shareholders' equity",
       [
         "Total Shareholder's Equity",
@@ -13191,6 +13132,7 @@ function validateBalanceSheetStatementTotals(
       periods,
       columns,
       evaluator,
+      warnings,
       "total equity",
       ["Total Equity"],
       [
@@ -13213,7 +13155,8 @@ function validateBalanceSheetClassificationCompleteness(
   periods: string[],
   columns: number[],
   ctx: ResolveContext,
-  evaluator: FormulaEvaluator
+  evaluator: FormulaEvaluator,
+  warnings: string[]
 ) {
   const errors: string[] = [];
   const investmentRow = findBalanceSheetRow(sheet, CURRENT_INVESTMENT_ROW_LABELS);
@@ -13266,17 +13209,19 @@ function validateBalanceSheetClassificationCompleteness(
       if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
       const lookupPeriod = balanceSheetInstantLookupPeriod(period);
       const resolved = check.resolver(lookupPeriod, ctx);
-      const modelValue = evaluatedCellNumber(sheet.getCell(rowNumber, col), evaluator);
+      const cell = sheet.getCell(rowNumber, col);
+      const protectedFormula = isProtectedFormulaOrCheckCell(cell);
+      const modelValue = evaluatedCellNumber(cell, evaluator);
       if (resolved.value === null) {
         const prior = mostRecentPriorResolvedBalanceSheetValue(lookupPeriod, ctx, check.resolver);
         if (prior && Math.abs(prior.value ?? 0) > 5_000_000 && (modelValue === null || Math.abs(modelValue) <= 0.5)) {
-          errors.push(
-            `Balance Sheet ${period}: ${check.metricName} disappeared after prior SEC filings reported ${roundModelValue((prior.value ?? 0) / 1_000_000)}. The row must be remapped or explicitly sourced as zero before writing output.`
-          );
+          const message = `Balance Sheet ${period}: ${check.metricName} disappeared after prior SEC filings reported ${roundModelValue((prior.value ?? 0) / 1_000_000)}. The row must be remapped or explicitly sourced as zero before writing output.`;
+          if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+          else errors.push(message);
         } else if (modelValue !== null && Math.abs(modelValue) > 0.5) {
-          errors.push(
-            `Balance Sheet ${period}: ${check.metricName} has model value ${roundModelValue(modelValue)} but no explicit SEC source was identified.`
-          );
+          const message = `Balance Sheet ${period}: ${check.metricName} has model value ${roundModelValue(modelValue)} but no explicit SEC source was identified.`;
+          if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+          else errors.push(message);
         }
         return;
       }
@@ -13284,9 +13229,9 @@ function validateBalanceSheetClassificationCompleteness(
       if (modelValue === null) return;
       const expected = resolved.value / 1_000_000;
       if (!statementMetricTies(modelValue, expected)) {
-        errors.push(
-          `Balance Sheet ${columnLetter(col)}${rowNumber} ${period}: ${check.metricName} ${roundModelValue(modelValue)} does not match SEC-sourced value ${roundModelValue(expected)} from ${resolvedSourceSummary(resolved)}.`
-        );
+        const message = `Balance Sheet ${columnLetter(col)}${rowNumber} ${period}: ${check.metricName} ${roundModelValue(modelValue)} does not match SEC-sourced value ${roundModelValue(expected)} from ${resolvedSourceSummary(resolved)}.`;
+        if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+        else errors.push(message);
       }
     });
   }
@@ -13332,6 +13277,7 @@ function validateBalanceSheetSubtotalEqualsComponents(
   periods: string[],
   columns: number[],
   evaluator: FormulaEvaluator,
+  warnings: string[],
   metricName: string,
   totalLabels: string[],
   componentLabelGroups: string[][]
@@ -13371,14 +13317,17 @@ function validateBalanceSheetSubtotalEqualsComponents(
   periods.forEach((period, index) => {
     const col = columns[index];
     if (isProjectedBalanceSheetCell(sheet, totalRow, col)) return;
-    const total = evaluatedCellNumber(sheet.getCell(totalRow, col), evaluator);
-    const components = componentRows.map((rowNumber) => evaluatedCellNumber(sheet.getCell(rowNumber, col), evaluator));
+    const totalCell = sheet.getCell(totalRow, col);
+    const componentCells = componentRows.map((rowNumber) => sheet.getCell(rowNumber, col));
+    const protectedFormula = isProtectedFormulaOrCheckCell(totalCell) || componentCells.some((cell) => isProtectedFormulaOrCheckCell(cell));
+    const total = evaluatedCellNumber(totalCell, evaluator);
+    const components = componentCells.map((cell) => evaluatedCellNumber(cell, evaluator));
     if (total === null || components.some((value) => value === null)) return;
     const expected = (components as number[]).reduce((sumValue, value) => sumValue + value, 0);
     if (!statementMetricTies(total, expected)) {
-      errors.push(
-        `Balance Sheet ${columnLetter(col)}${totalRow} ${period}: ${metricName} ${roundModelValue(total)} does not equal disclosed component sum ${roundModelValue(expected)} for ${totalLabel}.`
-      );
+      const message = `Balance Sheet ${columnLetter(col)}${totalRow} ${period}: ${metricName} ${roundModelValue(total)} does not equal disclosed component sum ${roundModelValue(expected)} for ${totalLabel}.`;
+      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      else errors.push(message);
     }
   });
 
@@ -13576,6 +13525,7 @@ function validateBalanceSheetCurrentLiabilitiesSubtotal(
     const col = columns[index];
     const cell = sheet.getCell(rowNumber, col);
     if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
+    const protectedFormula = isProtectedFormulaOrCheckCell(cell);
     const resolved = resolveCurrentLiabilitiesSubtotalForLabel(totalLabel, balanceSheetInstantLookupPeriod(period), ctx);
     if (resolved.value === null) {
       warnings.unshift(`Balance Sheet ${period}: modeled current liabilities tie-out skipped because the EDGAR residual bucket could not be resolved.`);
@@ -13585,15 +13535,17 @@ function validateBalanceSheetCurrentLiabilitiesSubtotal(
     const expected = resolved.value / 1_000_000;
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
-      errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate model modeled current liabilities.`);
+      const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model modeled current liabilities.`;
+      if (protectedFormula) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
 
     if (!otherBucketMetricTies(modelValue, expected)) {
       const concepts = resolved.sources.map((source) => source.concept).filter(Boolean).join("/");
-      errors.push(
-        `Balance Sheet ${cell.address} ${period}: modeled current liabilities ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`
-      );
+      const message = `Balance Sheet ${cell.address} ${period}: modeled current liabilities ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`;
+      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      else errors.push(message);
     }
   });
 
@@ -13636,9 +13588,12 @@ function validateBalanceSheetCurrentLiabilitiesExDebtBridge(
 
     const expectedSubtotal = (reportedCurrentLiabilities.value - currentDebt.value) / 1_000_000;
     const cell = sheet.getCell(rowNumber, col);
+    const protectedFormula = isProtectedFormulaOrCheckCell(cell);
     const subtotal = statementMetricCellValue(cell, evaluator, expectedSubtotal);
     if (subtotal === null) {
-      errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate total current liabilities excluding debt.`);
+      const message = `Balance Sheet ${cell.address} ${period}: could not evaluate total current liabilities excluding debt.`;
+      if (protectedFormula) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
 
@@ -13646,9 +13601,9 @@ function validateBalanceSheetCurrentLiabilitiesExDebtBridge(
     const reconstructedReportedTotal = subtotal + currentDebt.value / 1_000_000;
     if (!statementMetricTies(reconstructedReportedTotal, expectedReportedTotal)) {
       const debtSources = resolvedSourceSummary(currentDebt);
-      errors.push(
-        `Balance Sheet ${cell.address} ${period}: total current liabilities excluding debt ${roundModelValue(subtotal)} plus EDGAR current debt ${roundModelValue(currentDebt.value / 1_000_000)} does not reconcile to EDGAR total current liabilities ${roundModelValue(expectedReportedTotal)}. Difference ${roundModelValue(reconstructedReportedTotal - expectedReportedTotal)}. Current debt sources: ${debtSources}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`
-      );
+      const message = `Balance Sheet ${cell.address} ${period}: total current liabilities excluding debt ${roundModelValue(subtotal)} plus EDGAR current debt ${roundModelValue(currentDebt.value / 1_000_000)} does not reconcile to EDGAR total current liabilities ${roundModelValue(expectedReportedTotal)}. Difference ${roundModelValue(reconstructedReportedTotal - expectedReportedTotal)}. Current debt sources: ${debtSources}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`;
+      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      else errors.push(message);
     }
   });
 
@@ -13675,6 +13630,7 @@ function validateBalanceSheetMetricAgainstResolver(
   periods.forEach((period, index) => {
     const cell = sheet.getCell(rowNumber, columns[index]);
     if (isProjectedBalanceSheetCell(sheet, rowNumber, columns[index])) return;
+    const protectedFormula = isProtectedFormulaOrCheckCell(cell);
     const resolved = resolver(balanceSheetInstantLookupPeriod(period), ctx);
     if (resolved.value === null) {
       warnings.unshift(`Balance Sheet ${period}: ${metricName} tie-out skipped because the EDGAR residual bucket could not be resolved.`);
@@ -13685,13 +13641,18 @@ function validateBalanceSheetMetricAgainstResolver(
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`;
-      errors.push(message);
+      if (protectedFormula) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
 
     if (!otherBucketMetricTies(modelValue, expected)) {
       const concepts = resolved.sources.map((source) => source.concept).filter(Boolean).join("/");
       const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
+      if (protectedFormula) {
+        warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+        return;
+      }
       if (isPartialOtherBucketResolver(metricName, resolved)) {
         warnings.unshift(`${message} The available EDGAR concept is a partial component, so the broader model other-bucket residual was preserved for review.`);
         return;
@@ -13734,6 +13695,7 @@ function validateBalanceSheetMetricAgainstEdgar(
   periods.forEach((period, index) => {
     const cell = sheet.getCell(rowNumber, columns[index]);
     if (isProjectedBalanceSheetCell(sheet, rowNumber, columns[index])) return;
+    const protectedFormula = isProtectedFormulaOrCheckCell(cell);
     const edgarValue = first(balanceSheetInstantLookupPeriod(period), ctx.instant, concepts);
     if (!edgarValue) {
       warnings.unshift(`Balance Sheet ${period}: ${metricName} tie-out skipped because EDGAR ${concepts.join("/")} was unavailable for that period.`);
@@ -13744,13 +13706,15 @@ function validateBalanceSheetMetricAgainstEdgar(
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`;
-      errors.push(message);
+      if (protectedFormula) warnings.unshift(message);
+      else errors.push(message);
       return;
     }
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
-      errors.push(message);
+      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      else errors.push(message);
     }
   });
 
@@ -13767,11 +13731,16 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
     periods.forEach((period, index) => {
       const cell = sheet.getCell(checkRow, columns[index]);
       if (isProjectedBalanceSheetCell(sheet, checkRow, columns[index])) return;
+      const protectedFormula = isProtectedFormulaOrCheckCell(cell);
       const check = evaluator.evaluateCell(cell);
       if (check === null) {
-        errors.push(`Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`);
+        const message = `Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`;
+        if (protectedFormula) warnings.unshift(message);
+        else errors.push(message);
       } else if (!statementMetricTies(check, 0)) {
-        errors.push(`Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`);
+        const message = `Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
+        if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+        else errors.push(message);
       }
     });
   }
@@ -13787,14 +13756,19 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
   periods.forEach((period, index) => {
     const col = columns[index];
     if (isProjectedBalanceSheetCell(sheet, assetsRow, col) || isProjectedBalanceSheetCell(sheet, liabilitiesAndEquityRow, col)) return;
-    const assets = evaluator.evaluateCell(sheet.getCell(assetsRow, col));
-    const liabilitiesAndEquity = evaluator.evaluateCell(sheet.getCell(liabilitiesAndEquityRow, col));
+    const assetsCell = sheet.getCell(assetsRow, col);
+    const liabilitiesAndEquityCell = sheet.getCell(liabilitiesAndEquityRow, col);
+    const protectedFormula = isProtectedFormulaOrCheckCell(assetsCell) || isProtectedFormulaOrCheckCell(liabilitiesAndEquityCell);
+    const assets = evaluator.evaluateCell(assetsCell);
+    const liabilitiesAndEquity = evaluator.evaluateCell(liabilitiesAndEquityCell);
     if (assets === null || liabilitiesAndEquity === null) {
-      errors.push(`Balance Sheet ${period}: could not evaluate total assets or total liabilities plus shareholder's equity.`);
+      const message = `Balance Sheet ${period}: could not evaluate total assets or total liabilities plus shareholder's equity.`;
+      if (protectedFormula) warnings.unshift(message);
+      else errors.push(message);
     } else if (!statementMetricTies(assets, liabilitiesAndEquity)) {
-      errors.push(
-        `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}. Difference ${roundModelValue(assets - liabilitiesAndEquity)}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`
-      );
+      const message = `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}. Difference ${roundModelValue(assets - liabilitiesAndEquity)}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`;
+      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      else errors.push(message);
     }
   });
 
@@ -13953,14 +13927,10 @@ function cloneCellNote(note: ExcelJS.Cell["note"]): ExcelJS.Cell["note"] {
 }
 
 function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string, actual: string | null) {
-  if (!actual && balanceSheetRows(cell.worksheet).has(Number(cell.row)) && !isProjectedBalanceSheetCell(cell.worksheet, Number(cell.row), Number(cell.col))) {
-    return true;
-  }
   if (!actual && isSegmentAnalysisLabelRewriteCell(cell)) return true;
   if (!actual && isIncomeStatementReportedAnchorCell(cell)) return true;
   if (!actual && isIncomeStatementConstantFormulaReplacement(cell, expected)) return true;
   if (!actual && isIncomeStatementDepreciationAmortizationCell(cell)) return true;
-  if (!actual && isFormulaReplacementAllowedForReconciliation(rowLabel(cell.worksheet, Number(cell.row)))) return true;
   if (!actual && isSegmentAnalysisMetricRewriteCell(cell)) return true;
   if (!actual && isSegmentAnalysisTotalRewriteCell(cell)) return true;
   if (actual && isSegmentAnalysisTotalRewriteCell(cell)) return true;
@@ -14043,14 +14013,6 @@ function segmentMetricSectionRows(sheet: ExcelJS.Worksheet, startLabel: string, 
     if (rowLabel(sheet, rowNumber)) rows.push(rowNumber);
   }
   return rows;
-}
-
-function isFormulaReplacementAllowedForReconciliation(label: string) {
-  const normalized = normalize(label);
-  if (["pretaxadjustments", "posttaxadjustments", "discontinuedoperations", "incomelossduetononcontrollinginterest"].includes(normalized)) {
-    return true;
-  }
-  return /other\s+operating\s+income|other\s+operating\s+expense|other\s+non\s*-?\s*operating\s+income|other\s+non\s*-?\s*operating\s+expense|other\s+income\s+\(expense\)|other\s+expense\s+\(income\)|income\s*tax|pre\s*-\s*tax\s+adjustments|post\s*-\s*tax\s+adjustments|discontinued\s+operations|non\s*-\s*controlling\s+interest|prepaid\s+(?:&|and)\s+other\s+current\s+assets|other\s+current\s+assets|other\s+non-current\s+assets|other\s+long-term\s+assets|other\s+lt\s+assets|other\s+current\s+liabilities|other\s+non-current\s+liabilities|accounts\s+payable\s+(?:&|and)\s+accrued\s+liabilities|accrued\s+liabilities/i.test(label);
 }
 
 function isBridgeFormula(formula: string) {
@@ -14435,19 +14397,23 @@ function validateSegmentRevenueTieOut(
     const sheetTotal = evaluator.evaluateCell(totalCell);
     const edgarRevenue = resolveTotalRevenue(period, ctx);
     const expectedRevenue = edgarRevenue.value !== null ? edgarRevenue.value / 1_000_000 : null;
+    const protectedSegmentFormula = isProtectedFormulaOrCheckCell(totalCell) || rows.some((rowNumber) => isProtectedFormulaOrCheckCell(sheet.getCell(rowNumber, col)));
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, segmentTotal)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue formula evaluates to ${roundModelValue(sheetTotal)}, but segment rows sum to ${roundModelValue(segmentTotal)}.`;
-      errors.push(message);
+      if (protectedSegmentFormula) warnings.unshift(`${message} Protected segment formula cell(s) were preserved for review.`);
+      else errors.push(message);
     }
     if (expectedRevenue === null) return;
     if (!segmentModelRevenueTies(segmentTotal, expectedRevenue)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: segment revenue rows sum to ${roundModelValue(segmentTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
       if (isMissingFourthQuarterSegmentDetail(period, segmentTotal, expectedRevenue)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else if (protectedSegmentFormula) warnings.unshift(`${message} Protected segment formula cell(s) were preserved for review.`);
       else errors.push(message);
     }
     if (sheetTotal !== null && !segmentModelRevenueTies(sheetTotal, expectedRevenue)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: total company revenue evaluates to ${roundModelValue(sheetTotal)}, but EDGAR revenue is ${roundModelValue(expectedRevenue)}.`;
       if (isMissingFourthQuarterSegmentDetail(period, sheetTotal, expectedRevenue)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
+      else if (protectedSegmentFormula) warnings.unshift(`${message} Protected segment formula cell(s) were preserved for review.`);
       else errors.push(message);
     }
   });
@@ -14497,11 +14463,12 @@ function validateSegmentStatementTieOut(
     const sheetTotal = evaluator.evaluateCell(totalCell);
     const expected = linkedExpected ?? (expectedStatementValue! / 1_000_000);
     const sourceName = linkedExpected === null ? (/operating income/i.test(metricName) ? "reported EBIT / operating income" : "EDGAR") : "the linked model total";
+    const protectedSegmentFormula = isProtectedFormulaOrCheckCell(totalCell) || rows.some((rowNumber) => isProtectedFormulaOrCheckCell(sheet.getCell(rowNumber, col)));
     if (metricName !== "Revenue" && Math.abs(segmentTotal) <= 1 && Math.abs(expected) > 0.0001) {
       if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, expected)) {
-        errors.push(
-          `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`
-        );
+        const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`;
+        if (protectedSegmentFormula) warnings.unshift(`${message} Protected segment formula cell(s) were preserved for review.`);
+        else errors.push(message);
       }
       warnings.unshift(`${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName.toLowerCase()} detail was unavailable; leaving the segment breakout blank for review.`);
       return;
@@ -14510,7 +14477,7 @@ function validateSegmentStatementTieOut(
     if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, segmentTotal)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but detail rows sum to ${roundModelValue(segmentTotal)}.`;
       if (/operating income/i.test(metricName)) warnings.unshift(`${message} Segment operating income detail is disclosed separately and was not forced to reconcile with an estimated plug.`);
-      else if (hasFormula(totalCell)) warnings.unshift(message);
+      else if (protectedSegmentFormula || hasFormula(totalCell)) warnings.unshift(message);
       else errors.push(message);
     }
     if (!segmentStatementMetricTies(segmentTotal, expected)) {
@@ -14522,14 +14489,14 @@ function validateSegmentStatementTieOut(
       } else if (metricName === "D&A" && Math.abs(segmentTotal) <= 0.0001) warnings.unshift(`${message} Segment-level D&A detail appears unavailable, so this is reported as a review warning rather than a blocking error.`);
       else if (metricName === "D&A") warnings.unshift(`${message} Segment-level D&A can differ from the linked model D&A line, so this is reported as a review warning.`);
       else if (isMissingFourthQuarterSegmentDetail(period, segmentTotal, expected)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
-      else if (rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
+      else if (protectedSegmentFormula || rows.some((rowNumber) => hasFormula(sheet.getCell(rowNumber, col)))) warnings.unshift(message);
       else errors.push(message);
     }
     if (sheetTotal !== null && !segmentStatementMetricTies(sheetTotal, expected)) {
       const message = `${sheet.name}!${columnLetter(col)}${totalRow} ${period}: ${metricName} total evaluates to ${roundModelValue(sheetTotal)}, but ${sourceName} is ${roundModelValue(expected)}.`;
       if (/operating income/i.test(metricName)) warnings.unshift(`${message} Segment operating income was left as disclosed rather than forced into a residual reconciliation row.`);
       else if (isMissingFourthQuarterSegmentDetail(period, sheetTotal, expected)) warnings.unshift(`${message} Reliable 4Q segment detail was unavailable, so this is reported as a review warning rather than a blocking error.`);
-      else if (hasFormula(totalCell)) warnings.unshift(message);
+      else if (protectedSegmentFormula || hasFormula(totalCell)) warnings.unshift(message);
       else errors.push(message);
     }
   });
@@ -14624,6 +14591,7 @@ function addFilingPeriodMapSheet(workbook: ExcelJS.Workbook, entries: ModelPerio
 }
 
 function addComment(cell: ExcelJS.Cell, text: string) {
+  if (isProtectedFormulaOrCheckCell(cell)) return false;
   const existing = nonEdgarMapperCommentText(commentText(cell.note));
   const userText = userFacingCommentText(cell, text);
   if (!userText) {

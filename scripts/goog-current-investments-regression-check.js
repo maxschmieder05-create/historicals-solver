@@ -41,11 +41,19 @@ function cellValue(cell) {
   return value;
 }
 
+function cellFormula(cell) {
+  return cell.formula ?? null;
+}
+
 function valuesMatch(actual, expected) {
   return typeof actual === "number" && Math.abs(actual - expected) <= 0.5;
 }
 
 async function main() {
+  const input = new ExcelJS.Workbook();
+  await input.xlsx.readFile(inputWorkbook);
+  const inputModel = input.getWorksheet("Model");
+
   await postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook });
 
   const workbook = new ExcelJS.Workbook();
@@ -57,6 +65,14 @@ async function main() {
   const errors = [];
   for (const { period, col } of modelQuarterPeriods(model)) {
     for (const check of flowChecks) {
+      const inputFormula = inputModel ? cellFormula(inputModel.getCell(check.row, col)) : null;
+      if (inputFormula) {
+        const outputFormula = cellFormula(model.getCell(check.row, col));
+        if (outputFormula !== inputFormula) {
+          errors.push(`${period} ${check.label} Model!${columnLetter(col)}${check.row}: formula changed from "${inputFormula}" to "${outputFormula ?? "[hardcoded/blank]"}".`);
+        }
+        continue;
+      }
       const expected = expectedDurationConceptValue(facts, period, check.concepts);
       if (expected === null) continue;
       const actual = cellValue(model.getCell(check.row, col));
@@ -66,6 +82,14 @@ async function main() {
     }
 
     for (const check of checks) {
+      const inputFormula = inputModel ? cellFormula(inputModel.getCell(check.row, col)) : null;
+      if (inputFormula) {
+        const outputFormula = cellFormula(model.getCell(check.row, col));
+        if (outputFormula !== inputFormula) {
+          errors.push(`${period} ${check.label} Model!${columnLetter(col)}${check.row}: formula changed from "${inputFormula}" to "${outputFormula ?? "[hardcoded/blank]"}".`);
+        }
+        continue;
+      }
       const expected =
         check.resolver?.(facts, period) ??
         (check.concepts ? expectedConceptValue(facts, period, check.concepts) : null);
