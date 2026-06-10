@@ -102,7 +102,7 @@ export default function Home() {
     };
   }, [fileKey, pickFile]);
 
-  function handleDrag(event: DragEvent<HTMLButtonElement>) {
+  function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
     if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
@@ -114,7 +114,7 @@ export default function Home() {
     if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLButtonElement>) {
+  function handleDrop(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
@@ -131,13 +131,6 @@ export default function Home() {
 
   function handleFileInput(event: FormEvent<HTMLInputElement>) {
     pickInputFile(event.currentTarget);
-  }
-
-  function openFilePicker() {
-    if (isSubmitting) return;
-    if (!fileInputRef.current) return;
-    fileInputRef.current.value = "";
-    fileInputRef.current?.click();
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -257,31 +250,30 @@ export default function Home() {
             </div>
           </div>
 
-          <input
-            id="model-template-file"
-            ref={fileInputRef}
-            className="fileInput"
-            type="file"
-            name="file"
-            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
-            onChange={handleFileSelect}
-            onInput={handleFileInput}
-            onClick={(event) => {
-              event.currentTarget.value = "";
-            }}
-          />
-          <button
-            type="button"
+          <div
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
             aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
-            onClick={openFilePicker}
+            aria-disabled={isSubmitting}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}
             onDrop={handleDrop}
-            disabled={isSubmitting}
           >
+            <input
+              id="model-template-file"
+              ref={fileInputRef}
+              className="fileInput"
+              type="file"
+              name="file"
+              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
+              disabled={isSubmitting}
+              onChange={handleFileSelect}
+              onInput={handleFileInput}
+              onClick={(event) => {
+                event.currentTarget.value = "";
+              }}
+            />
             <span className="dropIcon">
               {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
             </span>
@@ -296,7 +288,7 @@ export default function Home() {
               <small>Click to browse or drag in an .xlsx file</small>
             )}
             <span className="browseCue">Choose workbook</span>
-          </button>
+          </div>
 
           <button className="primary" type="submit" disabled={!canSubmit}>
             {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}

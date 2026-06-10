@@ -2,7 +2,9 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const pagePath = path.join(__dirname, "..", "app", "page.tsx");
+const stylesPath = path.join(__dirname, "..", "app", "styles.css");
 const source = fs.readFileSync(pagePath, "utf8");
+const styles = fs.readFileSync(stylesPath, "utf8");
 
 const checks = [
   {
@@ -10,16 +12,20 @@ const checks = [
     message: "Dropzone must not be a label; label activation can swallow file-picker changes."
   },
   {
-    ok: /<button\s+[^>]*type="button"[\s\S]*className=\{`dropzone/.test(source),
-    message: "Dropzone should be an explicit non-submit button."
+    ok: !/<button[\s\S]*className=\{`dropzone/.test(source),
+    message: "Dropzone must not be a button that depends on scripted file-input clicks."
   },
   {
-    ok: /function openFilePicker\(\)[\s\S]*fileInputRef\.current\.value = ""[\s\S]*fileInputRef\.current\?\.click\(\)/.test(source),
-    message: "openFilePicker should clear the native input then click it exactly through the ref."
+    ok: /<div[\s\S]*className=\{`dropzone[\s\S]*<input[\s\S]*className="fileInput"[\s\S]*type="file"/.test(source),
+    message: "Native file input must live inside the dropzone so direct clicks open the picker."
   },
   {
     ok: /<input[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
-    message: "Hidden file input must remain wired to both change and input events."
+    message: "Native file input must remain wired to both change and input events."
+  },
+  {
+    ok: /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),
+    message: "File input must stay as a full-size transparent overlay, not a clipped hidden input."
   }
 ];
 
