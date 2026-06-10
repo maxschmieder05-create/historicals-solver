@@ -58,7 +58,7 @@ export default function Home() {
   useEffect(() => {
     function syncInputSelection() {
       const nextFile = fileInputRef.current?.files?.item(0) ?? undefined;
-      if (!nextFile || fileKey(nextFile) === selectedFileKeyRef.current) return;
+      if (!nextFile) return;
       pickFile(nextFile);
     }
 
@@ -100,7 +100,24 @@ export default function Home() {
       window.removeEventListener("focus", handleWindowFocus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [fileKey, pickFile]);
+  }, [pickFile]);
+
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) return;
+
+    const handleNativeFileSelection = () => {
+      const nextFile = input.files?.item(0) ?? undefined;
+      if (nextFile) pickFile(nextFile);
+    };
+
+    input.addEventListener("change", handleNativeFileSelection);
+    input.addEventListener("input", handleNativeFileSelection);
+    return () => {
+      input.removeEventListener("change", handleNativeFileSelection);
+      input.removeEventListener("input", handleNativeFileSelection);
+    };
+  }, [pickFile]);
 
   function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
@@ -131,10 +148,6 @@ export default function Home() {
 
   function handleFileInput(event: FormEvent<HTMLInputElement>) {
     pickInputFile(event.currentTarget);
-  }
-
-  function prepareFilePicker(input: HTMLInputElement) {
-    input.value = "";
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -274,12 +287,6 @@ export default function Home() {
               disabled={isSubmitting}
               onChange={handleFileSelect}
               onInput={handleFileInput}
-              onPointerDown={(event) => {
-                prepareFilePicker(event.currentTarget);
-              }}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") prepareFilePicker(event.currentTarget);
-              }}
             />
             <span className="dropIcon">
               {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}

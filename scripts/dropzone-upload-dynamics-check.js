@@ -24,12 +24,20 @@ const checks = [
     message: "Native file input must remain wired to both change and input events."
   },
   {
-    ok: !/onClick=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source),
-    message: "File input must not clear itself from onClick because some browsers dispatch that after the picker closes."
+    ok: /input\.addEventListener\("change", handleNativeFileSelection\)/.test(source) && /input\.addEventListener\("input", handleNativeFileSelection\)/.test(source),
+    message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing."
   },
   {
-    ok: /onPointerDown=\{\(event\)\s*=>\s*\{[\s\S]*prepareFilePicker\(event\.currentTarget\)/.test(source),
-    message: "File input should clear before picker activation through pointer down."
+    ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
+    message: "Focus-return sync must not skip a native file just because its key was seen before."
+  },
+  {
+    ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source),
+    message: "File input must not clear itself while opening the picker; that can erase the selected file after Open."
+  },
+  {
+    ok: !/prepareFilePicker/.test(source),
+    message: "Dropzone should not use a picker-preparation helper that mutates the native input value."
   },
   {
     ok: /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),
