@@ -133,6 +133,10 @@ export default function Home() {
     pickInputFile(event.currentTarget);
   }
 
+  function prepareFilePicker(input: HTMLInputElement) {
+    input.value = "";
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -270,8 +274,11 @@ export default function Home() {
               disabled={isSubmitting}
               onChange={handleFileSelect}
               onInput={handleFileInput}
-              onClick={(event) => {
-                event.currentTarget.value = "";
+              onPointerDown={(event) => {
+                prepareFilePicker(event.currentTarget);
+              }}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") prepareFilePicker(event.currentTarget);
               }}
             />
             <span className="dropIcon">

@@ -24,6 +24,14 @@ const checks = [
     message: "Native file input must remain wired to both change and input events."
   },
   {
+    ok: !/onClick=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source),
+    message: "File input must not clear itself from onClick because some browsers dispatch that after the picker closes."
+  },
+  {
+    ok: /onPointerDown=\{\(event\)\s*=>\s*\{[\s\S]*prepareFilePicker\(event\.currentTarget\)/.test(source),
+    message: "File input should clear before picker activation through pointer down."
+  },
+  {
     ok: /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),
     message: "File input must stay as a full-size transparent overlay, not a clipped hidden input."
   }
