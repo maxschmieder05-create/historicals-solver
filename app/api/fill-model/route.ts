@@ -4941,6 +4941,7 @@ export async function POST(request: NextRequest) {
     );
     ctx.filingPackageStatements = filingPackageSupport.statements;
     markReportedPeriodColumns(sheet, reportedPeriodPairs);
+    normalizeReportedPeriodHeaderLabels(sheet, reportedPeriodPairs);
     normalizeSharedFormulas(workbook);
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
     if (periods.some(isQuarterPeriod)) {
@@ -5002,7 +5003,8 @@ export async function POST(request: NextRequest) {
         const col = columns[index];
         if (isProjectedBalanceSheetCell(sheet, effectiveFillRow.row, col)) continue;
         const cell = sheet.getCell(effectiveFillRow.row, col);
-        const writeDecision = historicalWriteDecision(effectiveFillRow, cell);
+        const formulaBeforeWrite = hasFormula(cell);
+        const writeDecision = historicalWriteDecision(effectiveFillRow, cell, period, ctx);
         if (!writeDecision.writable) {
           if (shouldAuditSkippedWrite(writeDecision)) {
             auditRows.push(skippedMappingAuditRow(sheet, cell, effectiveFillRow, period, writeDecision));
@@ -5029,7 +5031,19 @@ export async function POST(request: NextRequest) {
         }
 
         const validation = validateResolvedValueForWrite(company, effectiveFillRow, period, resolved);
-        if (validation.status === "blocked") {
+        const actualizedForecastOverride = canWriteActualizedForecastBalanceValue(effectiveFillRow, cell, period, ctx, validation);
+        const effectiveValidation = actualizedForecastOverride
+          ? {
+              ...validation,
+              status: "warning" as const,
+              confidence: lowerConfidence(validation.confidence, "medium"),
+              notes: [
+                ...validation.notes,
+                "Classification-only validation block was overridden because this forecast column has a matching SEC filing and the balance-sheet value is derived from SEC balance-sheet components."
+              ]
+            }
+          : validation;
+        if (validation.status === "blocked" && !actualizedForecastOverride) {
           unresolved += 1;
           const value = resolved.value / (effectiveFillRow.scale ?? 1);
           const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
@@ -5045,12 +5059,16 @@ export async function POST(request: NextRequest) {
         const auditNote = auditNoteForResolvedValue(effectiveFillRow, resolved, period, ctx);
         if (auditNote) rowNotes.add(auditNote);
         const mappingConfidence = effectiveFillRow.comment?.startsWith("LLM-assisted") ? "medium" : "high";
-        const confidence = lowerConfidence(mappingConfidence, validation.confidence);
-        const notes = appendValidationNotes(auditNote, validation);
+        const confidence = lowerConfidence(mappingConfidence, effectiveValidation.confidence);
+        const notes = appendValidationNotes(auditNote, effectiveValidation);
         const cellComment = mappingComment(effectiveFillRow, resolved, period, cell.value as number, confidence, notes);
         if (addComment(cell, cellComment)) commentsAdded += 1;
         const auditRow = mappingAuditRow(sheet, cell, effectiveFillRow, period, cell.value as number, resolved, confidence, notes);
-        auditRow.validationStatus = validationStatusText(validation);
+        if (formulaBeforeWrite) {
+          auditRow.formulaStatus = "actualized forecast formula replaced with SEC filing actual";
+          auditRow.notes = [auditRow.notes, "Actualized forecast column because a matching SEC filing exists for this model period."].filter(Boolean).join(" ");
+        }
+        auditRow.validationStatus = validationStatusText(effectiveValidation);
         auditRows.push(auditRow);
       }
 
@@ -5072,6 +5090,20 @@ export async function POST(request: NextRequest) {
       }
     }
     warnings.push(...llmState.warnings);
+
+    const actualizedBalanceResult = writeActualizedForecastBalanceSheetValues(
+      company,
+      sheet,
+      fillRows,
+      balanceSheetPeriods,
+      balanceSheetColumns,
+      ctx,
+      normalizedPackage,
+      auditRows
+    );
+    filledCells += actualizedBalanceResult.filledCells;
+    commentsAdded += actualizedBalanceResult.commentsAdded;
+    warnings.push(...actualizedBalanceResult.warnings);
 
     if (isStandardModelSheet) refreshDividendCachedResults(sheet, periods, columns);
 
@@ -7239,10 +7271,42 @@ function bestPeriodHeaderRow(sheet: ExcelJS.Worksheet) {
 
 const projectedPeriodColumnsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
 const reportedPeriodColumnsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
+const actualizedForecastPeriodColumnsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
+const latestReportedPeriodBySheet = new WeakMap<ExcelJS.Worksheet, string>();
 const balanceSheetRowsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
 
-function markReportedPeriodColumns(sheet: ExcelJS.Worksheet, pairs: Array<{ col: number }>) {
-  reportedPeriodColumnsBySheet.set(sheet, new Set(pairs.map((pair) => pair.col)));
+function markReportedPeriodColumns(sheet: ExcelJS.Worksheet, pairs: Array<{ period: string; col: number }>) {
+  const reportedColumns = new Set(pairs.map((pair) => pair.col));
+  const headerInfos = bestPeriodHeaderRow(sheet)?.infos ?? [];
+  const headerByColumn = new Map(headerInfos.map((info) => [info.col, info]));
+  const actualizedForecastColumns = new Set<number>();
+  for (const pair of pairs) {
+    const info = headerByColumn.get(pair.col);
+    if (info?.isEstimate) actualizedForecastColumns.add(pair.col);
+  }
+  const latestReportedPeriod = pairs
+    .map((pair) => balanceSheetInstantLookupPeriod(pair.period))
+    .filter(isSupportedPeriodKey)
+    .sort(comparePeriods)
+    .at(-1);
+
+  reportedPeriodColumnsBySheet.set(sheet, reportedColumns);
+  actualizedForecastPeriodColumnsBySheet.set(sheet, actualizedForecastColumns);
+  if (latestReportedPeriod) latestReportedPeriodBySheet.set(sheet, latestReportedPeriod);
+  else latestReportedPeriodBySheet.delete(sheet);
+  projectedPeriodColumnsBySheet.delete(sheet);
+}
+
+function normalizeReportedPeriodHeaderLabels(sheet: ExcelJS.Worksheet, pairs: Array<{ period: string; col: number }>) {
+  const header = bestPeriodHeaderRow(sheet);
+  if (!header) return;
+  const byColumn = new Map(header.infos.map((info) => [info.col, info]));
+  for (const pair of pairs) {
+    const info = byColumn.get(pair.col);
+    if (!info?.isEstimate) continue;
+    const cell = sheet.getCell(header.rowNumber, pair.col);
+    cell.value = pair.period;
+  }
   projectedPeriodColumnsBySheet.delete(sheet);
 }
 
@@ -7250,7 +7314,16 @@ function projectedPeriodColumns(sheet: ExcelJS.Worksheet) {
   const cached = projectedPeriodColumnsBySheet.get(sheet);
   if (cached) return cached;
   const reportedColumns = reportedPeriodColumnsBySheet.get(sheet) ?? new Set<number>();
-  const columns = new Set(bestPeriodHeaderRow(sheet)?.infos.filter((info) => info.isEstimate && !reportedColumns.has(info.col)).map((info) => info.col) ?? []);
+  const latestReportedPeriod = latestReportedPeriodBySheet.get(sheet);
+  const columns = new Set(
+    bestPeriodHeaderRow(sheet)?.infos
+      .filter((info) => {
+        if (reportedColumns.has(info.col)) return false;
+        if (info.isEstimate) return true;
+        return latestReportedPeriod ? comparePeriods(balanceSheetInstantLookupPeriod(info.period), latestReportedPeriod) > 0 : false;
+      })
+      .map((info) => info.col) ?? []
+  );
   projectedPeriodColumnsBySheet.set(sheet, columns);
   return columns;
 }
@@ -7265,6 +7338,12 @@ function balanceSheetRows(sheet: ExcelJS.Worksheet) {
 
 function isProjectedBalanceSheetCell(sheet: ExcelJS.Worksheet, rowNumber: number, col: number) {
   return projectedPeriodColumns(sheet).has(col) && balanceSheetRows(sheet).has(rowNumber);
+}
+
+function isActualizedForecastPeriodCell(sheet: ExcelJS.Worksheet, col: number, period: string, ctx: ResolveContext) {
+  if (!hasReportedFilingPeriod(period, ctx)) return false;
+  if (!reportedPeriodColumnsBySheet.get(sheet)?.has(col)) return false;
+  return Boolean(actualizedForecastPeriodColumnsBySheet.get(sheet)?.has(col));
 }
 
 function isHistoricalReportedPeriod(period: string, isEstimate: boolean, ctx: ResolveContext) {
@@ -7526,9 +7605,10 @@ function cellFormula(cell: ExcelJS.Cell) {
   return null;
 }
 
-function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDecision {
+function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell, period?: string, ctx?: ResolveContext): WriteDecision {
+  const actualizedForecastCell = period && ctx ? isActualizedForecastWritableCell(fillRow, cell, period, ctx) : false;
   const protectedReason = protectedFormulaOrCheckCellReason(cell);
-  if (protectedReason) return { writable: false, reason: protectedReason, formulaPreserved: hasFormula(cell) };
+  if (protectedReason && !actualizedForecastCell) return { writable: false, reason: protectedReason, formulaPreserved: hasFormula(cell) };
   if (fillRow.onlyBlankHistoricalInput && cell.value !== null) {
     return { writable: false, reason: "existing model hardcode preserved", formulaPreserved: false };
   }
@@ -7538,10 +7618,97 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell): WriteDec
   if (isInactiveHelperCell(fillRow, cell)) {
     return { writable: false, reason: "blank inactive/helper cell", formulaPreserved: false };
   }
-  if (!isModelHistoricalInput(cell)) {
+  if (!actualizedForecastCell && !isModelHistoricalInput(cell)) {
     return { writable: false, reason: "not an active historical input cell", formulaPreserved: false };
   }
   return { writable: true, formulaPreserved: false };
+}
+
+function isActualizedForecastWritableCell(fillRow: FillRow, cell: ExcelJS.Cell, period: string, ctx: ResolveContext) {
+  if (!hasFormula(cell)) return false;
+  if (fillRow.classification === "formula" || fillRow.classification === "unused") return false;
+  if (fillRow.statement === "support") return false;
+  return isActualizedForecastPeriodCell(cell.worksheet, Number(cell.col), period, ctx);
+}
+
+function canWriteActualizedForecastBalanceValue(
+  fillRow: FillRow,
+  cell: ExcelJS.Cell,
+  period: string,
+  ctx: ResolveContext,
+  validation: SecWriteValidation
+) {
+  if (validation.status !== "blocked") return false;
+  if (!isActualizedForecastWritableCell(fillRow, cell, period, ctx)) return false;
+  if (!isStrictPrimaryBalanceSheetInputRow(cell.worksheet, fillRow)) return false;
+  return validation.notes.length > 0 && validation.notes.every(isClassificationOnlyValidationNote);
+}
+
+function isClassificationOnlyValidationNote(note: string) {
+  return /^Classification mismatch:/i.test(note) || /^Classification:/i.test(note);
+}
+
+function writeActualizedForecastBalanceSheetValues(
+  company: CompanyMatch,
+  sheet: ExcelJS.Worksheet,
+  fillRows: FillRow[],
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  normalizedPackage: NormalizedHistoricalsPackage,
+  auditRows: MappingAuditRow[]
+) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const periodPairs = uniquePeriodColumnPairs(periods.map((period, index) => ({ period, col: columns[index] })));
+
+  for (const fillRow of fillRows) {
+    if (!isStrictPrimaryBalanceSheetInputRow(sheet, fillRow)) continue;
+    for (const { period, col } of periodPairs) {
+      const cell = sheet.getCell(fillRow.row, col);
+      if (!isActualizedForecastWritableCell(fillRow, cell, period, ctx)) continue;
+      const resolved = resolveFillRowForModelPeriod(fillRow, period, ctx, normalizedPackage);
+      if (resolved.value === null || Number.isNaN(resolved.value)) continue;
+      const validation = validateResolvedValueForWrite(company, fillRow, period, resolved);
+      if (hasCriticalActualizedForecastBalanceBlock(validation)) {
+        warnings.push(`${fillRow.label} ${period}: actualized forecast write skipped because ${validation.notes.join(" ")}`);
+        continue;
+      }
+
+      const value = resolved.value / (fillRow.scale ?? 1);
+      clearEdgarMapperComment(cell);
+      cell.value = value;
+      filledCells += 1;
+      const effectiveValidation =
+        validation.status === "blocked"
+          ? {
+              ...validation,
+              status: "warning" as const,
+              confidence: lowerConfidence(validation.confidence, "medium"),
+              notes: [
+                ...validation.notes,
+                "Actualized forecast formula was replaced because a matching SEC filing exists for this model period."
+              ]
+            }
+          : validation;
+      const note = appendValidationNotes(auditNoteForResolvedValue(fillRow, resolved, period, ctx), effectiveValidation);
+      if (addComment(cell, mappingComment(fillRow, resolved, period, value, effectiveValidation.confidence, note))) commentsAdded += 1;
+      const auditRow = mappingAuditRow(sheet, cell, fillRow, period, value, resolved, effectiveValidation.confidence, note);
+      auditRow.formulaStatus = "actualized forecast formula replaced with SEC filing actual";
+      auditRow.validationStatus = validationStatusText(effectiveValidation);
+      auditRow.notes = [auditRow.notes, "Actualized forecast column because a matching SEC filing exists for this model period."].filter(Boolean).join(" ");
+      auditRows.push(auditRow);
+    }
+  }
+
+  if (filledCells) warnings.push(`Actualized ${filledCells} forecast balance-sheet formula cell(s) because matching SEC filing period(s) exist.`);
+  return { filledCells, commentsAdded, warnings };
+}
+
+function hasCriticalActualizedForecastBalanceBlock(validation: SecWriteValidation) {
+  if (validation.status !== "blocked") return false;
+  return validation.notes.some((note) => /CIK mismatch|Period mismatch|Period type mismatch|Unit mismatch|cannot be calculated/i.test(note));
 }
 
 function protectedFormulaOrCheckCellReason(cell: ExcelJS.Cell) {
@@ -9382,12 +9549,15 @@ function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, 
     for (const { source, category } of sourceCategories) {
       const compatible = reportedLineItemCategoryCompatible(expectedCategory, category, fillRow, source);
       const derivedBridgeExplainsComponents = resolvedIsDerived && hasCompatibleCategory && source.sourceLayer !== "derived" && category !== "segment_only";
-      if (!compatible && !derivedBridgeExplainsComponents) {
+      const balanceSheetResolverExplainsComponents = balanceSheetResolverDerivationExplainsCategory(fillRow, resolved, category, source);
+      if (!compatible && !derivedBridgeExplainsComponents && !balanceSheetResolverExplainsComponents) {
         status = "blocked";
         confidence = "low";
         notes.push(
           `Classification mismatch: ${source.concept} was identified as ${lineItemCategoryLabel(category)}, but ${fillRow.label} expects ${lineItemCategoryLabel(expectedCategory)}.`
         );
+      } else if (balanceSheetResolverExplainsComponents) {
+        notes.push(`Classification: ${source.concept} used as an SEC balance-sheet component to derive ${fillRow.label}.`);
       } else if (category !== "unknown" && category !== "cash_flow_or_support") {
         notes.push(`Classification: ${source.concept} identified as ${lineItemCategoryLabel(category)}.`);
       }
@@ -9409,6 +9579,26 @@ function validateResolvedValueForWrite(company: CompanyMatch, fillRow: FillRow, 
 
   if (resolved.classification === "grouped" || resolvedIsDerived) confidence = lowerConfidence(confidence, "medium");
   return { status, confidence, notes: unique(notes) };
+}
+
+function balanceSheetResolverDerivationExplainsCategory(fillRow: FillRow, resolved: ResolvedValue, category: ReportedLineItemCategory, source: FactSource) {
+  if (fillRow.statement !== "balance" || fillRow.kind !== "instant") return false;
+  if (!fillRow.resolver) return false;
+  if (resolved.classification !== "grouped" && resolved.sources.length < 2) return false;
+  if (source.sourceLayer === "model" || source.sourceLayer === "derived") return false;
+  return isBalanceSheetLineItemCategory(category);
+}
+
+function isBalanceSheetLineItemCategory(category: ReportedLineItemCategory) {
+  return [
+    "current_assets",
+    "non_current_assets",
+    "total_assets",
+    "current_liabilities",
+    "non_current_liabilities",
+    "total_liabilities",
+    "equity"
+  ].includes(category);
 }
 
 function currentLiabilitiesExDebtDoubleCount(fillRow: FillRow, resolved: ResolvedValue, sources: FactSource[]) {
@@ -10960,7 +11150,7 @@ function isStrictPrimaryBalanceSheetInputRow(sheet: ExcelJS.Worksheet, fillRow: 
   if (fillRow.classification === "formula" || fillRow.classification === "unused") return false;
   if (!fillRow.resolver && !fillRow.concepts?.length) return false;
   const sectionHeader = normalize(fillRow.modelContext?.sectionHeader ?? "");
-  if (sectionHeader) return sectionHeader === normalize("Balance Sheet");
+  if (sectionHeader === normalize("Balance Sheet")) return true;
   return balanceSheetSectionRows(sheet).includes(fillRow.row);
 }
 
@@ -11875,38 +12065,38 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     const totalEquity = resolveTotalEquityIncludingNci(lookupPeriod, ctx);
     const liabilities = resolveTotalLiabilities(lookupPeriod, ctx);
     const liabilitiesAndEquity = resolveTotalLiabilitiesAndEquity(lookupPeriod, ctx);
-    if (totalAssetsRow && assets) refreshBalanceSheetTotalFormulaResult(sheet, totalAssetsRow, col, period, assets.value / 1_000_000, assets, "total assets", auditRows);
+    if (totalAssetsRow && assets) refreshBalanceSheetTotalFormulaResult(sheet, totalAssetsRow, col, period, assets.value / 1_000_000, assets, "total assets", auditRows, ctx);
     if (totalCurrentAssetsRow && currentAssets.value !== null) {
       const source = resolvedAuditSource(period, "TotalCurrentAssetsResolved", "Resolved EDGAR total current assets", currentAssets);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalCurrentAssetsRow, col, period, currentAssets.value / 1_000_000, source, "total current assets", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalCurrentAssetsRow, col, period, currentAssets.value / 1_000_000, source, "total current assets", auditRows, ctx);
     }
     if (totalNonCurrentAssetsRow && nonCurrentAssets.value !== null) {
       const source = resolvedAuditSource(period, "TotalNonCurrentAssetsResolved", "Resolved EDGAR total non-current assets", nonCurrentAssets);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalNonCurrentAssetsRow, col, period, nonCurrentAssets.value / 1_000_000, source, "total non-current assets", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalNonCurrentAssetsRow, col, period, nonCurrentAssets.value / 1_000_000, source, "total non-current assets", auditRows, ctx);
     }
     if (totalCurrentLiabilitiesRow && currentLiabilities.value !== null) {
       const source = resolvedAuditSource(period, "TotalCurrentLiabilitiesResolved", "Resolved EDGAR current liabilities subtotal", currentLiabilities);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalCurrentLiabilitiesRow, col, period, currentLiabilities.value / 1_000_000, source, "total current liabilities", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalCurrentLiabilitiesRow, col, period, currentLiabilities.value / 1_000_000, source, "total current liabilities", auditRows, ctx);
     }
     if (totalNonCurrentLiabilitiesRow && nonCurrentLiabilities.value !== null) {
       const source = resolvedAuditSource(period, "TotalNonCurrentLiabilitiesResolved", "Resolved EDGAR non-current liabilities subtotal", nonCurrentLiabilities);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalNonCurrentLiabilitiesRow, col, period, nonCurrentLiabilities.value / 1_000_000, source, "total non-current liabilities", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalNonCurrentLiabilitiesRow, col, period, nonCurrentLiabilities.value / 1_000_000, source, "total non-current liabilities", auditRows, ctx);
     }
     if (totalEquityRow && stockholdersEquity.value !== null) {
       const source = resolvedAuditSource(period, "StockholdersEquityResolved", "Resolved EDGAR stockholders' equity", stockholdersEquity);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalEquityRow, col, period, stockholdersEquity.value / 1_000_000, source, "shareholders' equity", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalEquityRow, col, period, stockholdersEquity.value / 1_000_000, source, "shareholders' equity", auditRows, ctx);
     }
     if (totalEquityIncludingNciRow && totalEquityIncludingNciRow !== totalEquityRow && totalEquity.value !== null) {
       const source = resolvedAuditSource(period, "TotalEquityIncludingNciResolved", "Resolved EDGAR total equity including noncontrolling interests", totalEquity);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalEquityIncludingNciRow, col, period, totalEquity.value / 1_000_000, source, "total equity", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalEquityIncludingNciRow, col, period, totalEquity.value / 1_000_000, source, "total equity", auditRows, ctx);
     }
     if (totalLiabilitiesRow && liabilities.value !== null) {
       const source = resolvedAuditSource(period, "LiabilitiesResolved", "Resolved EDGAR total liabilities", liabilities);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalLiabilitiesRow, col, period, liabilities.value / 1_000_000, source, "total liabilities", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalLiabilitiesRow, col, period, liabilities.value / 1_000_000, source, "total liabilities", auditRows, ctx);
     }
     if (totalLiabilitiesAndEquityRow && liabilitiesAndEquity.value !== null) {
       const source = resolvedAuditSource(period, "LiabilitiesAndEquityResolved", "Resolved EDGAR total liabilities plus shareholders' equity", liabilitiesAndEquity);
-      refreshBalanceSheetTotalFormulaResult(sheet, totalLiabilitiesAndEquityRow, col, period, liabilitiesAndEquity.value / 1_000_000, source, "total liabilities plus shareholders' equity", auditRows);
+      refreshBalanceSheetTotalFormulaResult(sheet, totalLiabilitiesAndEquityRow, col, period, liabilitiesAndEquity.value / 1_000_000, source, "total liabilities plus shareholders' equity", auditRows, ctx);
     }
   });
 
@@ -12005,20 +12195,27 @@ function refreshBalanceSheetTotalFormulaResult(
   value: number,
   source: FactSource,
   metricName: string,
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  ctx: ResolveContext
 ) {
   const cell = sheet.getCell(rowNumber, col);
   if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
-  if (isProtectedFormulaOrCheckCell(cell)) return;
   const formula = formulaForCell(cell);
+  const actualizedForecastCell = Boolean(formula) && isActualizedForecastPeriodCell(sheet, col, period, ctx);
+  if (isProtectedFormulaOrCheckCell(cell) && !actualizedForecastCell) return;
   const currentValue = numericCellValue(cell);
-  if (currentValue !== null && incomeStatementFormulaTies(currentValue, value)) return;
-  if (formula) {
+  if (!actualizedForecastCell && currentValue !== null && incomeStatementFormulaTies(currentValue, value)) return;
+  if (formula && !actualizedForecastCell) {
     return;
   }
-  if (!isHardcodedFinancialInput(cell)) return;
+  if (!actualizedForecastCell && !isHardcodedFinancialInput(cell)) return;
   cell.value = value;
-  auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} from EDGAR.`));
+  const auditRow = statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "balance", `Refreshed ${metricName} from EDGAR.`);
+  if (actualizedForecastCell) {
+    auditRow.formulaStatus = "actualized forecast formula replaced with SEC filing actual";
+    auditRow.notes = [auditRow.notes, "Actualized forecast column because a matching SEC filing exists for this model period."].filter(Boolean).join(" ");
+  }
+  auditRows.push(auditRow);
 }
 
 function copyBalanceSheetFourthQuarterToAnnualColumns(
@@ -12786,6 +12983,28 @@ function statementMetricTies(actual: number, expected: number) {
   return Math.abs(actual - expected) <= Math.max(3.05, Math.abs(expected) * 0.0005);
 }
 
+function recordBalanceSheetValidationIssue(
+  errors: string[],
+  warnings: string[],
+  message: string,
+  protectedFormula: boolean,
+  sheet: ExcelJS.Worksheet,
+  period: string,
+  col: number,
+  ctx: ResolveContext,
+  protectedWarning = `${message} Protected formula/check cell was preserved for review.`
+) {
+  if (!protectedFormula) {
+    errors.push(message);
+    return;
+  }
+  if (isActualizedForecastPeriodCell(sheet, col, period, ctx)) {
+    errors.push(`${message} Actual-period write failure / forecast protection mismatch.`);
+    return;
+  }
+  warnings.unshift(protectedWarning);
+}
+
 function recordIncomeStatementBridgeMismatch(errors: string[], warnings: string[], targetCell: ExcelJS.Cell, message: string) {
   warnings.unshift(`${message} Classification is preserved for review; no balancing income-statement account was created.`);
 }
@@ -13216,12 +13435,10 @@ function validateBalanceSheetClassificationCompleteness(
         const prior = mostRecentPriorResolvedBalanceSheetValue(lookupPeriod, ctx, check.resolver);
         if (prior && Math.abs(prior.value ?? 0) > 5_000_000 && (modelValue === null || Math.abs(modelValue) <= 0.5)) {
           const message = `Balance Sheet ${period}: ${check.metricName} disappeared after prior SEC filings reported ${roundModelValue((prior.value ?? 0) / 1_000_000)}. The row must be remapped or explicitly sourced as zero before writing output.`;
-          if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-          else errors.push(message);
+          recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx);
         } else if (modelValue !== null && Math.abs(modelValue) > 0.5) {
           const message = `Balance Sheet ${period}: ${check.metricName} has model value ${roundModelValue(modelValue)} but no explicit SEC source was identified.`;
-          if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-          else errors.push(message);
+          recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx);
         }
         return;
       }
@@ -13230,8 +13447,7 @@ function validateBalanceSheetClassificationCompleteness(
       const expected = resolved.value / 1_000_000;
       if (!statementMetricTies(modelValue, expected)) {
         const message = `Balance Sheet ${columnLetter(col)}${rowNumber} ${period}: ${check.metricName} ${roundModelValue(modelValue)} does not match SEC-sourced value ${roundModelValue(expected)} from ${resolvedSourceSummary(resolved)}.`;
-        if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-        else errors.push(message);
+        recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx);
       }
     });
   }
@@ -13536,16 +13752,14 @@ function validateBalanceSheetCurrentLiabilitiesSubtotal(
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model modeled current liabilities.`;
-      if (protectedFormula) warnings.unshift(message);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx, message);
       return;
     }
 
     if (!otherBucketMetricTies(modelValue, expected)) {
       const concepts = resolved.sources.map((source) => source.concept).filter(Boolean).join("/");
       const message = `Balance Sheet ${cell.address} ${period}: modeled current liabilities ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`;
-      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx);
     }
   });
 
@@ -13592,8 +13806,7 @@ function validateBalanceSheetCurrentLiabilitiesExDebtBridge(
     const subtotal = statementMetricCellValue(cell, evaluator, expectedSubtotal);
     if (subtotal === null) {
       const message = `Balance Sheet ${cell.address} ${period}: could not evaluate total current liabilities excluding debt.`;
-      if (protectedFormula) warnings.unshift(message);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx, message);
       return;
     }
 
@@ -13602,8 +13815,7 @@ function validateBalanceSheetCurrentLiabilitiesExDebtBridge(
     if (!statementMetricTies(reconstructedReportedTotal, expectedReportedTotal)) {
       const debtSources = resolvedSourceSummary(currentDebt);
       const message = `Balance Sheet ${cell.address} ${period}: total current liabilities excluding debt ${roundModelValue(subtotal)} plus EDGAR current debt ${roundModelValue(currentDebt.value / 1_000_000)} does not reconcile to EDGAR total current liabilities ${roundModelValue(expectedReportedTotal)}. Difference ${roundModelValue(reconstructedReportedTotal - expectedReportedTotal)}. Current debt sources: ${debtSources}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`;
-      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx);
     }
   });
 
@@ -13641,8 +13853,7 @@ function validateBalanceSheetMetricAgainstResolver(
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`;
-      if (protectedFormula) warnings.unshift(message);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx, message);
       return;
     }
 
@@ -13650,7 +13861,7 @@ function validateBalanceSheetMetricAgainstResolver(
       const concepts = resolved.sources.map((source) => source.concept).filter(Boolean).join("/");
       const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
       if (protectedFormula) {
-        warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+        recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx);
         return;
       }
       if (isPartialOtherBucketResolver(metricName, resolved)) {
@@ -13706,15 +13917,13 @@ function validateBalanceSheetMetricAgainstEdgar(
     const modelValue = statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Balance Sheet ${cell.address} ${period}: could not evaluate model ${metricName}.`;
-      if (protectedFormula) warnings.unshift(message);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx, message);
       return;
     }
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
-      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx);
     }
   });
 
@@ -13735,12 +13944,10 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
       const check = evaluator.evaluateCell(cell);
       if (check === null) {
         const message = `Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`;
-        if (protectedFormula) warnings.unshift(message);
-        else errors.push(message);
+        recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx, message);
       } else if (!statementMetricTies(check, 0)) {
         const message = `Balance Sheet ${cell.address} ${period}: check is ${roundModelValue(check)}, not OK.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
-        if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-        else errors.push(message);
+        recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx);
       }
     });
   }
@@ -13763,12 +13970,10 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
     const liabilitiesAndEquity = evaluator.evaluateCell(liabilitiesAndEquityCell);
     if (assets === null || liabilitiesAndEquity === null) {
       const message = `Balance Sheet ${period}: could not evaluate total assets or total liabilities plus shareholder's equity.`;
-      if (protectedFormula) warnings.unshift(message);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx, message);
     } else if (!statementMetricTies(assets, liabilitiesAndEquity)) {
       const message = `Balance Sheet ${period}: total assets ${roundModelValue(assets)} do not equal total liabilities plus shareholder's equity ${roundModelValue(liabilitiesAndEquity)}. Difference ${roundModelValue(assets - liabilitiesAndEquity)}.${balanceSheetMismatchDiagnostic(sheet, period, col, ctx, evaluator)}`;
-      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
-      else errors.push(message);
+      recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, col, ctx);
     }
   });
 
@@ -13878,11 +14083,18 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     if (!cell) continue;
     const actual = cellFormula(cell);
     if (actual !== expected) {
+      if (isAllowedActualizedForecastFormulaReplacement(cell)) continue;
       if (isAllowedFormulaPreservationUpdate(cell, expected, actual)) continue;
       errors.push(`${address}: formula changed from "${expected}" to "${actual ?? "[hardcoded/blank]"}".`);
     }
   }
   return errors;
+}
+
+function isAllowedActualizedForecastFormulaReplacement(cell: ExcelJS.Cell) {
+  if (cellFormula(cell)) return false;
+  if (numericCellValue(cell) === null) return false;
+  return Boolean(actualizedForecastPeriodColumnsBySheet.get(cell.worksheet)?.has(Number(cell.col)));
 }
 
 function restoreProtectedCells(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
