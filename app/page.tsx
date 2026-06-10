@@ -24,42 +24,38 @@ export default function Home() {
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const selectedFileKeyRef = useRef("");
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
   const clearFileInput = useCallback(() => {
     if (!fileInputRef.current) return;
     fileInputRef.current.value = "";
-    selectedFileKeyRef.current = "";
   }, []);
-
-  const fileKey = useCallback((nextFile: File) => `${nextFile.name}:${nextFile.size}:${nextFile.lastModified}`, []);
 
   function formatFileSize(bytes: number) {
     if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`;
     return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
   }
 
-  const pickFile = useCallback((nextFile?: File) => {
+  const handleWorkbookSelected = useCallback((nextFile?: File | null) => {
+    if (!nextFile) return;
     setError("");
     setSummary(null);
-    if (!nextFile) return;
     if (!nextFile.name.toLowerCase().endsWith(".xlsx")) {
       setFile(null);
       clearFileInput();
       setError(`${nextFile.name} is not an .xlsx workbook.`);
       return;
     }
-    selectedFileKeyRef.current = fileKey(nextFile);
     setFile(nextFile);
-  }, [clearFileInput, fileKey]);
+    clearFileInput();
+  }, [clearFileInput]);
 
   useEffect(() => {
     function syncInputSelection() {
       const nextFile = fileInputRef.current?.files?.item(0) ?? undefined;
       if (!nextFile) return;
-      pickFile(nextFile);
+      handleWorkbookSelected(nextFile);
     }
 
     function syncInputSelectionSoon() {
@@ -79,7 +75,7 @@ export default function Home() {
       if (!hasTransferredFiles(transfer)) return;
       event.preventDefault();
       setIsDragging(false);
-      pickFile(transfer?.files?.[0]);
+      handleWorkbookSelected(transfer?.files?.[0]);
     }
 
     function handleWindowFocus() {
@@ -100,7 +96,7 @@ export default function Home() {
       window.removeEventListener("focus", handleWindowFocus);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [pickFile]);
+  }, [handleWorkbookSelected]);
 
   useEffect(() => {
     const input = fileInputRef.current;
@@ -108,7 +104,7 @@ export default function Home() {
 
     const handleNativeFileSelection = () => {
       const nextFile = input.files?.item(0) ?? undefined;
-      if (nextFile) pickFile(nextFile);
+      if (nextFile) handleWorkbookSelected(nextFile);
     };
 
     input.addEventListener("change", handleNativeFileSelection);
@@ -117,7 +113,7 @@ export default function Home() {
       input.removeEventListener("change", handleNativeFileSelection);
       input.removeEventListener("input", handleNativeFileSelection);
     };
-  }, [pickFile]);
+  }, [handleWorkbookSelected]);
 
   function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
@@ -135,11 +131,11 @@ export default function Home() {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
-    pickFile(event.dataTransfer.files?.[0]);
+    handleWorkbookSelected(event.dataTransfer.files?.[0]);
   }
 
   function pickInputFile(input: HTMLInputElement) {
-    pickFile(input.files?.item(0) ?? undefined);
+    handleWorkbookSelected(input.files?.item(0) ?? undefined);
   }
 
   function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
@@ -157,9 +153,10 @@ export default function Home() {
     const query = String(nativeFormData.get("ticker") ?? ticker).trim();
     const nativeFile = nativeFormData.get("file");
     const selectedFile =
-      nativeFile instanceof File && nativeFile.size > 0
-        ? nativeFile
-        : file ?? fileInputRef.current?.files?.item(0) ?? null;
+      file
+        ?? (nativeFile instanceof File && nativeFile.size > 0 ? nativeFile : null)
+        ?? fileInputRef.current?.files?.item(0)
+        ?? null;
     if (!query) {
       setError("Enter a ticker or company name before filling.");
       return;
@@ -301,7 +298,7 @@ export default function Home() {
             ) : (
               <small>Click to browse or drag in an .xlsx file</small>
             )}
-            <span className="browseCue">Choose workbook</span>
+            <span className="browseCue">{file ? "Choose different workbook" : "Choose workbook"}</span>
           </div>
 
           <button className="primary" type="submit" disabled={!canSubmit}>

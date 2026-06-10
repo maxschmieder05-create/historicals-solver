@@ -28,6 +28,20 @@ const checks = [
     message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing."
   },
   {
+    ok: /const handleWorkbookSelected = useCallback/.test(source)
+      && /handleWorkbookSelected\(event\.dataTransfer\.files\?\.\[0\]\)/.test(source)
+      && /handleWorkbookSelected\(input\.files\?\.item\(0\) \?\? undefined\)/.test(source),
+    message: "File picker and drag/drop paths must share the same workbook-selection handler."
+  },
+  {
+    ok: /const selectedFile =\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
+    message: "Submit must prefer the displayed selected file state over the native input value."
+  },
+  {
+    ok: /setFile\(nextFile\);\s*clearFileInput\(\);/.test(source),
+    message: "A valid workbook selection must update visible state before resetting the native input for same-file reselection."
+  },
+  {
     ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
     message: "Focus-return sync must not skip a native file just because its key was seen before."
   },
