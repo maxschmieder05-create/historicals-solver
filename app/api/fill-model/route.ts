@@ -774,6 +774,14 @@ const OTHER_CURRENT_ASSET_CONCEPTS = [
   "PrepaidExpensesAndOtherCurrentAssets"
 ];
 
+const OTHER_NON_CURRENT_ASSET_COMPONENT_CONCEPTS = [
+  "LongTermInvestments",
+  "InvestmentsNoncurrent",
+  "OtherAssetsNoncurrent",
+  "OperatingLeaseRightOfUseAsset",
+  "OperatingLeaseRightOfUseAssetNet"
+];
+
 const CURRENT_INVESTMENT_ROW_LABELS = [
   "Short-Term Investments",
   "Short Term Investments",
@@ -1828,6 +1836,260 @@ function withPrimaryBalanceSheetPresentationLabel(period: string, ctx: ResolveCo
     .map(({ row }) => cleanLineItemLabel(row.rowLabel))
     .find((item) => item && !isTechnicalLineItemLabel(item));
   return label ? { ...source, label } : source;
+}
+
+type PrimaryBalanceSheetRow = SecFilingStatementStructure["rows"][number];
+
+function primaryBalanceSheetComponentSources(
+  period: string,
+  ctx: ResolveContext,
+  predicate: (source: FactSource, row: PrimaryBalanceSheetRow) => boolean
+) {
+  return uniqueFactSources(
+    primaryBalanceSheetRowsForPeriod(period, ctx)
+      .map((row) => primaryBalanceSheetFactSource(row, period))
+      .filter((source): source is FactSource & { primaryRow: PrimaryBalanceSheetRow } => Boolean(source))
+      .filter(({ primaryRow, ...source }) => predicate(source, primaryRow))
+      .map(({ primaryRow: _primaryRow, ...source }) => source)
+  );
+}
+
+function primaryBalanceSheetRowsForPeriod(period: string, ctx: ResolveContext): PrimaryBalanceSheetRow[] {
+  const filing = primaryFilingEntryForModelPeriod(period, ctx);
+  const accession = filing?.accessionKey;
+  return (ctx.filingPackageStatements ?? [])
+    .filter(isPrimaryBalanceSheetStructure)
+    .filter((statement) => !accession || normalizeAccession(statement.accession) === accession)
+    .flatMap((statement) => statement.rows)
+    .filter((row) => row.consolidated && !row.dimensions.length)
+    .filter((row) => primaryBalanceSheetRowMatchesPeriod(row, period, ctx))
+    .filter((row) => typeof row.value === "number" && Number.isFinite(row.value))
+    .sort((a, b) => a.rowOrder - b.rowOrder);
+}
+
+function primaryBalanceSheetRowMatchesPeriod(row: PrimaryBalanceSheetRow, period: string, ctx: ResolveContext) {
+  if (row.period.periodType && row.period.periodType !== "instant") return false;
+  const instant = row.period.instant ?? row.period.end;
+  if (!instant) return true;
+  return fiscalQuarterPeriodForDate(instant, ctx.fiscalPeriods) === balanceSheetInstantLookupPeriod(period);
+}
+
+function primaryBalanceSheetFactSource(row: PrimaryBalanceSheetRow, period: string): (FactSource & { primaryRow: PrimaryBalanceSheetRow }) | null {
+  if (typeof row.value !== "number" || !Number.isFinite(row.value)) return null;
+  const concept = row.xbrlConcept || cleanLineItemLabel(row.rowLabel);
+  if (!concept) return null;
+  return {
+    concept,
+    label: cleanLineItemLabel(row.rowLabel) || concept,
+    value: row.value,
+    sourceUrl: row.sourceUrl,
+    unit: row.unit && /usd/i.test(row.unit) ? "USD" : row.unit,
+    taxonomy: row.taxonomy,
+    sourceLayer: "sec_filing_package",
+    form: primaryFilingEntryForm(row, period),
+    accn: row.accession,
+    end: row.period.instant ?? row.period.end,
+    periodKey: period,
+    periodType: "instant",
+    reportDate: row.reportingPeriod,
+    primaryRow: row
+  };
+}
+
+function primaryFilingEntryForm(row: PrimaryBalanceSheetRow, period: string) {
+  return row.period.periodType === "instant" && isFourthQuarterPeriod(balanceSheetInstantLookupPeriod(period)) ? "10-K" : undefined;
+}
+
+function isPrimaryBalanceSheetSubtotalSource(source: FactSource) {
+  return [
+    ...C.currentAssets,
+    ...C.assets,
+    ...C.currentLiabilities,
+    ...C.liabilities,
+    ...LIABILITIES_AND_EQUITY_CONCEPTS,
+    "LiabilitiesNoncurrent",
+    "AssetsNoncurrent",
+    "StockholdersEquity",
+    "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"
+  ].includes(source.concept);
+}
+
+function primaryRowParentConcept(row: PrimaryBalanceSheetRow) {
+  return row.parentSubtotal?.concept ?? "";
+}
+
+function primaryRowInCurrentAssetSection(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const parent = primaryRowParentConcept(row);
+  if (parent === "AssetsCurrent") return true;
+  if (row.currentNonCurrentSection === "current" && reportedLineItemCategory(source) === "current_assets") return true;
+  return reportedLineItemCategory(source) === "current_assets";
+}
+
+function primaryRowInNonCurrentAssetSection(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const parent = primaryRowParentConcept(row);
+  if (parent === "Assets" && !primaryRowInCurrentAssetSection(row, source) && !isPrimaryBalanceSheetSubtotalSource(source)) return true;
+  if (row.currentNonCurrentSection === "non_current") return true;
+  return reportedLineItemCategory(source) === "non_current_assets";
+}
+
+function primaryRowInCurrentLiabilitySection(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const parent = primaryRowParentConcept(row);
+  if (parent === "LiabilitiesCurrent") return true;
+  if (row.currentNonCurrentSection === "current" && reportedLineItemCategory(source) === "current_liabilities") return true;
+  return reportedLineItemCategory(source) === "current_liabilities";
+}
+
+function primaryRowInNonCurrentLiabilitySection(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const parent = primaryRowParentConcept(row);
+  if (parent === "Liabilities" && !primaryRowInCurrentLiabilitySection(row, source) && !isPrimaryBalanceSheetSubtotalSource(source)) return true;
+  if (row.currentNonCurrentSection === "non_current") return true;
+  return reportedLineItemCategory(source) === "non_current_liabilities";
+}
+
+function sourceTextMatches(source: FactSource, pattern: RegExp) {
+  return pattern.test(sourceSearchText(source));
+}
+
+function sourceLooksLikeAccountsPayable(source: FactSource) {
+  return C.ap.includes(source.concept) || sourceTextMatches(source, /\baccounts? payable\b|\btrade payables?\b/);
+}
+
+function sourceLooksLikeCurrentDebtLine(source: FactSource) {
+  return C.currentDebt.includes(source.concept) || sourceLooksLikeCurrentDebtMaturity(source) || sourceLooksLikeShortTermBorrowing(source);
+}
+
+function sourceLooksLikeCurrentLeaseLiability(source: FactSource) {
+  return sourceTextMatches(source, /\bcurrent\b.*\b(operating|finance)?\s*lease\b|\blease\b.*\bcurrent\b/);
+}
+
+function sourceLooksLikeOtherCurrentLiability(source: FactSource) {
+  if (BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS.includes(source.concept) || OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS.includes(source.concept)) return true;
+  return sourceTextMatches(
+    source,
+    /\bother\b.*\bcurrent liabilit|\bdeferred (revenue|income)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b|\bother insurance liabilit|\bcurrent portion\b.*\blease liabilit/
+  );
+}
+
+function sourceLooksLikeAccruedOperatingLiability(source: FactSource) {
+  if (C.accrued.includes(source.concept)) return true;
+  return sourceTextMatches(
+    source,
+    /\baccrued\b|\bpharmacy claims?\b|\bdiscounts payable\b|\bhealth care costs? payable\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b/
+  );
+}
+
+function sourceLooksLikeNonCurrentDebt(source: FactSource) {
+  return NONCURRENT_DEBT_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\blong[-\s]?term debt\b|\bsenior notes?\b|\bborrowings?\b/);
+}
+
+function sourceLooksLikeDeferredTaxLiability(source: FactSource) {
+  return C.deferredTaxLiability.includes(source.concept) || sourceTextMatches(source, /\bdeferred (income )?tax(?:es)?\b/);
+}
+
+function sourceLooksLikeNonCurrentLeaseLiability(source: FactSource) {
+  return NONCURRENT_LEASE_LIABILITY_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\blong[-\s]?term\b.*\blease liabilit|\bnoncurrent\b.*\blease liabilit|\blease liabilit.*\bnoncurrent\b/);
+}
+
+function sourceLooksLikePensionLiability(source: FactSource) {
+  return PENSION_LIABILITY_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\bpension\b|\bpostretirement\b/);
+}
+
+function sourceLooksLikeDedicatedAsset(source: FactSource) {
+  return [...C.ppe, ...C.intangibles, ...C.goodwill, ...C.assets, ...C.currentAssets].includes(source.concept);
+}
+
+function primaryOtherCurrentAssetSources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    const semanticOtherCurrentAsset = sourceTextMatches(source, /\bother current assets?\b|\bprepaid\b|\btax receivables?\b|\bother receivables?\b/);
+    if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInCurrentAssetSection(row, source) && !semanticOtherCurrentAsset)) return false;
+    if ([...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory].includes(source.concept)) return false;
+    if (inventoryLikeCurrentAssetScore(source) >= 5 || sourceTextMatches(source, /\bcash\b|\bshort[-\s]?term investments?\b|\bmarketable securities\b|\breceivables?\b|\binventor(?:y|ies)\b/)) return false;
+    return true;
+  });
+}
+
+function primaryOtherNonCurrentAssetSources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    const semanticOtherNonCurrentAsset = sourceTextMatches(source, /\blong[-\s]?term investments?\b|\bright[-\s]?of[-\s]?use assets?\b|\boperating lease\b.*\bassets?\b|\bother assets?\b/);
+    if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInNonCurrentAssetSection(row, source) && !semanticOtherNonCurrentAsset)) return false;
+    if (sourceLooksLikeDedicatedAsset(source)) return false;
+    if (sourceTextMatches(source, /\bproperty\b.*\bequipment\b|\bpp&e\b|\bgoodwill\b|\bintangibles?\b/)) return false;
+    return true;
+  });
+}
+
+function primaryCurrentLiabilitySources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInCurrentLiabilitySection(row, source)) return false;
+    return true;
+  });
+}
+
+function primaryAccruedLiabilitySources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    return (
+      (primaryRowInCurrentLiabilitySection(row, source) || sourceLooksLikeAccruedOperatingLiability(source)) &&
+      sourceLooksLikeAccruedOperatingLiability(source) &&
+      !sourceLooksLikeAccountsPayable(source) &&
+      !sourceLooksLikeCurrentDebtLine(source) &&
+      !sourceLooksLikeCurrentLeaseLiability(source) &&
+      !sourceTextMatches(source, /\bother insurance liabilit|\bdeferred (revenue|income)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b/)
+    );
+  });
+}
+
+function primaryOtherCurrentLiabilitySources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    return (
+      (primaryRowInCurrentLiabilitySection(row, source) || sourceLooksLikeOtherCurrentLiability(source) || sourceLooksLikeCurrentLeaseLiability(source)) &&
+      (sourceLooksLikeOtherCurrentLiability(source) || sourceLooksLikeCurrentLeaseLiability(source)) &&
+      !sourceLooksLikeAccountsPayable(source) &&
+      !sourceLooksLikeCurrentDebtLine(source) &&
+      !sourceLooksLikeAccruedOperatingLiability(source)
+    );
+  });
+}
+
+function primaryShortTermBorrowingSources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInCurrentLiabilitySection(row, source)) return false;
+    return sourceLooksLikeShortTermBorrowing(source);
+  });
+}
+
+function primaryCurrentDebtMaturitySources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInCurrentLiabilitySection(row, source)) return false;
+    return sourceLooksLikeCurrentDebtMaturity(source);
+  });
+}
+
+function primaryOtherNonCurrentLiabilitySources(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    const semanticOtherNonCurrentLiability = sourceTextMatches(
+      source,
+      /\blong[-\s]?term operating lease liabilit|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
+    );
+    if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInNonCurrentLiabilitySection(row, source) && !semanticOtherNonCurrentLiability)) return false;
+    if (sourceLooksLikeNonCurrentDebt(source)) return false;
+    if (ctx.template?.hasDeferredTaxLiabilityRow && sourceLooksLikeDeferredTaxLiability(source)) return false;
+    if (ctx.template?.hasNonCurrentLeaseLiabilityRow && sourceLooksLikeNonCurrentLeaseLiability(source)) return false;
+    if (ctx.template?.hasPensionLiabilityRow && sourceLooksLikePensionLiability(source)) return false;
+    return true;
+  });
+}
+
+function resolvedFromPrimarySources(sources: FactSource[], note: string): ResolvedValue {
+  if (!sources.length) return { value: null, sources: [] };
+  return {
+    value: sources.reduce((total, source) => total + source.value, 0),
+    sources,
+    note,
+    classification: sources.length > 1 ? "grouped" : "direct",
+    includedLineItems: sourceLineItemLabels({ sources })
+  };
 }
 
 function sourceMatchesPrimaryStatementRow(source: FactSource, row: SecFilingStatementStructure["rows"][number]) {
@@ -3418,11 +3680,18 @@ function reportedCurrentDebtForDebtInclCurrentPortion(period: string, ctx: Resol
 
 function reportedCurrentDebtMaturities(period: string, ctx: ResolveContext): ResolvedValue | null {
   const currentMaturities = first(period, ctx.instant, CURRENT_DEBT_MATURITY_BALANCE_SHEET_CONCEPTS);
+  const primaryCurrentMaturities = currentMaturities
+    ? null
+    : resolvedFromPrimarySources(
+        primaryCurrentDebtMaturitySources(period, ctx),
+        "Mapped to current maturities/current portion of long-term debt from the primary consolidated balance sheet."
+      );
   const aggregateCurrentDebt = first(period, ctx.instant, ["DebtCurrent"]);
   const presentedAggregateCurrentDebt = aggregateCurrentDebt ? withPrimaryBalanceSheetPresentationLabel(period, ctx, aggregateCurrentDebt) : null;
   const standaloneShortTermBorrowings = reportedStandaloneShortTermBorrowingSource(period, ctx);
   const aggregateCurrentMaturities =
     !currentMaturities &&
+    primaryCurrentMaturities?.value === null &&
     presentedAggregateCurrentDebt &&
     !sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(presentedAggregateCurrentDebt) &&
     (sourceLooksLikeCurrentDebtMaturity(presentedAggregateCurrentDebt) ||
@@ -3431,6 +3700,7 @@ function reportedCurrentDebtMaturities(period: string, ctx: ResolveContext): Res
       : null;
   const residualCurrentMaturities =
     !currentMaturities &&
+    primaryCurrentMaturities?.value === null &&
     !aggregateCurrentMaturities &&
     presentedAggregateCurrentDebt &&
     standaloneShortTermBorrowings &&
@@ -3443,23 +3713,24 @@ function reportedCurrentDebtMaturities(period: string, ctx: ResolveContext): Res
           [presentedAggregateCurrentDebt, standaloneShortTermBorrowings]
         )
       : null;
-  const hasDebtMaturity = Boolean(currentMaturities || aggregateCurrentMaturities || residualCurrentMaturities);
+  const hasDebtMaturity = Boolean(currentMaturities || primaryCurrentMaturities?.value !== null || aggregateCurrentMaturities || residualCurrentMaturities);
   const currentLeases =
     hasDebtMaturity && currentMaturities && /LeaseObligationsCurrent/i.test(currentMaturities.concept)
       ? null
       : hasDebtMaturity
         ? first(period, ctx.instant, ["FinanceLeaseLiabilityCurrent", "CapitalLeaseObligationsCurrent"])
         : null;
-  if (!currentMaturities && !aggregateCurrentMaturities && !residualCurrentMaturities && !currentLeases) return null;
+  if (!currentMaturities && primaryCurrentMaturities?.value === null && !aggregateCurrentMaturities && !residualCurrentMaturities && !currentLeases) return null;
   return withPrimaryBalanceSheetPresentationLabels(period, ctx, {
-    value: (currentMaturities?.value ?? aggregateCurrentMaturities?.value ?? residualCurrentMaturities?.value ?? 0) + (currentLeases?.value ?? 0),
-    sources: compactSources([currentMaturities, aggregateCurrentMaturities, residualCurrentMaturities, currentLeases])
+    value: (currentMaturities?.value ?? primaryCurrentMaturities?.value ?? aggregateCurrentMaturities?.value ?? residualCurrentMaturities?.value ?? 0) + (currentLeases?.value ?? 0),
+    sources: compactSources([currentMaturities, primaryCurrentMaturities, aggregateCurrentMaturities, residualCurrentMaturities, currentLeases])
   });
 }
 
 function reportedStandaloneShortTermBorrowingSource(period: string, ctx: ResolveContext): FactSource | null {
   const source = first(period, ctx.instant, SHORT_TERM_BORROWING_BALANCE_SHEET_CONCEPTS);
-  return source ? withPrimaryBalanceSheetPresentationLabel(period, ctx, source) : null;
+  if (source) return withPrimaryBalanceSheetPresentationLabel(period, ctx, source);
+  return primaryShortTermBorrowingSources(period, ctx)[0] ?? null;
 }
 
 function reportedShortTermBorrowings(period: string, ctx: ResolveContext): ResolvedValue | null {
@@ -3790,6 +4061,11 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
     };
   }
   if (directOtherCurrentAssets.value !== null) return directOtherCurrentAssets;
+  const primaryOtherCurrentAssets = resolvedFromPrimarySources(
+    primaryOtherCurrentAssetSources(period, ctx),
+    "Mapped to reported current asset lines without dedicated model rows from the primary consolidated balance sheet."
+  );
+  if (primaryOtherCurrentAssets.value !== null) return primaryOtherCurrentAssets;
   const segregatedCash =
     first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderSecuritiesExchangeCommissionRegulation"]) ??
     first(period, ctx.instant, ["CashAndSecuritiesSegregatedUnderFederalAndOtherRegulations"]);
@@ -3814,6 +4090,12 @@ function resolveAccountsPayable(period: string, ctx: ResolveContext): ResolvedVa
 }
 
 function resolveAccruedLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryAccrued = resolvedFromPrimarySources(
+    primaryAccruedLiabilitySources(period, ctx),
+    "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
+  );
+  if (primaryAccrued.value !== null) return primaryAccrued;
+
   const direct = first(period, ctx.instant, C.accrued);
   const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
   const accountsPayable = resolveAccountsPayable(period, ctx);
@@ -3883,6 +4165,14 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
   const otherAssetsNoncurrent = first(period, ctx.instant, ["OtherAssetsNoncurrent"]);
   const operatingLeaseAssets = sum(period, ctx.instant, ["OperatingLeaseRightOfUseAsset", "OperatingLeaseRightOfUseAssetNet"]);
+  const directOtherNonCurrentAssetComponents = sumWithNote(
+    period,
+    ctx.instant,
+    OTHER_NON_CURRENT_ASSET_COMPONENT_CONCEPTS,
+    "Mapped to reported non-current asset lines without dedicated model rows."
+  );
+  const primaryOtherNonCurrentAssets = primaryOtherNonCurrentAssetSources(period, ctx);
+  const primaryOtherNonCurrentAssetLabels = sourceLineItemLabels({ sources: primaryOtherNonCurrentAssets });
 
   const assets = first(period, ctx.instant, C.assets);
   const currentAssets = first(period, ctx.instant, C.currentAssets);
@@ -3907,15 +4197,35 @@ function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): Reso
         note: "Mapped to directly reported other non-current assets plus operating lease right-of-use assets so the non-current asset section ties to SEC total assets."
       };
     }
+    if (
+      directOtherNonCurrentAssetComponents.value !== null &&
+      statementMetricTies(residual / 1_000_000, directOtherNonCurrentAssetComponents.value / 1_000_000)
+    ) {
+      return directOtherNonCurrentAssetComponents;
+    }
+    const directPrimaryOtherNonCurrentAssets = resolvedFromPrimarySources(
+      primaryOtherNonCurrentAssets,
+      "Mapped to reported non-current asset lines without dedicated model rows from the primary consolidated balance sheet."
+    );
+    if (directPrimaryOtherNonCurrentAssets.value !== null && statementMetricTies(residual / 1_000_000, directPrimaryOtherNonCurrentAssets.value / 1_000_000)) {
+      return directPrimaryOtherNonCurrentAssets;
+    }
     return {
       value: residual,
       sources: compactSources([assets, currentAssets, ppe, intangibles.value !== null ? intangibles : zeroResolved(C.intangibles[0]), goodwill]),
       note:
         intangibles.value === null
           ? "Calculated from SEC total assets less current assets, PP&E, and goodwill because EDGAR did not report a separate current-period intangible-assets balance for this template row."
-          : "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill."
+          : "Calculated from SEC total assets less current assets and separately modeled PP&E, intangible assets, and goodwill.",
+      classification: "grouped",
+      includedLineItems: primaryOtherNonCurrentAssetLabels
     };
   }
+  const directPrimaryOtherNonCurrentAssets = resolvedFromPrimarySources(
+    primaryOtherNonCurrentAssets,
+    "Mapped to reported non-current asset lines without dedicated model rows from the primary consolidated balance sheet."
+  );
+  if (directPrimaryOtherNonCurrentAssets.value !== null) return directPrimaryOtherNonCurrentAssets;
   if (otherAssetsNoncurrent) {
     return {
       value: otherAssetsNoncurrent.value,
@@ -4038,6 +4348,12 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
 }
 
 function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryOtherCurrent = resolvedFromPrimarySources(
+    primaryOtherCurrentLiabilitySources(period, ctx),
+    "Mapped to reported current liability lines without dedicated model rows from the primary consolidated balance sheet."
+  );
+  if (primaryOtherCurrent.value !== null) return primaryOtherCurrent;
+
   const broad = first(period, ctx.instant, BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS);
   if (broad) {
     return {
@@ -4062,33 +4378,39 @@ function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContex
 
 function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
   const nonCurrentLiabilities = resolveModeledNonCurrentLiabilitiesSubtotal(period, ctx);
+  const currentBorrowings = ctx.template?.hasShortTermBorrowingsRow ? resolveShortTermBorrowings(period, ctx) : zeroResolved("ShortTermBorrowings");
   const debt = resolveLongTermDebtInclCurrentPortion(period, ctx);
   const dtl = ctx.template?.hasDeferredTaxLiabilityRow ? resolveDeferredTaxLiability(period, ctx) : zeroResolved(C.deferredTaxLiability[0]);
   const leases = ctx.template?.hasNonCurrentLeaseLiabilityRow ? resolveNonCurrentLeaseLiabilities(period, ctx) : zeroResolved(NONCURRENT_LEASE_LIABILITY_CONCEPTS[0]);
   const pension = ctx.template?.hasPensionLiabilityRow ? resolvePensionLiabilities(period, ctx) : zeroResolved(PENSION_LIABILITY_CONCEPTS[0]);
   const direct = resolveDirectOtherNonCurrentLiabilities(period, ctx);
+  const primaryOtherNonCurrentLiabilities = primaryOtherNonCurrentLiabilitySources(period, ctx);
+  const primaryOtherNonCurrentLiabilityLabels = sourceLineItemLabels({ sources: primaryOtherNonCurrentLiabilities });
   if (
     nonCurrentLiabilities.value !== null &&
+    currentBorrowings.value !== null &&
     debt.value !== null &&
     dtl.value !== null &&
     leases.value !== null &&
     pension.value !== null
   ) {
-    const residualValue = nonCurrentLiabilities.value - debt.value - dtl.value - leases.value - pension.value;
+    const residualValue = nonCurrentLiabilities.value - currentBorrowings.value - debt.value - dtl.value - leases.value - pension.value;
     if (direct.value !== null && statementMetricTies(residualValue / 1_000_000, direct.value / 1_000_000)) return direct;
     return {
       value: residualValue,
-      sources: compactSources([nonCurrentLiabilities, debt, dtl, leases, pension]),
+      sources: compactSources([nonCurrentLiabilities, currentBorrowings, debt, dtl, leases, pension]),
       note:
-        "Derived from SEC non-current liabilities less separately modeled debt, deferred tax, lease, and pension liabilities. Current debt is not included in this other non-current liability bucket.",
+        "Derived from SEC non-current liabilities less separately modeled current borrowings, debt, deferred tax, lease, and pension liabilities. Current debt is not included in this other non-current liability bucket.",
       classification: "grouped",
-      includedLineItems: [
-        lineItemExclusionLabel(
-          nonCurrentLiabilities,
-          [debt, dtl, leases, pension],
-          "Other non-current liabilities from the primary consolidated balance sheet"
-        )
-      ]
+      includedLineItems: primaryOtherNonCurrentLiabilityLabels.length
+        ? primaryOtherNonCurrentLiabilityLabels
+        : [
+            lineItemExclusionLabel(
+              nonCurrentLiabilities,
+              [currentBorrowings, debt, dtl, leases, pension],
+              "Other non-current liabilities from the primary consolidated balance sheet"
+            )
+          ]
     };
   }
 
@@ -4101,6 +4423,7 @@ function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext):
     !assets ||
     currentLiabilities.value === null ||
     totalEquity.value === null ||
+    currentBorrowings.value === null ||
     debt.value === null ||
     dtl.value === null ||
     leases.value === null ||
@@ -4109,22 +4432,30 @@ function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext):
     return { value: null, sources: [], note: "Could not calculate other non-current liabilities because assets, liabilities, or equity were unavailable." };
   }
   return {
-    value: assets.value - totalEquity.value - currentLiabilities.value - debt.value - dtl.value - leases.value - pension.value,
-    sources: compactSources([assets, totalEquity, currentLiabilities, debt, dtl, leases, pension]),
+    value: assets.value - totalEquity.value - currentLiabilities.value - currentBorrowings.value - debt.value - dtl.value - leases.value - pension.value,
+    sources: compactSources([assets, totalEquity, currentLiabilities, currentBorrowings, debt, dtl, leases, pension]),
     note:
-      "Included total assets less total equity, current liabilities, non-current debt, deferred taxes, leases, and pensions. Current debt is excluded from other non-current liabilities when the template has a current-debt row.",
+      "Included total assets less total equity, current liabilities, separately modeled current borrowings, non-current debt, deferred taxes, leases, and pensions. Current debt is excluded from other non-current liabilities when the template has a current-debt row.",
     classification: "grouped",
-    includedLineItems: [
-      lineItemExclusionLabel(
-        assets,
-        [totalEquity, currentLiabilities, debt, dtl, leases, pension],
-        "Other non-current liabilities from the primary consolidated balance sheet"
-      )
-    ]
+    includedLineItems: primaryOtherNonCurrentLiabilityLabels.length
+      ? primaryOtherNonCurrentLiabilityLabels
+      : [
+          lineItemExclusionLabel(
+            assets,
+            [totalEquity, currentLiabilities, currentBorrowings, debt, dtl, leases, pension],
+            "Other non-current liabilities from the primary consolidated balance sheet"
+          )
+        ]
   };
 }
 
 function resolveDirectOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryOtherNonCurrent = resolvedFromPrimarySources(
+    primaryOtherNonCurrentLiabilitySources(period, ctx),
+    "Mapped to reported non-current liability lines without dedicated model rows from the primary consolidated balance sheet."
+  );
+  if (primaryOtherNonCurrent.value !== null) return primaryOtherNonCurrent;
+
   const directConcepts = [...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS];
   if (!ctx.template?.hasDeferredTaxLiabilityRow) directConcepts.push(...C.deferredTaxLiability);
   if (!ctx.template?.hasNonCurrentLeaseLiabilityRow) directConcepts.push(...NONCURRENT_LEASE_LIABILITY_CONCEPTS);
@@ -4167,13 +4498,15 @@ function resolveModeledCurrentLiabilitiesSubtotal(period: string, ctx: ResolveCo
 }
 
 function resolveCurrentLiabilitiesForNonCurrentLiabilitySubtotal(period: string, ctx: ResolveContext): ResolvedValue {
+  if (ctx.template?.hasCurrentLiabilitiesExcludingDebtRow) return resolveModeledCurrentLiabilitiesSubtotal(period, ctx);
   if (ctx.template?.hasCurrentDebtRow) return resolveCurrentLiabilitiesSubtotal(period, ctx, false);
   return resolveModeledCurrentLiabilitiesSubtotal(period, ctx);
 }
 
 function resolveModeledNonCurrentLiabilitiesSubtotal(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, ["LiabilitiesNoncurrent"]);
-  const currentMaturitiesIncludedInDebt = currentMaturitiesIncludedInDebtRow(period, ctx);
+  const currentDebtAlreadyExcludedFromCurrentSubtotal = Boolean(ctx.template?.hasCurrentLiabilitiesExcludingDebtRow);
+  const currentMaturitiesIncludedInDebt = currentDebtAlreadyExcludedFromCurrentSubtotal ? null : currentMaturitiesIncludedInDebtRow(period, ctx);
   if (direct && currentMaturitiesIncludedInDebt) {
     return {
       value: direct.value + currentMaturitiesIncludedInDebt.value!,
@@ -7607,8 +7940,9 @@ function cellFormula(cell: ExcelJS.Cell) {
 
 function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell, period?: string, ctx?: ResolveContext): WriteDecision {
   const actualizedForecastCell = period && ctx ? isActualizedForecastWritableCell(fillRow, cell, period, ctx) : false;
+  const reportedBalanceFormulaCell = period && ctx ? isReportedBalanceSheetFormulaInputCell(fillRow, cell, period, ctx) : false;
   const protectedReason = protectedFormulaOrCheckCellReason(cell);
-  if (protectedReason && !actualizedForecastCell) return { writable: false, reason: protectedReason, formulaPreserved: hasFormula(cell) };
+  if (protectedReason && !actualizedForecastCell && !reportedBalanceFormulaCell) return { writable: false, reason: protectedReason, formulaPreserved: hasFormula(cell) };
   if (fillRow.onlyBlankHistoricalInput && cell.value !== null) {
     return { writable: false, reason: "existing model hardcode preserved", formulaPreserved: false };
   }
@@ -7625,10 +7959,40 @@ function historicalWriteDecision(fillRow: FillRow, cell: ExcelJS.Cell, period?: 
 }
 
 function isActualizedForecastWritableCell(fillRow: FillRow, cell: ExcelJS.Cell, period: string, ctx: ResolveContext) {
+  if (isReportedBalanceSheetFormulaInputCell(fillRow, cell, period, ctx)) return true;
   if (!hasFormula(cell)) return false;
   if (fillRow.classification === "formula" || fillRow.classification === "unused") return false;
   if (fillRow.statement === "support") return false;
   return isActualizedForecastPeriodCell(cell.worksheet, Number(cell.col), period, ctx);
+}
+
+function isReportedBalanceSheetFormulaInputCell(fillRow: FillRow, cell: ExcelJS.Cell, period: string, ctx: ResolveContext) {
+  if (!hasFormula(cell)) return false;
+  if (!isStrictPrimaryBalanceSheetInputRow(cell.worksheet, fillRow)) return false;
+  if (!isBalanceSheetComponentInputFillRow(fillRow)) return false;
+  const col = Number(cell.col);
+  if (!reportedPeriodColumnsBySheet.get(cell.worksheet)?.has(col)) return false;
+  const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+  return hasReportedFilingPeriod(lookupPeriod, ctx) || hasReportedFinancialStatementPeriod(lookupPeriod, ctx);
+}
+
+function isBalanceSheetComponentInputFillRow(fillRow: FillRow) {
+  if (fillRow.statement !== "balance" || fillRow.kind !== "instant") return false;
+  if (fillRow.classification === "formula" || fillRow.classification === "unused") return false;
+  const label = fillRow.label;
+  if (isProtectedCheckRowLabel(label)) return false;
+  if (
+    isTotalAssetsLabel(label) ||
+    isTotalCurrentAssetsLabel(label) ||
+    isTotalNonCurrentAssetsLabel(label) ||
+    isCurrentLiabilitiesSubtotalLabel(label) ||
+    isTotalNonCurrentLiabilitiesLabel(label) ||
+    isTotalLiabilitiesLabel(label) ||
+    isTotalLiabilitiesAndEquityLabel(label) ||
+    isTotalStockholdersEquityLabel(label) ||
+    isTotalEquityLabel(label)
+  ) return false;
+  return true;
 }
 
 function canWriteActualizedForecastBalanceValue(
@@ -9437,11 +9801,23 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   }
   if (BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(concept) || OTHER_NON_OPERATING_CONCEPTS.includes(concept) || otherNonOperatingScore(source) >= 5) return "other_non_operating_income_expense";
 
-  if ([...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory, ...C.currentAssets].includes(concept)) return "current_assets";
-  if ([...C.ppe, ...C.intangibles, ...C.goodwill].includes(concept) || /\bnoncurrent assets?\b|\bproperty\b.*\bplant\b|\bgoodwill\b|\bintangibles?\b/.test(text)) return "non_current_assets";
+  if (
+    [...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory, ...C.currentAssets, ...OTHER_CURRENT_ASSET_CONCEPTS].includes(concept) ||
+    /\bother current assets?\b|\bprepaid\b|\bcontract\b.*\bassets?\b.*\bcurrent\b|\bother receivables?\b.*\bcurrent\b|\btax receivables?\b/.test(text)
+  ) return "current_assets";
+  if (
+    [...C.ppe, ...C.intangibles, ...C.goodwill, ...INVESTMENT_ASSET_CONCEPTS, "LongTermInvestments", "OperatingLeaseRightOfUseAsset", "OperatingLeaseRightOfUseAssetNet", "OtherAssetsNoncurrent", "RestrictedCashNoncurrent"].includes(concept) ||
+    /\bnoncurrent assets?\b|\bnon-current assets?\b|\blong[-\s]?term investments?\b|\bequity investments?\b|\bright[-\s]?of[-\s]?use assets?\b|\boperating lease\b.*\bassets?\b|\bproperty\b.*\bplant\b|\bproperty and equipment\b|\bgoodwill\b|\bintangibles?\b|\bother assets?\b/.test(text)
+  ) return "non_current_assets";
   if (C.assets.includes(concept)) return "total_assets";
-  if ([...C.ap, ...C.accrued, ...C.customerDeposits, ...C.currentLiabilities, ...C.currentDebt].includes(concept)) return "current_liabilities";
-  if ([...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS].includes(concept) || /\bnoncurrent liabilit|\blong[- ]term debt|\bdeferred tax liabilit|\bpension liabilit/.test(text)) return "non_current_liabilities";
+  if (
+    [...C.ap, ...C.accrued, ...C.customerDeposits, ...C.currentLiabilities, ...C.currentDebt, ...BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS, ...OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS].includes(concept) ||
+    /\bcurrent liabilit|\baccounts? payable\b|\baccrued\b|\bpharmacy claims?\b|\bhealth care costs? payable\b|\bother insurance liabilit|\bcurrent portion\b.*\blease liabilit|\bdeferred (revenue|income)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b|\bshort[-\s]?term borrowings?\b|\bcommercial paper\b|\bcurrent portion\b.*\blong[-\s]?term debt\b/.test(text)
+  ) return "current_liabilities";
+  if (
+    [...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS, ...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS].includes(concept) ||
+    /\bnoncurrent liabilit|\bnon-current liabilit|\blong[- ]term debt|\blong[-\s]?term operating lease liabilit|\bdeferred tax liabilit|\bdeferred income taxes\b|\bpension liabilit|\bpostretirement\b|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\basset retirement obligations?\b/.test(text)
+  ) return "non_current_liabilities";
   if (C.liabilities.includes(concept)) return "total_liabilities";
   if ([...C.equity, ...C.commonApic, ...C.retained, ...C.treasury, ...C.aoci, ...C.nci].includes(concept) || /\bequity\b|\bstockholders?\b|\bshareholders?\b|\bretained earnings\b|\btreasury stock\b|\bnoncontrolling interest\b/.test(text)) return "equity";
 
@@ -11380,7 +11756,8 @@ function strictPrimaryBalanceSheetRebuild(options: WorkbookValidationRetryOption
         continue;
       }
 
-      if (isProtectedFormulaOrCheckCell(cell) || !isHardcodedFinancialInput(cell)) continue;
+      const canWriteReportedFormula = isReportedBalanceSheetFormulaInputCell(fillRow, cell, period, options.ctx);
+      if ((isProtectedFormulaOrCheckCell(cell) && !canWriteReportedFormula) || (!isHardcodedFinancialInput(cell) && !canWriteReportedFormula)) continue;
       const value = resolved.value / (fillRow.scale ?? 1);
       const existing = numericCellValue(cell);
       clearEdgarMapperComment(cell);
@@ -12998,8 +13375,13 @@ function recordBalanceSheetValidationIssue(
     errors.push(message);
     return;
   }
-  if (isActualizedForecastPeriodCell(sheet, col, period, ctx)) {
-    errors.push(`${message} Actual-period write failure / forecast protection mismatch.`);
+  if (
+    isActualizedForecastPeriodCell(sheet, col, period, ctx) ||
+    reportedPeriodColumnsBySheet.get(sheet)?.has(col) ||
+    hasReportedFilingPeriod(balanceSheetInstantLookupPeriod(period), ctx) ||
+    hasReportedFinancialStatementPeriod(balanceSheetInstantLookupPeriod(period), ctx)
+  ) {
+    errors.push(`${message} Reported-period balance-sheet formula must be refreshed or remapped before output.`);
     return;
   }
   warnings.unshift(protectedWarning);
@@ -14084,6 +14466,7 @@ function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: Work
     const actual = cellFormula(cell);
     if (actual !== expected) {
       if (isAllowedActualizedForecastFormulaReplacement(cell)) continue;
+      if (isAllowedReportedBalanceSheetFormulaReplacement(cell)) continue;
       if (isAllowedFormulaPreservationUpdate(cell, expected, actual)) continue;
       errors.push(`${address}: formula changed from "${expected}" to "${actual ?? "[hardcoded/blank]"}".`);
     }
@@ -14095,6 +14478,28 @@ function isAllowedActualizedForecastFormulaReplacement(cell: ExcelJS.Cell) {
   if (cellFormula(cell)) return false;
   if (numericCellValue(cell) === null) return false;
   return Boolean(actualizedForecastPeriodColumnsBySheet.get(cell.worksheet)?.has(Number(cell.col)));
+}
+
+function isAllowedReportedBalanceSheetFormulaReplacement(cell: ExcelJS.Cell) {
+  if (cellFormula(cell)) return false;
+  if (numericCellValue(cell) === null) return false;
+  const rowNumber = Number(cell.row);
+  if (!balanceSheetRows(cell.worksheet).has(rowNumber)) return false;
+  if (!reportedPeriodColumnsBySheet.get(cell.worksheet)?.has(Number(cell.col))) return false;
+  const label = rowLabel(cell.worksheet, rowNumber);
+  if (!label || isProtectedCheckRowLabel(label)) return false;
+  if (
+    isTotalAssetsLabel(label) ||
+    isTotalCurrentAssetsLabel(label) ||
+    isTotalNonCurrentAssetsLabel(label) ||
+    isCurrentLiabilitiesSubtotalLabel(label) ||
+    isTotalNonCurrentLiabilitiesLabel(label) ||
+    isTotalLiabilitiesLabel(label) ||
+    isTotalLiabilitiesAndEquityLabel(label) ||
+    isTotalStockholdersEquityLabel(label) ||
+    isTotalEquityLabel(label)
+  ) return false;
+  return true;
 }
 
 function restoreProtectedCells(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
