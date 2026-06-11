@@ -2,7 +2,7 @@ const fsp = require("node:fs/promises");
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 
-const DEFAULT_TIMEOUT_MS = 15 * 60 * 1000;
+const DEFAULT_TIMEOUT_MS = Number(process.env.FILL_API_TIMEOUT_MS || 15 * 60 * 1000);
 
 async function postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   await fsp.mkdir(path.dirname(outputWorkbook), { recursive: true });
