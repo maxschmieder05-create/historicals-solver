@@ -51,10 +51,14 @@ function request(overrides) {
     nearbyRows: overrides.nearbyRows ?? [],
     parentSubtotal: overrides.parentSubtotal,
     isSubtotal: false,
+    priorPeriodSourceLabels: overrides.priorPeriodSourceLabels ?? [],
+    currentPeriodSourceLines: overrides.currentPeriodSourceLines ?? [],
     availableModelRows: overrides.availableModelRows ?? availableModelRows,
     modelRowDefinitions,
     deterministicCandidate: overrides.deterministicCandidate,
-    uncertaintyReason: overrides.uncertaintyReason ?? "ambiguous accounting label"
+    uncertaintyReason: overrides.uncertaintyReason ?? "ambiguous accounting label",
+    validationError: overrides.validationError ?? "",
+    alreadyMappedRows: overrides.alreadyMappedRows ?? []
   };
 }
 
@@ -177,7 +181,17 @@ async function classify(overrides) {
                   message: {
                     content: JSON.stringify({
                       source_line_item: "Other lease financing obligations",
+                      recommended_action: "remap",
                       recommended_model_row: "LT Debt (Incl. Current Portion)",
+                      recommended_model_row_mappings: [
+                        {
+                          source_line_item: "Other lease financing obligations",
+                          model_row: "LT Debt (Incl. Current Portion)",
+                          amount: 100,
+                          reason: "Lease financing obligations are debt-like capital structure liabilities."
+                        }
+                      ],
+                      explicit_zero_rows: [],
                       classification_type: "lease financing debt obligation",
                       is_current: false,
                       is_debt: true,
@@ -189,7 +203,8 @@ async function classify(overrides) {
                       should_exclude_from_other_bucket: true,
                       confidence: "high",
                       reason: "Lease financing obligations are debt-like capital structure liabilities.",
-                      requires_validation: true
+                      requires_validation: true,
+                      requires_revalidation: true
                     })
                   }
                 }
@@ -207,6 +222,7 @@ async function classify(overrides) {
   const llmUserPayload = JSON.parse(llmRequestedPayloads[0].messages[1].content);
   assert.equal(llmUserPayload.reportedLineItemLabel, "Other lease financing obligations");
   assert.equal(llmUserPayload.modelRowDefinitions["LT Debt (Incl. Current Portion)"].includes("Long-term debt instruments"), true);
+  assert.equal(llmRequestedPayloads[0].response_format.json_schema.schema.properties.recommended_action.enum.includes("set_zero"), true);
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {

@@ -41,15 +41,30 @@ export type FinancialLineItemClassificationRequest = {
     concept?: string;
   };
   isSubtotal: boolean;
+  priorPeriodSourceLabels?: string[];
+  currentPeriodSourceLines?: string[];
   availableModelRows: string[];
   modelRowDefinitions: Record<string, string>;
   deterministicCandidate?: string;
   uncertaintyReason: string;
+  validationError?: string;
+  alreadyMappedRows?: string[];
 };
 
 export type FinancialLineItemClassification = {
   source_line_item: string;
+  recommended_action: "map" | "remap" | "set_zero" | "merge_into_other" | "split_across_rows" | "keep_existing" | "exclude";
   recommended_model_row: string;
+  recommended_model_row_mappings: Array<{
+    source_line_item: string;
+    model_row: string;
+    amount: number | null;
+    reason: string;
+  }>;
+  explicit_zero_rows: Array<{
+    model_row: string;
+    reason: string;
+  }>;
   classification_type: string;
   is_current: boolean | null;
   is_debt: boolean;
@@ -62,6 +77,7 @@ export type FinancialLineItemClassification = {
   confidence: "high" | "medium" | "low";
   reason: string;
   requires_validation: boolean;
+  requires_revalidation: boolean;
   llm_used: boolean;
   mapping_passed_validation: boolean;
   warning?: string;
@@ -507,7 +523,10 @@ function baseClassification(request: FinancialLineItemClassificationRequest): Fi
   const isDeferredRevenue = /\bdeferred (?:income|revenue)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b/.test(text);
   return {
     source_line_item: request.cleanLabel || request.reportedLineItemLabel,
+    recommended_action: "map",
     recommended_model_row: request.deterministicCandidate || "Unmapped / Needs Review",
+    recommended_model_row_mappings: [],
+    explicit_zero_rows: [],
     classification_type: "unclassified",
     is_current: request.section.includes("current") ? request.section.startsWith("current") : null,
     is_debt: /\bdebt\b|\bnotes?\b|\bborrowings?\b|\bcommercial paper\b|\brevolver\b|\bcredit facility\b/.test(text),
@@ -520,6 +539,7 @@ function baseClassification(request: FinancialLineItemClassificationRequest): Fi
     confidence: "medium",
     reason: "",
     requires_validation: true,
+    requires_revalidation: true,
     llm_used: false,
     mapping_passed_validation: false
   };
@@ -533,10 +553,16 @@ function finalizeClassification(
   const mappingPassedValidation = classification.mapping_passed_validation || classificationPassesValidation(request, { ...classification, recommended_model_row: recommended });
   return {
     ...classification,
+    recommended_action: classification.recommended_action || "map",
     recommended_model_row: recommended,
+    recommended_model_row_mappings: Array.isArray(classification.recommended_model_row_mappings)
+      ? classification.recommended_model_row_mappings
+      : [],
+    explicit_zero_rows: Array.isArray(classification.explicit_zero_rows) ? classification.explicit_zero_rows : [],
     source_line_item: classification.source_line_item || request.cleanLabel || request.reportedLineItemLabel,
     is_subtotal: request.isSubtotal || classification.is_subtotal,
     requires_validation: true,
+    requires_revalidation: true,
     mapping_passed_validation: mappingPassedValidation,
     reason: shortReason(classification.reason || request.uncertaintyReason || "Accounting classification requires validation.")
   };
@@ -569,6 +595,8 @@ async function requestLlmClassification(
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",
+    "When the correct repair is no reported line item, return recommended_action set_zero with explicit_zero_rows populated.",
+    "Use recommended_action remap for validation failures caused by a source line belonging in a different row; use exclude for subtotal/component double-counting.",
     "Return strict JSON only."
   ].join(" ");
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -628,7 +656,10 @@ function financialLineItemClassificationJsonSchema() {
       additionalProperties: false,
       required: [
         "source_line_item",
+        "recommended_action",
         "recommended_model_row",
+        "recommended_model_row_mappings",
+        "explicit_zero_rows",
         "classification_type",
         "is_current",
         "is_debt",
@@ -640,11 +671,39 @@ function financialLineItemClassificationJsonSchema() {
         "should_exclude_from_other_bucket",
         "confidence",
         "reason",
-        "requires_validation"
+        "requires_validation",
+        "requires_revalidation"
       ],
       properties: {
         source_line_item: { type: "string" },
+        recommended_action: { type: "string", enum: ["map", "remap", "set_zero", "merge_into_other", "split_across_rows", "keep_existing", "exclude"] },
         recommended_model_row: { type: "string" },
+        recommended_model_row_mappings: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["source_line_item", "model_row", "amount", "reason"],
+            properties: {
+              source_line_item: { type: "string" },
+              model_row: { type: "string" },
+              amount: { anyOf: [{ type: "number" }, { type: "null" }] },
+              reason: { type: "string" }
+            }
+          }
+        },
+        explicit_zero_rows: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: ["model_row", "reason"],
+            properties: {
+              model_row: { type: "string" },
+              reason: { type: "string" }
+            }
+          }
+        },
         classification_type: { type: "string" },
         is_current: { anyOf: [{ type: "boolean" }, { type: "null" }] },
         is_debt: { type: "boolean" },
@@ -656,7 +715,8 @@ function financialLineItemClassificationJsonSchema() {
         should_exclude_from_other_bucket: { type: "boolean" },
         confidence: { type: "string", enum: ["high", "medium", "low"] },
         reason: { type: "string" },
-        requires_validation: { type: "boolean" }
+        requires_validation: { type: "boolean" },
+        requires_revalidation: { type: "boolean" }
       }
     }
   };

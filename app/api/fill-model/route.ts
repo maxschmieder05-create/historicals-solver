@@ -1939,6 +1939,12 @@ async function buildLineItemClassificationStore(
   const warnings: string[] = [];
   const availableModelRows = unique(fillRows.map((rowItem) => rowItem.label).filter(Boolean));
   const modelRowDefinitions = modelRowDefinitionsForRows(availableModelRows);
+  const alreadyMappedRows = unique(
+    fillRows
+      .filter((rowItem) => rowItem.classification !== "unused" && rowItem.classification !== "formula")
+      .map((rowItem) => rowItem.label)
+      .filter(Boolean)
+  ).slice(0, 80);
   const wantedPeriods = new Set(periods.flatMap((period) => [period, balanceSheetInstantLookupPeriod(period)]));
   const seen = new Set<string>();
   const statements = (ctx.filingPackageStatements ?? []).filter((statement) => statement.sourceTableType === "primary_statement");
@@ -1984,10 +1990,14 @@ async function buildLineItemClassificationStore(
           ? { label: rowItem.parentSubtotal.label, concept: rowItem.parentSubtotal.concept }
           : undefined,
         isSubtotal: statementRowIsSubtotal(rowItem),
+        priorPeriodSourceLabels: priorPeriodSourceLabelsForStatementRow(statements, statementName, rowItem, period || "", ctx),
+        currentPeriodSourceLines: currentPeriodSourceLines(rows),
         availableModelRows,
         modelRowDefinitions,
         deterministicCandidate,
-        uncertaintyReason: lineItemClassificationUncertaintyReason(rowItem, deterministicCandidate)
+        uncertaintyReason: lineItemClassificationUncertaintyReason(rowItem, deterministicCandidate),
+        validationError: "",
+        alreadyMappedRows
       };
 
       if (!lineItemNeedsClassification(request)) continue;
@@ -2203,6 +2213,33 @@ function nearbyStatementRows(rows: SecFilingStatementStructure["rows"], row: Sec
     .filter(Boolean);
 }
 
+function currentPeriodSourceLines(rows: SecFilingStatementStructure["rows"]) {
+  return unique(rows.map((row) => cleanLineItemLabel(row.rowLabel)).filter(Boolean)).slice(0, 80);
+}
+
+function priorPeriodSourceLabelsForStatementRow(
+  statements: SecFilingStatementStructure[],
+  statementName: FinancialStatementName,
+  row: SecFilingStatementStructure["rows"][number],
+  period: string,
+  ctx: ResolveContext
+) {
+  if (!row.xbrlConcept || !isSupportedPeriodKey(period)) return [];
+  const labels = statements.flatMap((statement) => {
+    if (financialStatementNameForSecStatement(statement) !== statementName) return [];
+    return statement.rows
+      .filter((candidate) => candidate.consolidated && !candidate.dimensions.length)
+      .filter((candidate) => candidate.xbrlConcept === row.xbrlConcept)
+      .filter((candidate) => {
+        const candidatePeriod = statementRowPeriodKey(candidate, ctx);
+        return isSupportedPeriodKey(candidatePeriod) && comparePeriods(candidatePeriod, period) < 0;
+      })
+      .map((candidate) => cleanLineItemLabel(candidate.rowLabel))
+      .filter(Boolean);
+  });
+  return unique(labels).slice(-8);
+}
+
 function statementRowIsSubtotal(row: SecFilingStatementStructure["rows"][number]) {
   const text = `${row.rowLabel} ${row.xbrlConcept ?? ""}`.toLowerCase();
   return /\btotal\b|\bsubtotal\b|\bassetscurrent\b|\bliabilitiescurrent\b|\bassets$|\bliabilities$|\bstockholders? equity\b/.test(text);
@@ -2375,6 +2412,14 @@ function primaryCurrentLiabilitySources(period: string, ctx: ResolveContext) {
   return primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
     if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInCurrentLiabilitySection(row, source)) return false;
     return true;
+  });
+}
+
+function primaryCurrentLiabilitySectionWasInspected(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetRowsForPeriod(period, ctx).some((row) => {
+    const source = primaryBalanceSheetFactSource(row, period);
+    if (!source || isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    return primaryRowInCurrentLiabilitySection(row, source);
   });
 }
 
@@ -4029,6 +4074,16 @@ function zeroResolved(concept: string): ResolvedValue {
   return { value: 0, sources: [zeroSource(concept)] };
 }
 
+function explicitZeroResolved(concept: string, label: string, note: string): ResolvedValue {
+  return {
+    value: 0,
+    sources: [{ ...zeroSource(concept), label, note }],
+    note,
+    classification: "direct",
+    includedLineItems: [label]
+  };
+}
+
 function resolveCurrentDebt(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = reportedCurrentDebt(period, ctx);
   return direct
@@ -4489,6 +4544,20 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
   if (primaryAccrued.value !== null) return primaryAccrued;
 
   const direct = first(period, ctx.instant, C.accrued);
+  if (direct) return { value: direct.value, sources: [direct] };
+
+  if (
+    primaryCurrentLiabilitySectionWasInspected(period, ctx) ||
+    hasReportedFilingPeriod(period, ctx) ||
+    hasReportedFinancialStatementPeriod(period, ctx)
+  ) {
+    return explicitZeroResolved(
+      "AccruedLiabilitiesNotSeparatelyDisclosed",
+      "No separate accrued liabilities line disclosed",
+      "No separate accrued liabilities line was disclosed for the current SEC filing period, so the model row was explicitly sourced as zero."
+    );
+  }
+
   const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
   const accountsPayable = resolveAccountsPayable(period, ctx);
   const otherCurrent = resolveDirectOtherCurrentLiabilities(period, ctx);
@@ -4497,9 +4566,6 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
   const currentDebt = excludeCurrentDebt ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
   if (currentLiabilities && accountsPayable.value !== null && otherCurrent.value !== null && currentDebt.value !== null) {
     const residualValue = currentLiabilities.value - accountsPayable.value - otherCurrent.value - currentDebt.value;
-    if (direct && statementMetricTies(residualValue / 1_000_000, direct.value / 1_000_000)) {
-      return { value: direct.value, sources: [direct] };
-    }
     return {
       value: residualValue,
       sources: compactSources([currentLiabilities, accountsPayable, otherCurrent, currentDebt]),
@@ -4516,7 +4582,6 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
       ]
     };
   }
-  if (direct) return { value: direct.value, sources: [direct] };
   if (!ctx.template?.hasOtherCurrentLiabilityRow) {
     const fallback = first(period, ctx.instant, ["OtherAccruedLiabilitiesCurrent"]);
     if (fallback) return { value: fallback.value, sources: [fallback] };
