@@ -38,8 +38,14 @@ const checks = [
     message: "Submit must prefer the displayed selected file state over the native input value."
   },
   {
-    ok: /setFile\(nextFile\);\s*clearFileInput\(\);/.test(source),
-    message: "A valid workbook selection must update visible state before resetting the native input for same-file reselection."
+    ok: /const resetFileInputAfterSelection = useCallback/.test(source)
+      && /window\.setTimeout\(\(\) => \{\s*clearFileInput\(\);/.test(source)
+      && /setFile\(nextFile\);\s*resetFileInputAfterSelection\(\);/.test(source),
+    message: "A valid workbook selection must update visible state before deferring the native input reset for same-file reselection."
+  },
+  {
+    ok: !/setFile\(nextFile\);\s*clearFileInput\(\);/.test(source),
+    message: "Valid workbook selection must not clear the native input synchronously during the picker event."
   },
   {
     ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
