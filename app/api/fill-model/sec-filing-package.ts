@@ -212,7 +212,7 @@ type LinkbaseArc = {
 const SEC_DEFAULT_USER_AGENT = process.env.SEC_USER_AGENT || "HistoricalsSolver/0.1 contact@example.com";
 const SEC_ARCHIVE_ROOT = "https://www.sec.gov/Archives/edgar/data";
 const SEC_ARCHIVE_MIN_INTERVAL_MS = Number(process.env.SEC_ARCHIVE_MIN_INTERVAL_MS || 150);
-const SEC_FILING_PACKAGE_MAX_FILINGS = Number(process.env.SEC_FILING_PACKAGE_MAX_FILINGS || 12);
+const SEC_FILING_PACKAGE_MAX_FILINGS = Number(process.env.SEC_FILING_PACKAGE_MAX_FILINGS || 24);
 const SEC_FILING_PACKAGE_MAX_ROWS_PER_STATEMENT = Number(process.env.SEC_FILING_PACKAGE_MAX_ROWS_PER_STATEMENT || 2000);
 
 const responseTextCache = new Map<string, Promise<string | null>>();

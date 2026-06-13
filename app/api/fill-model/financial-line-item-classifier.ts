@@ -299,7 +299,7 @@ function deterministicFinancialLineItemClassification(
   const preferred = (...rows: string[]) => rows.find((row) => modelRowAvailable(row, request.availableModelRows)) ?? rows[0];
   const hasCurrentInvestmentsRow = request.availableModelRows.some((row) => /short[-\s]?term investments?|current investments?|marketable securities/i.test(row));
 
-  if (/\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text)) {
+  if (/\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text) && !/assets?/.test(section)) {
     return {
       ...base,
       recommended_model_row: preferred("Deferred Income Taxes"),
@@ -310,6 +310,20 @@ function deterministicFinancialLineItemClassification(
       should_exclude_from_other_bucket: true,
       confidence: "high",
       reason: "Deferred tax liabilities are true deferred income taxes and belong in the deferred tax row when available."
+    };
+  }
+
+  if (/\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text) && /assets?/.test(section)) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Other Non-Current Assets"),
+      classification_type: "deferred tax asset",
+      is_current: current,
+      is_tax_related: true,
+      is_deferred_tax: true,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Deferred tax assets are asset balances and belong in Other Non-Current Assets when the template has no dedicated deferred tax asset row."
     };
   }
 
@@ -384,17 +398,37 @@ function deterministicFinancialLineItemClassification(
   }
 
   if (/\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/.test(text) && section === "current assets") {
+    const isCashLikeShortTermInvestment = /\bshort[-\s]?term investments?\b/.test(text) && !/\bmarketable securities\b/.test(text);
     return {
       ...base,
-      recommended_model_row: hasCurrentInvestmentsRow ? request.availableModelRows.find((row) => /short[-\s]?term investments?|current investments?|marketable securities/i.test(row)) ?? "Short-Term Investments" : preferred("Cash & Cash Equivalents"),
-      classification_type: "cash-like current investment",
+      recommended_model_row: hasCurrentInvestmentsRow
+        ? request.availableModelRows.find((row) => /short[-\s]?term investments?|current investments?|marketable securities/i.test(row)) ?? "Short-Term Investments"
+        : isCashLikeShortTermInvestment
+          ? preferred("Cash & Cash Equivalents")
+          : preferred("Prepaid & Other Current Assets"),
+      classification_type: isCashLikeShortTermInvestment ? "cash-like current investment" : "other current investment",
       is_current: true,
       is_operating: false,
-      should_exclude_from_other_bucket: true,
+      should_exclude_from_other_bucket: isCashLikeShortTermInvestment || hasCurrentInvestmentsRow,
       confidence: "high",
       reason: hasCurrentInvestmentsRow
-        ? "Short-term investments map to the dedicated current investments row when the template provides one."
-        : "Short-term investments are cash-like current assets and should be included with cash when no dedicated row exists."
+        ? "Current investments map to the dedicated current investments row when the template provides one."
+        : isCashLikeShortTermInvestment
+          ? "Short-term investments are cash-like current assets and should be included with cash when no dedicated row exists."
+          : "Marketable securities are grouped into Prepaid & Other Current Assets when no dedicated current investments row exists and they are not treated as cash-like."
+    };
+  }
+
+  if (/\bassets?\b.*\bheld for sale\b|\bdisposal group\b.*\bassets?\b|\bassets?\b.*\bdiscontinued operation/.test(text) && section === "current assets") {
+    return {
+      ...base,
+      recommended_model_row: preferred("Prepaid & Other Current Assets"),
+      classification_type: "current assets held for sale",
+      is_current: true,
+      is_operating: null,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Current assets held for sale are current assets without a dedicated template row and should be grouped into Prepaid & Other Current Assets."
     };
   }
 
@@ -579,7 +613,7 @@ function classificationPassesValidation(request: FinancialLineItemClassification
   if (modelRowsMatch(row, "Revolver") && /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|convertible|senior notes?/.test(text)) return false;
   if (modelRowsMatch(row, "Deferred Income Taxes") && !classification.is_deferred_tax) return false;
   if ((modelRowsMatch(row, "Accrued Liabilities") || modelRowsMatch(row, "Other Current Liabilities")) && classification.is_debt) return false;
-  if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /inventor|spare parts?|aircraft fuel|supplies|short[-\s]?term investments?|marketable securities/.test(text)) return false;
+  if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /inventor|spare parts?|aircraft fuel|supplies|short[-\s]?term investments?/.test(text)) return false;
   if (request.section === "current assets" && !modelRowsMatch(row, "Cash & Cash Equivalents") && !modelRowsMatch(row, "Accounts Receivable") && !modelRowsMatch(row, "Inventory") && !modelRowsMatch(row, "Prepaid & Other Current Assets")) return false;
   if (request.section === "current liabilities" && !modelRowsMatch(row, "Accounts Payable") && !modelRowsMatch(row, "Accrued Liabilities") && !modelRowsMatch(row, "Other Current Liabilities") && !modelRowsMatch(row, "Revolver") && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)")) return false;
   return true;

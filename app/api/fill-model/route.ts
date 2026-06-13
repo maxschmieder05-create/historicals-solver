@@ -417,6 +417,37 @@ type HistoricalSourceLedgerRow = {
   classificationReason: string;
 };
 
+type BalanceSheetAssignmentStatus =
+  | "mapped_to_model_row"
+  | "grouped_into_model_row"
+  | "explicit_zero_no_source_disclosed"
+  | "explicitly_excluded_with_reason";
+
+type BalanceSheetAssignmentSide = "assets" | "liabilities_and_equity" | "unknown";
+
+type PrimaryBalanceSheetAssignmentLedgerRow = {
+  fiscalPeriod: string;
+  sourceFilingAccession: string;
+  sourceStatement: string;
+  sourceLineItemLabel: string;
+  amount: number;
+  sourceXbrlTag: string;
+  assignedModelRow: string;
+  assignmentStatus: BalanceSheetAssignmentStatus;
+  classificationReason: string;
+  llmUsed: boolean;
+  validationStatus: string;
+  side: BalanceSheetAssignmentSide;
+  sourceSection: FinancialStatementSection;
+  sourceRowKey: string;
+};
+
+type PrimaryBalanceSheetAssignment = {
+  modelRow: string | null;
+  status: BalanceSheetAssignmentStatus;
+  reason: string;
+};
+
 type RowClassification = "direct" | "grouped" | "partial" | "formula" | "unused";
 
 type WorkbookSnapshot = {
@@ -480,6 +511,7 @@ const SEGMENT_SHEET = "Segment Analysis";
 const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
 const MAPPING_AUDIT_SHEET = "Mapping Audit";
 const SOURCE_LEDGER_SHEET = "Source Ledger";
+const BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET = "Balance Sheet Assignment Ledger";
 const SEC_ARCHIVE_MIN_INTERVAL_MS = 150;
 const secArchiveHtmlCache = new Map<string, string>();
 let lastSecArchiveFetchAt = 0;
@@ -749,6 +781,10 @@ const C = {
   intangibles: [
     "FiniteLivedIntangibleAssetsNet",
     "IntangibleAssetsNetExcludingGoodwill",
+    "IndefiniteLivedIntangibleAssets",
+    "IndefiniteLivedTrademarks",
+    "Trademarks",
+    "TrademarksAndOtherIntangibleAssets",
     "ContentAssetsNetNoncurrent",
     "ContentAssetsNet",
     "LicensedContentNet",
@@ -832,12 +868,25 @@ const OTHER_CURRENT_ASSET_CONCEPTS = [
   "OtherCurrentAssets",
   "PrepaidExpenseAndOtherAssetsCurrent",
   "PrepaidExpenseCurrent",
-  "PrepaidExpensesAndOtherCurrentAssets"
+  "PrepaidExpensesAndOtherCurrentAssets",
+  "AssetsOfDisposalGroupIncludingDiscontinuedOperationCurrent",
+  "AssetsHeldForSaleCurrent",
+  "DisposalGroupIncludingDiscontinuedOperationAssetsCurrent"
+];
+
+const STANDALONE_RESTRICTED_CASH_CONCEPTS = [
+  "RestrictedCashAndCashEquivalents",
+  "RestrictedCashAndCashEquivalentsCurrent",
+  "RestrictedCashAndCashEquivalentsNoncurrent"
 ];
 
 const OTHER_NON_CURRENT_ASSET_COMPONENT_CONCEPTS = [
   "LongTermInvestments",
   "InvestmentsNoncurrent",
+  "EquityMethodInvestments",
+  "DeferredTaxAssetsNet",
+  "DeferredTaxAssetsLiabilitiesNet",
+  "DeferredIncomeTaxAssetsNet",
   "OtherAssetsNoncurrent",
   "OperatingLeaseRightOfUseAsset",
   "OperatingLeaseRightOfUseAssetNet"
@@ -1920,6 +1969,7 @@ function isPrimaryIncomeStatementStructure(statement: SecFilingStatementStructur
 function isPrimaryBalanceSheetStructure(statement: SecFilingStatementStructure) {
   if (statement.sourceTableType !== "primary_statement") return false;
   const text = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
+  if (/\bparenthetical|parentheticals|details?|supplemental\b/.test(text)) return false;
   if (/\b(cash flows?|operations?|income|earnings|comprehensive income|stockholders?|shareholders?|equity)\b/.test(text)) return false;
   return /\b(balance sheets?|financial position)\b/.test(text);
 }
@@ -2047,16 +2097,50 @@ function primaryBalanceSheetComponentSources(
 }
 
 function primaryBalanceSheetRowsForPeriod(period: string, ctx: ResolveContext): PrimaryBalanceSheetRow[] {
+  return primaryBalanceSheetStatementRowsForPeriod(period, ctx).map(({ row }) => row);
+}
+
+function primaryBalanceSheetStatementRowsForPeriod(
+  period: string,
+  ctx: ResolveContext
+): Array<{ statement: SecFilingStatementStructure; row: PrimaryBalanceSheetRow }> {
   const filing = primaryFilingEntryForModelPeriod(period, ctx);
   const accession = filing?.accessionKey;
-  return (ctx.filingPackageStatements ?? [])
+  const candidates = (ctx.filingPackageStatements ?? [])
     .filter(isPrimaryBalanceSheetStructure)
     .filter((statement) => !accession || normalizeAccession(statement.accession) === accession)
-    .flatMap((statement) => statement.rows)
-    .filter((row) => row.consolidated && !row.dimensions.length)
-    .filter((row) => primaryBalanceSheetRowMatchesPeriod(row, period, ctx))
-    .filter((row) => typeof row.value === "number" && Number.isFinite(row.value))
-    .sort((a, b) => a.rowOrder - b.rowOrder);
+    .map((statement) => ({
+      statement,
+      rows: statement.rows
+        .filter((row) => row.consolidated && !row.dimensions.length)
+        .filter((row) => primaryBalanceSheetRowMatchesPeriod(row, period, ctx))
+        .filter((row) => typeof row.value === "number" && Number.isFinite(row.value))
+        .sort((a, b) => a.rowOrder - b.rowOrder)
+    }))
+    .filter((candidate) => candidate.rows.length);
+  if (!candidates.length) return [];
+  const best = candidates
+    .map((candidate) => ({ ...candidate, score: primaryBalanceSheetStatementScore(candidate.statement, candidate.rows) }))
+    .sort((a, b) => b.score - a.score || b.rows.length - a.rows.length)[0];
+  return best.rows.map((row) => ({ statement: best.statement, row }));
+}
+
+function primaryBalanceSheetStatementScore(statement: SecFilingStatementStructure, rows: PrimaryBalanceSheetRow[]) {
+  const concepts = new Set(rows.map((row) => row.xbrlConcept).filter(Boolean));
+  const statementText = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
+  let score = 0;
+  if (concepts.has("Assets")) score += 100;
+  if (concepts.has("LiabilitiesAndStockholdersEquity")) score += 90;
+  if (concepts.has("AssetsCurrent")) score += 30;
+  if (concepts.has("LiabilitiesCurrent")) score += 30;
+  if (concepts.has("StockholdersEquity") || concepts.has("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest")) score += 25;
+  score += Math.min(rows.length, 40);
+  if (/\bparenthetical|parentheticals|details?|supplemental\b/.test(statementText)) score -= 500;
+  score -= rows.filter((row) => {
+    const source = primaryBalanceSheetFactSource(row, row.reportingPeriod || "");
+    return Boolean(source && (sourceLooksLikeParentheticalBalanceSheetDetail(source) || (source.unit && !/usd/i.test(source.unit))));
+  }).length * 8;
+  return score;
 }
 
 function primaryBalanceSheetRowMatchesPeriod(row: PrimaryBalanceSheetRow, period: string, ctx: ResolveContext) {
@@ -2449,6 +2533,14 @@ function primaryFilingEntryForm(row: PrimaryBalanceSheetRow, period: string) {
 }
 
 function isPrimaryBalanceSheetSubtotalSource(source: FactSource) {
+  if (
+    sourceTextMatches(
+      source,
+      /\btotal\b.*\b(cash|assets?|liabilit|equity)\b|\bassets?\b.*\btotal\b|\bliabilit(?:y|ies)\b.*\bequity\b|\bequity attributable to\b(?!.*\bnoncontrolling\b)|\bstockholders'? equity\b|\bshareholders'? equity\b/
+    )
+  ) {
+    return true;
+  }
   return [
     ...C.currentAssets,
     ...C.assets,
@@ -2514,7 +2606,7 @@ function sourceLooksLikeOtherCurrentLiability(source: FactSource) {
   if (BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS.includes(source.concept) || OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
-    /\bother\b.*\bcurrent liabilit|\bdeferred (revenue|income)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b|\bother insurance liabilit|\bcurrent portion\b.*\blease liabilit/
+    /\bother\b.*\bcurrent liabilit|\bliabilities?\b.*\bheld for sale\b|\bheld for sale\b.*\bliabilities?\b|\bdeferred (revenue|income)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b|\bother insurance liabilit|\bcurrent portion\b.*\blease liabilit/
   );
 }
 
@@ -2531,7 +2623,8 @@ function sourceLooksLikeNonCurrentDebt(source: FactSource) {
 }
 
 function sourceLooksLikeDeferredTaxLiability(source: FactSource) {
-  return C.deferredTaxLiability.includes(source.concept) || sourceTextMatches(source, /\bdeferred (income )?tax(?:es)?\b/);
+  if (sourceLooksLikeDeferredTaxAsset(source)) return false;
+  return C.deferredTaxLiability.includes(source.concept) || sourceTextMatches(source, /\bdeferred (income )?tax(?:es)?\b.*\bliabilit|\bdeferred tax liabilities?\b/);
 }
 
 function sourceLooksLikeNonCurrentLeaseLiability(source: FactSource) {
@@ -2542,16 +2635,68 @@ function sourceLooksLikePensionLiability(source: FactSource) {
   return PENSION_LIABILITY_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\bpension\b|\bpostretirement\b/);
 }
 
+function sourceLooksLikeOtherNonCurrentLiability(source: FactSource) {
+  if (BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS.includes(source.concept)) return true;
+  return sourceTextMatches(
+    source,
+    /\bother\b.*\bnon[-\s]?current liabilit|\bother\b.*\blong[-\s]?term liabilit|\bnon[-\s]?current\b.*\bother liabilit|\blong[-\s]?term operating lease liabilit|\boperating lease\b.*\bliabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\boperating lease\b.*\bliabilit|\bother long[-\s]?term insurance liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
+  );
+}
+
 function sourceLooksLikeDedicatedAsset(source: FactSource) {
   return [...C.ppe, ...C.intangibles, ...C.goodwill, ...C.assets, ...C.currentAssets].includes(source.concept);
 }
 
+function sourceLooksLikeCurrentInvestment(source: FactSource) {
+  return C.currentInvestments.includes(source.concept) || sourceTextMatches(source, /\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/);
+}
+
+function sourceLooksLikeCashBalance(source: FactSource) {
+  return C.cash.includes(source.concept) || STANDALONE_RESTRICTED_CASH_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\bcash and cash equivalents?\b|\brestricted cash\b/);
+}
+
+function sourceLooksLikeCashLikeShortTermInvestment(source: FactSource) {
+  const text = sourceSearchText(source);
+  if (/\bmarketable securities\b/.test(text)) return false;
+  return source.concept === "ShortTermInvestments" || source.concept === "OtherShortTermInvestments" || /\bshort[-\s]?term investments?\b/.test(text);
+}
+
+function sourceLooksLikeAssetHeldForSale(source: FactSource) {
+  return sourceTextMatches(source, /\bassets?\b.*\bheld for sale\b|\bdisposal group\b.*\bassets?\b|\bassets?\b.*\bdiscontinued operation/);
+}
+
+function sourceLooksLikeDeferredTaxAsset(source: FactSource) {
+  return sourceTextMatches(source, /\bdeferred (income )?tax(?:es)?\b.*\bassets?\b|\bdeferred tax assets?\b/);
+}
+
+function sourceLooksLikeEquityMethodInvestmentAsset(source: FactSource) {
+  return sourceTextMatches(source, /\bequity method investments?\b|\binvestments?\b.*\bequity method\b/);
+}
+
+function sourceLooksLikeIntangibleAsset(source: FactSource) {
+  return C.intangibles.includes(source.concept) || sourceTextMatches(source, /\bintangibles?\b|\btrademarks?\b|\btrade names?\b|\bbrand names?\b/);
+}
+
+function sourceLooksLikeOperatingLeaseRightOfUseAsset(source: FactSource) {
+  return sourceTextMatches(source, /\boperating lease\b.*\bright[-\s]?of[-\s]?use\b.*\bassets?\b|\bright[-\s]?of[-\s]?use\b.*\bassets?\b/) && !sourceTextMatches(source, /\bliabilit/);
+}
+
+function sourceLooksLikeParentheticalBalanceSheetDetail(source: FactSource) {
+  if (C.receivables.includes(source.concept) || C.ppe.includes(source.concept) || C.treasury.includes(source.concept) || source.concept === "CommonStockValue") return false;
+  if (Math.abs(source.value) < 1_000_000 && sourceTextMatches(source, /\bpar value\b|\bauthorized\b.*\bshares\b|\bissued\b.*\bshares\b/)) return true;
+  return sourceTextMatches(source, /\ballowances?\b|\baccumulated depreciation\b|\baccumulated amortization\b/);
+}
+
 function primaryOtherCurrentAssetSources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
-    const semanticOtherCurrentAsset = sourceTextMatches(source, /\bother current assets?\b|\bprepaid\b|\btax receivables?\b|\bother receivables?\b/);
+    const semanticOtherCurrentAsset =
+      sourceTextMatches(source, /\bother current assets?\b|\bprepaid\b|\btax receivables?\b|\bother receivables?\b/) ||
+      sourceLooksLikeAssetHeldForSale(source) ||
+      (!ctx.template?.hasCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source) && !sourceLooksLikeCashLikeShortTermInvestment(source));
     if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInCurrentAssetSection(row, source) && !semanticOtherCurrentAsset)) return false;
-    if ([...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory].includes(source.concept)) return false;
-    if (inventoryLikeCurrentAssetScore(source) >= 5 || sourceTextMatches(source, /\bcash\b|\bshort[-\s]?term investments?\b|\bmarketable securities\b|\breceivables?\b|\binventor(?:y|ies)\b/)) return false;
+    if ([...C.cash, ...C.receivables, ...C.cardReceivables, ...C.inventory].includes(source.concept)) return false;
+    if (ctx.template?.hasCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source)) return false;
+    if (inventoryLikeCurrentAssetScore(source) >= 5 || sourceTextMatches(source, /\bcash\b|\bshort[-\s]?term investments?\b|\breceivables?\b|\binventor(?:y|ies)\b/)) return false;
     return true;
   });
   return withAcceptedModelRowClassifications(period, ctx, sources, "Prepaid & Other Current Assets");
@@ -2559,13 +2704,24 @@ function primaryOtherCurrentAssetSources(period: string, ctx: ResolveContext) {
 
 function primaryOtherNonCurrentAssetSources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
-    const semanticOtherNonCurrentAsset = sourceTextMatches(source, /\blong[-\s]?term investments?\b|\bright[-\s]?of[-\s]?use assets?\b|\boperating lease\b.*\bassets?\b|\bother assets?\b/);
+    const semanticOtherNonCurrentAsset =
+      sourceTextMatches(source, /\blong[-\s]?term investments?\b|\bright[-\s]?of[-\s]?use assets?\b|\boperating lease\b.*\bassets?\b|\bother assets?\b/) ||
+      sourceLooksLikeEquityMethodInvestmentAsset(source) ||
+      sourceLooksLikeDeferredTaxAsset(source);
     if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInNonCurrentAssetSection(row, source) && !semanticOtherNonCurrentAsset)) return false;
     if (sourceLooksLikeDedicatedAsset(source)) return false;
     if (sourceTextMatches(source, /\bproperty\b.*\bequipment\b|\bpp&e\b|\bgoodwill\b|\bintangibles?\b/)) return false;
     return true;
   });
   return withAcceptedModelRowClassifications(period, ctx, sources, "Other Non-Current Assets");
+}
+
+function primaryIntangibleAssetSources(period: string, ctx: ResolveContext) {
+  const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInNonCurrentAssetSection(row, source)) return false;
+    return sourceLooksLikeIntangibleAsset(source) && !sourceTextMatches(source, /\bgoodwill\b/);
+  });
+  return withAcceptedModelRowClassifications(period, ctx, sources, "Intangible Assets, Net");
 }
 
 function primaryCurrentLiabilitySources(period: string, ctx: ResolveContext) {
@@ -2596,6 +2752,19 @@ function primaryAccruedLiabilitySources(period: string, ctx: ResolveContext) {
     );
   });
   return withAcceptedModelRowClassifications(period, ctx, sources, "Accrued Liabilities");
+}
+
+function primaryAccountsPayableSources(period: string, ctx: ResolveContext) {
+  const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    return (
+      (primaryRowInCurrentLiabilitySection(row, source) || sourceLooksLikeAccountsPayable(source)) &&
+      sourceLooksLikeAccountsPayable(source) &&
+      !sourceLooksLikeCurrentDebtLine(source) &&
+      !sourceLooksLikeCurrentLeaseLiability(source)
+    );
+  });
+  return withAcceptedModelRowClassifications(period, ctx, sources, "Accounts Payable");
 }
 
 function primaryOtherCurrentLiabilitySources(period: string, ctx: ResolveContext) {
@@ -4461,9 +4630,11 @@ function reportedCurrentDebtMaturities(period: string, ctx: ResolveContext): Res
 }
 
 function reportedStandaloneShortTermBorrowingSource(period: string, ctx: ResolveContext): FactSource | null {
+  const primary = primaryShortTermBorrowingSources(period, ctx)[0] ?? null;
+  if (primary) return primary;
   const source = acceptedSourceForModelRow(period, ctx, first(period, ctx.instant, SHORT_TERM_BORROWING_BALANCE_SHEET_CONCEPTS), "Revolver");
   if (source) return withPrimaryBalanceSheetPresentationLabel(period, ctx, source);
-  return primaryShortTermBorrowingSources(period, ctx)[0] ?? null;
+  return null;
 }
 
 function reportedShortTermBorrowings(period: string, ctx: ResolveContext): ResolvedValue | null {
@@ -4512,8 +4683,8 @@ function resolveCurrentDebtMaturities(period: string, ctx: ResolveContext): Reso
 
 function sourceLooksLikeShortTermBorrowing(source: FactSource) {
   const text = `${source.label} ${source.concept}`.toLowerCase();
-  if (/current portion|current maturit|long[-\s]?term|lease/.test(text)) return false;
-  return /short[-\s]?term|borrowings?|current borrowings?|commercial paper|revolver|revolving credit|credit facility|line of credit|notes payable|loans payable/.test(text);
+  if (/current portion|current maturit|long[-\s]?term|lease|investments?|securities/.test(text)) return false;
+  return /short[-\s]?term borrowings?|short[-\s]?term debt|borrowings?|current borrowings?|commercial paper|revolver|revolving credit|credit facility|line of credit|notes payable|loans payable/.test(text);
 }
 
 function sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(source: FactSource) {
@@ -4655,12 +4826,12 @@ function resolveCash(period: string, ctx: ResolveContext): ResolvedValue {
 }
 
 function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): ResolvedValue {
-  const cash = first(period, ctx.instant, C.cash);
-  if (!cash) return { value: null, sources: [] };
+  const cash = resolveReportedCashBalance(period, ctx);
+  if (cash.value === null) return { value: null, sources: [] };
 
-  const currentInvestments = sum(period, ctx.instant, C.currentInvestments);
+  const currentInvestments = cashLikeCurrentInvestmentBalance(period, ctx);
   if (!shouldCombineCashAndCurrentInvestments(period, ctx, cash, currentInvestments)) {
-    return { value: cash.value, sources: [cash] };
+    return cash;
   }
   const classifiedCurrentInvestments =
     currentInvestments && currentInvestments.value !== null
@@ -4679,21 +4850,80 @@ function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): 
   };
 }
 
-function currentInvestmentsAreModeledInCash(period: string, ctx: ResolveContext) {
+function resolveReportedCashBalance(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryCash = primaryReportedCashBalance(period, ctx);
+  if (primaryCash) return primaryCash;
+
   const cash = first(period, ctx.instant, C.cash);
-  if (!cash) return false;
-  return shouldCombineCashAndCurrentInvestments(period, ctx, cash, sum(period, ctx.instant, C.currentInvestments));
+  const restricted = cash && /RestrictedCash/i.test(cash.concept) ? null : sum(period, ctx.instant, STANDALONE_RESTRICTED_CASH_CONCEPTS);
+  if (!cash && !restricted) return { value: null, sources: [] };
+  return {
+    value: (cash?.value ?? 0) + (restricted?.value ?? 0),
+    sources: compactSources([cash, restricted]),
+    note: restricted?.value
+      ? "Included separately reported restricted cash with cash and equivalents because the template has no dedicated restricted cash row."
+      : cash?.note,
+    classification: restricted?.value ? "grouped" : "direct"
+  };
+}
+
+function primaryReportedCashBalance(period: string, ctx: ResolveContext): ResolvedValue | null {
+  const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    if (!primaryRowInCurrentAssetSection(row, source) && !sourceLooksLikeCashBalance(source)) return false;
+    if (sourceLooksLikeCurrentInvestment(source)) return false;
+    return sourceLooksLikeCashBalance(source);
+  });
+  if (!sources.length) return null;
+  return {
+    value: sources.reduce((total, source) => total + source.value, 0),
+    sources,
+    note: "Mapped to reported cash and cash equivalents from the primary consolidated balance sheet.",
+    classification: sources.length > 1 ? "grouped" : "direct"
+  };
+}
+
+function currentInvestmentsAreModeledInCash(period: string, ctx: ResolveContext) {
+  const cash = resolveReportedCashBalance(period, ctx);
+  if (cash.value === null) return false;
+  return shouldCombineCashAndCurrentInvestments(period, ctx, cash, cashLikeCurrentInvestmentBalance(period, ctx));
+}
+
+function cashLikeCurrentInvestmentBalance(period: string, ctx: ResolveContext): ResolvedValue | null {
+  const primarySources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    return (primaryRowInCurrentAssetSection(row, source) || sourceLooksLikeCurrentInvestment(source)) && sourceLooksLikeCashLikeShortTermInvestment(source);
+  });
+  const classifiedPrimarySources = withAcceptedModelRowClassifications(period, ctx, primarySources, "Cash & Cash Equivalents");
+  if (classifiedPrimarySources.length) {
+    return {
+      value: classifiedPrimarySources.reduce((total, source) => total + source.value, 0),
+      sources: classifiedPrimarySources,
+      note: "Included cash-like short-term investments from the primary balance sheet with cash because no dedicated current investment row exists."
+    };
+  }
+
+  const direct = sum(period, ctx.instant, C.currentInvestments);
+  if (!direct) return null;
+  const sources = direct.sources.filter(sourceLooksLikeCashLikeShortTermInvestment);
+  if (!sources.length) return null;
+  return {
+    value: sources.reduce((total, source) => total + source.value, 0),
+    sources,
+    note: "Included cash-like short-term investments with cash because no dedicated current investment row exists."
+  };
 }
 
 function shouldCombineCashAndCurrentInvestments(
   period: string,
   ctx: ResolveContext,
-  cash: FactSource,
+  cash: ResolvedValue,
   currentInvestments: ResolvedValue | null
 ) {
   if (ctx.template?.hasCurrentInvestmentRow) return false;
+  if (cash.value === null) return false;
   if (!currentInvestments || currentInvestments.value === null || currentInvestments.value === 0) return false;
-  if (!currentInvestments.sources.some((source) => CASH_ROW_COMBINABLE_CURRENT_INVESTMENT_CONCEPTS.has(source.concept))) return false;
+  if (!currentInvestments.sources.some((source) => CASH_ROW_COMBINABLE_CURRENT_INVESTMENT_CONCEPTS.has(source.concept) || sourceLooksLikeCashLikeShortTermInvestment(source))) return false;
   const currentAssets = first(period, ctx.instant, C.currentAssets);
   if (!currentAssets) return false;
   const receivables = resolveAccountsReceivable(period, ctx);
@@ -4782,6 +5012,9 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
   const currentInvestments = sum(period, ctx.instant, C.currentInvestments);
   const currentInvestmentsModeledInCash = currentInvestmentsAreModeledInCash(period, ctx);
   const separateCurrentInvestments = ctx.template?.hasCurrentInvestmentRow && !currentInvestmentsModeledInCash ? currentInvestments?.value ?? 0 : 0;
+  const primaryOtherCurrentAssetLineItems = sourceLineItemLabels({
+    sources: primaryOtherCurrentAssetSources(period, ctx)
+  });
   const directOtherCurrentAssets = resolvedWithAcceptedModelRowClassifications(
     period,
     ctx,
@@ -4801,7 +5034,9 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
           ? "Included current assets less cash and short-term investments, receivables, and inventory. Current investments are included in Cash & Cash Equivalents, not in this other-current-assets bucket."
           : currentInvestments && currentInvestments.value
             ? "Included current assets less the cash row, receivables, and inventory."
-          : "Included current assets less separately modeled cash, receivables, and inventory."
+          : "Included current assets less separately modeled cash, receivables, and inventory.",
+      classification: "grouped",
+      includedLineItems: primaryOtherCurrentAssetLineItems
     };
   }
   if (directOtherCurrentAssets.value !== null) return directOtherCurrentAssets;
@@ -4827,6 +5062,12 @@ function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext
 }
 
 function resolveAccountsPayable(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryAccountsPayable = resolvedFromPrimarySources(
+    primaryAccountsPayableSources(period, ctx),
+    "Mapped to reported accounts payable / accrued expenses from the primary consolidated balance sheet."
+  );
+  if (primaryAccountsPayable.value !== null) return primaryAccountsPayable;
+
   const brokerDealerPayables = sumWithNote(period, ctx.instant, BROKER_DEALER_PAYABLES, "Included broker-dealer and customer payables from the SEC filing.");
   if (brokerDealerPayables.value !== null) return brokerDealerPayables;
   const direct = first(period, ctx.instant, C.ap);
@@ -4889,6 +5130,11 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
 function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.intangibles);
   if (direct) return { value: direct.value, sources: [direct] };
+  const primaryIntangibles = resolvedFromPrimarySources(
+    primaryIntangibleAssetSources(period, ctx),
+    "Mapped to reported intangible asset lines from the primary consolidated balance sheet."
+  );
+  if (primaryIntangibles.value !== null) return primaryIntangibles;
   return {
     value: 0,
     sources: [zeroSource(C.intangibles[0])],
@@ -6027,8 +6273,8 @@ export async function POST(request: NextRequest) {
     balanceSheetPairs.push(...balanceSheetHeaderPairs);
     if (!balanceSheetPairs.length) balanceSheetPairs = periods.map((period, index) => ({ period, col: columns[index] }));
     balanceSheetPairs = uniquePeriodColumnPairs(balanceSheetPairs);
-    const balanceSheetPeriods = balanceSheetPairs.map((pair) => pair.period);
-    const balanceSheetColumns = balanceSheetPairs.map((pair) => pair.col);
+    let balanceSheetPeriods = balanceSheetPairs.map((pair) => pair.period);
+    let balanceSheetColumns = balanceSheetPairs.map((pair) => pair.col);
     const incomeStatementPairs = uniquePeriodColumnPairs(
       (bestPeriodHeaderRow(sheet)?.infos ?? [])
         .filter(({ period, isEstimate }) => isHistoricalReportedPeriod(period, isEstimate, ctx))
@@ -6037,6 +6283,9 @@ export async function POST(request: NextRequest) {
     const incomeStatementPeriods = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.period) : periods;
     const incomeStatementColumns = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.col) : columns;
     const reportedPeriodPairs = uniquePeriodColumnPairs([...periods.map((period, index) => ({ period, col: columns[index] })), ...balanceSheetPairs, ...incomeStatementPairs]);
+    balanceSheetPairs = uniquePeriodColumnPairs([...balanceSheetPairs, ...reportedPeriodPairs]);
+    balanceSheetPeriods = balanceSheetPairs.map((pair) => pair.period);
+    balanceSheetColumns = balanceSheetPairs.map((pair) => pair.col);
     const modelPeriodMap = buildModelPeriodMap(reportedPeriodPairs, ctx);
     if (modelPeriodMap.missing.length) {
       return jsonError(
@@ -6187,7 +6436,6 @@ export async function POST(request: NextRequest) {
         const valueToWrite = resolved.value / (effectiveFillRow.scale ?? 1);
         const preserveReportedBalanceFormula =
           formulaBeforeWrite &&
-          !actualizedForecastOverride &&
           isReportedBalanceSheetFormulaInputCell(effectiveFillRow, cell, period, ctx);
         if (preserveReportedBalanceFormula) {
           setFormulaResult(cell, valueToWrite);
@@ -6381,7 +6629,7 @@ export async function POST(request: NextRequest) {
     warnings.push(...postTaxEquityBridgeResult.warnings);
     refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
 
-    const validationResult = validateWorkbookWithAutomaticRetries({
+    const validationOptions: WorkbookValidationRetryOptions = {
       workbook,
       sheet,
       periods,
@@ -6399,7 +6647,8 @@ export async function POST(request: NextRequest) {
       auditRows,
       fillRows,
       isStandardModelSheet
-    });
+    };
+    const validationResult = validateWorkbookWithAutomaticRetries(validationOptions);
     filledCells += validationResult.filledCells;
     commentsAdded += validationResult.commentsAdded;
     if (validationResult.errors.length) {
@@ -6412,11 +6661,17 @@ export async function POST(request: NextRequest) {
       return jsonError(`Source-backed historical validation failed: ${sourceLedgerErrors.slice(0, 6).join(" | ")}`, 422);
     }
 
+    const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
     addFilingPeriodMapSheet(workbook, modelPeriodMap.entries);
     addMappingAuditSheet(workbook, auditRows);
     addSourceLedgerSheet(workbook, sourceLedgerRows);
+    addBalanceSheetAssignmentLedgerSheet(workbook, balanceSheetAssignmentLedgerRows);
 
     const output = await writeWorkbookBufferWithRecalculation(workbook);
+    const returnedWorkbookErrors = await validateReturnedWorkbookBuffer(output, validationOptions);
+    if (returnedWorkbookErrors.length) {
+      return jsonError(`Returned workbook validation failed: ${returnedWorkbookErrors.slice(0, 6).join(" | ")}`, 422);
+    }
     const outputName = `${company.ticker}_historicals_filled.xlsx`;
     const summary = encodeURIComponent(
       JSON.stringify({
@@ -6576,7 +6831,7 @@ function fiscalQuarterPeriodForFiling(filing: FilingRef, reportDate: string, fis
 
 function fiscalPeriodEntryPreference(entry: FiscalPeriodEntry) {
   let score = isTenK(entry.form) ? 4 : 2;
-  if (entry.form.endsWith("/A")) score += 1;
+  if (entry.form.endsWith("/A")) score -= 1;
   if (entry.reportDate) score += 1;
   return score;
 }
@@ -12685,7 +12940,8 @@ function runWorkbookReturnValidation(options: WorkbookValidationRetryOptions) {
     options.balanceSheetPeriods,
     options.balanceSheetColumns,
     options.incomeStatementPeriods,
-    options.incomeStatementColumns
+    options.incomeStatementColumns,
+    options.fillRows
   );
   errors.push(...validateWorkbookPreservation(options.workbook, options.workbookSnapshot));
   return unique(errors);
@@ -12705,7 +12961,7 @@ function automaticValidationRetryTrigger(errors: string[]) {
 
 function isRetriableBalanceSheetValidationError(error: string) {
   if (!/^Balance Sheet\b/i.test(error)) return false;
-  return /does not match|does not equal|check is|could not evaluate|disappeared|current liabilit|total liabilit|equity|assets|debt|borrowings|revolver|no explicit SEC source|stale|hardcoded/i.test(error);
+  return /assignment ledger|does not match|does not equal|check is|could not evaluate|disappeared|current liabilit|total liabilit|equity|assets|debt|borrowings|revolver|no explicit SEC source|stale|hardcoded|not assigned|missing model row/i.test(error);
 }
 
 function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOptions, errors: string[]) {
@@ -12856,7 +13112,8 @@ function validateWorkbookBeforeReturn(
   balanceSheetPeriods = periods,
   balanceSheetColumns = columns,
   incomeStatementPeriods = periods,
-  incomeStatementColumns = columns
+  incomeStatementColumns = columns,
+  fillRows: FillRow[] = []
 ) {
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
@@ -12899,6 +13156,9 @@ function validateWorkbookBeforeReturn(
       errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
     }
     errors.push(...validateBalanceSheetCheck(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
+    if (fillRows.length) {
+      errors.push(...validatePrimaryBalanceSheetAssignmentCoverage(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings, fillRows));
+    }
 
     const interestExpenseRow = findLabelRow(modelSheet, "Interest Expense");
     if (interestExpenseRow) {
@@ -14561,6 +14821,545 @@ function findPriorLabelRow(sheet: ExcelJS.Worksheet, startRow: number, label: st
   return null;
 }
 
+function buildPrimaryBalanceSheetAssignmentLedgerRows(
+  periods: string[],
+  ctx: ResolveContext,
+  fillRows: FillRow[]
+): PrimaryBalanceSheetAssignmentLedgerRow[] {
+  const rows: PrimaryBalanceSheetAssignmentLedgerRow[] = [];
+  for (const period of unique(periods.map(balanceSheetInstantLookupPeriod))) {
+    for (const { statement, row } of primaryBalanceSheetStatementRowsForPeriod(period, ctx)) {
+      const source = primaryBalanceSheetFactSource(row, period);
+      if (!source) continue;
+      if (statementRowIsSubtotal(row) || isPrimaryBalanceSheetSubtotalSource(source) || isPrimaryBalanceSheetComponentSubtotalRow(source)) continue;
+
+      const section = statementSectionForRow(statement, row, "balance_sheet");
+      const assignment = assignPrimaryBalanceSheetLineItem(period, ctx, source, row, section, fillRows);
+      const classification = lineItemClassificationForSource(period, ctx, source);
+      const rowSide = primaryBalanceSheetAssignmentSide(section, source, row);
+      const modelRowSide = primaryBalanceSheetAssignmentSideForModelRow(assignment.modelRow);
+      const side = modelRowSide === "unknown" ? rowSide : modelRowSide;
+      const assignedAmount = primaryBalanceSheetAssignmentAmount(source, assignment.modelRow);
+      rows.push({
+        fiscalPeriod: period,
+        sourceFilingAccession: row.accession || statement.accession,
+        sourceStatement: statement.statementName,
+        sourceLineItemLabel: cleanLineItemLabel(row.rowLabel) || source.label,
+        amount: assignedAmount,
+        sourceXbrlTag: row.xbrlConcept || source.concept,
+        assignedModelRow: assignment.modelRow ?? "",
+        assignmentStatus: assignment.status,
+        classificationReason: classification?.reason || assignment.reason,
+        llmUsed: Boolean(classification?.llm_used),
+        validationStatus: assignment.modelRow || assignment.status === "explicitly_excluded_with_reason" ? "OK!" : "missing_model_row",
+        side,
+        sourceSection: section,
+        sourceRowKey: primaryBalanceSheetAssignmentRowKey(statement, row, period)
+      });
+    }
+  }
+  return rows;
+}
+
+function primaryBalanceSheetAssignmentAmount(source: FactSource, modelRow: string | null) {
+  if (modelRow && modelRowsMatch(modelRow, "Treasury Stock")) return -Math.abs(source.value);
+  return source.value;
+}
+
+function isPrimaryBalanceSheetComponentSubtotalRow(source: FactSource) {
+  return source.concept === "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents" && sourceTextMatches(source, /\bcash\b.*\brestricted cash\b/);
+}
+
+function primaryBalanceSheetAssignmentRowKey(statement: SecFilingStatementStructure, row: PrimaryBalanceSheetRow, period: string) {
+  return [
+    period,
+    normalizeAccession(row.accession || statement.accession),
+    row.rowOrder,
+    row.xbrlConcept ?? "",
+    normalize(cleanLineItemLabel(row.rowLabel)),
+    typeof row.value === "number" ? Math.round(row.value) : ""
+  ].join("|");
+}
+
+function primaryBalanceSheetAssignmentSideForModelRow(modelRow: string | null): BalanceSheetAssignmentSide {
+  if (!modelRow) return "unknown";
+  if (
+    modelRowsMatch(modelRow, "Cash & Cash Equivalents") ||
+    modelRowsMatch(modelRow, "Accounts Receivable") ||
+    modelRowsMatch(modelRow, "Inventory") ||
+    modelRowsMatch(modelRow, "Prepaid & Other Current Assets") ||
+    modelRowsMatch(modelRow, "PP&E, Net") ||
+    modelRowsMatch(modelRow, "Intangible Assets, Net") ||
+    modelRowsMatch(modelRow, "Goodwill") ||
+    modelRowsMatch(modelRow, "Other Non-Current Assets")
+  ) {
+    return "assets";
+  }
+  if (
+    modelRowsMatch(modelRow, "Accounts Payable") ||
+    modelRowsMatch(modelRow, "Accrued Liabilities") ||
+    modelRowsMatch(modelRow, "Other Current Liabilities") ||
+    modelRowsMatch(modelRow, "Revolver") ||
+    modelRowsMatch(modelRow, "LT Debt (Incl. Current Portion)") ||
+    modelRowsMatch(modelRow, "Deferred Income Taxes") ||
+    modelRowsMatch(modelRow, "Other Non-Current Liabilities") ||
+    modelRowsMatch(modelRow, "Common Stock & APIC") ||
+    modelRowsMatch(modelRow, "Retained Earnings") ||
+    modelRowsMatch(modelRow, "Treasury Stock") ||
+    modelRowsMatch(modelRow, "Accumulated Other Comprehensive Income (AOCI)") ||
+    modelRowsMatch(modelRow, "Noncontrolling Interests")
+  ) {
+    return "liabilities_and_equity";
+  }
+  return "unknown";
+}
+
+function primaryBalanceSheetAssignmentSide(
+  section: FinancialStatementSection,
+  source: FactSource,
+  row: PrimaryBalanceSheetRow
+): BalanceSheetAssignmentSide {
+  if (section === "current assets" || section === "non-current assets") return "assets";
+  if (section === "current liabilities" || section === "non-current liabilities" || section === "equity") return "liabilities_and_equity";
+  if (primaryRowInCurrentAssetSection(row, source) || primaryRowInNonCurrentAssetSection(row, source)) return "assets";
+  if (primaryRowInCurrentLiabilitySection(row, source) || primaryRowInNonCurrentLiabilitySection(row, source) || reportedLineItemCategory(source) === "equity") {
+    return "liabilities_and_equity";
+  }
+  return "unknown";
+}
+
+function assignPrimaryBalanceSheetLineItem(
+  period: string,
+  ctx: ResolveContext,
+  source: FactSource,
+  row: PrimaryBalanceSheetRow,
+  section: FinancialStatementSection,
+  fillRows: FillRow[]
+): PrimaryBalanceSheetAssignment {
+  if (source.unit && !/usd/i.test(source.unit)) {
+    return {
+      modelRow: null,
+      status: "explicitly_excluded_with_reason",
+      reason: "Excluded non-USD primary balance sheet presentation row from dollar balance coverage."
+    };
+  }
+  if (sourceLooksLikeParentheticalBalanceSheetDetail(source)) {
+    return {
+      modelRow: null,
+      status: "explicitly_excluded_with_reason",
+      reason: "Excluded parenthetical allowance, accumulated depreciation, or accumulated amortization disclosure because it is not a primary balance sheet carrying amount."
+    };
+  }
+
+  const currentInvestmentRow = availableBalanceSheetModelRow(fillRows, "Short-Term Investments", CURRENT_INVESTMENT_ROW_LABELS);
+  const choose = (canonical: string, aliases: string[] = [], reason: string): PrimaryBalanceSheetAssignment => {
+    const modelRow = availableBalanceSheetModelRow(fillRows, canonical, aliases) ?? canonical;
+    return { modelRow, status: balanceSheetAssignmentStatusForModelRow(modelRow, source), reason };
+  };
+  const chooseOther = (canonical: string, aliases: string[], reason: string): PrimaryBalanceSheetAssignment => {
+    const modelRow = availableBalanceSheetModelRow(fillRows, canonical, aliases) ?? canonical;
+    return { modelRow, status: "grouped_into_model_row", reason };
+  };
+
+  if (sourceLooksLikeCashBalance(source)) {
+    return choose("Cash & Cash Equivalents", ["Cash and Cash Equivalents", "Cash"], "Cash, cash equivalents, and restricted cash map to the cash row when no dedicated restricted cash row exists.");
+  }
+  if (sourceTextMatches(source, /\bcommon stock\b|\bcapital surplus\b|\badditional paid[-\s]?in capital\b|\bapic\b/)) {
+    return choose("Common Stock & APIC", ["Common Stock and APIC", "Common Stock and Additional Paid-In Capital"], "Common stock and APIC/capital surplus map to Common Stock & APIC.");
+  }
+  if (C.retained.includes(source.concept) || sourceTextMatches(source, /\bretained earnings\b|\breinvested earnings\b|\baccumulated deficit\b/)) {
+    return choose("Retained Earnings", ["Accumulated Deficit"], "Retained/reinvested earnings map to retained earnings.");
+  }
+  if (C.treasury.includes(source.concept) || sourceTextMatches(source, /\btreasury stock\b/)) {
+    return choose("Treasury Stock", ["Treasury & Preferred Stock"], "Treasury stock maps to treasury stock.");
+  }
+  if (C.aoci.includes(source.concept) || sourceTextMatches(source, /\baccumulated other comprehensive\b|\baoci\b/)) {
+    return choose("Accumulated Other Comprehensive Income (AOCI)", ["Accumulated Other Comprehensive Income", "AOCI"], "AOCI maps to accumulated other comprehensive income.");
+  }
+  if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
+    return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
+  }
+  if (C.receivables.includes(source.concept) || C.cardReceivables.includes(source.concept) || sourceTextMatches(source, /\breceivables?\b/)) {
+    return choose("Accounts Receivable", ["Accounts Receivable, Net", "Trade Receivables"], "Trade and other receivables map to accounts receivable.");
+  }
+  if (C.inventory.includes(source.concept) || inventoryLikeCurrentAssetScore(source) >= 5) {
+    return choose("Inventory", ["Inventories"], "Inventories and inventory components map to inventory.");
+  }
+  if (C.ppe.includes(source.concept) || sourceTextMatches(source, /\bproperty\b.*\bplant\b.*\bequipment\b|\bpp&e\b/)) {
+    return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E maps directly to the PP&E row.");
+  }
+  if (sourceLooksLikeOperatingLeaseRightOfUseAsset(source)) {
+    return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "Operating lease right-of-use assets are grouped with PP&E when the template has no dedicated lease asset row.");
+  }
+  if (sourceLooksLikeIntangibleAsset(source)) {
+    return choose("Intangible Assets, Net", ["Intangibles, Net"], "Intangible asset lines, including trademarks, map to intangible assets.");
+  }
+  if (C.goodwill.includes(source.concept) || sourceTextMatches(source, /\bgoodwill\b/)) {
+    return choose("Goodwill", [], "Goodwill maps directly to goodwill.");
+  }
+  if (sourceLooksLikeCurrentInvestment(source)) {
+    if (currentInvestmentRow) {
+      return {
+        modelRow: currentInvestmentRow,
+        status: "mapped_to_model_row",
+        reason: "Current investments map to the template's dedicated current investment row."
+      };
+    }
+    if (sourceLooksLikeCashLikeShortTermInvestment(source)) {
+      return choose(
+        "Cash & Cash Equivalents",
+        ["Cash and Cash Equivalents", "Cash"],
+        "Cash-like short-term investments are grouped with cash because the template has no dedicated current investment row."
+      );
+    }
+    return chooseOther(
+      "Prepaid & Other Current Assets",
+      ["Prepaid and Other Current Assets", "Other Current Assets"],
+      "Marketable securities are grouped into other current assets because no dedicated current investment row exists."
+    );
+  }
+  if (sourceLooksLikeDeferredTaxAsset(source)) {
+    return chooseOther(
+      "Other Non-Current Assets",
+      ["Other Long-Term Assets", "Other LT Assets", "Other Assets and Loans"],
+      "Deferred tax assets are grouped into other non-current assets when no dedicated deferred tax asset row exists."
+    );
+  }
+  if (sourceLooksLikeEquityMethodInvestmentAsset(source)) {
+    return chooseOther(
+      "Other Non-Current Assets",
+      ["Other Long-Term Assets", "Other LT Assets", "Other Assets and Loans"],
+      "Equity method investments are grouped into other non-current assets when no dedicated investment row exists."
+    );
+  }
+  if (sourceLooksLikeAccountsPayable(source)) {
+    return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
+  }
+  if (sourceLooksLikeCurrentDebtMaturity(source)) {
+    return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Current maturities/current portion of long-term debt are grouped into LT Debt including current portion.");
+  }
+  if (sourceLooksLikeShortTermBorrowing(source)) {
+    return choose("Revolver", ["Short-Term Borrowings", "Short Term Borrowings", "Current Borrowings"], "Short-term borrowings and notes payable map to Revolver/current borrowings.");
+  }
+  if (sourceLooksLikeAccruedOperatingLiability(source)) {
+    return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
+  }
+  if (sourceLooksLikeDeferredTaxLiability(source)) {
+    return choose("Deferred Income Taxes", ["Deferred Tax Liabilities", "Deferred Taxes"], "Deferred tax liabilities map to deferred income taxes.");
+  }
+  if (sourceLooksLikeNonCurrentDebt(source)) {
+    return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Long-term debt maps to LT Debt including current portion.");
+  }
+  if (sourceLooksLikeOtherNonCurrentLiability(source)) {
+    return chooseOther(
+      "Other Non-Current Liabilities",
+      ["Other Long-Term Liabilities", "Other LT Liabilities"],
+      "Non-current liability line has no more dedicated model row, so it is grouped into other non-current liabilities."
+    );
+  }
+  if (sourceLooksLikeOtherCurrentLiability(source)) {
+    return chooseOther(
+      "Other Current Liabilities",
+      ["Other Current Liabs"],
+      "Current liability line has no more dedicated model row, so it is grouped into other current liabilities."
+    );
+  }
+
+  if (section === "current assets" || primaryRowInCurrentAssetSection(row, source)) {
+    if (sourceLooksLikeCashBalance(source)) {
+      return choose("Cash & Cash Equivalents", ["Cash and Cash Equivalents", "Cash"], "Cash and cash equivalents map directly to the cash row.");
+    }
+    if (sourceLooksLikeCurrentInvestment(source)) {
+      if (currentInvestmentRow) {
+        return {
+          modelRow: currentInvestmentRow,
+          status: "mapped_to_model_row",
+          reason: "Current investments map to the template's dedicated current investment row."
+        };
+      }
+      if (sourceLooksLikeCashLikeShortTermInvestment(source)) {
+        return choose(
+          "Cash & Cash Equivalents",
+          ["Cash and Cash Equivalents", "Cash"],
+          "Cash-like short-term investments are grouped with cash because the template has no dedicated current investment row."
+        );
+      }
+      return chooseOther(
+        "Prepaid & Other Current Assets",
+        ["Prepaid and Other Current Assets", "Other Current Assets"],
+        "Marketable securities are grouped into other current assets because no dedicated current investment row exists."
+      );
+    }
+    if (C.receivables.includes(source.concept) || C.cardReceivables.includes(source.concept) || sourceTextMatches(source, /\breceivables?\b/)) {
+      return choose("Accounts Receivable", ["Accounts Receivable, Net", "Trade Receivables"], "Trade and other receivables map to accounts receivable.");
+    }
+    if (C.inventory.includes(source.concept) || inventoryLikeCurrentAssetScore(source) >= 5) {
+      return choose("Inventory", ["Inventories"], "Inventories map directly to inventory.");
+    }
+    return chooseOther(
+      "Prepaid & Other Current Assets",
+      ["Prepaid and Other Current Assets", "Other Current Assets"],
+      sourceLooksLikeAssetHeldForSale(source)
+        ? "Assets held for sale are grouped into other current assets when no dedicated held-for-sale row exists."
+        : "Current asset line has no more dedicated model row, so it is grouped into prepaid and other current assets."
+    );
+  }
+
+  if (section === "non-current assets" || primaryRowInNonCurrentAssetSection(row, source)) {
+    if (C.ppe.includes(source.concept) || sourceTextMatches(source, /\bproperty\b.*\bplant\b.*\bequipment\b|\bpp&e\b/)) {
+      return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E maps directly to the PP&E row.");
+    }
+    if (sourceLooksLikeOperatingLeaseRightOfUseAsset(source)) {
+      return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "Operating lease right-of-use assets are grouped with PP&E when the template has no dedicated lease asset row.");
+    }
+    if (sourceLooksLikeIntangibleAsset(source)) {
+      return choose("Intangible Assets, Net", ["Intangibles, Net"], "Intangible asset lines, including trademarks, map to intangible assets.");
+    }
+    if (C.goodwill.includes(source.concept) || sourceTextMatches(source, /\bgoodwill\b/)) {
+      return choose("Goodwill", [], "Goodwill maps directly to goodwill.");
+    }
+    return chooseOther(
+      "Other Non-Current Assets",
+      ["Other Long-Term Assets", "Other LT Assets", "Other Assets and Loans"],
+      sourceLooksLikeDeferredTaxAsset(source)
+        ? "Deferred tax assets are grouped into other non-current assets when no dedicated deferred tax asset row exists."
+        : sourceLooksLikeEquityMethodInvestmentAsset(source)
+          ? "Equity method investments are grouped into other non-current assets when no dedicated investment row exists."
+          : "Non-current asset line has no more dedicated model row, so it is grouped into other non-current assets."
+    );
+  }
+
+  if (section === "current liabilities" || primaryRowInCurrentLiabilitySection(row, source)) {
+    if (sourceLooksLikeAccountsPayable(source)) {
+      return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
+    }
+    if (sourceLooksLikeCurrentDebtMaturity(source)) {
+      return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Current maturities/current portion of long-term debt are grouped into LT Debt including current portion.");
+    }
+    if (sourceLooksLikeShortTermBorrowing(source)) {
+      return choose("Revolver", ["Short-Term Borrowings", "Short Term Borrowings", "Current Borrowings"], "Short-term borrowings and notes payable map to Revolver/current borrowings.");
+    }
+    if (sourceLooksLikeAccruedOperatingLiability(source)) {
+      return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
+    }
+    return chooseOther(
+      "Other Current Liabilities",
+      ["Other Current Liabs"],
+      "Current liability line has no more dedicated model row, so it is grouped into other current liabilities."
+    );
+  }
+
+  if (section === "non-current liabilities" || primaryRowInNonCurrentLiabilitySection(row, source)) {
+    if (sourceLooksLikeNonCurrentDebt(source)) {
+      return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Long-term debt maps to LT Debt including current portion.");
+    }
+    if (sourceLooksLikeDeferredTaxLiability(source)) {
+      return choose("Deferred Income Taxes", ["Deferred Tax Liabilities", "Deferred Taxes"], "Deferred tax liabilities map to deferred income taxes.");
+    }
+    const leaseRow = availableBalanceSheetModelRow(fillRows, "Lease Liabilities", ["Operating Lease Liabilities", "Finance Lease Liabilities", "Lease Obligations"]);
+    if (leaseRow && sourceLooksLikeNonCurrentLeaseLiability(source)) {
+      return { modelRow: leaseRow, status: "mapped_to_model_row", reason: "Non-current lease liabilities map to the template's lease liability row." };
+    }
+    const pensionRow = availableBalanceSheetModelRow(fillRows, "Pension Liabilities", ["Pension and Other Postretirement Liabilities", "Postretirement Liabilities"]);
+    if (pensionRow && sourceLooksLikePensionLiability(source)) {
+      return { modelRow: pensionRow, status: "mapped_to_model_row", reason: "Pension/postretirement liabilities map to the template's pension liability row." };
+    }
+    return chooseOther(
+      "Other Non-Current Liabilities",
+      ["Other Long-Term Liabilities", "Other LT Liabilities"],
+      "Non-current liability line has no more dedicated model row, so it is grouped into other non-current liabilities."
+    );
+  }
+
+  if (section === "equity" || reportedLineItemCategory(source) === "equity") {
+    if (sourceTextMatches(source, /\bcommon stock\b|\bcapital surplus\b|\badditional paid[-\s]?in capital\b|\bapic\b/)) {
+      return choose("Common Stock & APIC", ["Common Stock and APIC", "Common Stock and Additional Paid-In Capital"], "Common stock and APIC/capital surplus map to Common Stock & APIC.");
+    }
+    if (C.retained.includes(source.concept) || sourceTextMatches(source, /\bretained earnings\b|\breinvested earnings\b|\baccumulated deficit\b/)) {
+      return choose("Retained Earnings", ["Accumulated Deficit"], "Retained/reinvested earnings map to retained earnings.");
+    }
+    if (C.treasury.includes(source.concept) || sourceTextMatches(source, /\btreasury stock\b/)) {
+      return choose("Treasury Stock", ["Treasury & Preferred Stock"], "Treasury stock maps to treasury stock.");
+    }
+    if (C.aoci.includes(source.concept) || sourceTextMatches(source, /\baccumulated other comprehensive\b|\baoci\b/)) {
+      return choose("Accumulated Other Comprehensive Income (AOCI)", ["Accumulated Other Comprehensive Income", "AOCI"], "AOCI maps to accumulated other comprehensive income.");
+    }
+    if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
+      return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
+    }
+    return chooseOther("Common Stock & APIC", ["Common Stock and APIC"], "Equity line has no more dedicated model row, so it is grouped into Common Stock & APIC.");
+  }
+
+  return {
+    modelRow: null,
+    status: "explicitly_excluded_with_reason",
+    reason: "Could not determine asset, liability, or equity section for this primary balance sheet line."
+  };
+}
+
+function availableBalanceSheetModelRow(fillRows: FillRow[], canonical: string, aliases: string[] = []) {
+  const candidates = [canonical, ...aliases];
+  return (
+    fillRows
+      .filter((row) => row.statement === "balance" && row.kind === "instant")
+      .find((row) => candidates.some((candidate) => modelRowsMatch(row.label, candidate) || normalize(row.label) === normalize(candidate)))?.label ?? null
+  );
+}
+
+function balanceSheetAssignmentStatusForModelRow(modelRow: string, source: FactSource): BalanceSheetAssignmentStatus {
+  if (source.value === 0) return "mapped_to_model_row";
+  if (
+    modelRowsMatch(modelRow, "Prepaid & Other Current Assets") ||
+    modelRowsMatch(modelRow, "Other Non-Current Assets") ||
+    modelRowsMatch(modelRow, "Other Current Liabilities") ||
+    modelRowsMatch(modelRow, "Other Non-Current Liabilities") ||
+    modelRowsMatch(modelRow, "Common Stock & APIC")
+  ) {
+    return "grouped_into_model_row";
+  }
+  if (modelRowsMatch(modelRow, "Cash & Cash Equivalents") && !C.cash.includes(source.concept)) return "grouped_into_model_row";
+  if (modelRowsMatch(modelRow, "LT Debt (Incl. Current Portion)") && sourceLooksLikeCurrentDebtMaturity(source)) return "grouped_into_model_row";
+  return "mapped_to_model_row";
+}
+
+function validatePrimaryBalanceSheetAssignmentCoverage(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[],
+  fillRows: FillRow[]
+) {
+  const errors: string[] = [];
+  const ledgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(periods, ctx, fillRows);
+  if (!ledgerRows.length) return errors;
+  const periodPairs = uniquePeriodColumnPairs(periods.map((period, index) => ({ period, col: columns[index] })));
+  const latestHardAssignmentPeriod = latestPrimaryBalanceSheetAssignmentPeriod(periodPairs.map((pair) => pair.period), ctx);
+  const duplicateKeys = duplicateBalanceSheetAssignmentKeys(ledgerRows);
+  duplicateKeys.forEach((key) => errors.push(`Balance Sheet assignment ledger: primary balance sheet source row ${key} was assigned more than once.`));
+
+  for (const { period, col } of periodPairs) {
+    const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+    const hardValidateAssignments = lookupPeriod === latestHardAssignmentPeriod;
+    const rows = ledgerRows.filter((row) => row.fiscalPeriod === lookupPeriod);
+    if (!rows.length) {
+      if (hasReportedFilingPeriod(lookupPeriod, ctx) || hasReportedFinancialStatementPeriod(lookupPeriod, ctx)) {
+        errors.push(`Balance Sheet ${period}: no primary balance sheet assignment ledger rows were generated for a reported SEC balance sheet period.`);
+      }
+      continue;
+    }
+    const unsupportedRows = rows.filter(
+      (row) => row.assignmentStatus === "explicitly_excluded_with_reason" && Math.abs(row.amount) > 0.5 && !allowedPrimaryBalanceSheetAssignmentExclusion(row)
+    );
+    unsupportedRows.forEach((row) => {
+      const message = `Balance Sheet ${period}: primary line "${row.sourceLineItemLabel}" (${roundModelValue(row.amount / 1_000_000)}) was not assigned to a model row. Reason: ${row.classificationReason}`;
+      if (hardValidateAssignments) errors.push(message);
+      else warnings.unshift(`${message}. Historical assignment coverage was recorded for audit; hard row-level coverage is enforced on the latest reported balance sheet period.`);
+    });
+    const unknownRows = rows.filter(
+      (row) => row.side === "unknown" && Math.abs(row.amount) > 0.5 && !allowedPrimaryBalanceSheetAssignmentExclusion(row)
+    );
+    unknownRows.forEach((row) => {
+      const message = `Balance Sheet ${period}: primary line "${row.sourceLineItemLabel}" could not be classified as asset, liability, or equity.`;
+      if (hardValidateAssignments) errors.push(message);
+      else warnings.unshift(`${message} Historical assignment coverage was recorded for audit; hard row-level coverage is enforced on the latest reported balance sheet period.`);
+    });
+
+    const assignedRows = rows.filter((row) => row.assignmentStatus !== "explicitly_excluded_with_reason");
+    const assetTotal = first(lookupPeriod, ctx.instant, C.assets);
+    const liabilitiesAndEquityTotal = first(lookupPeriod, ctx.instant, LIABILITIES_AND_EQUITY_CONCEPTS);
+    const assignedAssets = assignedRows.filter((row) => row.side === "assets").reduce((total, row) => total + row.amount, 0);
+    const assignedLiabilitiesAndEquity = assignedRows.filter((row) => row.side === "liabilities_and_equity").reduce((total, row) => total + row.amount, 0);
+    if (assetTotal && !statementMetricTies(assignedAssets / 1_000_000, assetTotal.value / 1_000_000)) {
+      const message = `Balance Sheet ${period}: assignment ledger asset rows sum to ${roundModelValue(assignedAssets / 1_000_000)}, but EDGAR Total Assets is ${roundModelValue(assetTotal.value / 1_000_000)}.`;
+      if (hardValidateAssignments) errors.push(message);
+      else warnings.unshift(`${message} Historical assignment coverage was recorded for audit; hard row-level coverage is enforced on the latest reported balance sheet period.`);
+    }
+    if (liabilitiesAndEquityTotal && !statementMetricTies(assignedLiabilitiesAndEquity / 1_000_000, liabilitiesAndEquityTotal.value / 1_000_000)) {
+      const message = `Balance Sheet ${period}: assignment ledger liabilities and equity rows sum to ${roundModelValue(assignedLiabilitiesAndEquity / 1_000_000)}, but EDGAR Total Liabilities & Equity is ${roundModelValue(liabilitiesAndEquityTotal.value / 1_000_000)}.`;
+      if (hardValidateAssignments) errors.push(message);
+      else warnings.unshift(`${message} Historical assignment coverage was recorded for audit; hard row-level coverage is enforced on the latest reported balance sheet period.`);
+    }
+    if (!hardValidateAssignments) continue;
+
+    const byModelRow = new Map<string, PrimaryBalanceSheetAssignmentLedgerRow[]>();
+    for (const row of assignedRows) {
+      if (!row.assignedModelRow) continue;
+      const group = byModelRow.get(row.assignedModelRow) ?? [];
+      group.push(row);
+      byModelRow.set(row.assignedModelRow, group);
+    }
+    byModelRow.forEach((assigned, modelRow) => {
+      const rowNumber = findBalanceSheetLedgerModelRow(sheet, modelRow, fillRows);
+      if (!rowNumber) {
+        errors.push(`Balance Sheet ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`);
+        return;
+      }
+      if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
+      const expected = assigned.reduce((total, row) => total + row.amount, 0) / 1_000_000;
+      const cell = sheet.getCell(rowNumber, col);
+      const protectedFormula = isProtectedFormulaOrCheckCell(cell);
+      const actual = statementMetricCellValue(cell, evaluator, expected);
+      if (actual === null) {
+        recordBalanceSheetValidationIssue(
+          errors,
+          warnings,
+          `Balance Sheet ${cell.address} ${period}: could not evaluate assigned model row "${modelRow}" against primary statement assignment ledger.`,
+          protectedFormula,
+          sheet,
+          period,
+          col,
+          ctx
+        );
+        return;
+      }
+      if (!statementMetricTies(actual, expected)) {
+        const sourceLabels = assigned.map((row) => row.sourceLineItemLabel).filter(Boolean).join(", ");
+        recordBalanceSheetValidationIssue(
+          errors,
+          warnings,
+          `Balance Sheet ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`,
+          protectedFormula,
+          sheet,
+          period,
+          col,
+          ctx
+        );
+      }
+    });
+  }
+
+  return unique(errors);
+}
+
+function latestPrimaryBalanceSheetAssignmentPeriod(periods: string[], ctx: ResolveContext) {
+  const lookupPeriods = unique(periods.map(balanceSheetInstantLookupPeriod).filter(isSupportedPeriodKey));
+  const periodsWithPrimaryRows = lookupPeriods.filter((period) => primaryBalanceSheetStatementRowsForPeriod(period, ctx).length > 0);
+  const candidates = periodsWithPrimaryRows.length ? periodsWithPrimaryRows : lookupPeriods;
+  return candidates.sort(comparePeriods).at(-1) ?? "";
+}
+
+function allowedPrimaryBalanceSheetAssignmentExclusion(row: PrimaryBalanceSheetAssignmentLedgerRow) {
+  return /non-USD primary balance sheet presentation row|parenthetical allowance|accumulated depreciation|accumulated amortization/i.test(row.classificationReason);
+}
+
+function duplicateBalanceSheetAssignmentKeys(rows: PrimaryBalanceSheetAssignmentLedgerRow[]) {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.sourceRowKey)) duplicates.add(row.sourceRowKey);
+    seen.add(row.sourceRowKey);
+  }
+  return Array.from(duplicates);
+}
+
+function findBalanceSheetLedgerModelRow(sheet: ExcelJS.Worksheet, modelRow: string, fillRows: FillRow[]) {
+  const fillRow = fillRows.find((row) => row.statement === "balance" && row.kind === "instant" && modelRowsMatch(row.label, modelRow));
+  if (fillRow && balanceSheetRows(sheet).has(fillRow.row)) return fillRow.row;
+  return findBalanceSheetRow(sheet, [modelRow]);
+}
+
 function validateBalanceSheetStatementTotals(
   sheet: ExcelJS.Worksheet,
   periods: string[],
@@ -14819,10 +15618,11 @@ function validateBalanceSheetClassificationCompleteness(
       currentInvestments?.value &&
       Math.abs(currentInvestments.value) > 5_000_000 &&
       !investmentRow &&
-      !currentInvestmentsAreModeledInCash(lookupPeriod, ctx)
+      !currentInvestmentsAreModeledInCash(lookupPeriod, ctx) &&
+      !findBalanceSheetRow(sheet, ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets"])
     ) {
       errors.push(
-        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no separate investment row; this balance was not allowed to be dumped into other current assets.`
+        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no current investment, cash-like grouping, or other current asset row to receive it.`
       );
     }
   });
@@ -16325,7 +17125,7 @@ function numericCellValue(cell: ExcelJS.Cell) {
 }
 
 function removeGeneratedMetadataSheets(workbook: ExcelJS.Workbook) {
-  for (const sheetName of [MAPPING_AUDIT_SHEET, SOURCE_LEDGER_SHEET, "Filing Period Map"]) {
+  for (const sheetName of [MAPPING_AUDIT_SHEET, SOURCE_LEDGER_SHEET, BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET, "Filing Period Map"]) {
     const sheet = workbook.getWorksheet(sheetName);
     if (sheet) workbook.removeWorksheet(sheet.id);
   }
@@ -16625,6 +17425,31 @@ function addSourceLedgerSheet(workbook: ExcelJS.Workbook, ledgerRows: Historical
   sheet.views = [{ state: "frozen", ySplit: 1 }];
 }
 
+function addBalanceSheetAssignmentLedgerSheet(workbook: ExcelJS.Workbook, ledgerRows: PrimaryBalanceSheetAssignmentLedgerRow[]) {
+  const existing = workbook.getWorksheet(BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET);
+  if (existing) workbook.removeWorksheet(existing.id);
+  const sheet = workbook.addWorksheet(BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET);
+  sheet.columns = [
+    { header: "fiscal period", key: "fiscalPeriod", width: 14 },
+    { header: "source filing accession", key: "sourceFilingAccession", width: 26 },
+    { header: "source statement", key: "sourceStatement", width: 40 },
+    { header: "source line item label", key: "sourceLineItemLabel", width: 44 },
+    { header: "amount", key: "amount", width: 16 },
+    { header: "XBRL tag", key: "sourceXbrlTag", width: 44 },
+    { header: "assigned model row", key: "assignedModelRow", width: 36 },
+    { header: "assignment status", key: "assignmentStatus", width: 30 },
+    { header: "classification reason", key: "classificationReason", width: 70 },
+    { header: "LLM used", key: "llmUsed", width: 10 },
+    { header: "validation status", key: "validationStatus", width: 18 },
+    { header: "side", key: "side", width: 20 },
+    { header: "source section", key: "sourceSection", width: 24 },
+    { header: "source row key", key: "sourceRowKey", width: 48 }
+  ];
+  ledgerRows.forEach((row) => sheet.addRow(row));
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+}
+
 function addFilingPeriodMapSheet(workbook: ExcelJS.Workbook, entries: ModelPeriodMapEntry[]) {
   const sheetName = "Filing Period Map";
   const existing = workbook.getWorksheet(sheetName);
@@ -16727,6 +17552,20 @@ function requestAutomaticWorkbookCalculation(workbook: ExcelJS.Workbook) {
   calcProperties.fullCalcOnLoad = true;
   calcProperties.forceFullCalc = true;
   calcProperties.calcOnSave = true;
+}
+
+async function validateReturnedWorkbookBuffer(output: Buffer<ArrayBuffer>, options: WorkbookValidationRetryOptions) {
+  const returnedWorkbook = new ExcelJS.Workbook();
+  await returnedWorkbook.xlsx.load(output as unknown as ExcelJS.Buffer);
+  const returnedSheet = returnedWorkbook.getWorksheet(options.modelSheetName) ?? returnedWorkbook.getWorksheet(MODEL_SHEET);
+  if (!returnedSheet) return [`Returned workbook is missing the ${options.modelSheetName || MODEL_SHEET} sheet.`];
+  const warnings: string[] = [];
+  return runWorkbookReturnValidation({
+    ...options,
+    workbook: returnedWorkbook,
+    sheet: returnedSheet,
+    warnings
+  });
 }
 
 async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook): Promise<Buffer<ArrayBuffer>> {
