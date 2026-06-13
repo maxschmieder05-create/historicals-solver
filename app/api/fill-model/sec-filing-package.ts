@@ -1,3 +1,5 @@
+import { normalizeAccession } from "./sec-accession";
+
 export type SecFilingPackageRequest = {
   cik: string;
   accessionNumber: string;
@@ -1098,10 +1100,6 @@ function decodeXml(value: string) {
     .replace(/&apos;/g, "'")
     .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
     .replace(/&#(\d+);/g, (_, decimal) => String.fromCharCode(Number(decimal)));
-}
-
-function normalizeAccession(accession: string) {
-  return accession.replace(/-/g, "");
 }
 
 function unitLocalName(value: string) {

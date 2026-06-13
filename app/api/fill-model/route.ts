@@ -43,6 +43,7 @@ import {
   type FinancialStatementName,
   type FinancialStatementSection
 } from "./financial-line-item-classifier";
+import { cikFromAccession, normalizeAccession, normalizeAccessionList, normalizeCik } from "./sec-accession";
 
 export const runtime = "nodejs";
 export const maxDuration = 900;
@@ -402,6 +403,10 @@ type HistoricalSourceLedgerRow = {
   ticker: string;
   cik: string;
   accessionNumber: string;
+  accessionRaw: string;
+  accessionNormalized: string;
+  filingFormType: string;
+  reportingPeriodEndDate: string;
   filingPeriod: string;
   sourceStatement: string;
   sourceTableType: string;
@@ -6321,7 +6326,7 @@ export async function POST(request: NextRequest) {
     }
 
     const sourceLedgerRows = buildHistoricalSourceLedgerRows(company, modelPeriodMap.entries, sheet, fillRows, reportedPeriodPairs, auditRows);
-    const sourceLedgerErrors = validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries);
+    const sourceLedgerErrors = await validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries, company, filingMetadata);
     if (sourceLedgerErrors.length) {
       return jsonError(`Source-backed historical validation failed: ${sourceLedgerErrors.slice(0, 6).join(" | ")}`, 422);
     }
@@ -6411,8 +6416,8 @@ async function fetchCompanyFacts(cik: string) {
   return response.json();
 }
 
-async function fetchFilingMetadata(company: CompanyMatch, bulkSupport?: SecBulkSupport) {
-  const filings = await fetchFilingRefs(company, 120, bulkSupport);
+async function fetchFilingMetadata(company: CompanyMatch, bulkSupport?: SecBulkSupport, limit = 120) {
+  const filings = await fetchFilingRefs(company, limit, bulkSupport);
   return new Map(filings.map((filing) => [normalizeAccession(filing.accessionNumber), filing]));
 }
 
@@ -6541,7 +6546,7 @@ async function fetchSegmentRevenueByPeriod(company: CompanyMatch, periods: strin
 
   for (const filing of filings) {
     try {
-      const accession = filing.accessionNumber.replace(/-/g, "");
+      const accession = normalizeAccession(filing.accessionNumber);
       const cikNoZeros = String(Number(company.cik));
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
       const html = await fetchSecArchiveHtml(url, true);
@@ -6695,7 +6700,7 @@ async function fetchInlineFactContext(company: CompanyMatch, periods: string[], 
 
   for (const filing of filings) {
     try {
-      const accession = filing.accessionNumber.replace(/-/g, "");
+      const accession = normalizeAccession(filing.accessionNumber);
       const cikNoZeros = String(Number(company.cik));
       const url = `https://www.sec.gov/Archives/edgar/data/${cikNoZeros}/${accession}/${filing.primaryDocument}`;
       const html = await fetchSecArchiveHtml(url);
@@ -7918,11 +7923,7 @@ function buildFactContext(payload: any, company?: CompanyMatch, options: FactCon
 
 function sourceUrlForAccession(cik: string | number | undefined, accn?: string) {
   if (!cik || !accn) return "";
-  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${accn.replace(/-/g, "")}/`;
-}
-
-function normalizeAccession(accession: string) {
-  return accession.replace(/-/g, "");
+  return `https://www.sec.gov/Archives/edgar/data/${Number(cik)}/${normalizeAccession(accn)}/`;
 }
 
 function preferredUnitFacts(units: Record<string, SecFact[]>): [string, SecFact[]] {
@@ -16326,6 +16327,8 @@ function sourceLedgerRowFromCell(
   status: SourceLedgerStatus
 ): HistoricalSourceLedgerRow {
   const parsed = parseCellAddress(cell.address);
+  const accessionRaw = auditRow?.accession || filing?.accessionNumber || "";
+  const reportingPeriodEndDate = auditRow?.endDate || filing?.periodEndDate || "";
   return {
     sheetName: sheet.name,
     modelRow: parsed?.row ?? Number(cell.row),
@@ -16336,8 +16339,12 @@ function sourceLedgerRowFromCell(
     company: company.title,
     ticker: company.ticker,
     cik: company.cik,
-    accessionNumber: auditRow?.accession || filing?.accessionNumber || "",
-    filingPeriod: filing?.periodEndDate || auditRow?.endDate || "",
+    accessionNumber: accessionRaw,
+    accessionRaw,
+    accessionNormalized: normalizeAccessionList(accessionRaw).join("; "),
+    filingFormType: auditRow?.filingForm || filing?.form || "",
+    reportingPeriodEndDate,
+    filingPeriod: reportingPeriodEndDate,
     sourceStatement: auditRow?.sourceStatement || fillRow.statement,
     sourceTableType: sourceTableTypeForLedger(auditRow?.sourceStatement || fillRow.statement),
     sourceLineItemLabel: auditRow?.finalSourceLineItems || auditRow?.secLabels || "",
@@ -16378,9 +16385,16 @@ function sourceLedgerStatusForAuditRow(row: MappingAuditRow): SourceLedgerStatus
   return row.accession ? "explicit_current_sec_source" : "stale_or_unsupported";
 }
 
-function validateHistoricalSourceLedger(rows: HistoricalSourceLedgerRow[], modelPeriodEntries: ModelPeriodMapEntry[]) {
+async function validateHistoricalSourceLedger(
+  rows: HistoricalSourceLedgerRow[],
+  modelPeriodEntries: ModelPeriodMapEntry[],
+  company: CompanyMatch,
+  filingMetadata: Map<string, FilingRef>
+) {
   const errors: string[] = [];
-  const currentAccessions = new Set(modelPeriodEntries.map((entry) => normalizeAccession(entry.accessionNumber)).filter(Boolean));
+  let currentAccessions = currentCompanyAccessionsNormalized(modelPeriodEntries, filingMetadata);
+  let refreshAttempted = false;
+  const selectedCompanyCik = normalizeCik(company.cik);
   for (const row of rows) {
     if (row.mappingStatus === "formula_preserved") continue;
     if (row.value === null || row.value === "") continue;
@@ -16400,14 +16414,28 @@ function validateHistoricalSourceLedger(rows: HistoricalSourceLedgerRow[], model
       continue;
     }
     if (row.mappingStatus === "explicit_current_sec_source") {
-      const sourceAccessions = row.accessionNumber
-        .split(";")
-        .map((item) => normalizeAccession(item.trim()))
-        .filter(Boolean);
+      const sourceAccessions = ledgerRowSourceAccessions(row);
       if (!sourceAccessions.length) {
         errors.push(`${address}: current SEC source status is missing an accession number.`);
-      } else if (currentAccessions.size && !sourceAccessions.some((accession) => currentAccessions.has(accession))) {
-        errors.push(`${address}: source accession ${sourceAccessions.join(", ")} is not one of the current company filing accessions.`);
+      } else if (currentAccessions.size) {
+        let missingAccessions = sourceAccessions.filter((accession) => !currentAccessions.has(accession));
+        const sourceCiks = missingAccessions.map((accession) => cikFromAccession(accession)).filter(Boolean);
+        const sourceLooksLikeSelectedCompany = sourceCiks.some((cik) => cik === selectedCompanyCik);
+        if (sourceLooksLikeSelectedCompany && !refreshAttempted) {
+          refreshAttempted = true;
+          const refreshedFilings = await fetchFilingMetadata(company, undefined, 500).catch(() => null);
+          if (refreshedFilings?.size) currentAccessions = currentCompanyAccessionsNormalized(modelPeriodEntries, refreshedFilings);
+          missingAccessions = sourceAccessions.filter((accession) => !currentAccessions.has(accession));
+        }
+        if (missingAccessions.length) {
+          const missingCiks = missingAccessions.map((accession) => cikFromAccession(accession)).filter(Boolean);
+          const otherCompanyCik = missingCiks.find((cik) => cik !== selectedCompanyCik);
+          if (otherCompanyCik) {
+            errors.push(`${address}: source accession ${missingAccessions.join(", ")} belongs to CIK ${otherCompanyCik}, not current company CIK ${selectedCompanyCik}.`);
+          } else {
+            errors.push(`${address}: source accession ${missingAccessions.join(", ")} was not found in the selected company's SEC submissions after normalization.`);
+          }
+        }
       }
       if (!row.sourceXbrlTag && !row.sourceLineItemLabel) {
         errors.push(`${address}: current SEC source status is missing source line item metadata.`);
@@ -16418,6 +16446,27 @@ function validateHistoricalSourceLedger(rows: HistoricalSourceLedgerRow[], model
     }
   }
   return unique(errors);
+}
+
+function currentCompanyAccessionsNormalized(modelPeriodEntries: ModelPeriodMapEntry[], filingMetadata: Map<string, FilingRef>) {
+  const accessions = new Set<string>();
+  for (const accession of filingMetadata.keys()) {
+    const normalized = normalizeAccession(accession);
+    if (normalized) accessions.add(normalized);
+  }
+  for (const entry of modelPeriodEntries) {
+    for (const accession of [entry.accessionKey, entry.accessionNumber]) {
+      const normalized = normalizeAccession(accession);
+      if (normalized) accessions.add(normalized);
+    }
+  }
+  return accessions;
+}
+
+function ledgerRowSourceAccessions(row: HistoricalSourceLedgerRow) {
+  const sourceAccessions = normalizeAccessionList(row.accessionNormalized || row.accessionRaw || row.accessionNumber);
+  row.accessionNormalized = sourceAccessions.join("; ");
+  return sourceAccessions;
 }
 
 function addMappingAuditSheet(workbook: ExcelJS.Workbook, auditRows: MappingAuditRow[]) {
@@ -16475,7 +16524,11 @@ function addSourceLedgerSheet(workbook: ExcelJS.Workbook, ledgerRows: Historical
     { header: "company", key: "company", width: 32 },
     { header: "ticker", key: "ticker", width: 10 },
     { header: "CIK", key: "cik", width: 14 },
+    { header: "accession raw", key: "accessionRaw", width: 26 },
+    { header: "accession normalized", key: "accessionNormalized", width: 26 },
     { header: "accession number", key: "accessionNumber", width: 24 },
+    { header: "filing form type", key: "filingFormType", width: 16 },
+    { header: "reporting period end date", key: "reportingPeriodEndDate", width: 22 },
     { header: "filing period", key: "filingPeriod", width: 14 },
     { header: "source statement", key: "sourceStatement", width: 18 },
     { header: "source table type", key: "sourceTableType", width: 20 },

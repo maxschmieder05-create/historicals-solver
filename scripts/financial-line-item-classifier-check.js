@@ -7,15 +7,27 @@ const ts = require("typescript");
 const repoRoot = path.resolve(__dirname, "..");
 const sourcePath = path.join(repoRoot, "app", "api", "fill-model", "financial-line-item-classifier.ts");
 
-function loadTypeScriptModule(file) {
-  const source = fs.readFileSync(file, "utf8");
-  const compiled = ts.transpileModule(source, {
+function compileTypeScript(source) {
+  return ts.transpileModule(source, {
     compilerOptions: {
       module: ts.ModuleKind.CommonJS,
       target: ts.ScriptTarget.ES2020,
       esModuleInterop: true
     }
   }).outputText;
+}
+
+function registerTypeScriptRequire() {
+  if (require.extensions[".ts"]) return;
+  require.extensions[".ts"] = (mod, file) => {
+    mod._compile(compileTypeScript(fs.readFileSync(file, "utf8")), file);
+  };
+}
+
+function loadTypeScriptModule(file) {
+  registerTypeScriptRequire();
+  const source = fs.readFileSync(file, "utf8");
+  const compiled = compileTypeScript(source);
   const mod = new Module(file, module);
   mod.filename = file;
   mod.paths = Module._nodeModulePaths(path.dirname(file));

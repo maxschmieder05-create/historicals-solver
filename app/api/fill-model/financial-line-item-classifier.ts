@@ -1,3 +1,5 @@
+import { normalizeAccession } from "./sec-accession";
+
 export type FinancialStatementName = "income_statement" | "balance_sheet" | "cash_flow" | "segment_analysis";
 
 export type FinancialSourceTableType = "primary_statement" | "footnote" | "segment_table" | "roll_forward" | "cash_flow_reconciliation";
@@ -787,10 +789,6 @@ function requestSearchText(request: FinancialLineItemClassificationRequest) {
 
 function normalizeKey(input: string) {
   return input.toLowerCase().replace(/[^a-z0-9]/g, "");
-}
-
-function normalizeAccession(input: string) {
-  return input.replace(/-/g, "").toLowerCase();
 }
 
 function lowerClassificationConfidence(a: FinancialLineItemClassification["confidence"], b: FinancialLineItemClassification["confidence"]) {
