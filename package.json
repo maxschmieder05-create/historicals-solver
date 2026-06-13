@@ -30,6 +30,7 @@
     "test:nvda-income-statement": "node scripts/nvda-income-statement-regression-check.js",
     "test:de-source-ledger": "node scripts/de-source-ledger-regression-check.js",
     "test:sec-accession-normalization": "node scripts/sec-accession-normalization-check.js",
+    "test:ko-income-statement-classification": "node scripts/ko-income-statement-classification-check.js",
     "test:ibm-income-statement-classification": "node scripts/ibm-income-statement-classification-check.js",
     "test:lly-income-statement-classification": "node scripts/lly-income-statement-classification-check.js",
     "test:lly-balance-sheet-classification": "node scripts/lly-balance-sheet-classification-check.js",

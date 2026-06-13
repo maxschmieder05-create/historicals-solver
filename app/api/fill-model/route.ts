@@ -3280,7 +3280,7 @@ function resolveOtherNonOperatingFromPrimaryStatementRows(period: string, ctx: R
   const dedicatedValue = dedicatedItems
     .filter((item) => item.value !== null && Math.abs(item.value) > 0 && item.sources.some((source) => source.sourceLayer !== "model"))
     .reduce((total, item) => total + (item.value ?? 0), 0);
-  const shouldSplitBroadReportedLine = dedicatedValue !== 0 && sources.some(isBroadOtherIncomeExpenseLine);
+  const shouldSplitBroadReportedLine = dedicatedValue !== 0 && sources.some(isCombinedBelowOperatingSummaryLine);
   const value = shouldSplitBroadReportedLine ? reportedPrimaryValue - dedicatedValue : reportedPrimaryValue;
 
   return {
@@ -3339,9 +3339,9 @@ function primaryBelowOperatingSemanticDuplicateKey(source: FactSource) {
 function isOtherNonOperatingPrimaryStatementSource(source: FactSource) {
   const concept = source.concept;
   const text = sourceSearchText(source);
-  if (isEquityMethodIncomeSource(source)) return false;
   if (isAllowanceOrRollForwardTranslationSource(source)) return false;
   if (sourceIsSeparatelyModeledOperatingExpense(source)) return false;
+  if (isEquityMethodIncomeSource(source)) return true;
   if (
     C.operatingIncome.includes(concept) ||
     PRETAX_INCOME_CONCEPTS.includes(concept) ||
@@ -3388,6 +3388,10 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
   }
 
   const directReportedLine = directReportedOtherNonOperatingLine(period, ctx);
+  const primaryStatementRows = resolveOtherNonOperatingFromPrimaryStatementRows(period, ctx);
+  if (primaryStatementRows.value !== null && shouldUsePrimaryStatementOtherNonOperatingRows(primaryStatementRows, directReportedLine)) {
+    return primaryStatementRows;
+  }
   if (directReportedLine) {
     return {
       value: otherNonOperatingValue(directReportedLine),
@@ -3397,7 +3401,6 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     };
   }
 
-  const primaryStatementRows = resolveOtherNonOperatingFromPrimaryStatementRows(period, ctx);
   if (primaryStatementRows.value !== null) return primaryStatementRows;
 
   const splitFromPreTaxBridge = resolveOtherNonOperatingFromPreTaxBridge(period, ctx);
@@ -3422,6 +3425,14 @@ function resolveOtherNonOperatingIncomeExpense(period: string, ctx: ResolveConte
     note: "No explicit EDGAR other non-operating line was reported, so the model uses an explicit zero instead of preserving stale hardcodes or creating a residual plug.",
     classification: "grouped"
   };
+}
+
+function shouldUsePrimaryStatementOtherNonOperatingRows(resolved: ResolvedValue, directReportedLine: FactSource | null) {
+  if (!directReportedLine) return true;
+  const directKey = factSourceIdentity(directReportedLine);
+  return resolved.sources
+    .filter((source) => source.sourceLayer !== "derived" && source.sourceLayer !== "model")
+    .some((source) => factSourceIdentity(source) !== directKey);
 }
 
 function directReportedOtherNonOperatingLine(period: string, ctx: ResolveContext) {
@@ -3541,6 +3552,13 @@ function isBroadOtherIncomeExpenseLine(source: FactSource) {
   return /^(other)?nonoperatingincomeexpense$|^otherincome(expense)?net$|^otherincome$|^otherexpense$/.test(compact);
 }
 
+function isCombinedBelowOperatingSummaryLine(source: FactSource) {
+  if (isCombinedInterestAndOtherIncomeSource(source)) return true;
+  const text = sourceSearchText(source);
+  if (source.concept === "NonoperatingIncomeExpense") return true;
+  return /\b(total|net)\b.*\bnon[-\s]?operating\b|\bnon[-\s]?operating\b.*\b(total|net)\b/.test(text) && !/\bother\b.*\bnon[-\s]?operating\b/.test(text);
+}
+
 function resolveOtherNonOperatingFromReportedLine(period: string, ctx: ResolveContext, source: FactSource): ResolvedValue {
   const interestIncome = resolveInterestIncome(period, ctx);
   const interestExpense = resolveInterestExpense(period, ctx);
@@ -3653,6 +3671,11 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
   const explicitItems = resolveExplicitOtherOperatingItems(period, ctx);
   if (explicitItems.value !== null) return explicitItems;
 
+  const reportedOperatingBridge = resolveOtherOperatingFromReportedOperatingIncomeBridge(period, ctx);
+  if (reportedOperatingBridge.value !== null && !statementMetricTies(reportedOperatingBridge.value / 1_000_000, 0)) {
+    return reportedOperatingBridge;
+  }
+
   if (reportedOperatingIncomeTiesWithoutOtherOperating(period, ctx)) {
     return {
       value: 0,
@@ -3686,6 +3709,49 @@ function resolveOtherOperatingIncomeExpense(period: string, ctx: ResolveContext)
     value: 0,
     sources: [zeroSource("OtherOperatingIncomeExpenseNotReported")],
     note: "Set to zero because no standalone other operating income/expense line was reported. Operating income tie-outs do not create this row by residual.",
+    classification: "grouped"
+  };
+}
+
+function resolveOtherOperatingFromReportedOperatingIncomeBridge(period: string, ctx: ResolveContext): ResolvedValue {
+  const operating = first(period, ctx.duration, ["OperatingIncomeLoss"]);
+  if (!operating) {
+    return {
+      value: null,
+      sources: [],
+      note: "No reported EDGAR operating income subtotal was available for an other-operating bridge."
+    };
+  }
+
+  const revenue = selectOperatingBridgeRevenueSourceWithoutOtherOperating(period, ctx);
+  const cogs = resolveCostOfRevenue(period, ctx);
+  const sga = resolveSellingGeneralAdministrativeExpense(period, ctx);
+  const rd = resolveResearchDevelopmentExpense(period, ctx);
+  const da = resolveIncomeStatementDepreciationAmortization(period, ctx);
+  if (!revenue || [cogs, sga, rd, da].some((item) => item.value === null)) {
+    return {
+      value: null,
+      sources: compactSources([operating, revenue, cogs, sga, rd, da]),
+      note: "Could not derive other operating income/expense because one or more EDGAR operating bridge inputs were unavailable."
+    };
+  }
+
+  const value = operating.value - (revenue.value + (cogs.value ?? 0) + (sga.value ?? 0) + (rd.value ?? 0) + (da.value ?? 0));
+  return {
+    value,
+    sources: [
+      bridgeSource(period, "OtherOperatingIncomeExpenseDerivedFromOperatingIncomeBridge", "Other operating income/expense derived from reported operating income bridge", value, [
+        operating,
+        revenue,
+        cogs,
+        sga,
+        rd,
+        da
+      ]),
+      ...compactSources([operating, revenue, cogs, sga, rd, da])
+    ],
+    note:
+      "Derived from reported EDGAR operating income less the separately modeled EDGAR revenue, cost of revenue, SG&A, R&D, and income-statement D&A rows.",
     classification: "grouped"
   };
 }
@@ -3775,7 +3841,7 @@ function isExplicitOtherOperatingLineSource(source: FactSource) {
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
   if (OTHER_OPERATING_EXPENSE_CONCEPTS.includes(source.concept) || source.concept === "OtherOperatingIncomeExpenseNet") return true;
-  return /otheroperating(income|expense|incomeexpense|expenses?)|otheroperatingcosts?/.test(compact) || /\bother operating\b.*\b(income|expenses?|costs?)\b/.test(text);
+  return /otheroperating(income|expense|incomeexpense|expenses?|charges?|costs?)/.test(compact) || /\bother operating\b.*\b(income|expenses?|charges?|costs?)\b/.test(text);
 }
 
 function resolveSellingGeneralAdministrativeExpense(period: string, ctx: ResolveContext): ResolvedValue {
@@ -3889,7 +3955,7 @@ function resolvePostTaxAdjustments(period: string, ctx: ResolveContext): Resolve
   }
 
   const equityMethod = first(period, ctx.duration, EQUITY_METHOD_INCOME_CONCEPTS);
-  if (equityMethod) {
+  if (equityMethod && equityMethodIncomeBelongsInPostTaxBridge(period, ctx, equityMethod)) {
     return {
       value: equityMethod.value,
       sources: [equityMethod],
@@ -3909,6 +3975,21 @@ function resolvePostTaxAdjustments(period: string, ctx: ResolveContext): Resolve
     note: "No EDGAR-supported post-tax adjustment item was reported for this period, so the adjusted net income bridge uses zero instead of preserving stale model hardcodes.",
     classification: "grouped"
   };
+}
+
+function equityMethodIncomeBelongsInPostTaxBridge(period: string, ctx: ResolveContext, source: FactSource | null = first(period, ctx.duration, EQUITY_METHOD_INCOME_CONCEPTS)) {
+  if (!source) return false;
+  if (sourceReportedBelowOperatingOnPrimaryIncomeStatement(period, ctx, source)) return false;
+
+  const pretax = resolvePreTaxIncome(period, ctx);
+  const tax = directIncomeTaxExpenseSource(period, ctx);
+  const netIncome = directNetIncomeSource(period, ctx);
+  if (pretax.value !== null && tax && netIncome) {
+    const bridgeAmount = netIncome.value - (pretax.value - tax.value);
+    return statementMetricTies(bridgeAmount / 1_000_000, source.value / 1_000_000);
+  }
+
+  return !ctx.filingPackageStatements?.length;
 }
 
 function taxEffectForPreTaxAdjustment(period: string, ctx: ResolveContext, preTaxAdjustment: ResolvedValue): ResolvedValue {
@@ -11077,6 +11158,7 @@ function reconcilePostTaxEquityMethodNetIncomeBridge(
   periods.forEach((period, index) => {
     const equityMethod = first(period, ctx.duration, EQUITY_METHOD_INCOME_CONCEPTS);
     if (!equityMethod || Math.abs(equityMethod.value) < 1) return;
+    if (!equityMethodIncomeBelongsInPostTaxBridge(period, ctx, equityMethod)) return;
     const col = columns[index];
     const netIncome = resolveNetIncome(period, ctx);
     if (netIncome.value === null) return;
