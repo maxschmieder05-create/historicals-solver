@@ -70,12 +70,14 @@ async function main() {
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "gold-model-library-"));
   const jefPath = path.join(tmp, "Jefferies Financial Group Inc. (JEF)_Valuation Workbook (10-Mar-2026) (1)(1).xlsx");
   const filledPath = path.join(tmp, "Jefferies Financial Group Inc. (JEF)_historicals_filled.xlsx");
+  const verifiedFilledPath = path.join(tmp, "Verified Filled Co. (VFC)_historicals_filled.xlsx");
   const unverifiedPath = path.join(tmp, "Example Manufacturing Inc. (EXM)_Valuation Workbook (10-Mar-2026).xlsx");
   const generatedPath = path.join(tmp, "Generated Metadata Co. (GMC)_Valuation Workbook (10-Mar-2026).xlsx");
   const manifestPath = path.join(tmp, "gold_models.json");
 
   await writeModelWorkbook(jefPath, { financial: true });
   await writeModelWorkbook(filledPath, { financial: true });
+  await writeModelWorkbook(verifiedFilledPath, { financial: false });
   await writeModelWorkbook(unverifiedPath, { financial: false });
   await writeModelWorkbook(generatedPath, { financial: false, generated: true, creator: "Historicals Solver" });
   await fs.writeFile(
@@ -90,6 +92,15 @@ async function main() {
           file_path: jefPath,
           verified_by_user: true,
           notes: "Completed user-verified financial-services model."
+        },
+        {
+          ticker: "VFC",
+          company_name: "Verified Filled Co.",
+          CIK: "0000000001",
+          model_type: "standard_operating_company",
+          file_path: verifiedFilledPath,
+          verified_by_user: true,
+          notes: "User explicitly verified this completed filled workbook as a gold model."
         }
       ],
       null,
@@ -111,6 +122,11 @@ async function main() {
     filled.exclusionReasons.some((reason) => /filled/i.test(reason)),
     "Filled workbook exclusion should cite the filled filename rule."
   );
+
+  const verifiedFilled = scan.models.find((model) => model.filePath === verifiedFilledPath);
+  assert(verifiedFilled, "Manifest-verified workbook with filled in filename should be allowed as a gold model.");
+  assert(verifiedFilled.usableAsGold, "Manifest-verified filled workbook should be usable as gold.");
+  assert(verifiedFilled.verifiedByUser, "Manifest-verified filled workbook should retain verified status.");
 
   const generated = scan.excluded.find((model) => model.filePath === generatedPath);
   assert(generated, "Historicals Solver generated workbook should be excluded.");
@@ -139,6 +155,60 @@ async function main() {
   assert(
     workbookType.modelType === "financial_services_broker_dealer",
     `JEF-style workbook labels should classify as financial_services_broker_dealer, got ${workbookType.modelType}.`
+  );
+
+  const standardWithInterestIncome = library.classifyCompanyModelTypeFromSecSignals({
+    companyName: "Alphabet Inc.",
+    ticker: "GOOG",
+    cik: "0001652044",
+    conceptNames: [
+      "RevenueFromContractWithCustomerExcludingAssessedTax",
+      "CostOfRevenue",
+      "GrossProfit",
+      "InventoryNet",
+      "AccountsReceivableNetCurrent",
+      "InterestIncomeExpenseNonOperatingNet",
+      "BrokerDealerRelatedReceivables",
+      "SecuritiesBorrowed",
+      "SecuritiesLoaned",
+      "InsuranceRecoveries",
+      "PremiumsPaid",
+      "ClaimsExpense",
+      "CustomerDeposits",
+      "PropertyAndEquipmentNet",
+      "DebtUnderwritingFees",
+      "Forfeitures",
+      "LoansReceivable",
+      "NetRevenues"
+    ],
+    labels: ["Revenue", "Cost of revenues", "Gross profit", "Inventories", "Accounts receivable", "Interest income", "Insurance", "Premiums", "Claims", "Bank deposits", "Property", "Underwriting", "Forfeitures", "Loans receivable", "Net revenues"]
+  });
+  assert(
+    standardWithInterestIncome.modelType === "standard_operating_company",
+    `Standard companies with ordinary interest income should not route as financial services, got ${standardWithInterestIncome.modelType}.`
+  );
+
+  const bankSignals = library.classifyCompanyModelTypeFromSecSignals({
+    companyName: "Example Bancorp",
+    ticker: "BNK",
+    cik: "0000000002",
+    conceptNames: ["Deposits", "LoansReceivable", "NetInterestIncome", "ProvisionForCreditLosses"],
+    labels: ["Deposits", "Loans receivable", "Net interest income", "Provision for credit losses"]
+  });
+  assert(bankSignals.modelType === "bank", `Bank signals should classify as bank, got ${bankSignals.modelType}.`);
+
+  const jefCompanySignals = library.classifyCompanyModelTypeFromSecSignals({
+    companyName: "Jefferies Financial Group Inc.",
+    ticker: "JEF",
+    cik: "0001084580",
+    sic: "6211",
+    sicDescription: "Security brokers, dealers, and flotation companies",
+    conceptNames: ["InvestmentBankingRevenue", "PrincipalTransactionsRevenue", "FinancialInstrumentsOwned", "RevenuesNetOfInterestExpense"],
+    labels: ["Investment banking", "Capital markets", "Principal transactions", "Financial instruments owned", "Net revenues"]
+  });
+  assert(
+    jefCompanySignals.modelType === "financial_services_broker_dealer",
+    `Strong JEF-like signals should classify as financial_services_broker_dealer, got ${jefCompanySignals.modelType}.`
   );
 
   console.log("Gold model library guard passed.");

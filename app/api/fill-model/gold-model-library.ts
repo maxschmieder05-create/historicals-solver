@@ -101,6 +101,8 @@ type TextSignals = {
   normalized: string;
 };
 
+type StructuredClassificationSignals = Pick<CompanyModelTypeSignals, "companyName" | "ticker" | "sic" | "sicDescription">;
+
 export function modelTypeDisplayName(modelType: GoldModelType) {
   return MODEL_TYPE_LABELS[modelType];
 }
@@ -205,7 +207,7 @@ export function classifyCompanyModelTypeFromSecSignals(signals: CompanyModelType
   ]
     .filter((item) => item !== null && item !== undefined && String(item).trim())
     .join(" ");
-  return classifyTextModelType(text, "sec_filing_signals", "Company SEC filing signals");
+  return classifyTextModelType(text, "sec_filing_signals", "Company SEC filing signals", signals);
 }
 
 export function classifyWorkbookModelType(workbook: ExcelJS.Workbook, templateProfileKind?: string | null): ModelTypeClassification {
@@ -300,6 +302,7 @@ export function checkModelTemplateCompatibility(company: ModelTypeClassification
 async function inspectGoldModelCandidate(filePath: string, manifestEntry: ManifestRecord | null, verifiedFolders: string[]): Promise<GoldModelMetadata> {
   const fileName = path.basename(filePath);
   const guessed = guessCompletedModelIdentity(fileName);
+  const verifiedByUser = manifestEntry?.verifiedByUser ?? isInsideAnyFolder(filePath, verifiedFolders);
   const base: GoldModelMetadata = {
     filePath,
     fileName,
@@ -313,10 +316,10 @@ async function inspectGoldModelCandidate(filePath: string, manifestEntry: Manife
     sheetsPresent: [],
     historicalPeriodsCovered: [],
     lastModifiedDate: null,
-    verifiedByUser: manifestEntry?.verifiedByUser ?? isInsideAnyFolder(filePath, verifiedFolders),
+    verifiedByUser,
     usableAsGold: false,
     notes: manifestEntry?.notes ?? null,
-    exclusionReasons: initialFileExclusionReasons(fileName)
+    exclusionReasons: initialFileExclusionReasons(fileName, verifiedByUser)
   };
 
   let stat;
@@ -494,11 +497,13 @@ function isWorkbookFileName(fileName: string) {
   return /\.(xlsx|xlsm)$/i.test(fileName);
 }
 
-function initialFileExclusionReasons(fileName: string) {
+function initialFileExclusionReasons(fileName: string, verifiedByUser = false) {
   const reasons: string[] = [];
   if (!isWorkbookFileName(fileName)) reasons.push("File is not an .xlsx or .xlsm workbook.");
   if (/^~\$/.test(fileName)) reasons.push("Temporary Excel lock file.");
-  if (/filled/i.test(fileName)) reasons.push("Filename contains \"filled\", which marks a system-generated output.");
+  if (/filled/i.test(fileName) && !verifiedByUser) {
+    reasons.push("Filename contains \"filled\" and the workbook is not explicitly marked verified by the user.");
+  }
   return reasons;
 }
 
@@ -623,7 +628,12 @@ function periodOrder(period: string) {
   return Number(period[0]) || 0;
 }
 
-function classifyTextModelType(text: string, source: ModelTypeClassificationSource, context: string): ModelTypeClassification {
+function classifyTextModelType(
+  text: string,
+  source: ModelTypeClassificationSource,
+  context: string,
+  structuredSignals?: StructuredClassificationSignals
+): ModelTypeClassification {
   const signals = textSignals(text);
   const scores: Record<Exclude<GoldModelType, "unknown">, { score: number; reasons: string[] }> = {
     standard_operating_company: { score: 0, reasons: [] },
@@ -654,7 +664,6 @@ function classifyTextModelType(text: string, source: ModelTypeClassificationSour
     "loansreceivable",
     "loansheldforinvestment",
     "netinterestincome",
-    "interestincome",
     "provisionforcreditlosses",
     "allowanceforcreditlosses"
   ]);
@@ -701,9 +710,10 @@ function classifyTextModelType(text: string, source: ModelTypeClassificationSour
     "productrevenue"
   ]);
 
-  const ranked = Object.entries(scores)
+  let ranked = Object.entries(scores)
     .map(([modelType, item]) => ({ modelType: modelType as Exclude<GoldModelType, "unknown">, ...item }))
     .sort((a, b) => b.score - a.score);
+  ranked = ranked.filter((item) => item.modelType === "standard_operating_company" || hasStrongModelTypeSignals(item.modelType, signals, structuredSignals));
   const best = ranked[0];
   if (!best || best.score <= 0) {
     return { modelType: "unknown", confidence: "low", source, rationale: [`${context} did not contain enough model-type signals.`] };
@@ -721,11 +731,103 @@ function classifyTextModelType(text: string, source: ModelTypeClassificationSour
   };
 }
 
+function hasStrongModelTypeSignals(modelType: Exclude<GoldModelType, "unknown">, signals: TextSignals, structuredSignals?: StructuredClassificationSignals) {
+  if (modelType === "financial_services_broker_dealer") return hasStrongBrokerDealerSignals(signals, structuredSignals);
+  if (modelType === "bank") return hasStrongBankSignals(signals, structuredSignals);
+  if (modelType === "insurance") return hasStrongInsuranceSignals(signals, structuredSignals);
+  if (modelType === "reit_real_estate") return hasStrongReitSignals(signals, structuredSignals);
+  if (modelType === "utility") return hasStrongUtilitySignals(signals, structuredSignals);
+  return true;
+}
+
+function hasStrongBrokerDealerSignals(signals: TextSignals, structuredSignals?: StructuredClassificationSignals) {
+  return identityMatches(structuredSignals, /(broker|dealer|investment bank|capital markets|securities|financial group)/i, /^(6211)$/) || hasAnySignal(signals, [
+    "investmentbanking",
+    "capitalmarkets",
+    "assetmanagement",
+    "principaltransactions",
+    "tradingrevenue",
+    "brokerage",
+    "financialinstrumentsowned",
+    "revenuesnetofinterestexpense",
+    "securitybrokersdealers",
+    "securitybrokersdealersandflotationcompanies"
+  ]);
+}
+
+function hasStrongBankSignals(signals: TextSignals, structuredSignals?: StructuredClassificationSignals) {
+  if (identityMatches(structuredSignals, /(bank|bancorp|depository|lending|credit card)/i, /^(60|61)/)) return true;
+  if (structuredSignals) return hasAnySignal(signals, ["netinterestincome", "provisionforcreditlosses"]);
+  return hasAnySignal(signals, ["bancorp", "netinterestincome", "provisionforcreditlosses", "allowanceforcreditlosses", "depositoryinstitution"]);
+}
+
+function hasStrongInsuranceSignals(signals: TextSignals, structuredSignals?: StructuredClassificationSignals) {
+  if (structuredSignals) return identityMatches(structuredSignals, /(insurance|insurer|reinsurance|underwriter)/i, /^(63)/);
+  return hasAnySignal(signals, [
+    "insurancecompany",
+    "insurer",
+    "policyholder",
+    "premiumsearned",
+    "lossadjustment",
+    "reinsurance",
+    "benefitsclaims"
+  ]);
+}
+
+function hasStrongReitSignals(signals: TextSignals, structuredSignals?: StructuredClassificationSignals) {
+  if (structuredSignals) return identityMatches(structuredSignals, /(reit|real estate investment trust|realty|properties trust)/i, /^(6798)$/);
+  return hasAnySignal(signals, [
+    "realestateinvestmenttrust",
+    "rentalrevenues",
+    "realestateinvestments",
+    "fundsfromoperations",
+    "sameproperty",
+    "netoperatingincome"
+  ]);
+}
+
+function hasStrongUtilitySignals(signals: TextSignals, structuredSignals?: StructuredClassificationSignals) {
+  if (structuredSignals) return identityMatches(structuredSignals, /(regulated utility|electric utility|gas utility|water utility|utilities)/i);
+  return hasAnySignal(signals, [
+    "regulatedutility",
+    "electricutility",
+    "gasutility",
+    "waterutility",
+    "ratebase",
+    "kilowatthours",
+    "megawatthours"
+  ]);
+}
+
+function identityMatches(structuredSignals: StructuredClassificationSignals | undefined, textPattern: RegExp, sicPattern?: RegExp) {
+  if (!structuredSignals) return false;
+  const identityText = [structuredSignals.companyName, structuredSignals.ticker, structuredSignals.sicDescription].filter(Boolean).join(" ");
+  if (textPattern.test(identityText)) return true;
+  const sic = String(structuredSignals.sic ?? "").trim();
+  return Boolean(sicPattern && sicPattern.test(sic));
+}
+
+function hasAnySignal(signals: TextSignals, patterns: string[]) {
+  return patterns.some((pattern) => signalMatches(signals, pattern));
+}
+
+function signalMatches(signals: TextSignals, pattern: string) {
+  const normalizedPattern = normalize(pattern);
+  if (!normalizedPattern) return false;
+  if (/^[a-z0-9]+$/i.test(pattern) && normalizedPattern.length <= 4) {
+    return new RegExp(`\\b${escapeRegExp(pattern)}\\b`, "i").test(signals.text);
+  }
+  return signals.normalized.includes(normalizedPattern) || signals.text.toLowerCase().includes(pattern.toLowerCase());
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function addScore(target: { score: number; reasons: string[] }, signals: TextSignals, points: number, reason: string, patterns: string[]) {
   let hits = 0;
   for (const pattern of patterns) {
-    const normalizedPattern = normalize(pattern);
-    if (signals.normalized.includes(normalizedPattern) || signals.text.toLowerCase().includes(pattern.toLowerCase())) hits += 1;
+    if (signalMatches(signals, pattern)) hits += 1;
   }
   if (!hits) return;
   target.score += points + Math.min(hits, 6);

@@ -38,6 +38,8 @@
     "test:audit-note-format": "node scripts/audit-note-format-check.js",
     "test:llm-workbench": "node scripts/llm-workbench-check.js",
     "test:gold-model-library": "node scripts/gold-model-library-check.js",
+    "test:regression-basket": "node scripts/regression-basket-check.js",
+    "test:regression-preflight": "REGRESSION_ROUTING_ONLY=1 node scripts/regression-basket-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",
     "test:cvs-balance-sheet-anchor": "node scripts/cvs-balance-sheet-anchor-regression-check.js",
     "test:balance-sheet-conservation": "node scripts/balance-sheet-conservation-check.js",

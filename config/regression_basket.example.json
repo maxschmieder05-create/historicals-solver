@@ -1,0 +1,13 @@
+{
+  "description": "Optional local overrides for scripts/regression-basket-check.js. Copy to config/regression_basket.local.json or point REGRESSION_BASKET_CONFIG at another file. Do not commit local workbook paths.",
+  "cases": [
+    {
+      "ticker": "AAPL",
+      "inputWorkbook": "/absolute/path/to/standard-operating-company-template.xlsx"
+    },
+    {
+      "ticker": "JEF",
+      "inputWorkbook": "/absolute/path/to/financial-services-broker-dealer-template.xlsx"
+    }
+  ]
+}
