@@ -8,10 +8,10 @@ const inputWorkbook = process.env.KO_INPUT_WORKBOOK || "/Users/maxschmieder/Down
 const outputWorkbook = process.env.KO_BALANCE_SHEET_OUTPUT_WORKBOOK || path.join(repoRoot, "tmp", "ko-balance-sheet-coverage-output.xlsx");
 
 const expectedRows = [
-  { labels: ["Cash & Cash Equivalents", "Cash and Cash Equivalents"], value: 11083 },
+  { labels: ["Cash & Cash Equivalents", "Cash and Cash Equivalents"], value: 13820 },
   { labels: ["Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables"], value: 3675 },
   { labels: ["Inventory", "Inventories"], value: 4730 },
-  { labels: ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets"], value: 10902 },
+  { labels: ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets"], value: 8165 },
   { labels: ["Total Current Assets"], value: 30390 },
   { labels: ["PP&E, Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], value: 9522 },
   { labels: ["Intangible Assets, Net", "Intangibles, Net"], value: 12463 },
@@ -39,7 +39,7 @@ const expectedRows = [
 const ledgerExpectations = [
   { source: "Cash and cash equivalents", row: "Cash & Cash Equivalents" },
   { source: "Short-term investments", row: "Cash & Cash Equivalents" },
-  { source: "Marketable securities", row: "Prepaid & Other Current Assets" },
+  { source: "Marketable securities", row: "Cash & Cash Equivalents" },
   { source: "Trade accounts receivable", row: "Accounts Receivable" },
   { source: "Inventories", row: "Inventory" },
   { source: "Prepaid expenses and other current assets", row: "Prepaid & Other Current Assets" },

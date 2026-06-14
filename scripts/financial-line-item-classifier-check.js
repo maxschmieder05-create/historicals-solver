@@ -134,6 +134,14 @@ async function classify(overrides) {
   });
   assert.equal(shortTermInvestments.recommended_model_row, "Cash & Cash Equivalents");
 
+  const marketableSecurities = await classify({
+    label: "Marketable securities",
+    section: "current assets",
+    deterministicCandidate: "Prepaid & Other Current Assets",
+    availableModelRows: availableModelRows.filter((row) => !/short[-\s]?term investments?|current investments?|marketable securities/i.test(row))
+  });
+  assert.equal(marketableSecurities.recommended_model_row, "Cash & Cash Equivalents");
+
   const iprd = await classify({
     label: "Acquired in-process research and development",
     statement: "income_statement",

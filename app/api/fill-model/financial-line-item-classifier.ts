@@ -104,7 +104,7 @@ type ClassifierOptions = {
 
 export const MODEL_ROW_DEFINITIONS: Record<string, string> = {
   "Cash & Cash Equivalents":
-    "Cash, cash equivalents, and cash-like short-term investments/marketable securities when no dedicated short-term investments row exists.",
+    "Cash, cash equivalents, marketable securities, and short-term investments when no dedicated short-term/current investments row exists.",
   "Accounts Receivable": "Trade accounts receivable, accounts receivable, receivables net of allowances.",
   Inventory:
     "Inventories and inventory-like operating assets, including supplies, parts, merchandise inventory, raw materials, WIP, finished goods, aircraft fuel/spare parts/supplies.",
@@ -398,24 +398,19 @@ function deterministicFinancialLineItemClassification(
   }
 
   if (/\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/.test(text) && section === "current assets") {
-    const isCashLikeShortTermInvestment = /\bshort[-\s]?term investments?\b/.test(text) && !/\bmarketable securities\b/.test(text);
     return {
       ...base,
       recommended_model_row: hasCurrentInvestmentsRow
         ? request.availableModelRows.find((row) => /short[-\s]?term investments?|current investments?|marketable securities/i.test(row)) ?? "Short-Term Investments"
-        : isCashLikeShortTermInvestment
-          ? preferred("Cash & Cash Equivalents")
-          : preferred("Prepaid & Other Current Assets"),
-      classification_type: isCashLikeShortTermInvestment ? "cash-like current investment" : "other current investment",
+        : preferred("Cash & Cash Equivalents"),
+      classification_type: "cash and marketable securities current investment",
       is_current: true,
       is_operating: false,
-      should_exclude_from_other_bucket: isCashLikeShortTermInvestment || hasCurrentInvestmentsRow,
+      should_exclude_from_other_bucket: true,
       confidence: "high",
       reason: hasCurrentInvestmentsRow
         ? "Current investments map to the dedicated current investments row when the template provides one."
-        : isCashLikeShortTermInvestment
-          ? "Short-term investments are cash-like current assets and should be included with cash when no dedicated row exists."
-          : "Marketable securities are grouped into Prepaid & Other Current Assets when no dedicated current investments row exists and they are not treated as cash-like."
+        : "Marketable securities, available-for-sale securities, and short-term investments are included with Cash & Cash Equivalents when no dedicated current investments row exists."
     };
   }
 

@@ -197,6 +197,42 @@ type LlmCandidateFact = {
   values: Record<string, number>;
 };
 
+type LlmMappingReviewIssue = {
+  severity: "info" | "warning" | "error";
+  issueType:
+    | "verified"
+    | "missing_source_line"
+    | "wrong_model_row"
+    | "duplicate_or_double_count"
+    | "sign_or_amount_issue"
+    | "unsupported_exclusion"
+    | "needs_human_review";
+  period: string;
+  sourceLineItemLabel: string;
+  sourceXbrlTag: string;
+  currentModelRow: string;
+  recommendedModelRow: string;
+  reason: string;
+  reusableRule: string;
+  evidence: string[];
+};
+
+type LlmMappingReviewResult = {
+  status: "passed" | "needs_review";
+  coverageSummary: string;
+  verifiedDecisionCount: number;
+  issues: LlmMappingReviewIssue[];
+};
+
+type LlmMappingReviewRow = LlmMappingReviewIssue & {
+  company: string;
+  ticker: string;
+  reviewerModel: string;
+  reviewStatus: LlmMappingReviewResult["status"] | "skipped";
+  coverageSummary: string;
+  verifiedDecisionCount: number;
+};
+
 type FilingCommentaryEvidence = {
   period: string;
   text: string;
@@ -504,7 +540,11 @@ const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost
 const LLM_MAPPING_FAST_MODEL = process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || "openrouter/owl-alpha";
 const LLM_MAPPING_COMPLEX_MODEL =
   process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || process.env.LLM_MAPPING_MODEL || LLM_MAPPING_FAST_MODEL;
+const LLM_MAPPING_REVIEW_MODEL = process.env.LLM_MAPPING_REVIEW_MODEL || LLM_MAPPING_COMPLEX_MODEL || LLM_MAPPING_FAST_MODEL;
 const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 24);
+const LLM_MAPPING_REVIEW_MAX_ITEMS = Number(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS || 2500);
+const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 20_000);
+const LLM_MAPPING_REVIEW_BLOCKING = /^(true|1|yes)$/i.test(process.env.LLM_MAPPING_REVIEW_BLOCKING || "");
 const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
@@ -521,6 +561,7 @@ const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
 const MAPPING_AUDIT_SHEET = "Mapping Audit";
 const SOURCE_LEDGER_SHEET = "Source Ledger";
 const BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET = "Balance Sheet Assignment Ledger";
+const LLM_MAPPING_REVIEW_SHEET = "LLM Mapping Review";
 const SEC_ARCHIVE_MIN_INTERVAL_MS = 150;
 const secArchiveHtmlCache = new Map<string, string>();
 let lastSecArchiveFetchAt = 0;
@@ -2666,8 +2707,11 @@ function sourceLooksLikeCashBalance(source: FactSource) {
 
 function sourceLooksLikeCashLikeShortTermInvestment(source: FactSource) {
   const text = sourceSearchText(source);
-  if (/\bmarketable securities\b/.test(text)) return false;
-  return source.concept === "ShortTermInvestments" || source.concept === "OtherShortTermInvestments" || /\bshort[-\s]?term investments?\b/.test(text);
+  return (
+    source.concept === "ShortTermInvestments" ||
+    source.concept === "OtherShortTermInvestments" ||
+    /\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/.test(text)
+  );
 }
 
 function sourceLooksLikeAssetHeldForSale(source: FactSource) {
@@ -4854,7 +4898,7 @@ function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): 
     value: cash.value + (currentInvestments?.value ?? 0),
     sources: compactSources([cash, classifiedCurrentInvestments]),
     note:
-      "Cash & Cash Equivalents includes cash and cash equivalents and short-term investments because the template has no dedicated current investment row.",
+      "Cash & Cash Equivalents includes cash and cash equivalents, marketable securities, and short-term investments because the template has no dedicated current investment row.",
     classification: "grouped"
   };
 }
@@ -4908,7 +4952,7 @@ function cashLikeCurrentInvestmentBalance(period: string, ctx: ResolveContext): 
     return {
       value: classifiedPrimarySources.reduce((total, source) => total + source.value, 0),
       sources: classifiedPrimarySources,
-      note: "Included cash-like short-term investments from the primary balance sheet with cash because no dedicated current investment row exists."
+      note: "Included marketable securities and short-term investments from the primary balance sheet with cash because no dedicated current investment row exists."
     };
   }
 
@@ -4919,7 +4963,7 @@ function cashLikeCurrentInvestmentBalance(period: string, ctx: ResolveContext): 
   return {
     value: sources.reduce((total, source) => total + source.value, 0),
     sources,
-    note: "Included cash-like short-term investments with cash because no dedicated current investment row exists."
+    note: "Included marketable securities and short-term investments with cash because no dedicated current investment row exists."
   };
 }
 
@@ -6711,10 +6755,17 @@ export async function POST(request: NextRequest) {
     }
 
     const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
+    const llmMappingReview = await runLlmMappingReview(company, periods, fillRows, sourceLedgerRows, balanceSheetAssignmentLedgerRows, auditRows);
+    warnings.push(...llmMappingReview.warnings);
+    if (llmMappingReview.blockingErrors.length) {
+      return jsonError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422);
+    }
+
     addFilingPeriodMapSheet(workbook, modelPeriodMap.entries);
     addMappingAuditSheet(workbook, auditRows);
     addSourceLedgerSheet(workbook, sourceLedgerRows);
     addBalanceSheetAssignmentLedgerSheet(workbook, balanceSheetAssignmentLedgerRows);
+    addLlmMappingReviewSheet(workbook, llmMappingReview.rows);
 
     const output = await writeWorkbookBufferWithRecalculation(workbook);
     const returnedWorkbookErrors = await validateReturnedWorkbookBuffer(output, validationOptions);
@@ -12171,6 +12222,339 @@ function llmApiKey() {
   return process.env.OPENROUTER_API_KEY || process.env.OPENAI_API_KEY || "";
 }
 
+function llmMappingReviewEnabledByEnv() {
+  const raw = process.env.LLM_MAPPING_REVIEW_ENABLED;
+  if (raw === undefined || raw === "") return llmMappingEnabledByEnv();
+  return /^(true|1|yes)$/i.test(raw);
+}
+
+async function runLlmMappingReview(
+  company: CompanyMatch,
+  periods: string[],
+  fillRows: FillRow[],
+  sourceLedgerRows: HistoricalSourceLedgerRow[],
+  balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[],
+  auditRows: MappingAuditRow[]
+): Promise<{ rows: LlmMappingReviewRow[]; warnings: string[]; blockingErrors: string[] }> {
+  if (!llmMappingReviewEnabledByEnv()) return { rows: [], warnings: [], blockingErrors: [] };
+  if (!llmApiKey()) {
+    const message = "LLM mapping review was enabled but OPENROUTER_API_KEY was not set; generated workbook relies on deterministic validation only.";
+    return {
+      rows: [llmMappingReviewSkippedRow(company, message)],
+      warnings: [message],
+      blockingErrors: []
+    };
+  }
+
+  try {
+    const payload = llmMappingReviewPayload(company, periods, fillRows, sourceLedgerRows, balanceSheetAssignmentLedgerRows, auditRows);
+    const result = await requestLlmMappingReview(payload);
+    const rows = llmMappingReviewRowsFromResult(company, result);
+    const issueWarnings = result.issues
+      .filter((issue) => issue.severity !== "info")
+      .map((issue) => {
+        const recommended = issue.recommendedModelRow && issue.recommendedModelRow !== issue.currentModelRow ? ` Recommended row: ${issue.recommendedModelRow}.` : "";
+        return `LLM mapping review ${issue.severity}: ${issue.period || "all periods"} ${issue.sourceLineItemLabel || issue.currentModelRow}: ${issue.reason}${recommended}`;
+      });
+    const blockingErrors = LLM_MAPPING_REVIEW_BLOCKING
+      ? result.issues
+          .filter((issue) => issue.severity === "error")
+          .map((issue) => `${issue.period || "all periods"} ${issue.sourceLineItemLabel || issue.currentModelRow}: ${issue.reason}`)
+      : [];
+    return { rows, warnings: issueWarnings, blockingErrors };
+  } catch (error) {
+    const message = `LLM mapping review skipped (${error instanceof Error ? error.message : "unknown OpenRouter API error"}).`;
+    return {
+      rows: [llmMappingReviewSkippedRow(company, message)],
+      warnings: [message],
+      blockingErrors: []
+    };
+  }
+}
+
+function llmMappingReviewSkippedRow(company: CompanyMatch, reason: string): LlmMappingReviewRow {
+  return {
+    company: company.title,
+    ticker: company.ticker,
+    reviewerModel: LLM_MAPPING_REVIEW_MODEL,
+    reviewStatus: "skipped",
+    coverageSummary: reason,
+    verifiedDecisionCount: 0,
+    severity: "warning",
+    issueType: "needs_human_review",
+    period: "",
+    sourceLineItemLabel: "",
+    sourceXbrlTag: "",
+    currentModelRow: "",
+    recommendedModelRow: "",
+    reason,
+    reusableRule: "Run deterministic workbook validation and source-ledger checks when LLM review is unavailable.",
+    evidence: []
+  };
+}
+
+function llmMappingReviewRowsFromResult(company: CompanyMatch, result: LlmMappingReviewResult): LlmMappingReviewRow[] {
+  const issues = result.issues.length
+    ? result.issues
+    : [
+        {
+          severity: "info" as const,
+          issueType: "verified" as const,
+          period: "",
+          sourceLineItemLabel: "",
+          sourceXbrlTag: "",
+          currentModelRow: "",
+          recommendedModelRow: "",
+          reason: result.coverageSummary || "LLM reviewer did not identify missed or misplaced EDGAR line items.",
+          reusableRule: "Continue to route line items by SEC label, statement section, XBRL tag semantics, template row availability, and validation tie-outs.",
+          evidence: []
+        }
+      ];
+  return issues.map((issue) => ({
+    company: company.title,
+    ticker: company.ticker,
+    reviewerModel: LLM_MAPPING_REVIEW_MODEL,
+    reviewStatus: result.status,
+    coverageSummary: result.coverageSummary,
+    verifiedDecisionCount: result.verifiedDecisionCount,
+    ...issue
+  }));
+}
+
+async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingReviewPayload>): Promise<LlmMappingReviewResult> {
+  const apiKey = llmApiKey();
+  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
+
+  const system = [
+    "You are an accounting review controller for an EDGAR-sourced financial model historicals system.",
+    "Review every provided mapping and source coverage item using accounting reasoning, SEC statement context, XBRL tag semantics, current/non-current section, subtotal/component relationships, model row definitions, and validation status.",
+    "Use only the provided EDGAR source rows, mapping audit rows, source ledger rows, and primary balance-sheet assignment ledger rows. Do not invent facts, line items, or amounts.",
+    "Confirm that every material primary SEC line item is either assigned to the correct model row, grouped into the correct Other row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
+    "Current marketable securities, available-for-sale securities, and short-term investments belong in Cash & Cash Equivalents when the template has no dedicated current investments row; when the template has a dedicated row, they belong there.",
+    "Current maturities/current portion of long-term debt belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, and notes payable current may belong in Revolver/current borrowings.",
+    "Deferred revenue or contract liabilities are operating liabilities, not deferred income taxes. Deferred tax assets/liabilities require tax-specific semantics.",
+    "Cash-flow-only depreciation and amortization should not populate income-statement D&A unless it is an income-statement line.",
+    "Use warnings/errors only for reusable accounting issues that should generalize to other templates or companies. Do not create ticker-specific rules.",
+    "If the evidence is insufficient, return needs_human_review rather than guessing. Return strict JSON only."
+  ].join(" ");
+
+  const controller = new AbortController();
+  const timeoutMs = Number.isFinite(LLM_MAPPING_REVIEW_TIMEOUT_MS) && LLM_MAPPING_REVIEW_TIMEOUT_MS > 0 ? LLM_MAPPING_REVIEW_TIMEOUT_MS : 20_000;
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const response = await Promise.race([
+    fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "HTTP-Referer": OPENROUTER_SITE_URL,
+        "X-Title": OPENROUTER_APP_TITLE
+      },
+      body: JSON.stringify({
+        model: LLM_MAPPING_REVIEW_MODEL,
+        messages: [
+          { role: "system", content: system },
+          { role: "user", content: JSON.stringify(payload) }
+        ],
+        temperature: 0,
+        max_tokens: 2200,
+        provider: { require_parameters: true },
+        response_format: {
+          type: "json_schema",
+          json_schema: llmMappingReviewJsonSchema()
+        }
+      })
+    }),
+    new Promise<Response>((_, reject) => {
+      timeout = setTimeout(() => {
+        controller.abort();
+        reject(new Error(`OpenRouter mapping review timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
+    })
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+
+  const body = await response.json().catch(() => null);
+  if (!response.ok) {
+    const message = body?.error?.message || `${response.status} ${response.statusText}`;
+    throw new Error(message);
+  }
+
+  const text = responseOutputText(body);
+  if (!text) throw new Error("OpenRouter mapping review response did not include text output");
+  return JSON.parse(text) as LlmMappingReviewResult;
+}
+
+function llmMappingReviewPayload(
+  company: CompanyMatch,
+  periods: string[],
+  fillRows: FillRow[],
+  sourceLedgerRows: HistoricalSourceLedgerRow[],
+  balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[],
+  auditRows: MappingAuditRow[]
+) {
+  const modelRows = fillRows.map((row) => ({
+    row: row.row,
+    label: row.label,
+    section: row.modelContext?.sectionHeader ?? "",
+    statement: row.statement,
+    kind: row.kind,
+    classification: row.classification
+  }));
+  const availableModelRows = unique(fillRows.map((row) => row.label).filter(Boolean));
+  const maxItems = Number.isFinite(LLM_MAPPING_REVIEW_MAX_ITEMS) && LLM_MAPPING_REVIEW_MAX_ITEMS > 0 ? LLM_MAPPING_REVIEW_MAX_ITEMS : Number.POSITIVE_INFINITY;
+  const balanceAssignments = balanceSheetAssignmentLedgerRows.map(compactBalanceSheetAssignmentForReview);
+  const sourceRows = sourceLedgerRows.map(compactSourceLedgerRowForReview);
+  const mappingRows = auditRows.map(compactMappingAuditRowForReview);
+  const selectedBalanceAssignments = balanceAssignments.slice(0, maxItems);
+  const remainingAfterAssignments = Math.max(0, maxItems - selectedBalanceAssignments.length);
+  const selectedSourceRows = sourceRows.slice(0, remainingAfterAssignments);
+  const remainingAfterSourceRows = Math.max(0, remainingAfterAssignments - selectedSourceRows.length);
+  const selectedMappingRows = mappingRows.slice(0, remainingAfterSourceRows);
+
+  return {
+    company: { ticker: company.ticker, name: company.title, cik: company.cik },
+    periods,
+    reviewInstructions: {
+      sourceOfTruth: "All source values and source labels must come from SEC EDGAR evidence included in this payload.",
+      accountingGoal: "Verify every source line is either correctly transferred into a model row, deliberately grouped, explicitly excluded, or preserved by supported formula logic.",
+      templateRuleExamples: [
+        "Marketable securities / short-term investments combine with Cash & Cash Equivalents when no dedicated current investment row exists.",
+        "Current maturities of long-term debt combine with LT Debt including current portion.",
+        "Deferred revenue is an operating liability, not deferred income taxes."
+      ]
+    },
+    modelRows,
+    modelRowDefinitions: modelRowDefinitionsForRows(availableModelRows),
+    primaryBalanceSheetAssignments: selectedBalanceAssignments,
+    sourceLedgerRows: selectedSourceRows,
+    mappingAuditRows: selectedMappingRows,
+    omittedCounts: {
+      primaryBalanceSheetAssignments: Math.max(0, balanceAssignments.length - selectedBalanceAssignments.length),
+      sourceLedgerRows: Math.max(0, sourceRows.length - selectedSourceRows.length),
+      mappingAuditRows: Math.max(0, mappingRows.length - selectedMappingRows.length)
+    }
+  };
+}
+
+function compactBalanceSheetAssignmentForReview(row: PrimaryBalanceSheetAssignmentLedgerRow) {
+  return {
+    period: row.fiscalPeriod,
+    sourceLineItemLabel: reviewText(row.sourceLineItemLabel),
+    sourceXbrlTag: row.sourceXbrlTag,
+    amountMillions: roundModelValue(row.amount / 1_000_000),
+    assignedModelRow: row.assignedModelRow,
+    assignmentStatus: row.assignmentStatus,
+    reason: reviewText(row.classificationReason),
+    validationStatus: row.validationStatus,
+    sourceSection: row.sourceSection,
+    side: row.side
+  };
+}
+
+function compactSourceLedgerRowForReview(row: HistoricalSourceLedgerRow) {
+  return {
+    period: row.fiscalPeriod,
+    cell: row.cell,
+    modelRow: row.modelRow,
+    value: typeof row.value === "number" ? roundModelValue(row.value) : row.value,
+    sourceLineItemLabel: reviewText(row.sourceLineItemLabel),
+    sourceXbrlTag: row.sourceXbrlTag,
+    mappingStatus: row.mappingStatus,
+    sourceStatement: row.sourceStatement,
+    sourceTableType: row.sourceTableType,
+    reason: reviewText(row.classificationReason)
+  };
+}
+
+function compactMappingAuditRowForReview(row: MappingAuditRow) {
+  return {
+    period: row.period,
+    cell: row.cell,
+    modelRowLabel: row.modelRowLabel,
+    section: row.section ?? "",
+    valueWritten: roundModelValue(row.valueWritten),
+    mappingType: row.mappingType,
+    conceptsUsed: reviewText(row.conceptsUsed, 500),
+    secLabels: reviewText(row.finalSourceLineItems || row.secLabels || "", 400),
+    sourceStatement: row.sourceStatement,
+    validationStatus: row.validationStatus,
+    confidence: row.confidence,
+    notes: reviewText(row.classificationReasons || row.notes || row.writeBlockedReason || "", 500),
+    llmClassificationUsed: Boolean(row.llmClassificationUsed),
+    mappingPassedValidation: row.mappingPassedValidation !== false
+  };
+}
+
+function reviewText(value: string | null | undefined, maxLength = 240) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 1))}...` : text;
+}
+
+function llmMappingReviewJsonSchema() {
+  return {
+    name: "edgar_mapping_review",
+    strict: true,
+    schema: {
+      type: "object",
+      additionalProperties: false,
+      required: ["status", "coverageSummary", "verifiedDecisionCount", "issues"],
+      properties: {
+        status: { type: "string", enum: ["passed", "needs_review"] },
+        coverageSummary: { type: "string" },
+        verifiedDecisionCount: { type: "integer" },
+        issues: {
+          type: "array",
+          items: {
+            type: "object",
+            additionalProperties: false,
+            required: [
+              "severity",
+              "issueType",
+              "period",
+              "sourceLineItemLabel",
+              "sourceXbrlTag",
+              "currentModelRow",
+              "recommendedModelRow",
+              "reason",
+              "reusableRule",
+              "evidence"
+            ],
+            properties: {
+              severity: { type: "string", enum: ["info", "warning", "error"] },
+              issueType: {
+                type: "string",
+                enum: [
+                  "verified",
+                  "missing_source_line",
+                  "wrong_model_row",
+                  "duplicate_or_double_count",
+                  "sign_or_amount_issue",
+                  "unsupported_exclusion",
+                  "needs_human_review"
+                ]
+              },
+              period: { type: "string" },
+              sourceLineItemLabel: { type: "string" },
+              sourceXbrlTag: { type: "string" },
+              currentModelRow: { type: "string" },
+              recommendedModelRow: { type: "string" },
+              reason: { type: "string" },
+              reusableRule: { type: "string" },
+              evidence: {
+                type: "array",
+                items: { type: "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  };
+}
+
 async function llmAssistedFillRow(
   fillRow: FillRow,
   company: CompanyMatch,
@@ -15077,17 +15461,10 @@ function assignPrimaryBalanceSheetLineItem(
         reason: "Current investments map to the template's dedicated current investment row."
       };
     }
-    if (sourceLooksLikeCashLikeShortTermInvestment(source)) {
-      return choose(
-        "Cash & Cash Equivalents",
-        ["Cash and Cash Equivalents", "Cash"],
-        "Cash-like short-term investments are grouped with cash because the template has no dedicated current investment row."
-      );
-    }
-    return chooseOther(
-      "Prepaid & Other Current Assets",
-      ["Prepaid and Other Current Assets", "Other Current Assets"],
-      "Marketable securities are grouped into other current assets because no dedicated current investment row exists."
+    return choose(
+      "Cash & Cash Equivalents",
+      ["Cash and Cash Equivalents", "Cash"],
+      "Marketable securities and short-term investments are grouped with cash because the template has no dedicated current investment row."
     );
   }
   if (sourceLooksLikeDeferredTaxAsset(source)) {
@@ -15149,17 +15526,10 @@ function assignPrimaryBalanceSheetLineItem(
           reason: "Current investments map to the template's dedicated current investment row."
         };
       }
-      if (sourceLooksLikeCashLikeShortTermInvestment(source)) {
-        return choose(
-          "Cash & Cash Equivalents",
-          ["Cash and Cash Equivalents", "Cash"],
-          "Cash-like short-term investments are grouped with cash because the template has no dedicated current investment row."
-        );
-      }
-      return chooseOther(
-        "Prepaid & Other Current Assets",
-        ["Prepaid and Other Current Assets", "Other Current Assets"],
-        "Marketable securities are grouped into other current assets because no dedicated current investment row exists."
+      return choose(
+        "Cash & Cash Equivalents",
+        ["Cash and Cash Equivalents", "Cash"],
+        "Marketable securities and short-term investments are grouped with cash because the template has no dedicated current investment row."
       );
     }
     if (C.receivables.includes(source.concept) || C.cardReceivables.includes(source.concept) || sourceTextMatches(source, /\breceivables?\b/)) {
@@ -15694,7 +16064,7 @@ function validateBalanceSheetClassificationCompleteness(
       !findBalanceSheetRow(sheet, ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets"])
     ) {
       errors.push(
-        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no current investment, cash-like grouping, or other current asset row to receive it.`
+        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no current investment row or cash/current-investment grouping row to receive it.`
       );
     }
   });
@@ -17198,7 +17568,7 @@ function numericCellValue(cell: ExcelJS.Cell) {
 }
 
 function removeGeneratedMetadataSheets(workbook: ExcelJS.Workbook) {
-  for (const sheetName of [MAPPING_AUDIT_SHEET, SOURCE_LEDGER_SHEET, BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET, "Filing Period Map"]) {
+  for (const sheetName of [MAPPING_AUDIT_SHEET, SOURCE_LEDGER_SHEET, BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET, LLM_MAPPING_REVIEW_SHEET, "Filing Period Map"]) {
     const sheet = workbook.getWorksheet(sheetName);
     if (sheet) workbook.removeWorksheet(sheet.id);
   }
@@ -17519,6 +17889,39 @@ function addBalanceSheetAssignmentLedgerSheet(workbook: ExcelJS.Workbook, ledger
     { header: "source row key", key: "sourceRowKey", width: 48 }
   ];
   ledgerRows.forEach((row) => sheet.addRow(row));
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+}
+
+function addLlmMappingReviewSheet(workbook: ExcelJS.Workbook, reviewRows: LlmMappingReviewRow[]) {
+  const existing = workbook.getWorksheet(LLM_MAPPING_REVIEW_SHEET);
+  if (existing) workbook.removeWorksheet(existing.id);
+  if (!reviewRows.length) return;
+  const sheet = workbook.addWorksheet(LLM_MAPPING_REVIEW_SHEET);
+  sheet.columns = [
+    { header: "company", key: "company", width: 32 },
+    { header: "ticker", key: "ticker", width: 10 },
+    { header: "reviewer model", key: "reviewerModel", width: 28 },
+    { header: "review status", key: "reviewStatus", width: 16 },
+    { header: "coverage summary", key: "coverageSummary", width: 70 },
+    { header: "verified decision count", key: "verifiedDecisionCount", width: 22 },
+    { header: "severity", key: "severity", width: 12 },
+    { header: "issue type", key: "issueType", width: 28 },
+    { header: "period", key: "period", width: 12 },
+    { header: "source line item label", key: "sourceLineItemLabel", width: 44 },
+    { header: "source XBRL tag", key: "sourceXbrlTag", width: 44 },
+    { header: "current model row", key: "currentModelRow", width: 36 },
+    { header: "recommended model row", key: "recommendedModelRow", width: 36 },
+    { header: "reason", key: "reason", width: 70 },
+    { header: "reusable rule", key: "reusableRule", width: 70 },
+    { header: "evidence", key: "evidence", width: 90 }
+  ];
+  reviewRows.forEach((row) =>
+    sheet.addRow({
+      ...row,
+      evidence: row.evidence.join(" | ")
+    })
+  );
   sheet.getRow(1).font = { bold: true };
   sheet.views = [{ state: "frozen", ySplit: 1 }];
 }
