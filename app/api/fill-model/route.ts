@@ -53,6 +53,17 @@ import {
   scanConfiguredGoldModelLibrary,
   type CompanyModelTypeSignals
 } from "./gold-model-library";
+import {
+  buildLlmWorkbookToolbox,
+  llmWorkbookToolboxSystemInstruction,
+  type LlmWorkbenchAuditRow,
+  type LlmWorkbenchBalanceAssignment,
+  type LlmWorkbenchCell,
+  type LlmWorkbenchFact,
+  type LlmWorkbenchSourceLedgerRow,
+  type LlmWorkbenchStatementRow,
+  type LlmWorkbookToolbox
+} from "./llm-workbench";
 
 export const runtime = "nodejs";
 export const maxDuration = 900;
@@ -544,11 +555,20 @@ const LLM_MAPPING_REVIEW_MODEL = process.env.LLM_MAPPING_REVIEW_MODEL || LLM_MAP
 const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 24);
 const LLM_MAPPING_REVIEW_MAX_ITEMS = Number(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS || 2500);
 const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 20_000);
-const LLM_MAPPING_REVIEW_BLOCKING = /^(true|1|yes)$/i.test(process.env.LLM_MAPPING_REVIEW_BLOCKING || "");
+const LLM_MAPPING_REVIEW_BLOCKING =
+  process.env.LLM_MAPPING_REVIEW_BLOCKING === undefined || process.env.LLM_MAPPING_REVIEW_BLOCKING === ""
+    ? true
+    : /^(true|1|yes)$/i.test(process.env.LLM_MAPPING_REVIEW_BLOCKING);
 const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
 const LLM_MAPPING_TIMEOUT_MS = Number(process.env.LLM_MAPPING_TIMEOUT_MS || 3_000);
+const LLM_WORKBENCH_MAX_FACTS = Number(process.env.LLM_WORKBENCH_MAX_FACTS || 500);
+const LLM_WORKBENCH_MAX_STATEMENT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_STATEMENT_ROWS || 650);
+const LLM_WORKBENCH_MAX_WORKBOOK_CELLS = Number(process.env.LLM_WORKBENCH_MAX_WORKBOOK_CELLS || 700);
+const LLM_WORKBENCH_MAX_AUDIT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_AUDIT_ROWS || 500);
+const LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS = Number(process.env.LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS || 600);
+const LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS = Number(process.env.LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS || 500);
 const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
   process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24, 3)
 );
@@ -6755,7 +6775,20 @@ export async function POST(request: NextRequest) {
     }
 
     const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
-    const llmMappingReview = await runLlmMappingReview(company, periods, fillRows, sourceLedgerRows, balanceSheetAssignmentLedgerRows, auditRows);
+    const llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
+      company,
+      periods: unique([...periods, ...balanceSheetPeriods, ...incomeStatementPeriods]),
+      workbook,
+      sheet,
+      fillRows,
+      ctx,
+      sourceLedgerRows,
+      balanceSheetAssignmentLedgerRows,
+      auditRows,
+      warnings,
+      validationFailures: []
+    });
+    const llmMappingReview = await runLlmMappingReview(company, periods, fillRows, sourceLedgerRows, balanceSheetAssignmentLedgerRows, auditRows, llmWorkbookToolbox);
     warnings.push(...llmMappingReview.warnings);
     if (llmMappingReview.blockingErrors.length) {
       return jsonError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422);
@@ -12234,7 +12267,8 @@ async function runLlmMappingReview(
   fillRows: FillRow[],
   sourceLedgerRows: HistoricalSourceLedgerRow[],
   balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[],
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  llmWorkbookToolbox: LlmWorkbookToolbox
 ): Promise<{ rows: LlmMappingReviewRow[]; warnings: string[]; blockingErrors: string[] }> {
   if (!llmMappingReviewEnabledByEnv()) return { rows: [], warnings: [], blockingErrors: [] };
   if (!llmApiKey()) {
@@ -12247,7 +12281,7 @@ async function runLlmMappingReview(
   }
 
   try {
-    const payload = llmMappingReviewPayload(company, periods, fillRows, sourceLedgerRows, balanceSheetAssignmentLedgerRows, auditRows);
+    const payload = llmMappingReviewPayload(company, periods, fillRows, sourceLedgerRows, balanceSheetAssignmentLedgerRows, auditRows, llmWorkbookToolbox);
     const result = await requestLlmMappingReview(payload);
     const rows = llmMappingReviewRowsFromResult(company, result);
     const issueWarnings = result.issues
@@ -12327,6 +12361,7 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
 
   const system = [
     "You are an accounting review controller for an EDGAR-sourced financial model historicals system.",
+    llmWorkbookToolboxSystemInstruction(),
     "Review every provided mapping and source coverage item using accounting reasoning, SEC statement context, XBRL tag semantics, current/non-current section, subtotal/component relationships, model row definitions, and validation status.",
     "Use only the provided EDGAR source rows, mapping audit rows, source ledger rows, and primary balance-sheet assignment ledger rows. Do not invent facts, line items, or amounts.",
     "Confirm that every material primary SEC line item is either assigned to the correct model row, grouped into the correct Other row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
@@ -12393,7 +12428,8 @@ function llmMappingReviewPayload(
   fillRows: FillRow[],
   sourceLedgerRows: HistoricalSourceLedgerRow[],
   balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[],
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  llmWorkbookToolbox: LlmWorkbookToolbox
 ) {
   const modelRows = fillRows.map((row) => ({
     row: row.row,
@@ -12428,6 +12464,7 @@ function llmMappingReviewPayload(
     },
     modelRows,
     modelRowDefinitions: modelRowDefinitionsForRows(availableModelRows),
+    llmWorkbookToolbox,
     primaryBalanceSheetAssignments: selectedBalanceAssignments,
     sourceLedgerRows: selectedSourceRows,
     mappingAuditRows: selectedMappingRows,
@@ -12491,6 +12528,226 @@ function compactMappingAuditRowForReview(row: MappingAuditRow) {
 function reviewText(value: string | null | undefined, maxLength = 240) {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   return text.length > maxLength ? `${text.slice(0, Math.max(0, maxLength - 1))}...` : text;
+}
+
+function buildLlmWorkbookToolboxForReview(input: {
+  company: CompanyMatch;
+  periods: string[];
+  workbook: ExcelJS.Workbook;
+  sheet: ExcelJS.Worksheet;
+  fillRows: FillRow[];
+  ctx: ResolveContext;
+  sourceLedgerRows: HistoricalSourceLedgerRow[];
+  balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[];
+  auditRows: MappingAuditRow[];
+  warnings: string[];
+  validationFailures: string[];
+}) {
+  return buildLlmWorkbookToolbox({
+    company: {
+      ticker: input.company.ticker,
+      name: input.company.title,
+      cik: input.company.cik
+    },
+    periods: input.periods,
+    facts: llmWorkbenchFacts(input.periods, input.ctx),
+    statementRows: llmWorkbenchStatementRows(input.periods, input.ctx),
+    workbookCells: llmWorkbenchWorkbookCells(input.workbook, input.auditRows, input.sourceLedgerRows),
+    auditRows: llmWorkbenchAuditRows(input.auditRows),
+    sourceLedgerRows: llmWorkbenchSourceLedgerRows(input.sourceLedgerRows),
+    balanceSheetAssignments: llmWorkbenchBalanceAssignments(input.balanceSheetAssignmentLedgerRows),
+    validationFailures: input.validationFailures,
+    warnings: input.warnings,
+    limits: {
+      maxFacts: positiveLimit(LLM_WORKBENCH_MAX_FACTS, 500),
+      maxStatementRows: positiveLimit(LLM_WORKBENCH_MAX_STATEMENT_ROWS, 650),
+      maxWorkbookCells: positiveLimit(LLM_WORKBENCH_MAX_WORKBOOK_CELLS, 700),
+      maxAuditRows: positiveLimit(LLM_WORKBENCH_MAX_AUDIT_ROWS, 500),
+      maxSourceLedgerRows: positiveLimit(LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS, 600),
+      maxBalanceSheetAssignments: positiveLimit(LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS, 500)
+    }
+  });
+}
+
+function llmWorkbenchFacts(periods: string[], ctx: ResolveContext): LlmWorkbenchFact[] {
+  const rows: LlmWorkbenchFact[] = [];
+  const seen = new Set<string>();
+  const addFacts = (modelPeriod: string, sourcePeriod: string, periodType: LlmWorkbenchFact["periodType"], facts?: Map<string, FactSource>) => {
+    if (!facts) return;
+    for (const [concept, source] of facts.entries()) {
+      if (!Number.isFinite(source.value)) continue;
+      const key = [modelPeriod, sourcePeriod, periodType, concept, source.accn ?? "", source.value].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({
+        period: modelPeriod,
+        sourcePeriod: source.periodKey && source.periodKey !== modelPeriod ? source.periodKey : sourcePeriod !== modelPeriod ? sourcePeriod : undefined,
+        periodType,
+        concept,
+        label: sourceDisplayLabel(source),
+        value: source.value,
+        valueMillions: roundModelValue(source.value / 1_000_000),
+        unit: source.unit,
+        taxonomy: source.taxonomy,
+        sourceLayer: source.sourceLayer,
+        form: source.form,
+        filed: source.filed,
+        accession: source.accn,
+        sourceUrl: source.sourceUrl,
+        statement: source.lineItemClassification?.recommended_model_row,
+        section: source.lineItemClassificationSourceSection
+      });
+    }
+  };
+
+  for (const period of unique(periods)) {
+    addFacts(period, period, "duration", ctx.duration.get(period));
+    const instantPeriod = balanceSheetInstantLookupPeriod(period);
+    addFacts(period, instantPeriod, "instant", ctx.instant.get(instantPeriod));
+  }
+  return rows;
+}
+
+function llmWorkbenchStatementRows(periods: string[], ctx: ResolveContext): LlmWorkbenchStatementRow[] {
+  const wantedPeriods = new Set(unique(periods.flatMap((period) => [period, balanceSheetInstantLookupPeriod(period)])));
+  const rows: LlmWorkbenchStatementRow[] = [];
+  const seen = new Set<string>();
+  for (const statement of ctx.filingPackageStatements ?? []) {
+    const statementName = financialStatementNameForSecStatement(statement);
+    for (const row of statement.rows) {
+      const period = statementRowPeriodKey(row, ctx) || row.reportingPeriod || statement.reportingPeriod || "";
+      if (wantedPeriods.size && period && !wantedPeriods.has(period) && !wantedPeriods.has(balanceSheetInstantLookupPeriod(period))) continue;
+      const key = [statement.accession, statement.statementName, row.rowOrder, period, row.xbrlConcept ?? "", row.rowLabel].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const numericValue = typeof row.value === "number" && Number.isFinite(row.value) ? row.value : null;
+      rows.push({
+        period,
+        statementName: statement.statementName,
+        sourceTableType: statement.sourceTableType,
+        rowLabel: row.rowLabel,
+        xbrlConcept: row.xbrlConcept,
+        value: row.value,
+        valueMillions: numericValue === null ? undefined : roundModelValue(numericValue / 1_000_000),
+        unit: row.unit,
+        accession: row.accession || statement.accession,
+        form: statement.form,
+        filingDate: statement.filingDate,
+        rowOrder: row.rowOrder,
+        section: statementName ? statementSectionForRow(statement, row, statementName) : undefined,
+        currentNonCurrentSection: row.currentNonCurrentSection,
+        dimensionMembers: row.dimensions.map((dimension) => `${dimension.dimension}=${dimension.member || dimension.typedValue || ""}`),
+        sourceUrl: row.sourceUrl || statement.sourceUrl
+      });
+    }
+  }
+  return rows;
+}
+
+function llmWorkbenchWorkbookCells(
+  workbook: ExcelJS.Workbook,
+  auditRows: MappingAuditRow[],
+  sourceLedgerRows: HistoricalSourceLedgerRow[]
+): LlmWorkbenchCell[] {
+  const rows: LlmWorkbenchCell[] = [];
+  const seen = new Set<string>();
+  const ledgerByKey = new Map(sourceLedgerRows.map((row) => [sourceLedgerKey(row.sheetName, row.cell, row.fiscalPeriod), row]));
+  const add = (sheetName: string, address: string, period: string, auditRow?: MappingAuditRow, ledgerRow?: HistoricalSourceLedgerRow) => {
+    if (!/^[A-Z]{1,3}\d+$/i.test(address)) return;
+    const key = sourceLedgerKey(sheetName, address, period);
+    if (seen.has(key)) return;
+    seen.add(key);
+    const sheet = workbook.getWorksheet(sheetName);
+    const cell = sheet?.getCell(address);
+    const parsed = parseCellAddress(address);
+    const formula = cell ? formulaForCell(cell) : null;
+    const value = cell ? llmWorkbookCellValue(cell) : ledgerRow?.value ?? auditRow?.valueWritten ?? null;
+    rows.push({
+      sheetName,
+      cell: address,
+      row: parsed?.row,
+      column: parsed?.col,
+      period,
+      modelRowLabel: auditRow?.modelRowLabel || ledgerRow?.classificationReason?.match(/model row "([^"]+)"/)?.[1] || "",
+      section: auditRow?.section,
+      value,
+      formula: formula ?? undefined,
+      isFormula: Boolean(formula),
+      mappingType: auditRow?.mappingType,
+      validationStatus: auditRow?.validationStatus,
+      sourceLedgerStatus: ledgerRow?.mappingStatus,
+      sourceLineItemLabel: ledgerRow?.sourceLineItemLabel || auditRow?.finalSourceLineItems || auditRow?.secLabels,
+      sourceXbrlTag: ledgerRow?.sourceXbrlTag,
+      classificationReason: ledgerRow?.classificationReason || auditRow?.classificationReasons || auditRow?.notes || auditRow?.writeBlockedReason
+    });
+  };
+
+  for (const auditRow of auditRows) {
+    const ledgerRow = ledgerByKey.get(sourceLedgerKey(auditRow.sheetName, auditRow.cell, auditRow.period));
+    add(auditRow.sheetName, auditRow.cell, auditRow.period, auditRow, ledgerRow);
+  }
+  for (const ledgerRow of sourceLedgerRows) {
+    add(ledgerRow.sheetName, ledgerRow.cell, ledgerRow.fiscalPeriod, undefined, ledgerRow);
+  }
+  return rows;
+}
+
+function llmWorkbookCellValue(cell: ExcelJS.Cell): number | string | null {
+  const numeric = numericCellValue(cell);
+  if (numeric !== null) return numeric;
+  const display = cellDisplay(cell).trim();
+  return display || null;
+}
+
+function llmWorkbenchAuditRows(auditRows: MappingAuditRow[]): LlmWorkbenchAuditRow[] {
+  return auditRows.map((row) => ({
+    period: row.period,
+    cell: `${row.sheetName}!${row.cell}`,
+    modelRowLabel: row.modelRowLabel,
+    valueWritten: row.valueWritten,
+    mappingType: row.mappingType,
+    validationStatus: row.validationStatus,
+    conceptsUsed: reviewText(row.conceptsUsed, 800),
+    secLabels: reviewText(row.finalSourceLineItems || row.secLabels || "", 500),
+    sourceStatement: row.sourceStatement,
+    confidence: row.confidence,
+    notes: reviewText(row.classificationReasons || row.notes || row.writeBlockedReason || row.formulaStatus || "", 700)
+  }));
+}
+
+function llmWorkbenchSourceLedgerRows(rows: HistoricalSourceLedgerRow[]): LlmWorkbenchSourceLedgerRow[] {
+  return rows.map((row) => ({
+    period: row.fiscalPeriod,
+    cell: `${row.sheetName}!${row.cell}`,
+    modelRow: row.modelRow,
+    value: row.value,
+    sourceLineItemLabel: reviewText(row.sourceLineItemLabel, 500),
+    sourceXbrlTag: row.sourceXbrlTag,
+    mappingStatus: row.mappingStatus,
+    sourceStatement: row.sourceStatement,
+    sourceTableType: row.sourceTableType,
+    classificationReason: reviewText(row.classificationReason, 700)
+  }));
+}
+
+function llmWorkbenchBalanceAssignments(rows: PrimaryBalanceSheetAssignmentLedgerRow[]): LlmWorkbenchBalanceAssignment[] {
+  return rows.map((row) => ({
+    period: row.fiscalPeriod,
+    sourceLineItemLabel: reviewText(row.sourceLineItemLabel, 500),
+    sourceXbrlTag: row.sourceXbrlTag,
+    amount: row.amount,
+    amountMillions: roundModelValue(row.amount / 1_000_000),
+    assignedModelRow: row.assignedModelRow,
+    assignmentStatus: row.assignmentStatus,
+    classificationReason: reviewText(row.classificationReason, 700),
+    validationStatus: row.validationStatus,
+    side: row.side,
+    sourceSection: row.sourceSection
+  }));
+}
+
+function positiveLimit(value: number, fallback: number) {
+  return Number.isFinite(value) && value > 0 ? value : fallback;
 }
 
 function llmMappingReviewJsonSchema() {
@@ -12711,6 +12968,7 @@ async function requestLlmMappingDecision(
 
   const system = [
     "You map financial model rows to SEC EDGAR XBRL facts.",
+    "You have MCP-style tool outputs in the payload. Use sec.get_candidate_facts for available EDGAR facts, sec.get_relevant_statement_rows for statement context, and workbook.inspect_model_row for template context.",
     "Use only the provided candidate concepts. Do not invent concepts or values.",
     "Classify the source line item using the reported label, statement, section context, current/non-current status, operating/non-operating location, and whether it is a subtotal or component.",
     "Use Other buckets only when no more dedicated model row exists for the source line item.",
@@ -12784,8 +13042,78 @@ function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: str
     },
     periods,
     candidates,
+    llmTools: [
+      {
+        name: "sec.get_candidate_facts",
+        output: { candidates }
+      },
+      {
+        name: "sec.get_relevant_statement_rows",
+        output: { rows: llmRelevantStatementRows(fillRow, periods, ctx) }
+      },
+      {
+        name: "workbook.inspect_model_row",
+        output: {
+          label: fillRow.label,
+          statement: fillRow.statement,
+          kind: fillRow.kind,
+          sectionHeader: fillRow.modelContext?.sectionHeader ?? "",
+          previousLabel: fillRow.modelContext?.previousLabel ?? "",
+          nextLabel: fillRow.modelContext?.nextLabel ?? "",
+          subtotalFormula: fillRow.modelContext?.subtotalFormula ?? "",
+          signConvention: fillRow.modelContext?.signConvention ?? fillRow.sign ?? 1
+        }
+      }
+    ],
     filingCommentary: llmFilingCommentaryEvidence(fillRow, periods, ctx)
   };
+}
+
+function llmRelevantStatementRows(fillRow: FillRow, periods: string[], ctx: ResolveContext) {
+  const wantedPeriods = new Set(unique(periods.flatMap((period) => [period, balanceSheetInstantLookupPeriod(period)])));
+  const wantedStatement = fillRow.statement === "balance" ? "balance_sheet" : fillRow.statement === "income" ? "income_statement" : null;
+  const rowTokens = significantTokens(
+    [fillRow.label, fillRow.modelContext?.sectionHeader, fillRow.modelContext?.previousLabel, fillRow.modelContext?.nextLabel].join(" ")
+  );
+  return (ctx.filingPackageStatements ?? [])
+    .flatMap((statement) => {
+      const statementName = financialStatementNameForSecStatement(statement);
+      if (wantedStatement && statementName !== wantedStatement) return [];
+      return statement.rows.map((row) => ({ statement, statementName, row }));
+    })
+    .map(({ statement, statementName, row }) => {
+      const period = statementRowPeriodKey(row, ctx) || row.reportingPeriod || statement.reportingPeriod || "";
+      const tokens = significantTokens(`${row.rowLabel} ${row.xbrlConcept ?? ""} ${statement.statementName}`);
+      let score = wantedPeriods.has(period) || wantedPeriods.has(balanceSheetInstantLookupPeriod(period)) ? 2 : 0;
+      rowTokens.forEach((token) => {
+        if (tokens.has(token)) score += token.length >= 6 ? 3 : 1;
+      });
+      if (statement.sourceTableType === "primary_statement") score += 2;
+      return { statement, statementName, row, period, score };
+    })
+    .filter(({ score }) => score >= 3)
+    .sort((a, b) => b.score - a.score || periodSortForLlmEvidence(a.period, b.period) || a.row.rowOrder - b.row.rowOrder)
+    .slice(0, 60)
+    .map(({ statement, statementName, row, period, score }) => ({
+      period,
+      score,
+      statementName: statement.statementName,
+      sourceTableType: statement.sourceTableType,
+      rowLabel: row.rowLabel,
+      xbrlConcept: row.xbrlConcept ?? "",
+      value: typeof row.value === "number" ? roundModelValue(row.value / 1_000_000) : row.value,
+      unit: row.unit ?? "",
+      section: statementName ? statementSectionForRow(statement, row, statementName) : "",
+      accession: row.accession || statement.accession,
+      form: statement.form ?? "",
+      currentNonCurrentSection: row.currentNonCurrentSection ?? "",
+      dimensions: row.dimensions.map((dimension) => `${dimension.dimension}=${dimension.member || dimension.typedValue || ""}`).slice(0, 6)
+    }));
+}
+
+function periodSortForLlmEvidence(a: string, b: string) {
+  if (!isSupportedPeriodKey(a) || !isSupportedPeriodKey(b)) return String(a).localeCompare(String(b));
+  return comparePeriods(a, b);
 }
 
 function llmFilingCommentaryEvidence(fillRow: FillRow, periods: string[], ctx: ResolveContext) {
