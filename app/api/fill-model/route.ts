@@ -44,6 +44,15 @@ import {
   type FinancialStatementSection
 } from "./financial-line-item-classifier";
 import { cikFromAccession, normalizeAccession, normalizeAccessionList, normalizeCik } from "./sec-accession";
+import {
+  checkModelTemplateCompatibility,
+  classifyCompanyModelTypeFromSecSignals,
+  classifyModelTypeFromGoldReference,
+  classifyWorkbookModelType,
+  findVerifiedGoldModelForCompany,
+  scanConfiguredGoldModelLibrary,
+  type CompanyModelTypeSignals
+} from "./gold-model-library";
 
 export const runtime = "nodejs";
 export const maxDuration = 900;
@@ -6036,6 +6045,26 @@ function hasAnyConcept(ctx: ResolveContext, kind: "duration" | "instant", concep
   return Array.from(source.values()).some((facts) => concepts.some((concept) => facts.has(concept)));
 }
 
+function companyModelTypeSignals(company: CompanyMatch, ctx: ResolveContext, bulkSupport: SecBulkSupport): CompanyModelTypeSignals {
+  const conceptNames = new Set<string>();
+  const labels = new Set<string>();
+  for (const periodFacts of [...ctx.duration.values(), ...ctx.instant.values()]) {
+    for (const source of periodFacts.values()) {
+      if (source.concept) conceptNames.add(source.concept);
+      if (source.label) labels.add(source.label);
+    }
+  }
+  return {
+    companyName: company.title,
+    ticker: company.ticker,
+    cik: company.cik,
+    sic: bulkSupport.submissions?.sic ?? null,
+    sicDescription: bulkSupport.submissions?.sicDescription ?? null,
+    conceptNames: Array.from(conceptNames),
+    labels: Array.from(labels)
+  };
+}
+
 function buildNormalizedHistoricalsPackage(
   company: CompanyMatch,
   profile: TemplateProfile,
@@ -6232,6 +6261,7 @@ export async function POST(request: NextRequest) {
     removeExternalWorkbookDefinedNames(workbook);
     removeGeneratedMetadataSheets(workbook);
     const coverWarnings: string[] = [];
+    const preflightWarnings: string[] = [];
     await updateCoverCompanyMetadata(workbook, company, ctx, coverWarnings);
 
     const sheet = primaryFinancialWorksheet(workbook);
@@ -6309,6 +6339,20 @@ export async function POST(request: NextRequest) {
     const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
     const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods, bulkSupport, fiscalPeriods) : [];
     const profile = detectTemplateProfile(workbook, sheet, ctx);
+    const goldLibrary = await scanConfiguredGoldModelLibrary().catch((error) => {
+      preflightWarnings.push(`Gold-model library scan was skipped: ${error instanceof Error ? error.message : String(error)}.`);
+      return null;
+    });
+    if (goldLibrary) preflightWarnings.push(...goldLibrary.warnings);
+    const goldReference = goldLibrary ? findVerifiedGoldModelForCompany(goldLibrary, company) : null;
+    const companyModelType = goldReference
+      ? classifyModelTypeFromGoldReference(goldReference)
+      : classifyCompanyModelTypeFromSecSignals(companyModelTypeSignals(company, ctx, bulkSupport));
+    const templateModelType = classifyWorkbookModelType(workbook, profile.kind);
+    const compatibility = checkModelTemplateCompatibility(companyModelType, templateModelType);
+    if (!compatibility.compatible) {
+      return jsonError(compatibility.message || "The uploaded workbook template is not compatible with this company model type.", 422);
+    }
     const normalizedPackage = buildNormalizedHistoricalsPackage(company, profile, periods, ctx, segmentRevenue);
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
@@ -6320,6 +6364,7 @@ export async function POST(request: NextRequest) {
     let filledCells = 0;
     let commentsAdded = 0;
     warnings.push(...coverWarnings);
+    warnings.push(...preflightWarnings);
     warnings.push(...bulkSupport.warnings);
     warnings.push(...filingPackageSupport.warnings);
     warnings.push(...missingReportedFilingPeriodWarnings(sheet, ctx));
@@ -6499,7 +6544,9 @@ export async function POST(request: NextRequest) {
     if (isStandardModelSheet) refreshDividendCachedResults(sheet, periods, columns);
 
     if (segmentSheet) {
-      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows);
+      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows, {
+        preserveExistingLabels: profile.kind === "financial_company"
+      });
       filledCells += segmentResult.filledCells;
       commentsAdded += segmentResult.commentsAdded;
       warnings.push(...segmentResult.warnings);
@@ -6646,7 +6693,9 @@ export async function POST(request: NextRequest) {
       formulaCacheColumns,
       auditRows,
       fillRows,
-      isStandardModelSheet
+      isStandardModelSheet,
+      reportedPeriodPairs,
+      actualizedForecastColumns: Array.from(actualizedForecastPeriodColumnsBySheet.get(sheet) ?? [])
     };
     const validationResult = validateWorkbookWithAutomaticRetries(validationOptions);
     filledCells += validationResult.filledCells;
@@ -6679,6 +6728,16 @@ export async function POST(request: NextRequest) {
         ticker: company.ticker,
         templateProfile: profile.kind,
         templateProfileConfidence: profile.confidence,
+        companyModelType: companyModelType.modelType,
+        companyModelTypeSource: companyModelType.source,
+        templateModelType: templateModelType.modelType,
+        templateModelTypeSource: templateModelType.source,
+        goldModelReference: goldReference
+          ? {
+              fileName: goldReference.fileName,
+              modelType: goldReference.modelType
+            }
+          : null,
         secBulkLatestRefreshAt: bulkSupport.latestRefreshAt ?? null,
         periods,
         filledCells,
@@ -6736,6 +6795,7 @@ function fallbackCompanyMatch(query: string): CompanyMatch | null {
     { cik: "0000063908", ticker: "MCD", title: "McDonald's Corporation" },
     { cik: "0001018724", ticker: "AMZN", title: "Amazon.com, Inc." },
     { cik: "0000004962", ticker: "AXP", title: "American Express Company" },
+    { cik: "0001084580", ticker: "JEF", title: "Jefferies Financial Group Inc." },
     { cik: "0001065280", ticker: "NFLX", title: "Netflix, Inc." },
     { cik: "0000310764", ticker: "SYK", title: "Stryker Corporation" }
   ];
@@ -8679,11 +8739,15 @@ const actualizedForecastPeriodColumnsBySheet = new WeakMap<ExcelJS.Worksheet, Se
 const latestReportedPeriodBySheet = new WeakMap<ExcelJS.Worksheet, string>();
 const balanceSheetRowsBySheet = new WeakMap<ExcelJS.Worksheet, Set<number>>();
 
-function markReportedPeriodColumns(sheet: ExcelJS.Worksheet, pairs: Array<{ period: string; col: number }>) {
+function markReportedPeriodColumns(
+  sheet: ExcelJS.Worksheet,
+  pairs: Array<{ period: string; col: number }>,
+  options: { actualizedForecastColumns?: number[] } = {}
+) {
   const reportedColumns = new Set(pairs.map((pair) => pair.col));
   const headerInfos = bestPeriodHeaderRow(sheet)?.infos ?? [];
   const headerByColumn = new Map(headerInfos.map((info) => [info.col, info]));
-  const actualizedForecastColumns = new Set<number>();
+  const actualizedForecastColumns = new Set<number>(options.actualizedForecastColumns ?? []);
   for (const pair of pairs) {
     const info = headerByColumn.get(pair.col);
     if (info?.isEstimate) actualizedForecastColumns.add(pair.col);
@@ -9367,11 +9431,13 @@ function fillSegmentAnalysis(
   columns: number[],
   segments: SegmentRevenue[],
   ctx: ResolveContext,
-  auditRows: MappingAuditRow[]
+  auditRows: MappingAuditRow[],
+  options: { preserveExistingLabels?: boolean } = {}
 ) {
   const warnings: string[] = [];
   let filledCells = 0;
   let commentsAdded = 0;
+  const preserveExistingLabels = options.preserveExistingLabels === true;
   const revenueConcepts = C.revenue;
   const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns).slice(0, 6);
   const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns).slice(0, 6);
@@ -9379,10 +9445,14 @@ function fillSegmentAnalysis(
   const selectedSegments = selectSegmentFamilyForTemplate(segments, periods, ctx, Math.max(rows.length, 1));
   const reconciledSegments = reconcileRevenueSegmentsToStatement(selectedSegments, periods, ctx, Math.max(rows.length, 1));
   const fallbackSegment = reconciledSegments.length ? null : reportedRevenueFallbackSegment(periods, ctx);
-  const usableSegments = reconciledSegments.length ? reconciledSegments : fallbackSegment ? [fallbackSegment] : [];
+  const usableSegments = reconciledSegments.length ? reconciledSegments : fallbackSegment && !preserveExistingLabels ? [fallbackSegment] : [];
 
   if (!usableSegments.length) {
-    warnings.push("No consolidated EDGAR revenue was available for Segment Analysis fallback; revenue detail rows were left blank.");
+    warnings.push(
+      fallbackSegment && preserveExistingLabels
+        ? "No disclosed revenue breakout table reliably reconciled to consolidated EDGAR revenue; existing Segment Analysis labels were preserved for review."
+        : "No consolidated EDGAR revenue was available for Segment Analysis fallback; revenue detail rows were left blank."
+    );
   } else if (!reconciledSegments.length) {
     warnings.push("No disclosed revenue breakout table reliably reconciled to consolidated EDGAR revenue; Segment Analysis used a Reported Revenue fallback.");
   }
@@ -9390,8 +9460,8 @@ function fillSegmentAnalysis(
   const revenueClearPairs = allHistoricalPeriodColumnPairs(sheet);
   const revenueResult = usableSegments.length
     ? fillSegmentMetricRows(sheet, periods, columns, rows, usableSegments, "values", "Revenue", auditRows, {
-        forceOrderedAssignment: true,
-        clearUnmatchedLabels: true
+        forceOrderedAssignment: !preserveExistingLabels,
+        clearUnmatchedLabels: !preserveExistingLabels
       })
     : clearSegmentMetricRows(
         sheet,
@@ -9400,7 +9470,7 @@ function fillSegmentAnalysis(
         rows,
         "Revenue",
         auditRows,
-        { clearLabels: true, clearReferencedBaseLabels: true }
+        { clearLabels: !preserveExistingLabels, clearReferencedBaseLabels: !preserveExistingLabels }
       );
   const operatingIncomeSegments = hasSegmentMetricData(usableSegments, "operatingIncome", periods)
     ? usableSegments
@@ -9411,19 +9481,19 @@ function fillSegmentAnalysis(
   const operatingIncomeResult = hasOperatingIncomeSegments
     ? fillSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, operatingIncomeSegments, "operatingIncome", "Operating Income", auditRows, {
         preserveLinkedBaseLabels: operatingIncomeSegments !== usableSegments,
-        clearUnmatchedLabels: true
+        clearUnmatchedLabels: !preserveExistingLabels
       })
     : clearSegmentMetricRows(sheet, periods, columns, operatingIncomeRows, "Operating Income", auditRows, {
-        clearLabels: true,
+        clearLabels: !preserveExistingLabels,
         clearReferencedBaseLabels: false
       });
   const depreciationResult = hasDepreciationSegments
     ? fillSegmentMetricRows(sheet, periods, columns, depreciationRows, depreciationSegments, "depreciationAmortization", "D&A", auditRows, {
         preserveLinkedBaseLabels: depreciationSegments !== usableSegments,
-        clearUnmatchedLabels: true
+        clearUnmatchedLabels: !preserveExistingLabels
       })
     : clearSegmentMetricRows(sheet, periods, columns, depreciationRows, "D&A", auditRows, {
-        clearLabels: true,
+        clearLabels: !preserveExistingLabels,
         clearReferencedBaseLabels: false
       });
   filledCells += revenueResult.filledCells + operatingIncomeResult.filledCells + depreciationResult.filledCells;
@@ -12872,6 +12942,8 @@ type WorkbookValidationRetryOptions = {
   auditRows: MappingAuditRow[];
   fillRows: FillRow[];
   isStandardModelSheet: boolean;
+  reportedPeriodPairs: Array<{ period: string; col: number }>;
+  actualizedForecastColumns: number[];
 };
 
 type ValidationRetryAttempt = {
@@ -16305,6 +16377,7 @@ function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firs
 function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
   const errors: string[] = [];
   for (const [address, expected] of snapshot.labels.entries()) {
+    if (snapshot.formulas.has(address)) continue;
     const cell = cellFromSnapshotAddress(workbook, address);
     if (!cell) continue;
     const actual = cellDisplay(cell);
@@ -17559,6 +17632,7 @@ async function validateReturnedWorkbookBuffer(output: Buffer<ArrayBuffer>, optio
   await returnedWorkbook.xlsx.load(output as unknown as ExcelJS.Buffer);
   const returnedSheet = returnedWorkbook.getWorksheet(options.modelSheetName) ?? returnedWorkbook.getWorksheet(MODEL_SHEET);
   if (!returnedSheet) return [`Returned workbook is missing the ${options.modelSheetName || MODEL_SHEET} sheet.`];
+  markReportedPeriodColumns(returnedSheet, options.reportedPeriodPairs, { actualizedForecastColumns: options.actualizedForecastColumns });
   const warnings: string[] = [];
   return runWorkbookReturnValidation({
     ...options,
@@ -17612,6 +17686,7 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
         if (!hasFormula(cell)) return;
         const formulaBefore = formulaForCell(cell);
         if (!formulaBefore) return;
+        if (isFormulaLabelColumnCell(cell)) return;
         if (hasFormulaResult(cell) && !formulaCanReturnText(formulaBefore) && !hasFormulaErrorResult(cell)) return;
         const result = evaluator.evaluateDisplayCell(cell);
         if (result === null) {
@@ -17626,6 +17701,10 @@ function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
       });
     });
   }
+}
+
+function isFormulaLabelColumnCell(cell: ExcelJS.Cell) {
+  return Number(cell.col) <= 5;
 }
 
 function formulaCanReturnText(formula: string): boolean {

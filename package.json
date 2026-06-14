@@ -36,6 +36,7 @@
     "test:lly-balance-sheet-classification": "node scripts/lly-balance-sheet-classification-check.js",
     "test:aal-classification-tightening": "node scripts/aal-classification-tightening-check.js",
     "test:audit-note-format": "node scripts/audit-note-format-check.js",
+    "test:gold-model-library": "node scripts/gold-model-library-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",
     "test:cvs-balance-sheet-anchor": "node scripts/cvs-balance-sheet-anchor-regression-check.js",
     "test:balance-sheet-conservation": "node scripts/balance-sheet-conservation-check.js",

@@ -1,0 +1,11 @@
+[
+  {
+    "ticker": "JEF",
+    "company_name": "Jefferies Financial Group Inc.",
+    "CIK": "0001084580",
+    "model_type": "financial_services_broker_dealer",
+    "file_path": "/Users/maxschmieder/Desktop/Jefferies Financial Group Inc. (JEF)_Valuation Workbook (10-Mar-2026) (1).xlsx",
+    "verified_by_user": true,
+    "notes": "Completed user-verified financial-services / broker-dealer model. Do not treat as a standard operating-company template."
+  }
+]
