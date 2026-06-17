@@ -31,7 +31,7 @@ import {
   uniqueByNormalizedLabel
 } from "./audit-notes";
 import {
-  classifyFinancialLineItem,
+  classifyFinancialStatementLineItems,
   classificationSourceKeys,
   lineItemNeedsClassification,
   modelRowDefinitionsForRows,
@@ -2280,26 +2280,30 @@ async function buildLineItemClassificationStore(
       .filter((rowItem) => rowItem.consolidated && !rowItem.dimensions.length)
       .filter((rowItem) => typeof rowItem.value === "number" && Number.isFinite(rowItem.value))
       .sort((a, b) => a.rowOrder - b.rowOrder);
-
+    const requestsByPeriod = new Map<string, FinancialLineItemClassificationRequest[]>();
     for (const rowItem of rows) {
       const period = statementRowPeriodKey(rowItem, ctx);
       if (period && wantedPeriods.size && !wantedPeriods.has(period) && !wantedPeriods.has(balanceSheetInstantLookupPeriod(period))) continue;
       const source = factSourceFromStatementRow(rowItem, period || rowItem.reportingPeriod || statement.reportingPeriod || "");
       if (!source) continue;
-      const deterministicCandidate = deterministicModelRowCandidateForSource(source, statementName, statementSectionForRow(statement, rowItem, statementName));
+      const section = statementSectionForRow(statement, rowItem, statementName);
+      const deterministicCandidate = deterministicModelRowCandidateForSource(source, statementName, section);
+      const fiscalPeriod = period || rowItem.reportingPeriod || statement.reportingPeriod || "";
       const request: FinancialLineItemClassificationRequest = {
         company: { name: company.title, ticker: company.ticker },
         filing: { accession: statement.accession, form: statement.form, filingDate: statement.filingDate },
-        fiscalPeriod: period || rowItem.reportingPeriod || statement.reportingPeriod || "",
+        fiscalPeriod,
         statement: statementName,
         sourceTableType: financialSourceTableType(statement, statementName),
+        sourceRowKey: statementLineItemSourceRowKey(statement, statementName, fiscalPeriod, rowItem),
+        rowOrder: rowItem.rowOrder,
         reportedLineItemLabel: rowItem.rowLabel,
         cleanLabel: cleanLineItemLabel(rowItem.rowLabel),
         xbrlTag: rowItem.xbrlConcept,
         amount: typeof rowItem.value === "number" ? rowItem.value : null,
         unit: rowItem.unit,
         periodType: rowItem.period.periodType === "instant" ? "instant" : "duration",
-        section: statementSectionForRow(statement, rowItem, statementName),
+        section,
         nearbyRows: nearbyStatementRows(rows, rowItem),
         parentSubtotal: rowItem.parentSubtotal
           ? { label: rowItem.parentSubtotal.label, concept: rowItem.parentSubtotal.concept }
@@ -2314,37 +2318,35 @@ async function buildLineItemClassificationStore(
         validationError: "",
         alreadyMappedRows
       };
-
-      if (!lineItemNeedsClassification(request)) continue;
-      const dedupeKey = [
-        normalizeAccession(statement.accession),
-        request.fiscalPeriod,
-        request.statement,
-        rowItem.rowOrder,
-        normalize(rowItem.rowLabel),
-        rowItem.xbrlConcept ?? ""
-      ].join("|");
+      const dedupeKey = statementLineItemDedupeKey(statement, request, rowItem);
       if (seen.has(dedupeKey)) continue;
       seen.add(dedupeKey);
+      const bucket = requestsByPeriod.get(fiscalPeriod) ?? [];
+      bucket.push(request);
+      requestsByPeriod.set(fiscalPeriod, bucket);
+    }
 
+    for (const requests of requestsByPeriod.values()) {
+      if (!requests.some((request) => lineItemNeedsClassification(request))) continue;
       const willUseLlm = state.enabled && state.calls < state.maxCalls && lineItemLlmCalls < maxLineItemLlmCalls;
-      if (willUseLlm) {
-        state.calls += 1;
-        lineItemLlmCalls += 1;
-      }
-      const classification = await classifyFinancialLineItem(request, {
+      const classificationResult = await classifyFinancialStatementLineItems(requests, {
         llm: {
           enabled: willUseLlm,
           apiKey: llmApiKey(),
           endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
-          model: chooseLineItemClassificationModel(request),
+          model: chooseStatementLineItemClassificationModel(requests),
           siteUrl: OPENROUTER_SITE_URL,
           appTitle: OPENROUTER_APP_TITLE,
           timeoutMs: lineItemLlmTimeoutMs
         }
       });
-      if (classification.warning) warnings.push(`${request.cleanLabel || request.reportedLineItemLabel}: ${classification.warning}`);
-      registerLineItemClassification(store, request, classification);
+      state.calls += classificationResult.llmCalls;
+      lineItemLlmCalls += classificationResult.llmCalls;
+      warnings.push(...classificationResult.warnings);
+      for (const { request, classification } of classificationResult.classifications) {
+        if (classification.warning) warnings.push(`${request.cleanLabel || request.reportedLineItemLabel}: ${classification.warning}`);
+        registerLineItemClassification(store, request, classification);
+      }
     }
   }
 
@@ -2446,9 +2448,45 @@ function sourceSectionLabelForClassification(source: FactSource, classification:
   return lineItemCategoryLabel(reportedLineItemCategory(source));
 }
 
-function chooseLineItemClassificationModel(request: FinancialLineItemClassificationRequest) {
-  const text = `${request.cleanLabel} ${request.xbrlTag ?? ""} ${request.section}`.toLowerCase();
-  if (/\bdeferred\b|\bdebt\b|\bnotes?\b|\bother\b|\bspecial\b|\bimpairment\b|\brestructuring\b|\binvestments?\b/.test(text)) {
+function statementLineItemSourceRowKey(
+  statement: SecFilingStatementStructure,
+  statementName: FinancialStatementName,
+  period: string,
+  row: SecFilingStatementStructure["rows"][number]
+) {
+  return [
+    normalizeAccession(statement.accession),
+    statementName,
+    period,
+    row.rowOrder,
+    row.xbrlConcept ?? "",
+    normalize(cleanLineItemLabel(row.rowLabel)),
+    typeof row.value === "number" && Number.isFinite(row.value) ? Math.round(row.value) : ""
+  ]
+    .filter((part) => part !== "")
+    .join("|");
+}
+
+function statementLineItemDedupeKey(
+  statement: SecFilingStatementStructure,
+  request: FinancialLineItemClassificationRequest,
+  row: SecFilingStatementStructure["rows"][number]
+) {
+  return [
+    normalizeAccession(statement.accession),
+    request.fiscalPeriod,
+    request.statement,
+    row.rowOrder,
+    normalize(row.rowLabel),
+    row.xbrlConcept ?? "",
+    typeof row.value === "number" && Number.isFinite(row.value) ? Math.round(row.value) : ""
+  ].join("|");
+}
+
+function chooseStatementLineItemClassificationModel(requests: FinancialLineItemClassificationRequest[]) {
+  const text = requests.map((request) => `${request.cleanLabel} ${request.xbrlTag ?? ""} ${request.section}`).join(" ").toLowerCase();
+  const targetCount = requests.filter((request) => lineItemNeedsClassification(request)).length;
+  if (targetCount > 1 || /\bdeferred\b|\bdebt\b|\bnotes?\b|\bother\b|\bspecial\b|\bimpairment\b|\brestructuring\b|\binvestments?\b/.test(text)) {
     return LLM_MAPPING_COMPLEX_MODEL;
   }
   return LLM_MAPPING_FAST_MODEL;

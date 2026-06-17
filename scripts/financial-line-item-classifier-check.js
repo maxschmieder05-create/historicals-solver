@@ -38,6 +38,7 @@ function loadTypeScriptModule(file) {
 const {
   MODEL_ROW_DEFINITIONS,
   classifyFinancialLineItem,
+  classifyFinancialStatementLineItems,
   modelRowDefinitionsForRows,
   modelRowsMatch,
   lineItemNeedsClassification
@@ -53,6 +54,8 @@ function request(overrides) {
     fiscalPeriod: "1Q26",
     statement: overrides.statement ?? "balance_sheet",
     sourceTableType: overrides.sourceTableType ?? "primary_statement",
+    sourceRowKey: overrides.sourceRowKey,
+    rowOrder: overrides.rowOrder,
     reportedLineItemLabel: overrides.label,
     cleanLabel: overrides.label,
     xbrlTag: overrides.xbrlTag,
@@ -172,6 +175,7 @@ async function classify(overrides) {
   assert.equal(specialItems.recommended_model_row, "Other Operating Income / Expense");
 
   assert.equal(lineItemNeedsClassification(request({ label: "Deferred income", section: "current liabilities" })), true);
+  assert.equal(lineItemNeedsClassification(request({ label: "Marketable securities", section: "current assets" })), true);
 
   const llmRequestedPayloads = [];
   const ambiguousLease = await classifyFinancialLineItem(
@@ -243,6 +247,128 @@ async function classify(overrides) {
   assert.equal(llmUserPayload.reportedLineItemLabel, "Other lease financing obligations");
   assert.equal(llmUserPayload.modelRowDefinitions["LT Debt (Incl. Current Portion)"].includes("Long-term debt instruments"), true);
   assert.equal(llmRequestedPayloads[0].response_format.json_schema.schema.properties.recommended_action.enum.includes("set_zero"), true);
+
+  const statementBatchPayloads = [];
+  const batchResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-cash",
+        rowOrder: 1,
+        label: "Cash and cash equivalents",
+        xbrlTag: "CashAndCashEquivalentsAtCarryingValue",
+        section: "current assets",
+        uncertaintyReason: ""
+      }),
+      request({
+        sourceRowKey: "row-investments",
+        rowOrder: 2,
+        label: "Short-term investments",
+        xbrlTag: "ShortTermInvestments",
+        section: "current assets",
+        deterministicCandidate: "Prepaid & Other Current Assets"
+      }),
+      request({
+        sourceRowKey: "row-lease-financing",
+        rowOrder: 12,
+        label: "Other lease financing obligations",
+        xbrlTag: "OtherLeaseFinancingObligations",
+        section: "non-current liabilities",
+        deterministicCandidate: "Other Non-Current Liabilities",
+        uncertaintyReason: "lease financing may represent debt or another long-term liability"
+      }),
+      request({
+        sourceRowKey: "row-notes-payable",
+        rowOrder: 13,
+        label: "Notes payable",
+        xbrlTag: "NotesPayableCurrent",
+        section: "current liabilities",
+        deterministicCandidate: "Other Current Liabilities",
+        uncertaintyReason: "notes payable could be current borrowings even if reported below other liabilities"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "test-model",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init.body);
+          statementBatchPayloads.push(body);
+          return {
+            ok: true,
+            json: async () => ({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-lease-financing",
+                          source_line_item: "Other lease financing obligations",
+                          recommended_action: "remap",
+                          recommended_model_row: "LT Debt (Incl. Current Portion)",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "debt-like financing obligation",
+                          is_current: false,
+                          is_debt: true,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Whole-statement context shows this is a financing obligation below operating liabilities.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        },
+                        {
+                          source_row_key: "row-notes-payable",
+                          source_line_item: "Notes payable",
+                          recommended_action: "remap",
+                          recommended_model_row: "Revolver",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "current borrowing facility",
+                          is_current: true,
+                          is_debt: true,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Notes payable current is a current borrowing source and belongs with Revolver/current borrowings.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            })
+          };
+        }
+      }
+    }
+  );
+  assert.equal(statementBatchPayloads.length, 1);
+  const statementPayload = JSON.parse(statementBatchPayloads[0].messages[1].content);
+  assert.deepEqual(statementPayload.targetSourceRowKeys, ["row-lease-financing", "row-notes-payable"]);
+  assert.equal(statementPayload.statementRows.length, 4);
+  assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-cash" && row.target === false), true);
+  assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-investments" && row.deterministicClassification), true);
+  assert.equal(statementBatchPayloads[0].response_format.json_schema.schema.properties.classifications.items.properties.source_row_key.type, "string");
+  assert.equal(batchResult.llmCalls, 1);
+  assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-investments").classification.recommended_model_row, "Cash & Cash Equivalents");
+  assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-notes-payable").classification.recommended_model_row, "Revolver");
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {
