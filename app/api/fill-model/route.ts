@@ -569,6 +569,10 @@ const LLM_WORKBENCH_MAX_WORKBOOK_CELLS = Number(process.env.LLM_WORKBENCH_MAX_WO
 const LLM_WORKBENCH_MAX_AUDIT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_AUDIT_ROWS || 500);
 const LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS = Number(process.env.LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS || 600);
 const LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS = Number(process.env.LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS || 500);
+// Stored XLSX entries are larger but avoid minutes of duplicate DEFLATE work during interactive downloads.
+const FAST_XLSX_ZIP_OPTIONS = {
+  compression: "STORE" as const
+};
 const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
   process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24, 3)
 );
@@ -901,6 +905,7 @@ const OTHER_COMMON_APIC_EQUITY_CONCEPTS = ["OtherAdditionalCapital"];
 const LIABILITIES_AND_EQUITY_CONCEPTS = ["LiabilitiesAndStockholdersEquity", ...C.assets];
 const PREFERRED_STOCK_EQUITY_CONCEPTS = ["PreferredStockValue", "PreferredStocksIncludingAdditionalPaidInCapital"];
 const EMPLOYEE_TRUST_CONTRA_EQUITY_CONCEPTS = ["CommonStockSharesHeldInEmployeeTrust"];
+const REDEEMABLE_NCI_CONCEPTS = ["RedeemableNoncontrollingInterestEquityCarryingAmount"];
 
 const BROKER_DEALER_RECEIVABLES = [
   "ReceivablesFromBrokersDealersAndClearingOrganizations",
@@ -1524,7 +1529,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (has("Treasury & Preferred Stock", "Preferred Stock")) return plug(rowNumber, label, "balance", "instant", resolveTreasuryAndPreferredStock);
   if (has("Treasury Stock")) return plug(rowNumber, label, "balance", "instant", resolveTreasuryStockOnly);
   if (has("Accumulated Other Comprehensive Income (AOCI)", "AOCI")) return row(rowNumber, label, "balance", "instant", C.aoci);
-  if (has("Noncontrolling Interests", "Non-Controlling Interests")) return row(rowNumber, label, "balance", "instant", C.nci);
+  if (has("Noncontrolling Interests", "Non-Controlling Interests")) return plug(rowNumber, label, "balance", "instant", resolveNoncontrollingInterests);
 
   if (has("(Increase)/Decrease in Working Capital", "Increase / (Decrease) in Working Capital")) return row(rowNumber, label, "support", "duration", C.workingCapital);
   if (has("(Increase)/Decrease in LT Items", "Increase / (Decrease) in LT Items")) return row(rowNumber, label, "support", "duration", C.longTermItems);
@@ -2761,8 +2766,19 @@ function sourceLooksLikeDeferredTaxLiability(source: FactSource) {
   return C.deferredTaxLiability.includes(source.concept) || sourceTextMatches(source, /\bdeferred (income )?tax(?:es)?\b.*\bliabilit|\bdeferred tax liabilities?\b/);
 }
 
+function sourceLooksLikeMixedDeferredTaxAndOtherLiability(source: FactSource) {
+  return sourceTextMatches(source, /\bdeferred (income )?tax(?:es)?\b.*\band other\b|\bdeferred tax(?:es)?\b.*\band other\b/);
+}
+
 function sourceLooksLikeNonCurrentLeaseLiability(source: FactSource) {
-  return NONCURRENT_LEASE_LIABILITY_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\blong[-\s]?term\b.*\blease liabilit|\bnoncurrent\b.*\blease liabilit|\blease liabilit.*\bnoncurrent\b/);
+  return (
+    NONCURRENT_LEASE_LIABILITY_CONCEPTS.includes(source.concept) ||
+    sourceTextMatches(source, /\blong[-\s]?term\b.*\blease (?:liabilit|obligations?)|\bnoncurrent\b.*\blease (?:liabilit|obligations?)|\blease (?:liabilit|obligations?).*\bnoncurrent\b/)
+  );
+}
+
+function sourceLooksLikeRedeemableNoncontrollingInterest(source: FactSource) {
+  return REDEEMABLE_NCI_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\bredeemable\b.*\bnon[-\s]?controlling interest|\bnon[-\s]?controlling interest\b.*\bredeemable\b/);
 }
 
 function sourceLooksLikePensionLiability(source: FactSource) {
@@ -2912,16 +2928,17 @@ function primaryAccountsPayableSources(period: string, ctx: ResolveContext) {
 function primaryOtherCurrentLiabilitySources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
     if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    const currentLeaseLiability = sourceLooksLikeCurrentLeaseLiability(source);
     const inCurrentLiabilitySection = primaryRowInCurrentLiabilitySection(row, source);
     const hasNoDedicatedCurrentLiabilityRow =
       inCurrentLiabilitySection &&
       !sourceLooksLikeAccountsPayable(source) &&
-      !sourceLooksLikeCurrentDebtLine(source) &&
+      (currentLeaseLiability || !sourceLooksLikeCurrentDebtLine(source)) &&
       !sourceLooksLikeAccruedOperatingLiability(source);
     return (
-      (hasNoDedicatedCurrentLiabilityRow || sourceLooksLikeOtherCurrentLiability(source) || sourceLooksLikeCurrentLeaseLiability(source)) &&
+      (hasNoDedicatedCurrentLiabilityRow || sourceLooksLikeOtherCurrentLiability(source) || currentLeaseLiability) &&
       !sourceLooksLikeAccountsPayable(source) &&
-      !sourceLooksLikeCurrentDebtLine(source) &&
+      (currentLeaseLiability || !sourceLooksLikeCurrentDebtLine(source)) &&
       !sourceLooksLikeAccruedOperatingLiability(source)
     );
   });
@@ -2939,6 +2956,7 @@ function primaryShortTermBorrowingSources(period: string, ctx: ResolveContext) {
 function primaryCurrentDebtMaturitySources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
     if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInCurrentLiabilitySection(row, source)) return false;
+    if (sourceLooksLikeCurrentLeaseLiability(source)) return false;
     return sourceLooksLikeCurrentDebtMaturity(source);
   });
   return withAcceptedModelRowClassifications(period, ctx, sources, "LT Debt (Incl. Current Portion)");
@@ -2946,13 +2964,14 @@ function primaryCurrentDebtMaturitySources(period: string, ctx: ResolveContext) 
 
 function primaryOtherNonCurrentLiabilitySources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    const nonCurrentLeaseLiability = sourceLooksLikeNonCurrentLeaseLiability(source);
     const semanticOtherNonCurrentLiability = sourceTextMatches(
       source,
       /\blong[-\s]?term operating lease liabilit|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
-    );
+    ) || nonCurrentLeaseLiability || sourceLooksLikeMixedDeferredTaxAndOtherLiability(source);
     if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInNonCurrentLiabilitySection(row, source) && !semanticOtherNonCurrentLiability)) return false;
-    if (sourceLooksLikeNonCurrentDebt(source)) return false;
-    if (ctx.template?.hasDeferredTaxLiabilityRow && sourceLooksLikeDeferredTaxLiability(source)) return false;
+    if (sourceLooksLikeNonCurrentDebt(source) && !nonCurrentLeaseLiability) return false;
+    if (ctx.template?.hasDeferredTaxLiabilityRow && sourceLooksLikeDeferredTaxLiability(source) && !sourceLooksLikeMixedDeferredTaxAndOtherLiability(source)) return false;
     if (ctx.template?.hasNonCurrentLeaseLiabilityRow && sourceLooksLikeNonCurrentLeaseLiability(source)) return false;
     if (ctx.template?.hasPensionLiabilityRow && sourceLooksLikePensionLiability(source)) return false;
     return true;
@@ -4841,7 +4860,12 @@ function sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(source: 
 
 function sourceLooksLikeCurrentDebtMaturity(source: FactSource) {
   const text = `${source.label} ${source.concept}`.toLowerCase();
-  return /current portion|current maturit|long[-\s]?term debt.*current|current.*long[-\s]?term debt|debt due within one year|finance lease|capital lease/.test(text);
+  if (/\b(?:finance|capital) lease\b/.test(text)) {
+    const compact = text.replace(/[^a-z0-9]/g, "");
+    if (/noncurrent|longterm/.test(compact)) return false;
+    return /\bcurrent\b|due within one year|within one year|current portion|current maturit|financeleaseliabilitycurrent|capitalleaseobligationscurrent/.test(text);
+  }
+  return /current portion|current maturit|long[-\s]?term debt.*current|current.*long[-\s]?term debt|debt due within one year/.test(text);
 }
 
 function genericCurrentDebtBelongsInCurrentMaturities(source: FactSource, standaloneShortTermBorrowings: FactSource | null, ctx: ResolveContext) {
@@ -5961,8 +5985,8 @@ function resolveAoci(period: string, ctx: ResolveContext): ResolvedValue {
 }
 
 function resolveNoncontrollingInterests(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = first(period, ctx.instant, C.nci);
-  return direct ? { value: direct.value, sources: [direct] } : { value: 0, sources: [zeroSource(C.nci[0])] };
+  const nonredeemable = first(period, ctx.instant, C.nci);
+  return nonredeemable ? { value: nonredeemable.value, sources: [nonredeemable] } : { value: 0, sources: [zeroSource(C.nci[0])] };
 }
 
 function primaryFinancialWorksheet(workbook: ExcelJS.Workbook) {
@@ -6365,6 +6389,17 @@ function normalizedMetricKeyForFillRow(fillRow: FillRow, profile: TemplateProfil
   return null;
 }
 
+function createFillTiming(query: string) {
+  if (process.env.FILL_MODEL_TIMING !== "1") return () => {};
+  const startedAt = Date.now();
+  let lastAt = startedAt;
+  return (stage: string) => {
+    const now = Date.now();
+    console.error(`[fill-model timing] ${query || "unknown"} ${stage}: +${now - lastAt}ms total=${now - startedAt}ms`);
+    lastAt = now;
+  };
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData();
@@ -6374,6 +6409,8 @@ export async function POST(request: NextRequest) {
     if (!query) return jsonError("Enter a ticker or company name.", 400);
     if (!(file instanceof File)) return jsonError("Upload an .xlsx workbook.", 400);
 
+    const timing = createFillTiming(query);
+    timing("request parsed");
     const company = await findCompany(query);
     const bulkSupport = await loadSecBulkSupport(company.cik, SEC_HEADERS);
     const filingMetadata = await fetchFilingMetadata(company, bulkSupport);
@@ -6396,6 +6433,7 @@ export async function POST(request: NextRequest) {
         })
       );
     }
+    timing("SEC facts/context loaded");
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Historicals Solver";
@@ -6414,6 +6452,7 @@ export async function POST(request: NextRequest) {
     const isStandardModelSheet = sheet.name === MODEL_SHEET;
     let columns = blueColumns(sheet);
     if (!columns.length) return jsonError(`Could not find blue historical input cells in the "${sheet.name}" worksheet.`, 400);
+    timing("workbook loaded and primary worksheet detected");
 
     let periodInfos = templatePeriodInfos(sheet, columns);
     let periods: string[];
@@ -6473,6 +6512,7 @@ export async function POST(request: NextRequest) {
       SEC_HEADERS
     );
     ctx.filingPackageStatements = filingPackageSupport.statements;
+    timing("periods and filing package loaded");
     markReportedPeriodColumns(sheet, reportedPeriodPairs);
     normalizeReportedPeriodHeaderLabels(sheet, reportedPeriodPairs);
     normalizeSharedFormulas(workbook);
@@ -6502,6 +6542,7 @@ export async function POST(request: NextRequest) {
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
     if (!fillRows.length) return jsonError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
     ctx.template = buildLiabilityTemplateMappingContext(templateMappingRows(sheet, fillRows));
+    timing("template classified and fill rows discovered");
 
     const warnings: string[] = [];
     const auditRows: MappingAuditRow[] = [];
@@ -6537,6 +6578,7 @@ export async function POST(request: NextRequest) {
     );
     ctx.lineItemClassifications = lineItemClassificationResult.store;
     warnings.push(...lineItemClassificationResult.warnings);
+    timing("line item classifications built");
 
     const cleanupResult = cleanStaleProtectedHistoricalRows(sheet, fillRows, periods, columns, ctx, auditRows);
     filledCells += cleanupResult.clearedCells;
@@ -6671,6 +6713,7 @@ export async function POST(request: NextRequest) {
       }
     }
     warnings.push(...llmState.warnings);
+    timing("base fill rows mapped");
 
     const actualizedBalanceResult = writeActualizedForecastBalanceSheetValues(
       company,
@@ -6820,6 +6863,7 @@ export async function POST(request: NextRequest) {
     filledCells += postTaxEquityBridgeResult.filledCells;
     warnings.push(...postTaxEquityBridgeResult.warnings);
     refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
+    timing("reconciliations complete");
 
     const validationOptions: WorkbookValidationRetryOptions = {
       workbook,
@@ -6848,12 +6892,14 @@ export async function POST(request: NextRequest) {
     if (validationResult.errors.length) {
       return jsonError(validationFailureResponseMessage(validationResult.errors, validationResult.attempts), 422);
     }
+    timing("workbook validation complete");
 
     const sourceLedgerRows = buildHistoricalSourceLedgerRows(company, modelPeriodMap.entries, sheet, fillRows, reportedPeriodPairs, auditRows);
     const sourceLedgerErrors = await validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries, company, filingMetadata);
     if (sourceLedgerErrors.length) {
       return jsonError(`Source-backed historical validation failed: ${sourceLedgerErrors.slice(0, 6).join(" | ")}`, 422);
     }
+    timing("source ledger validation complete");
 
     const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
     const llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
@@ -6874,6 +6920,7 @@ export async function POST(request: NextRequest) {
     if (llmMappingReview.blockingErrors.length) {
       return jsonError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422);
     }
+    timing("LLM mapping review complete");
 
     addFilingPeriodMapSheet(workbook, modelPeriodMap.entries);
     addMappingAuditSheet(workbook, auditRows);
@@ -6881,11 +6928,24 @@ export async function POST(request: NextRequest) {
     addBalanceSheetAssignmentLedgerSheet(workbook, balanceSheetAssignmentLedgerRows);
     addLlmMappingReviewSheet(workbook, llmMappingReview.rows);
 
-    const output = await writeWorkbookBufferWithRecalculation(workbook);
+    const recalculationSheetNames = unique([
+      sheet.name,
+      MODEL_SHEET,
+      SEGMENT_SHEET,
+      "Filing Period Map",
+      MAPPING_AUDIT_SHEET,
+      SOURCE_LEDGER_SHEET,
+      BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET,
+      LLM_MAPPING_REVIEW_SHEET
+    ]);
+    timing("audit sheets added; writing workbook");
+    const output = await writeWorkbookBufferWithRecalculation(workbook, recalculationSheetNames);
+    timing("workbook buffer written");
     const returnedWorkbookErrors = await validateReturnedWorkbookBuffer(output, validationOptions);
     if (returnedWorkbookErrors.length) {
       return jsonError(`Returned workbook validation failed: ${returnedWorkbookErrors.slice(0, 6).join(" | ")}`, 422);
     }
+    timing("returned workbook validated");
     const outputName = `${company.ticker}_historicals_filled.xlsx`;
     const summary = encodeURIComponent(
       JSON.stringify({
@@ -16051,7 +16111,8 @@ function primaryBalanceSheetAssignmentSideForModelRow(modelRow: string | null): 
     modelRowsMatch(modelRow, "Retained Earnings") ||
     modelRowsMatch(modelRow, "Treasury Stock") ||
     modelRowsMatch(modelRow, "Accumulated Other Comprehensive Income (AOCI)") ||
-    modelRowsMatch(modelRow, "Noncontrolling Interests")
+    modelRowsMatch(modelRow, "Noncontrolling Interests") ||
+    modelRowsMatch(modelRow, "Mezzanine Equity")
   ) {
     return "liabilities_and_equity";
   }
@@ -16127,6 +16188,16 @@ function assignPrimaryBalanceSheetLineItem(
   if (C.aoci.includes(source.concept) || sourceTextMatches(source, /\baccumulated other comprehensive\b|\baoci\b/)) {
     return choose("Accumulated Other Comprehensive Income (AOCI)", ["Accumulated Other Comprehensive Income", "AOCI"], "AOCI maps to accumulated other comprehensive income.");
   }
+  if (sourceLooksLikeRedeemableNoncontrollingInterest(source) && ctx.template?.hasMezzanineEquityRow) {
+    return choose("Mezzanine Equity", ["Redeemable Noncontrolling Interests", "Redeemable NCI"], "Redeemable noncontrolling interests map to mezzanine equity when the template exposes that row.");
+  }
+  if (sourceLooksLikeRedeemableNoncontrollingInterest(source)) {
+    return {
+      modelRow: null,
+      status: "explicitly_excluded_with_reason",
+      reason: "Redeemable noncontrolling interests are mezzanine equity outside stockholders' equity, and the template has no mezzanine-equity row."
+    };
+  }
   if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
     return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
   }
@@ -16140,7 +16211,11 @@ function assignPrimaryBalanceSheetLineItem(
     return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E maps directly to the PP&E row.");
   }
   if (sourceLooksLikeOperatingLeaseRightOfUseAsset(source)) {
-    return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "Operating lease right-of-use assets are grouped with PP&E when the template has no dedicated lease asset row.");
+    return chooseOther(
+      "Other Non-Current Assets",
+      ["Other Long-Term Assets", "Other LT Assets", "Other Assets and Loans"],
+      "Lease right-of-use assets are grouped into other non-current assets when the template has no dedicated lease asset row."
+    );
   }
   if (sourceLooksLikeIntangibleAsset(source)) {
     return choose("Intangible Assets, Net", ["Intangibles, Net"], "Intangible asset lines, including trademarks, map to intangible assets.");
@@ -16179,6 +16254,13 @@ function assignPrimaryBalanceSheetLineItem(
   if (sourceLooksLikeAccountsPayable(source)) {
     return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
   }
+  if (sourceLooksLikeCurrentLeaseLiability(source)) {
+    return chooseOther(
+      "Other Current Liabilities",
+      ["Other Current Liabs"],
+      "Current lease liabilities are grouped into other current liabilities when the template has no dedicated current lease row."
+    );
+  }
   if (sourceLooksLikeCurrentDebtMaturity(source)) {
     return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Current maturities/current portion of long-term debt are grouped into LT Debt including current portion.");
   }
@@ -16202,8 +16284,24 @@ function assignPrimaryBalanceSheetLineItem(
   if (sourceLooksLikeAccruedOperatingLiability(source)) {
     return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
   }
+  if (sourceLooksLikeMixedDeferredTaxAndOtherLiability(source)) {
+    return chooseOther(
+      "Other Non-Current Liabilities",
+      ["Other Long-Term Liabilities", "Other LT Liabilities"],
+      "Combined deferred tax and other liability lines are grouped into other non-current liabilities unless the filing provides a clean deferred-tax-only balance."
+    );
+  }
   if (sourceLooksLikeDeferredTaxLiability(source)) {
     return choose("Deferred Income Taxes", ["Deferred Tax Liabilities", "Deferred Taxes"], "Deferred tax liabilities map to deferred income taxes.");
+  }
+  if (sourceLooksLikeNonCurrentLeaseLiability(source)) {
+    const leaseRow = availableBalanceSheetModelRow(fillRows, "Lease Liabilities", ["Operating Lease Liabilities", "Finance Lease Liabilities", "Lease Obligations"]);
+    if (leaseRow) return { modelRow: leaseRow, status: "mapped_to_model_row", reason: "Non-current lease liabilities map to the template's lease liability row." };
+    return chooseOther(
+      "Other Non-Current Liabilities",
+      ["Other Long-Term Liabilities", "Other LT Liabilities"],
+      "Non-current lease liabilities are grouped into other non-current liabilities when the template has no dedicated lease liability row."
+    );
   }
   if (sourceLooksLikeNonCurrentDebt(source)) {
     return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Long-term debt maps to LT Debt including current portion.");
@@ -16261,7 +16359,11 @@ function assignPrimaryBalanceSheetLineItem(
       return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E maps directly to the PP&E row.");
     }
     if (sourceLooksLikeOperatingLeaseRightOfUseAsset(source)) {
-      return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "Operating lease right-of-use assets are grouped with PP&E when the template has no dedicated lease asset row.");
+      return chooseOther(
+        "Other Non-Current Assets",
+        ["Other Long-Term Assets", "Other LT Assets", "Other Assets and Loans"],
+        "Lease right-of-use assets are grouped into other non-current assets when the template has no dedicated lease asset row."
+      );
     }
     if (sourceLooksLikeIntangibleAsset(source)) {
       return choose("Intangible Assets, Net", ["Intangibles, Net"], "Intangible asset lines, including trademarks, map to intangible assets.");
@@ -16283,6 +16385,13 @@ function assignPrimaryBalanceSheetLineItem(
   if (section === "current liabilities" || primaryRowInCurrentLiabilitySection(row, source)) {
     if (sourceLooksLikeAccountsPayable(source)) {
       return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
+    }
+    if (sourceLooksLikeCurrentLeaseLiability(source)) {
+      return chooseOther(
+        "Other Current Liabilities",
+        ["Other Current Liabs"],
+        "Current lease liabilities are grouped into other current liabilities when the template has no dedicated current lease row."
+      );
     }
     if (sourceLooksLikeCurrentDebtMaturity(source)) {
       return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Current maturities/current portion of long-term debt are grouped into LT Debt including current portion.");
@@ -16315,8 +16424,24 @@ function assignPrimaryBalanceSheetLineItem(
   }
 
   if (section === "non-current liabilities" || primaryRowInNonCurrentLiabilitySection(row, source)) {
+    if (sourceLooksLikeNonCurrentLeaseLiability(source)) {
+      const leaseRow = availableBalanceSheetModelRow(fillRows, "Lease Liabilities", ["Operating Lease Liabilities", "Finance Lease Liabilities", "Lease Obligations"]);
+      if (leaseRow) return { modelRow: leaseRow, status: "mapped_to_model_row", reason: "Non-current lease liabilities map to the template's lease liability row." };
+      return chooseOther(
+        "Other Non-Current Liabilities",
+        ["Other Long-Term Liabilities", "Other LT Liabilities"],
+        "Non-current lease liabilities are grouped into other non-current liabilities when the template has no dedicated lease liability row."
+      );
+    }
     if (sourceLooksLikeNonCurrentDebt(source)) {
       return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Long-term debt maps to LT Debt including current portion.");
+    }
+    if (sourceLooksLikeMixedDeferredTaxAndOtherLiability(source)) {
+      return chooseOther(
+        "Other Non-Current Liabilities",
+        ["Other Long-Term Liabilities", "Other LT Liabilities"],
+        "Combined deferred tax and other liability lines are grouped into other non-current liabilities unless the filing provides a clean deferred-tax-only balance."
+      );
     }
     if (sourceLooksLikeDeferredTaxLiability(source)) {
       return choose("Deferred Income Taxes", ["Deferred Tax Liabilities", "Deferred Taxes"], "Deferred tax liabilities map to deferred income taxes.");
@@ -16348,6 +16473,16 @@ function assignPrimaryBalanceSheetLineItem(
     }
     if (C.aoci.includes(source.concept) || sourceTextMatches(source, /\baccumulated other comprehensive\b|\baoci\b/)) {
       return choose("Accumulated Other Comprehensive Income (AOCI)", ["Accumulated Other Comprehensive Income", "AOCI"], "AOCI maps to accumulated other comprehensive income.");
+    }
+    if (sourceLooksLikeRedeemableNoncontrollingInterest(source) && ctx.template?.hasMezzanineEquityRow) {
+      return choose("Mezzanine Equity", ["Redeemable Noncontrolling Interests", "Redeemable NCI"], "Redeemable noncontrolling interests map to mezzanine equity when the template exposes that row.");
+    }
+    if (sourceLooksLikeRedeemableNoncontrollingInterest(source)) {
+      return {
+        modelRow: null,
+        status: "explicitly_excluded_with_reason",
+        reason: "Redeemable noncontrolling interests are mezzanine equity outside stockholders' equity, and the template has no mezzanine-equity row."
+      };
     }
     if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
       return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
@@ -16535,7 +16670,9 @@ function latestPrimaryBalanceSheetAssignmentPeriod(periods: string[], ctx: Resol
 }
 
 function allowedPrimaryBalanceSheetAssignmentExclusion(row: PrimaryBalanceSheetAssignmentLedgerRow) {
-  return /non-USD primary balance sheet presentation row|parenthetical allowance|accumulated depreciation|accumulated amortization/i.test(row.classificationReason);
+  return /non-USD primary balance sheet presentation row|parenthetical allowance|accumulated depreciation|accumulated amortization|redeemable noncontrolling interests are mezzanine equity/i.test(
+    row.classificationReason
+  );
 }
 
 function duplicateBalanceSheetAssignmentKeys(rows: PrimaryBalanceSheetAssignmentLedgerRow[]) {
@@ -18841,14 +18978,14 @@ async function validateReturnedWorkbookBuffer(output: Buffer<ArrayBuffer>, optio
   });
 }
 
-async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook): Promise<Buffer<ArrayBuffer>> {
-  refreshWorkbookFormulaDisplayCaches(workbook);
-  validateWorkbookFormulaCellsReadyForDisplay(workbook);
-  const output = Buffer.from((await workbook.xlsx.writeBuffer()) as ArrayBuffer);
-  return enforceXlsxAutomaticCalculation(output);
+async function writeWorkbookBufferWithRecalculation(workbook: ExcelJS.Workbook, recalculationSheetNames?: string[]): Promise<Buffer<ArrayBuffer>> {
+  refreshWorkbookFormulaDisplayCaches(workbook, recalculationSheetNames);
+  validateWorkbookFormulaCellsReadyForDisplay(workbook, recalculationSheetNames);
+  const output = Buffer.from((await workbook.xlsx.writeBuffer({ zip: FAST_XLSX_ZIP_OPTIONS })) as ArrayBuffer);
+  return enforceXlsxAutomaticCalculation(output, recalculationSheetNames);
 }
 
-async function enforceXlsxAutomaticCalculation(output: Buffer<ArrayBuffer>): Promise<Buffer<ArrayBuffer>> {
+async function enforceXlsxAutomaticCalculation(output: Buffer<ArrayBuffer>, recalculationSheetNames?: string[]): Promise<Buffer<ArrayBuffer>> {
   const zip = await JSZip.loadAsync(output);
   const workbookXmlFile = zip.file("xl/workbook.xml");
   if (!workbookXmlFile) return output;
@@ -18863,10 +19000,10 @@ async function enforceXlsxAutomaticCalculation(output: Buffer<ArrayBuffer>): Pro
   zip.remove("xl/calcChain.xml");
   await removeCalcChainRelationship(zip);
   await removeCalcChainContentType(zip);
-  await markWorksheetFormulasForRecalculation(zip);
-  await validateXlsxFormulaCellsReadyForDisplay(zip);
+  await markWorksheetFormulasForRecalculation(zip, updatedWorkbookXml, recalculationSheetNames);
+  await validateXlsxFormulaCellsReadyForDisplay(zip, updatedWorkbookXml, recalculationSheetNames);
 
-  return Buffer.from(await zip.generateAsync({ type: "arraybuffer", compression: "DEFLATE" }));
+  return Buffer.from(await zip.generateAsync({ type: "arraybuffer", ...FAST_XLSX_ZIP_OPTIONS }));
 }
 
 function insertWorkbookCalcPr(workbookXml: string, calcPr: string) {
@@ -18874,8 +19011,8 @@ function insertWorkbookCalcPr(workbookXml: string, calcPr: string) {
   return workbookXml.replace(/<\/workbook>\s*$/i, `${calcPr}</workbook>`);
 }
 
-function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook) {
-  for (const sheet of workbook.worksheets) {
+function refreshWorkbookFormulaDisplayCaches(workbook: ExcelJS.Workbook, sheetNames?: string[]) {
+  for (const sheet of selectedWorkbookSheets(workbook, sheetNames)) {
     const evaluator =
       sheet.name === SEGMENT_SHEET
         ? new FormulaEvaluator(sheet, { useCachedFormulaResults: true, skipCrossSheetFormulas: true })
@@ -18934,9 +19071,9 @@ function clearFormulaResult(cell: ExcelJS.Cell) {
   cell.value = nextValue as unknown as ExcelJS.CellValue;
 }
 
-function validateWorkbookFormulaCellsReadyForDisplay(workbook: ExcelJS.Workbook) {
+function validateWorkbookFormulaCellsReadyForDisplay(workbook: ExcelJS.Workbook, sheetNames?: string[]) {
   const textFormulas: string[] = [];
-  workbook.eachSheet((sheet) => {
+  for (const sheet of selectedWorkbookSheets(workbook, sheetNames)) {
     sheet.eachRow({ includeEmpty: false }, (row) => {
       row.eachCell({ includeEmpty: false }, (cell) => {
         if (typeof cell.value === "string" && isPlainTextFormula(cell.value)) {
@@ -18944,15 +19081,64 @@ function validateWorkbookFormulaCellsReadyForDisplay(workbook: ExcelJS.Workbook)
         }
       });
     });
-  });
+  }
   if (textFormulas.length) {
     throw new Error(`Workbook contains formulas stored as text: ${textFormulas.slice(0, 12).join(", ")}`);
   }
 }
 
-async function markWorksheetFormulasForRecalculation(zip: JSZip) {
+function selectedWorkbookSheets(workbook: ExcelJS.Workbook, sheetNames?: string[]) {
+  if (!sheetNames?.length) return workbook.worksheets;
+  const wanted = new Set(sheetNames);
+  return workbook.worksheets.filter((sheet) => wanted.has(sheet.name));
+}
+
+async function worksheetXmlPathsForSheetNames(zip: JSZip, workbookXml: string, sheetNames?: string[]) {
+  const allWorksheetPaths = Object.keys(zip.files).filter((path) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
+  if (!sheetNames?.length) return allWorksheetPaths;
+
+  const wanted = new Set(sheetNames);
+  const relsXml = await zip.file("xl/_rels/workbook.xml.rels")?.async("string");
+  if (!relsXml) return allWorksheetPaths;
+
+  const targetsByRelationshipId = new Map<string, string>();
+  for (const match of relsXml.matchAll(/<Relationship\b([^>]*)\/>/g)) {
+    const attrs = match[1];
+    const type = xmlAttribute(attrs, "Type") ?? "";
+    if (!/\/worksheet$/i.test(type)) continue;
+    const id = xmlAttribute(attrs, "Id");
+    const target = xmlAttribute(attrs, "Target");
+    if (id && target) targetsByRelationshipId.set(id, workbookRelationshipTargetPath(target));
+  }
+
+  const paths = new Set<string>();
+  for (const match of workbookXml.matchAll(/<sheet\b([^>]*)\/>/g)) {
+    const attrs = match[1];
+    const name = unescapeXml(xmlAttribute(attrs, "name") ?? "");
+    if (!wanted.has(name)) continue;
+    const relationshipId = xmlAttribute(attrs, "r:id");
+    const path = relationshipId ? targetsByRelationshipId.get(relationshipId) : undefined;
+    if (path && zip.file(path)) paths.add(path);
+  }
+
+  return paths.size ? Array.from(paths) : allWorksheetPaths;
+}
+
+function workbookRelationshipTargetPath(target: string) {
+  const clean = target.replace(/^\/+/, "");
+  if (clean.startsWith("xl/")) return clean;
+  return `xl/${clean.replace(/^\.\.\//, "")}`;
+}
+
+function xmlAttribute(attrs: string, name: string) {
+  const escapedName = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = attrs.match(new RegExp(`(?:^|\\s)${escapedName}=("|')([^"']*)\\1`));
+  return match?.[2] ?? null;
+}
+
+async function markWorksheetFormulasForRecalculation(zip: JSZip, workbookXml: string, sheetNames?: string[]) {
   const sharedStrings = await sharedStringValues(zip);
-  const worksheetPaths = Object.keys(zip.files).filter((path) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
+  const worksheetPaths = await worksheetXmlPathsForSheetNames(zip, workbookXml, sheetNames);
   for (const path of worksheetPaths) {
     const file = zip.file(path);
     if (!file) continue;
@@ -19009,8 +19195,7 @@ function formulaStringValue(cellXml: string, sharedStrings: Map<number, string>)
   return inlineText === undefined ? null : unescapeXml(inlineText);
 }
 
-async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
-  const workbookXml = await zip.file("xl/workbook.xml")?.async("string");
+async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip, workbookXml: string, sheetNames?: string[]) {
   if (!workbookXml || !/<calcPr\b[^>]*calcMode="auto"/.test(workbookXml)) {
     throw new Error("Workbook calculation properties are not set to automatic calculation.");
   }
@@ -19020,7 +19205,7 @@ async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip) {
 
   const problems: string[] = [];
   const sharedStrings = await sharedStringValues(zip);
-  const worksheetPaths = Object.keys(zip.files).filter((path) => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
+  const worksheetPaths = await worksheetXmlPathsForSheetNames(zip, workbookXml, sheetNames);
   for (const path of worksheetPaths) {
     const file = zip.file(path);
     if (!file) continue;

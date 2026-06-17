@@ -15,6 +15,7 @@ export type TemplateMappingContext = {
   hasDeferredTaxLiabilityRow: boolean;
   hasNonCurrentLeaseLiabilityRow: boolean;
   hasPensionLiabilityRow: boolean;
+  hasMezzanineEquityRow: boolean;
 };
 
 export const NONCURRENT_DEBT_CONCEPTS = [
@@ -196,7 +197,10 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
       hasAnyLabel([/^(operating|finance)?leaseliabilities$/, /^(operating|finance)?leaseobligations$/]),
     hasPensionLiabilityRow:
       hasAnyConcept(PENSION_LIABILITY_CONCEPTS) ||
-      hasAnyLabel([/^pensionliabilities$/, /^pensionandotherpostretirementliabilities$/, /^postretirementliabilities$/])
+      hasAnyLabel([/^pensionliabilities$/, /^pensionandotherpostretirementliabilities$/, /^postretirementliabilities$/]),
+    hasMezzanineEquityRow:
+      hasAnyConcept(["RedeemableNoncontrollingInterestEquityCarryingAmount"]) ||
+      hasAnyLabel([/^mezzanineequity$/, /^redeemablenoncontrollinginterests?$/, /^redeemablenci$/])
   };
 }
 
