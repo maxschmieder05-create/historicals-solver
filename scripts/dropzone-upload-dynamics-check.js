@@ -20,8 +20,8 @@ const checks = [
     message: "Native file input must live inside the dropzone so direct clicks open the picker."
   },
   {
-    ok: /<input[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
-    message: "Native file input must remain wired to both change and input events."
+    ok: /<input[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChangeCapture=\{handleFileSelect\}[\s\S]*onInputCapture=\{handleFileInput\}[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
+    message: "Native file input must remain wired to capture and bubble change/input events."
   },
   {
     ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*dataTransfer\.types[\s\S]*includes\("Files"\)[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
@@ -50,14 +50,12 @@ const checks = [
     message: "Submit must prefer the displayed selected file state over the native input value."
   },
   {
-    ok: /const resetFileInputAfterSelection = useCallback/.test(source)
-      && /window\.setTimeout\(\(\) => \{\s*clearFileInput\(\);/.test(source)
-      && /setFile\(nextFile\);\s*resetFileInputAfterSelection\(\);/.test(source),
-    message: "A valid workbook selection must update visible state before deferring the native input reset for same-file reselection."
+    ok: /setFile\(nextFile\);/.test(source) && !/resetFileInputAfterSelection/.test(source),
+    message: "A valid workbook selection must store the selected File without scheduling a native input reset."
   },
   {
-    ok: !/setFile\(nextFile\);\s*clearFileInput\(\);/.test(source),
-    message: "Valid workbook selection must not clear the native input synchronously during the picker event."
+    ok: !/setFile\(nextFile\);[\s\S]{0,160}clearFileInput\(\);/.test(source),
+    message: "Valid workbook selection must not clear the native input during or after the picker event."
   },
   {
     ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),

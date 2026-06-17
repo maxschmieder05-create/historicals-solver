@@ -38,7 +38,6 @@ export default function Home() {
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
-  const fileInputResetTimerRef = useRef<number | null>(null);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
@@ -46,14 +45,6 @@ export default function Home() {
     if (!fileInputRef.current) return;
     fileInputRef.current.value = "";
   }, []);
-
-  const resetFileInputAfterSelection = useCallback(() => {
-    if (fileInputResetTimerRef.current !== null) window.clearTimeout(fileInputResetTimerRef.current);
-    fileInputResetTimerRef.current = window.setTimeout(() => {
-      clearFileInput();
-      fileInputResetTimerRef.current = null;
-    }, 0);
-  }, [clearFileInput]);
 
   function formatFileSize(bytes: number) {
     if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024)).toLocaleString()} KB`;
@@ -71,14 +62,7 @@ export default function Home() {
       return;
     }
     setFile(nextFile);
-    resetFileInputAfterSelection();
-  }, [clearFileInput, resetFileInputAfterSelection]);
-
-  useEffect(() => {
-    return () => {
-      if (fileInputResetTimerRef.current !== null) window.clearTimeout(fileInputResetTimerRef.current);
-    };
-  }, []);
+  }, [clearFileInput]);
 
   useEffect(() => {
     function syncInputSelection() {
@@ -311,6 +295,8 @@ export default function Home() {
               accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               disabled={isSubmitting}
+              onChangeCapture={handleFileSelect}
+              onInputCapture={handleFileInput}
               onChange={handleFileSelect}
               onInput={handleFileInput}
             />
