@@ -13,7 +13,21 @@ type FillSummary = {
 };
 
 function hasTransferredFiles(dataTransfer: DataTransfer | null) {
-  return Array.from(dataTransfer?.types ?? []).includes("Files");
+  if (!dataTransfer) return false;
+  if (Array.from(dataTransfer.types ?? []).includes("Files")) return true;
+  return Array.from(dataTransfer.items ?? []).some((item) => item.kind === "file");
+}
+
+function workbookFileFromTransfer(dataTransfer: DataTransfer | null) {
+  if (!dataTransfer) return null;
+  const listedFile = Array.from(dataTransfer.files ?? [])[0];
+  if (listedFile) return listedFile;
+  for (const item of Array.from(dataTransfer.items ?? [])) {
+    if (item.kind !== "file") continue;
+    const itemFile = item.getAsFile();
+    if (itemFile) return itemFile;
+  }
+  return null;
 }
 
 export default function Home() {
@@ -90,7 +104,7 @@ export default function Home() {
       if (!hasTransferredFiles(transfer)) return;
       event.preventDefault();
       setIsDragging(false);
-      handleWorkbookSelected(transfer?.files?.[0]);
+      handleWorkbookSelected(workbookFileFromTransfer(transfer));
     }
 
     function handleWindowFocus() {
@@ -146,7 +160,7 @@ export default function Home() {
     event.preventDefault();
     event.stopPropagation();
     setIsDragging(false);
-    handleWorkbookSelected(event.dataTransfer.files?.[0]);
+    handleWorkbookSelected(workbookFileFromTransfer(event.dataTransfer));
   }
 
   function pickInputFile(input: HTMLInputElement) {

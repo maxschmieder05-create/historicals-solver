@@ -24,14 +24,26 @@ const checks = [
     message: "Native file input must remain wired to both change and input events."
   },
   {
+    ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*dataTransfer\.types[\s\S]*includes\("Files"\)[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
+    message: "File drag detection must accept both DataTransfer.types and DataTransfer.items file payloads."
+  },
+  {
+    ok: /function workbookFileFromTransfer\(dataTransfer: DataTransfer \| null\)[\s\S]*Array\.from\(dataTransfer\.files \?\? \[\]\)\[0\][\s\S]*item\.getAsFile\(\)/.test(source),
+    message: "Dropped workbook extraction must fall back to DataTransferItem.getAsFile when files is empty."
+  },
+  {
     ok: /input\.addEventListener\("change", handleNativeFileSelection\)/.test(source) && /input\.addEventListener\("input", handleNativeFileSelection\)/.test(source),
     message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing."
   },
   {
     ok: /const handleWorkbookSelected = useCallback/.test(source)
-      && /handleWorkbookSelected\(event\.dataTransfer\.files\?\.\[0\]\)/.test(source)
+      && /handleWorkbookSelected\(workbookFileFromTransfer\(event\.dataTransfer\)\)/.test(source)
       && /handleWorkbookSelected\(input\.files\?\.item\(0\) \?\? undefined\)/.test(source),
     message: "File picker and drag/drop paths must share the same workbook-selection handler."
+  },
+  {
+    ok: /handleWorkbookSelected\(workbookFileFromTransfer\(transfer\)\)/.test(source),
+    message: "Window-level file drops must use the normalized drag payload extractor."
   },
   {
     ok: /const selectedFile =\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
