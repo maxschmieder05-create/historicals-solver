@@ -112,6 +112,23 @@ export type LlmWorkbenchIncomeAssignment = {
   sourceSection: string;
 };
 
+export type LlmWorkbenchSegmentAssignment = {
+  period: string;
+  sourceLineItemLabel: string;
+  sourceMetric: string;
+  sourceAmount: number;
+  sourceAmountMillions: number;
+  modelAmount: number;
+  modelAmountMillions: number;
+  sourceXbrlTag: string;
+  assignedSheet: string;
+  assignedModelRow: string;
+  assignedCell: string;
+  assignmentStatus: string;
+  classificationReason: string;
+  validationStatus: string;
+};
+
 export type LlmWorkbookToolboxInput = {
   company: {
     ticker: string;
@@ -126,6 +143,7 @@ export type LlmWorkbookToolboxInput = {
   sourceLedgerRows: LlmWorkbenchSourceLedgerRow[];
   balanceSheetAssignments: LlmWorkbenchBalanceAssignment[];
   incomeStatementAssignments?: LlmWorkbenchIncomeAssignment[];
+  segmentAnalysisAssignments?: LlmWorkbenchSegmentAssignment[];
   validationFailures: string[];
   warnings: string[];
   limits?: Partial<LlmWorkbookToolboxLimits>;
@@ -139,6 +157,7 @@ export type LlmWorkbookToolboxLimits = {
   maxSourceLedgerRows: number;
   maxBalanceSheetAssignments: number;
   maxIncomeStatementAssignments: number;
+  maxSegmentAnalysisAssignments: number;
   maxWarnings: number;
 };
 
@@ -166,6 +185,7 @@ export type LlmWorkbookToolbox = {
     sourceLedgerRows: number;
     balanceSheetAssignments: number;
     incomeStatementAssignments: number;
+    segmentAnalysisAssignments: number;
     warnings: number;
   };
 };
@@ -178,6 +198,7 @@ const DEFAULT_LIMITS: LlmWorkbookToolboxLimits = {
   maxSourceLedgerRows: 600,
   maxBalanceSheetAssignments: 500,
   maxIncomeStatementAssignments: 500,
+  maxSegmentAnalysisAssignments: 500,
   maxWarnings: 80
 };
 
@@ -190,6 +211,7 @@ export function buildLlmWorkbookToolbox(input: LlmWorkbookToolboxInput): LlmWork
   const sourceLedgerRows = rankSourceLedgerRows(input.sourceLedgerRows).slice(0, limits.maxSourceLedgerRows);
   const balanceSheetAssignments = rankBalanceAssignments(input.balanceSheetAssignments).slice(0, limits.maxBalanceSheetAssignments);
   const incomeStatementAssignments = rankIncomeAssignments(input.incomeStatementAssignments ?? []).slice(0, limits.maxIncomeStatementAssignments);
+  const segmentAnalysisAssignments = rankSegmentAssignments(input.segmentAnalysisAssignments ?? []).slice(0, limits.maxSegmentAnalysisAssignments);
   const warnings = input.warnings.slice(0, limits.maxWarnings);
   const blockingFailures = uniqueStrings(input.validationFailures).filter(Boolean);
 
@@ -242,6 +264,11 @@ export function buildLlmWorkbookToolbox(input: LlmWorkbookToolboxInput): LlmWork
         output: { rows: incomeStatementAssignments }
       },
       {
+        name: "workbook.get_segment_analysis_assignment_ledger",
+        description: "SEC segment, revenue-disaggregation, operating-income, and D&A lines and how each was assigned to the Segment Analysis tab.",
+        output: { rows: segmentAnalysisAssignments }
+      },
+      {
         name: "workbook.validate_return",
         description: "Deterministic fail-closed validation gate for returned workbooks.",
         output: {
@@ -259,6 +286,7 @@ export function buildLlmWorkbookToolbox(input: LlmWorkbookToolboxInput): LlmWork
       sourceLedgerRows: Math.max(0, input.sourceLedgerRows.length - sourceLedgerRows.length),
       balanceSheetAssignments: Math.max(0, input.balanceSheetAssignments.length - balanceSheetAssignments.length),
       incomeStatementAssignments: Math.max(0, (input.incomeStatementAssignments ?? []).length - incomeStatementAssignments.length),
+      segmentAnalysisAssignments: Math.max(0, (input.segmentAnalysisAssignments ?? []).length - segmentAnalysisAssignments.length),
       warnings: Math.max(0, input.warnings.length - warnings.length)
     }
   };
@@ -268,8 +296,8 @@ export function llmWorkbookToolboxSystemInstruction() {
   return [
     "You have access to materialized MCP-style tool outputs under payload.llmWorkbookToolbox.",
     "Treat each tool output as authoritative for its domain: SEC tools for EDGAR data, workbook tools for output cells and traces, and workbook.validate_return for deterministic return validation.",
-    "Use these tool outputs to verify workbook behavior, grouping logic, source provenance, formula preservation, and line-item assignment. Never invent missing SEC facts or fill gaps with estimates.",
-    "A workbook cannot be approved if workbook.validate_return reports failed, if nonblank workbook cells lack source-ledger support, or if a material primary SEC line item is unmapped without an explicit reusable accounting reason."
+    "Use these tool outputs to verify workbook behavior, grouping logic, source provenance, formula preservation, primary statement line-item assignment, and Segment Analysis assignment. Never invent missing SEC facts or fill gaps with estimates.",
+    "A workbook cannot be approved if workbook.validate_return reports failed, if nonblank workbook cells lack source-ledger support, or if a material primary SEC or Segment Analysis line item is unmapped without an explicit reusable accounting reason."
   ].join(" ");
 }
 
@@ -290,6 +318,19 @@ function rankIncomeAssignments(rows: LlmWorkbenchIncomeAssignment[]) {
   return rows.slice().sort((a, b) => {
     const statusRank = assignmentStatusRank(a.assignmentStatus) - assignmentStatusRank(b.assignmentStatus);
     return statusRank || periodSort(a.period, b.period) || Math.abs(b.modelAmount) - Math.abs(a.modelAmount);
+  });
+}
+
+function rankSegmentAssignments(rows: LlmWorkbenchSegmentAssignment[]) {
+  return rows.slice().sort((a, b) => {
+    const statusRank = assignmentStatusRank(a.assignmentStatus) - assignmentStatusRank(b.assignmentStatus);
+    return (
+      statusRank ||
+      periodSort(a.period, b.period) ||
+      a.sourceMetric.localeCompare(b.sourceMetric) ||
+      Math.abs(b.modelAmount) - Math.abs(a.modelAmount) ||
+      a.assignedCell.localeCompare(b.assignedCell)
+    );
   });
 }
 

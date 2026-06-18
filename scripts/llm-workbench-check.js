@@ -151,6 +151,24 @@ const toolbox = buildLlmWorkbookToolbox({
       sourceSection: "operating expenses"
     }
   ],
+  segmentAnalysisAssignments: [
+    {
+      period: "1Q25",
+      sourceLineItemLabel: "Cloud revenue",
+      sourceMetric: "Revenue",
+      sourceAmount: 200_000_000,
+      sourceAmountMillions: 200,
+      modelAmount: 200_000_000,
+      modelAmountMillions: 200,
+      sourceXbrlTag: "segment:values",
+      assignedSheet: "Segment Analysis",
+      assignedModelRow: "Cloud Revenue",
+      assignedCell: "F12",
+      assignmentStatus: "mapped_to_segment_row",
+      classificationReason: "Disclosed Cloud revenue maps to the matching Segment Analysis Revenue row.",
+      validationStatus: "OK!"
+    }
+  ],
   validationFailures: ["Model!F20 1Q25: hardcoded historical value has no current-company source ledger support."],
   warnings: ["Example warning"],
   limits: {
@@ -160,7 +178,8 @@ const toolbox = buildLlmWorkbookToolbox({
     maxAuditRows: 10,
     maxSourceLedgerRows: 10,
     maxBalanceSheetAssignments: 10,
-    maxIncomeStatementAssignments: 10
+    maxIncomeStatementAssignments: 10,
+    maxSegmentAnalysisAssignments: 10
   }
 });
 
@@ -178,6 +197,7 @@ assert.deepEqual(
     "workbook.get_mapping_audit",
     "workbook.get_balance_sheet_assignment_ledger",
     "workbook.get_income_statement_assignment_ledger",
+    "workbook.get_segment_analysis_assignment_ledger",
     "workbook.validate_return"
   ]
 );
@@ -185,6 +205,7 @@ assert.equal(toolbox.omittedCounts.facts, 1);
 assert.equal(toolbox.toolOutputs[0].output.facts[0].concept, "RevenueFromContractWithCustomerExcludingAssessedTax");
 assert.equal(toolbox.toolOutputs[2].output.cells[0].sourceLedgerStatus, "stale_or_unsupported");
 assert.equal(toolbox.toolOutputs[6].output.rows[0].assignedModelRow, "SG&A");
+assert.equal(toolbox.toolOutputs[7].output.rows[0].assignedSheet, "Segment Analysis");
 assert.match(llmWorkbookToolboxSystemInstruction(), /MCP-style tool outputs/);
 assert.match(llmWorkbookToolboxSystemInstruction(), /workbook\.validate_return/);
 

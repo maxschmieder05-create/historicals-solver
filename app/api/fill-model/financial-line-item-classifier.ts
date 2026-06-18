@@ -219,6 +219,7 @@ const MODEL_ROW_ALIASES: Record<string, string[]> = {
   "Common Stock & APIC": ["common stock & apic", "common stock and apic", "common stock and additional paid-in capital"],
   "Treasury Stock": ["treasury stock", "treasury & preferred stock"],
   AOCI: ["accumulated other comprehensive income", "accumulated other comprehensive income (aoci)", "accumulated other comprehensive loss"],
+  "Mezzanine Equity": ["mezzanine equity", "redeemable noncontrolling interests", "redeemable nci"],
   "SG&A": [
     "sga",
     "sg&a",
@@ -239,6 +240,15 @@ const MODEL_ROW_ALIASES: Record<string, string[]> = {
   "Other Operating Income / Expense": ["other operating income expense", "other operating income", "other operating expense"],
   "Other Non-Operating Income / Expense": ["other non-operating income expense", "other income expense", "other expense income"]
 };
+
+const GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS = [
+  "This is a general side-by-side mapping task, not a keyword lookup and not a rule limited to the examples.",
+  "For every target row, compare the SEC source row against all available model rows and definitions, then choose the row whose accounting substance best fits.",
+  "Use statement placement, current/non-current section, parent subtotal, nearby rows, XBRL concept semantics, and prior-period labels to infer meaning when filing labels and model labels differ.",
+  "Prefer a specific model row when the template exposes one; otherwise group into the appropriate Other bucket with a reusable accounting reason.",
+  "Exclude subtotals, totals, component detail, and duplicate rows when mapping them would double-count a model row.",
+  "Preserve EDGAR tie-outs: major model totals should reconcile to the SEC filing through assigned components, formulas, or explicit exclusion reasons."
+];
 
 export function modelRowDefinitionsForRows(availableRows: string[]) {
   const output: Record<string, string> = {};
@@ -852,9 +862,10 @@ async function requestLlmClassification(
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Classify the reported source line item into the best model template row using accounting meaning, statement section, XBRL tag semantics, parent subtotal, and template row definitions.",
     "Think like a human reviewer with the SEC statement and model open side by side: map the source row to the model row whose accounting definition fits, even when labels do not match one-for-one.",
+    ...GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
     "Do not use keyword matching alone. Reported statement location and accounting meaning take precedence over mathematical tie-outs.",
     "Use Other buckets only when no dedicated row exists. Do not use residual plugging.",
-    "Advertising, promotional, selling, and marketing expenses presented as operating expenses belong in SG&A unless the model has a more specific dedicated row.",
+    "Examples are non-exhaustive: current investments may belong with cash when no investment row exists; current maturities may belong with LT debt; advertising may belong with SG&A.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",
@@ -919,10 +930,11 @@ async function requestStatementLlmClassification(
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Do not classify one row in isolation. Review the entire provided statement in row order, including sibling labels, parent subtotals, current/non-current sections, XBRL tag semantics, deterministic classifications, and model row definitions.",
     "Think like a human reviewer with the SEC statement and model open side by side: the filing labels and model labels will not always match, so assign by accounting substance and template definitions.",
+    ...GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
     "Only return classifications for targetSourceRowKeys. Use each source_row_key exactly as provided.",
     "The model template order may differ from the filing statement order. Assign each source line to the model row that best fits the accounting meaning, even if that model row appears much earlier or later in the template.",
     "Use Other buckets only when no dedicated model row exists. Do not use residual plugging.",
-    "Advertising, promotional, selling, and marketing expenses presented as operating expenses belong in SG&A unless the model has a more specific dedicated row.",
+    "Examples are non-exhaustive: current investments may belong with cash when no investment row exists; current maturities may belong with LT debt; advertising may belong with SG&A.",
     "Current marketable securities, available-for-sale securities, and short-term investments belong in Cash & Cash Equivalents when the template has no dedicated current investments row.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, notes payable current, and revolving facilities may belong in Revolver/current borrowings.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
@@ -992,7 +1004,8 @@ function statementLlmClassificationPayload(prepared: PreparedLineItemClassificat
     modelRowDefinitions: first?.modelRowDefinitions ?? {},
     alreadyMappedRows: first?.alreadyMappedRows ?? [],
     classificationGoal:
-      "Classify only the target rows after reviewing the full SEC statement context as if the SEC statement and model template were open side by side. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match.",
+      "Classify only the target rows after reviewing the full SEC statement context as if the SEC statement and model template were open side by side. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match. The examples in the system prompt are non-exhaustive; apply the same accounting-substance reasoning to any random SEC line item.",
+    routingPrinciples: GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
     statementRows: prepared
       .slice()
       .sort((a, b) => (a.request.rowOrder ?? 0) - (b.request.rowOrder ?? 0))
