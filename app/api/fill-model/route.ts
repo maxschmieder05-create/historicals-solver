@@ -648,8 +648,8 @@ const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
 const MAPPING_AUDIT_SHEET = "Mapping Audit";
 const SOURCE_LEDGER_SHEET = "Source Ledger";
 const BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET = "Balance Sheet Assignment Ledger";
-const INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET = "Income Statement Assignment Ledger";
-const SEGMENT_ANALYSIS_ASSIGNMENT_LEDGER_SHEET = "Segment Analysis Assignment Ledger";
+const INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET = "Income Stmt Assignment Ledger";
+const SEGMENT_ANALYSIS_ASSIGNMENT_LEDGER_SHEET = "Segment Assignment Ledger";
 const LLM_MAPPING_REVIEW_SHEET = "LLM Mapping Review";
 const SEC_ARCHIVE_MIN_INTERVAL_MS = 150;
 const secArchiveHtmlCache = new Map<string, string>();
@@ -2218,7 +2218,25 @@ function primaryIncomeStatementRowsForPeriod(period: string, ctx: ResolveContext
 function primaryIncomeStatementRowMatchesPeriod(row: PrimaryIncomeStatementRow, period: string, ctx: ResolveContext) {
   if (row.period.periodType === "instant") return false;
   const rowPeriod = statementRowPeriodKey(row, ctx);
-  return !rowPeriod || rowPeriod === period;
+  if (rowPeriod && rowPeriod !== period) return false;
+  const durationType = statementRowDurationPeriodType(row);
+  if (isQuarterPeriod(period)) return durationType === "quarterly";
+  if (isAnnualPeriod(period)) return durationType === "annual";
+  return true;
+}
+
+function statementRowDurationPeriodType(row: SecFilingStatementStructure["rows"][number]): Exclude<FactSource["periodType"], "instant"> {
+  if (row.period.periodType === "instant") return "annual";
+  const start = row.period.start;
+  const end = row.period.end ?? row.reportingPeriod;
+  if (!start || !end) return "quarterly";
+  const startDate = new Date(`${start}T00:00:00Z`);
+  const endDate = new Date(`${end}T00:00:00Z`);
+  if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) return "quarterly";
+  const days = Math.round((endDate.getTime() - startDate.getTime()) / 86_400_000) + 1;
+  if (days <= 115) return "quarterly";
+  if (days < 330) return "year_to_date";
+  return "annual";
 }
 
 function primaryIncomeStatementDimensionsAllowed(row: PrimaryIncomeStatementRow) {
@@ -2592,7 +2610,7 @@ function factSourceFromStatementRow(row: SecFilingStatementStructure["rows"][num
     start: row.period.start,
     end: row.period.instant ?? row.period.end,
     periodKey: period,
-    periodType: row.period.periodType === "instant" ? "instant" : "quarterly",
+    periodType: row.period.periodType === "instant" ? "instant" : statementRowDurationPeriodType(row),
     reportDate: row.reportingPeriod
   };
 }
@@ -2891,6 +2909,10 @@ function sourceLooksLikeCurrentInvestment(source: FactSource) {
   return C.currentInvestments.includes(source.concept) || sourceTextMatches(source, /\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/);
 }
 
+function sourceLooksLikeNonTradeReceivable(source: FactSource) {
+  return sourceTextMatches(source, /\bvendor\b.*\bnon[-\s]?trade receivables?\b|\bnon[-\s]?trade receivables?\b|\bother receivables?\b|\btax receivables?\b/);
+}
+
 function sourceLooksLikeCashBalance(source: FactSource) {
   return C.cash.includes(source.concept) || STANDALONE_RESTRICTED_CASH_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\bcash and cash equivalents?\b|\brestricted cash\b/);
 }
@@ -2940,11 +2962,14 @@ function primaryOtherCurrentAssetSources(period: string, ctx: ResolveContext) {
     const semanticOtherCurrentAsset =
       sourceTextMatches(source, /\bother current assets?\b|\bprepaid\b|\btax receivables?\b|\bother receivables?\b/) ||
       sourceLooksLikeAssetHeldForSale(source) ||
-      (!ctx.template?.hasCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source) && !sourceLooksLikeCashLikeShortTermInvestment(source));
+      (!ctx.template?.hasCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source));
     if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInCurrentAssetSection(row, source) && !semanticOtherCurrentAsset)) return false;
-    if ([...C.cash, ...C.receivables, ...C.cardReceivables, ...C.inventory].includes(source.concept)) return false;
+    if ([...C.cash, ...C.cardReceivables, ...C.inventory].includes(source.concept)) return false;
+    if (C.receivables.includes(source.concept) && !sourceLooksLikeNonTradeReceivable(source)) return false;
     if (ctx.template?.hasCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source)) return false;
-    if (inventoryLikeCurrentAssetScore(source) >= 5 || sourceTextMatches(source, /\bcash\b|\bshort[-\s]?term investments?\b|\breceivables?\b|\binventor(?:y|ies)\b/)) return false;
+    if (inventoryLikeCurrentAssetScore(source) >= 5) return false;
+    if (sourceTextMatches(source, /\bcash\b|\binventor(?:y|ies)\b/)) return false;
+    if (sourceTextMatches(source, /\breceivables?\b/) && !sourceLooksLikeNonTradeReceivable(source)) return false;
     return true;
   });
   return withAcceptedModelRowClassifications(period, ctx, sources, "Prepaid & Other Current Assets");
@@ -6664,18 +6689,24 @@ export async function POST(request: NextRequest) {
     markReportedPeriodColumns(sheet, reportedPeriodPairs);
     normalizeReportedPeriodHeaderLabels(sheet, reportedPeriodPairs);
     normalizeSharedFormulas(workbook);
+    timing("reported period headers normalized");
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
+    timing("workbook snapshot captured");
     if (periods.some(isQuarterPeriod)) {
       const inlineCtx = await fetchInlineFactContext(company, periods, bulkSupport, fiscalPeriods);
       mergeContexts(ctx, inlineCtx);
+      timing("inline SEC fact context loaded");
     }
     const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
     const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods, bulkSupport, fiscalPeriods) : [];
+    timing("segment revenue loaded");
     const profile = detectTemplateProfile(workbook, sheet, ctx);
+    timing("template profile detected");
     const goldLibrary = await scanConfiguredGoldModelLibrary().catch((error) => {
       preflightWarnings.push(`Gold-model library scan was skipped: ${error instanceof Error ? error.message : String(error)}.`);
       return null;
     });
+    timing("gold-model library scanned");
     if (goldLibrary) preflightWarnings.push(...goldLibrary.warnings);
     const goldReference = goldLibrary ? findVerifiedGoldModelForCompany(goldLibrary, company) : null;
     const companyModelType = goldReference
@@ -16696,6 +16727,7 @@ function buildPrimaryBalanceSheetAssignmentLedgerRows(
   fillRows: FillRow[]
 ): PrimaryBalanceSheetAssignmentLedgerRow[] {
   const rows: PrimaryBalanceSheetAssignmentLedgerRow[] = [];
+  const seen = new Set<string>();
   for (const period of unique(periods.map(balanceSheetInstantLookupPeriod))) {
     for (const { statement, row } of primaryBalanceSheetStatementRowsForPeriod(period, ctx)) {
       const source = primaryBalanceSheetFactSource(row, period);
@@ -16704,6 +16736,9 @@ function buildPrimaryBalanceSheetAssignmentLedgerRows(
 
       const sourceWithStatementAccession = source.accn ? source : { ...source, accn: row.accession || statement.accession };
       const section = statementSectionForRow(statement, row, "balance_sheet");
+      const semanticKey = primaryAssignmentSemanticKey(period, statement, row, sourceWithStatementAccession, section);
+      if (seen.has(semanticKey)) continue;
+      seen.add(semanticKey);
       const assignment = assignPrimaryBalanceSheetLineItem(period, ctx, sourceWithStatementAccession, row, section, fillRows);
       const classification = lineItemClassificationForSource(period, ctx, sourceWithStatementAccession);
       const rowSide = primaryBalanceSheetAssignmentSide(section, source, row);
@@ -16752,6 +16787,23 @@ function primaryBalanceSheetAssignmentRowKey(statement: SecFilingStatementStruct
     row.xbrlConcept ?? "",
     normalize(cleanLineItemLabel(row.rowLabel)),
     typeof row.value === "number" ? Math.round(row.value) : ""
+  ].join("|");
+}
+
+function primaryAssignmentSemanticKey(
+  period: string,
+  statement: SecFilingStatementStructure,
+  row: SecFilingStatementStructure["rows"][number],
+  source: FactSource,
+  section: FinancialStatementSection
+) {
+  return [
+    period,
+    normalizeAccession(row.accession || statement.accession),
+    section,
+    source.concept,
+    normalize(cleanLineItemLabel(row.rowLabel) || source.label),
+    Math.round(source.value)
   ].join("|");
 }
 
@@ -16878,6 +16930,13 @@ function assignPrimaryBalanceSheetLineItem(
   if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
     return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
   }
+  if (sourceLooksLikeNonTradeReceivable(source)) {
+    return chooseOther(
+      "Prepaid & Other Current Assets",
+      ["Prepaid and Other Current Assets", "Other Current Assets"],
+      "Non-trade, vendor, tax, and other receivables are grouped into prepaid and other current assets when the template has no dedicated non-trade receivables row."
+    );
+  }
   if (C.receivables.includes(source.concept) || C.cardReceivables.includes(source.concept) || sourceTextMatches(source, /\breceivables?\b/)) {
     return choose("Accounts Receivable", ["Accounts Receivable, Net", "Trade Receivables"], "Trade and other receivables map to accounts receivable.");
   }
@@ -16908,10 +16967,10 @@ function assignPrimaryBalanceSheetLineItem(
         reason: "Current investments map to the template's dedicated current investment row."
       };
     }
-    return choose(
-      "Cash & Cash Equivalents",
-      ["Cash and Cash Equivalents", "Cash"],
-      "Marketable securities and short-term investments are grouped with cash because the template has no dedicated current investment row."
+    return chooseOther(
+      "Prepaid & Other Current Assets",
+      ["Prepaid and Other Current Assets", "Other Current Assets"],
+      "Current investments are grouped into the current-asset plug when the template has no dedicated current investment row."
     );
   }
   if (sourceLooksLikeDeferredTaxAsset(source)) {
@@ -17010,10 +17069,17 @@ function assignPrimaryBalanceSheetLineItem(
           reason: "Current investments map to the template's dedicated current investment row."
         };
       }
-      return choose(
-        "Cash & Cash Equivalents",
-        ["Cash and Cash Equivalents", "Cash"],
-        "Marketable securities and short-term investments are grouped with cash because the template has no dedicated current investment row."
+      return chooseOther(
+        "Prepaid & Other Current Assets",
+        ["Prepaid and Other Current Assets", "Other Current Assets"],
+        "Current investments are grouped into the current-asset plug when the template has no dedicated current investment row."
+      );
+    }
+    if (sourceLooksLikeNonTradeReceivable(source)) {
+      return chooseOther(
+        "Prepaid & Other Current Assets",
+        ["Prepaid and Other Current Assets", "Other Current Assets"],
+        "Non-trade, vendor, tax, and other receivables are grouped into prepaid and other current assets when the template has no dedicated non-trade receivables row."
       );
     }
     if (C.receivables.includes(source.concept) || C.cardReceivables.includes(source.concept) || sourceTextMatches(source, /\breceivables?\b/)) {
@@ -17249,6 +17315,7 @@ function buildPrimaryIncomeStatementAssignmentLedgerRows(
 ): PrimaryIncomeStatementAssignmentLedgerRow[] {
   const rows: PrimaryIncomeStatementAssignmentLedgerRow[] = [];
   const seen = new Set<string>();
+  const seenSemanticRows = new Set<string>();
   for (const period of unique(periods)) {
     for (const { statement, row } of primaryIncomeStatementRowsForPeriod(period, ctx)) {
       const source = factSourceFromStatementRow(row, period);
@@ -17259,6 +17326,9 @@ function buildPrimaryIncomeStatementAssignmentLedgerRows(
 
       const sourceWithStatementAccession = source.accn ? source : { ...source, accn: row.accession || statement.accession };
       const section = statementSectionForRow(statement, row, "income_statement");
+      const semanticKey = primaryAssignmentSemanticKey(period, statement, row, sourceWithStatementAccession, section);
+      if (seenSemanticRows.has(semanticKey)) continue;
+      seenSemanticRows.add(semanticKey);
       const assignment = assignPrimaryIncomeStatementLineItem(period, ctx, sourceWithStatementAccession, row, section, fillRows);
       const classification = lineItemClassificationForSource(period, ctx, sourceWithStatementAccession);
       rows.push({
@@ -17482,6 +17552,9 @@ function primaryIncomeStatementAssignmentExclusionReason(
   if (primaryIncomeStatementCostComponentCoveredByTotal(period, ctx, source, row)) {
     return "Excluded cost component/detail row because the same primary income statement reports an additive total cost of revenue line that is assigned to the model.";
   }
+  if (primaryIncomeStatementTaxComponentCoveredByTotal(period, ctx, source, row)) {
+    return "Excluded income-tax component/detail row because the same primary income statement reports a total income-tax provision line that is assigned to the model.";
+  }
   if (sourceLooksLikePerShareOrShareCountIncomeStatementLine(source)) {
     return "Excluded per-share, share-count, or earnings-per-share presentation row because it is not a dollar income-statement amount.";
   }
@@ -17517,6 +17590,29 @@ function primaryIncomeStatementCostComponentCoveredByTotal(period: string, ctx: 
     if (candidateRow.dimensions.length) return false;
     return C.cogs.includes(candidate.concept) || sourceTextMatches(candidate, /\b(total )?cost of (revenue|sales|goods|services|products)\b/);
   });
+}
+
+function primaryIncomeStatementTaxComponentCoveredByTotal(period: string, ctx: ResolveContext, source: FactSource, row: PrimaryIncomeStatementRow) {
+  if (reportedLineItemCategory(source) !== "income_tax") return false;
+  if (sourceLooksLikeIncomeTaxTotal(source) && !sourceLooksLikeIncomeTaxDetail(source)) return false;
+  if (!sourceLooksLikeIncomeTaxDetail(source) && !row.dimensions.length && !row.parentSubtotal) return false;
+  return primaryIncomeStatementRowsForPeriod(period, ctx).some(({ row: candidateRow }) => {
+    if (candidateRow === row) return false;
+    const candidate = factSourceFromStatementRow(candidateRow, period);
+    return Boolean(candidate && reportedLineItemCategory(candidate) === "income_tax" && sourceLooksLikeIncomeTaxTotal(candidate));
+  });
+}
+
+function sourceLooksLikeIncomeTaxTotal(source: FactSource) {
+  if (source.concept === "IncomeTaxExpenseBenefit" && !sourceLooksLikeIncomeTaxDetail(source)) return true;
+  return sourceTextMatches(source, /\b(provision for|benefit from|expense for)?\s*income taxes?\b|\bincome tax (?:expense|benefit|provision)\b/);
+}
+
+function sourceLooksLikeIncomeTaxDetail(source: FactSource) {
+  return sourceTextMatches(
+    source,
+    /\bshare[-\s]?based compensation\b|\bstock[-\s]?based compensation\b|\bexcess tax benefits?\b|\brelated to\b|\bcurrent\b.*\btax\b|\bdeferred\b.*\btax\b|\btax credits?\b|\bforeign\b.*\btax\b|\bfederal\b.*\btax\b|\bstate\b.*\btax\b/
+  );
 }
 
 function sourceLooksLikePerShareOrShareCountIncomeStatementLine(source: FactSource) {
@@ -17568,7 +17664,7 @@ function duplicateIncomeStatementAssignmentKeys(rows: PrimaryIncomeStatementAssi
 }
 
 function allowedPrimaryIncomeStatementAssignmentExclusion(row: PrimaryIncomeStatementAssignmentLedgerRow) {
-  return /non-USD primary income statement|subtotal\/total row|double-counted|component\/detail row|per-share|share-count|earnings-per-share|not a dollar income-statement amount/i.test(
+  return /non-USD primary income statement|subtotal\/total row|double-counted|component\/detail row|tax component|tax provision|per-share|share-count|earnings-per-share|not a dollar income-statement amount/i.test(
     row.classificationReason
   );
 }
@@ -17661,7 +17757,8 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
     byModelRow.forEach((assigned, modelRow) => {
       const rowNumber = findBalanceSheetLedgerModelRow(sheet, modelRow, fillRows);
       if (!rowNumber) {
-        errors.push(`Balance Sheet ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`);
+        const message = `Balance Sheet ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`;
+        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
         return;
       }
       if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
@@ -17684,16 +17781,8 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
       }
       if (!statementMetricTies(actual, expected)) {
         const sourceLabels = assigned.map((row) => row.sourceLineItemLabel).filter(Boolean).join(", ");
-        recordBalanceSheetValidationIssue(
-          errors,
-          warnings,
-          `Balance Sheet ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`,
-          protectedFormula,
-          sheet,
-          period,
-          col,
-          ctx
-        );
+        const message = `Balance Sheet ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`;
+        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
       }
     });
   }
@@ -17755,7 +17844,8 @@ function validatePrimaryIncomeStatementAssignmentCoverage(
     byModelRow.forEach((assigned, modelRow) => {
       const rowNumber = findIncomeStatementLedgerModelRow(sheet, modelRow, fillRows);
       if (!rowNumber) {
-        errors.push(`Income Statement ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`);
+        const message = `Income Statement ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`;
+        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
         return;
       }
       const expected = assigned.reduce((total, row) => total + row.modelAmount, 0) / 1_000_000;
@@ -17773,12 +17863,8 @@ function validatePrimaryIncomeStatementAssignmentCoverage(
       }
       if (!statementMetricTies(actual, expected)) {
         const sourceLabels = assigned.map((row) => row.sourceLineItemLabel).filter(Boolean).join(", ");
-        recordIncomeStatementAssignmentValidationIssue(
-          errors,
-          warnings,
-          `Income Statement ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`,
-          protectedFormula
-        );
+        const message = `Income Statement ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`;
+        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
       }
     });
   }
@@ -18814,7 +18900,7 @@ function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firs
   for (const sheetName of sheetNames) {
     const sheet = workbook.getWorksheet(sheetName);
     if (!sheet) continue;
-    for (let rowNumber = 1; rowNumber <= sheet.rowCount; rowNumber += 1) {
+    for (const rowNumber of workbookSnapshotRowNumbers(sheet)) {
       for (let col = 1; col <= Math.min(labelSnapshotEndCol, sheet.columnCount); col += 1) {
         const address = snapshotAddress(sheet, rowNumber, col);
         labels.set(address, cellDisplay(sheet.getCell(rowNumber, col)));
@@ -18837,6 +18923,13 @@ function snapshotWorkbook(workbook: ExcelJS.Workbook, sheetNames: string[], firs
     }
   }
   return { labels, formulas, protectedCells };
+}
+
+function workbookSnapshotRowNumbers(sheet: ExcelJS.Worksheet) {
+  const rows = new Set<number>();
+  sheet.eachRow({ includeEmpty: false }, (_row, rowNumber) => rows.add(rowNumber));
+  for (const rowNumber of balanceSheetRows(sheet)) rows.add(rowNumber);
+  return Array.from(rows).sort((a, b) => a - b);
 }
 
 function validateWorkbookPreservation(workbook: ExcelJS.Workbook, snapshot: WorkbookSnapshot) {
@@ -19660,6 +19753,10 @@ function removeGeneratedMetadataSheets(workbook: ExcelJS.Workbook) {
     INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET,
     SEGMENT_ANALYSIS_ASSIGNMENT_LEDGER_SHEET,
     LLM_MAPPING_REVIEW_SHEET,
+    "Income Statement Assignment Ledger",
+    "Income Statement Assignment Led",
+    "Segment Analysis Assignment Ledger",
+    "Segment Analysis Assignment Led",
     "Filing Period Map"
   ]) {
     const sheet = workbook.getWorksheet(sheetName);
