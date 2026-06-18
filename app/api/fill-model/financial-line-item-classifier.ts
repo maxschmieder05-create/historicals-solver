@@ -406,6 +406,41 @@ export function modelRowAvailable(row: string, availableRows: string[]) {
   return availableRows.some((available) => modelRowsMatch(row, available));
 }
 
+export function classificationModelRowAssignmentForPrimaryStatement(
+  classification: FinancialLineItemClassification | null | undefined,
+  availableModelRows: string[]
+) {
+  if (!classification) return null;
+  if (!classification.llm_used) return null;
+  if (classification.confidence === "low") return null;
+  if (classification.recommended_action === "exclude" || classification.recommended_action === "set_zero") return null;
+  if (!classification.mapping_passed_validation) return null;
+
+  const normalizedRow = normalizeModelRow(classification.recommended_model_row) || classification.recommended_model_row;
+  if (!normalizedRow || /unmapped|needs review/i.test(normalizedRow)) return null;
+  const modelRow = availableModelRows.find((available) => modelRowsMatch(available, normalizedRow)) ?? normalizedRow;
+  const grouped =
+    classification.recommended_action === "merge_into_other" ||
+    classification.recommended_action === "split_across_rows" ||
+    isReusableOtherBucketModelRow(modelRow);
+  return {
+    modelRow,
+    grouped,
+    llmUsed: classification.llm_used,
+    reason: `LLM line-item classification: ${shortReason(classification.reason)}`
+  };
+}
+
+function isReusableOtherBucketModelRow(modelRow: string) {
+  return (
+    modelRowsMatch(modelRow, "Prepaid & Other Current Assets") ||
+    modelRowsMatch(modelRow, "Other Non-Current Assets") ||
+    modelRowsMatch(modelRow, "Other Current Liabilities") ||
+    modelRowsMatch(modelRow, "Other Non-Current Liabilities") ||
+    modelRowsMatch(modelRow, "Common Stock & APIC")
+  );
+}
+
 function deterministicFinancialLineItemClassification(
   request: FinancialLineItemClassificationRequest
 ): FinancialLineItemClassification | null {

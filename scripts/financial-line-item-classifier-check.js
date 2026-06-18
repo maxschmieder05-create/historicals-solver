@@ -39,6 +39,7 @@ const {
   MODEL_ROW_DEFINITIONS,
   classifyFinancialLineItem,
   classifyFinancialStatementLineItems,
+  classificationModelRowAssignmentForPrimaryStatement,
   modelRowDefinitionsForRows,
   modelRowsMatch,
   lineItemNeedsClassification
@@ -369,6 +370,28 @@ async function classify(overrides) {
   assert.equal(batchResult.llmCalls, 1);
   assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-investments").classification.recommended_model_row, "Cash & Cash Equivalents");
   assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-notes-payable").classification.recommended_model_row, "Revolver");
+  const leaseFinancingClassification = batchResult.classifications.find((item) => item.request.sourceRowKey === "row-lease-financing").classification;
+  const leaseFinancingAssignment = classificationModelRowAssignmentForPrimaryStatement(leaseFinancingClassification, availableModelRows);
+  assert.equal(leaseFinancingAssignment.modelRow, "LT Debt (Incl. Current Portion)");
+  assert.equal(leaseFinancingAssignment.llmUsed, true);
+  assert.equal(leaseFinancingAssignment.reason.startsWith("LLM line-item classification:"), true);
+
+  const lowConfidenceAssignment = classificationModelRowAssignmentForPrimaryStatement(
+    {
+      ...leaseFinancingClassification,
+      confidence: "low"
+    },
+    availableModelRows
+  );
+  assert.equal(lowConfidenceAssignment, null);
+  const deterministicAssignment = classificationModelRowAssignmentForPrimaryStatement(
+    {
+      ...leaseFinancingClassification,
+      llm_used: false
+    },
+    availableModelRows
+  );
+  assert.equal(deterministicAssignment, null);
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {

@@ -32,6 +32,7 @@ import {
 } from "./audit-notes";
 import {
   classifyFinancialStatementLineItems,
+  classificationModelRowAssignmentForPrimaryStatement,
   classificationSourceKeys,
   lineItemNeedsClassification,
   modelRowDefinitionsForRows,
@@ -548,9 +549,11 @@ const SEC_HEADERS = {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-const LLM_MAPPING_FAST_MODEL = process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || "openrouter/owl-alpha";
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "openrouter/owl-alpha";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-5.5";
+const LLM_MAPPING_FAST_MODEL = process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL;
 const LLM_MAPPING_COMPLEX_MODEL =
-  process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || process.env.LLM_MAPPING_MODEL || LLM_MAPPING_FAST_MODEL;
+  process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || DEFAULT_LLM_MAPPING_COMPLEX_MODEL;
 const LLM_MAPPING_REVIEW_MODEL = process.env.LLM_MAPPING_REVIEW_MODEL || LLM_MAPPING_COMPLEX_MODEL || LLM_MAPPING_FAST_MODEL;
 const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 24);
 const LLM_MAPPING_REVIEW_MAX_ITEMS = Number(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS || 2500);
@@ -574,9 +577,9 @@ const FAST_XLSX_ZIP_OPTIONS = {
   compression: "STORE" as const
 };
 const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
-  process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24, 3)
+  process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24, 8)
 );
-const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 3_000);
+const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 15_000);
 
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
@@ -2331,7 +2334,12 @@ async function buildLineItemClassificationStore(
       requestsByPeriod.set(fiscalPeriod, bucket);
     }
 
-    for (const requests of requestsByPeriod.values()) {
+    const requestGroups = Array.from(requestsByPeriod.values()).sort((a, b) => {
+      const left = a[0]?.fiscalPeriod ?? "";
+      const right = b[0]?.fiscalPeriod ?? "";
+      return comparePeriods(right, left);
+    });
+    for (const requests of requestGroups) {
       if (!requests.some((request) => lineItemNeedsClassification(request))) continue;
       const willUseLlm = state.enabled && state.calls < state.maxCalls && lineItemLlmCalls < maxLineItemLlmCalls;
       const classificationResult = await classifyFinancialStatementLineItems(requests, {
@@ -16037,23 +16045,26 @@ function buildPrimaryBalanceSheetAssignmentLedgerRows(
       if (!source) continue;
       if (statementRowIsSubtotal(row) || isPrimaryBalanceSheetSubtotalSource(source) || isPrimaryBalanceSheetComponentSubtotalRow(source)) continue;
 
+      const sourceWithStatementAccession = source.accn ? source : { ...source, accn: row.accession || statement.accession };
       const section = statementSectionForRow(statement, row, "balance_sheet");
-      const assignment = assignPrimaryBalanceSheetLineItem(period, ctx, source, row, section, fillRows);
-      const classification = lineItemClassificationForSource(period, ctx, source);
+      const assignment = assignPrimaryBalanceSheetLineItem(period, ctx, sourceWithStatementAccession, row, section, fillRows);
+      const classification = lineItemClassificationForSource(period, ctx, sourceWithStatementAccession);
       const rowSide = primaryBalanceSheetAssignmentSide(section, source, row);
       const modelRowSide = primaryBalanceSheetAssignmentSideForModelRow(assignment.modelRow);
       const side = modelRowSide === "unknown" ? rowSide : modelRowSide;
-      const assignedAmount = primaryBalanceSheetAssignmentAmount(source, assignment.modelRow);
+      const assignedAmount = primaryBalanceSheetAssignmentAmount(sourceWithStatementAccession, assignment.modelRow);
       rows.push({
         fiscalPeriod: period,
         sourceFilingAccession: row.accession || statement.accession,
         sourceStatement: statement.statementName,
-        sourceLineItemLabel: cleanLineItemLabel(row.rowLabel) || source.label,
+        sourceLineItemLabel: cleanLineItemLabel(row.rowLabel) || sourceWithStatementAccession.label,
         amount: assignedAmount,
-        sourceXbrlTag: row.xbrlConcept || source.concept,
+        sourceXbrlTag: row.xbrlConcept || sourceWithStatementAccession.concept,
         assignedModelRow: assignment.modelRow ?? "",
         assignmentStatus: assignment.status,
-        classificationReason: classification?.reason || assignment.reason,
+        classificationReason: /^LLM line-item classification|^Validated line-item classification/.test(assignment.reason)
+          ? assignment.reason
+          : classification?.reason || assignment.reason,
         llmUsed: Boolean(classification?.llm_used),
         validationStatus: assignment.modelRow || assignment.status === "explicitly_excluded_with_reason" ? "OK!" : "missing_model_row",
         side,
@@ -16151,13 +16162,6 @@ function assignPrimaryBalanceSheetLineItem(
     return { modelRow, status: "grouped_into_model_row", reason };
   };
 
-  if (sourceLooksLikePrepaidOtherCurrentAsset(source)) {
-    return chooseOther(
-      "Prepaid & Other Current Assets",
-      ["Prepaid and Other Current Assets", "Other Current Assets"],
-      "Prepaid expenses and other current assets map to the template's prepaid and other current assets row."
-    );
-  }
   if (source.unit && !/usd/i.test(source.unit)) {
     return {
       modelRow: null,
@@ -16171,6 +16175,17 @@ function assignPrimaryBalanceSheetLineItem(
       status: "explicitly_excluded_with_reason",
       reason: "Excluded parenthetical allowance, accumulated depreciation, accumulated amortization, or per-share capital disclosure because it is not a primary balance sheet carrying amount."
     };
+  }
+
+  const classifiedAssignment = classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows);
+  if (classifiedAssignment) return classifiedAssignment;
+
+  if (sourceLooksLikePrepaidOtherCurrentAsset(source)) {
+    return chooseOther(
+      "Prepaid & Other Current Assets",
+      ["Prepaid and Other Current Assets", "Other Current Assets"],
+      "Prepaid expenses and other current assets map to the template's prepaid and other current assets row."
+    );
   }
 
   if (sourceLooksLikeCashBalance(source)) {
@@ -16494,6 +16509,25 @@ function assignPrimaryBalanceSheetLineItem(
     modelRow: null,
     status: "explicitly_excluded_with_reason",
     reason: "Could not determine asset, liability, or equity section for this primary balance sheet line."
+  };
+}
+
+function classifiedPrimaryBalanceSheetAssignment(
+  period: string,
+  ctx: ResolveContext,
+  source: FactSource,
+  fillRows: FillRow[]
+): PrimaryBalanceSheetAssignment | null {
+  const classification = lineItemClassificationForSource(period, ctx, source);
+  const availableRows = fillRows.filter((row) => row.statement === "balance" && row.kind === "instant").map((row) => row.label);
+  const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
+  if (!assignment) return null;
+  if (primaryBalanceSheetAssignmentSideForModelRow(assignment.modelRow) === "unknown") return null;
+
+  return {
+    modelRow: assignment.modelRow,
+    status: assignment.grouped ? "grouped_into_model_row" : balanceSheetAssignmentStatusForModelRow(assignment.modelRow, source),
+    reason: assignment.reason
   };
 }
 
