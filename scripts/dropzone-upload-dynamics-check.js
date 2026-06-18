@@ -32,8 +32,10 @@ const checks = [
     message: "Dropped workbook extraction must fall back to DataTransferItem.getAsFile when files is empty."
   },
   {
-    ok: /input\.addEventListener\("change", handleNativeFileSelection\)/.test(source) && /input\.addEventListener\("input", handleNativeFileSelection\)/.test(source),
-    message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing."
+    ok: /input\.addEventListener\("change", handleNativeFileSelection\)/.test(source)
+      && /input\.addEventListener\("input", handleNativeFileSelection\)/.test(source)
+      && /input\.addEventListener\("cancel", handleNativeFileSelection\)/.test(source),
+    message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing, including same-file cancel events."
   },
   {
     ok: /const handleWorkbookSelected = useCallback/.test(source)
@@ -62,12 +64,20 @@ const checks = [
     message: "Focus-return sync must not skip a native file just because its key was seen before."
   },
   {
-    ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source),
-    message: "File input must not clear itself while opening the picker; that can erase the selected file after Open."
+    ok: /function handlePageShow\(\)[\s\S]*syncInputSelectionSoon\(\);[\s\S]*syncInputSelectionSoon\(\);[\s\S]*window\.addEventListener\("pageshow", handlePageShow\)/.test(source),
+    message: "Dropzone must resync from the native file input on mount and page-show after app reloads or browser restores."
   },
   {
-    ok: !/prepareFilePicker/.test(source),
-    message: "Dropzone should not use a picker-preparation helper that mutates the native input value."
+    ok: /const prepareNativeFilePicker = useCallback\(\(input: HTMLInputElement\) => \{\s*syncInputSelectionSoon\(input\);\s*input\.value = "";\s*\}/.test(source),
+    message: "Native picker reset must first sync the current file so same-path reselection works without losing displayed state."
+  },
+  {
+    ok: /onPointerDown=\{handleFilePickerPointerDown\}[\s\S]*onKeyDown=\{handleFilePickerKeyDown\}/.test(source),
+    message: "File input must prepare the native picker for pointer and keyboard activation."
+  },
+  {
+    ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source),
+    message: "Native picker resets must stay centralized instead of inline event handlers that can erase picker results."
   },
   {
     ok: /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),

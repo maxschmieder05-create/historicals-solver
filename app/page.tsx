@@ -1,6 +1,17 @@
 "use client";
 
-import { ChangeEvent, DragEvent, FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChangeEvent,
+  DragEvent,
+  FormEvent,
+  KeyboardEvent,
+  PointerEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState
+} from "react";
 import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
 
 type FillSummary = {
@@ -38,6 +49,8 @@ export default function Home() {
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const inputSyncFrameRef = useRef<number | null>(null);
+  const inputSyncTimersRef = useRef<number[]>([]);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
@@ -64,19 +77,37 @@ export default function Home() {
     setFile(nextFile);
   }, [clearFileInput]);
 
+  const clearPendingInputSync = useCallback(() => {
+    if (inputSyncFrameRef.current !== null) {
+      window.cancelAnimationFrame(inputSyncFrameRef.current);
+      inputSyncFrameRef.current = null;
+    }
+    for (const timer of inputSyncTimersRef.current) window.clearTimeout(timer);
+    inputSyncTimersRef.current = [];
+  }, []);
+
+  const syncInputSelection = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
+    const nextFile = input?.files?.item(0) ?? undefined;
+    if (!nextFile) return;
+    handleWorkbookSelected(nextFile);
+  }, [handleWorkbookSelected]);
+
+  const syncInputSelectionSoon = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
+    clearPendingInputSync();
+    syncInputSelection(input);
+    inputSyncFrameRef.current = window.requestAnimationFrame(() => {
+      syncInputSelection(input);
+      inputSyncFrameRef.current = null;
+    });
+    inputSyncTimersRef.current = [100, 300, 1000].map((delay) => window.setTimeout(() => syncInputSelection(input), delay));
+  }, [clearPendingInputSync, syncInputSelection]);
+
+  const prepareNativeFilePicker = useCallback((input: HTMLInputElement) => {
+    syncInputSelectionSoon(input);
+    input.value = "";
+  }, [syncInputSelectionSoon]);
+
   useEffect(() => {
-    function syncInputSelection() {
-      const nextFile = fileInputRef.current?.files?.item(0) ?? undefined;
-      if (!nextFile) return;
-      handleWorkbookSelected(nextFile);
-    }
-
-    function syncInputSelectionSoon() {
-      syncInputSelection();
-      window.requestAnimationFrame(syncInputSelection);
-      window.setTimeout(syncInputSelection, 250);
-    }
-
     function handleWindowDragOver(event: globalThis.DragEvent) {
       if (!hasTransferredFiles(event.dataTransfer)) return;
       event.preventDefault();
@@ -99,34 +130,45 @@ export default function Home() {
       if (document.visibilityState === "visible") syncInputSelectionSoon();
     }
 
+    function handlePageShow() {
+      syncInputSelectionSoon();
+    }
+
+    syncInputSelectionSoon();
+
     window.addEventListener("dragover", handleWindowDragOver);
     window.addEventListener("drop", handleWindowDrop);
     window.addEventListener("focus", handleWindowFocus);
+    window.addEventListener("pageshow", handlePageShow);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       window.removeEventListener("dragover", handleWindowDragOver);
       window.removeEventListener("drop", handleWindowDrop);
       window.removeEventListener("focus", handleWindowFocus);
+      window.removeEventListener("pageshow", handlePageShow);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
+      clearPendingInputSync();
     };
-  }, [handleWorkbookSelected]);
+  }, [clearPendingInputSync, handleWorkbookSelected, syncInputSelectionSoon]);
 
   useEffect(() => {
     const input = fileInputRef.current;
     if (!input) return;
 
     const handleNativeFileSelection = () => {
-      const nextFile = input.files?.item(0) ?? undefined;
-      if (nextFile) handleWorkbookSelected(nextFile);
+      syncInputSelection(input);
     };
 
     input.addEventListener("change", handleNativeFileSelection);
     input.addEventListener("input", handleNativeFileSelection);
+    input.addEventListener("cancel", handleNativeFileSelection);
+    syncInputSelection(input);
     return () => {
       input.removeEventListener("change", handleNativeFileSelection);
       input.removeEventListener("input", handleNativeFileSelection);
+      input.removeEventListener("cancel", handleNativeFileSelection);
     };
-  }, [handleWorkbookSelected]);
+  }, [syncInputSelection]);
 
   function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
@@ -157,6 +199,14 @@ export default function Home() {
 
   function handleFileInput(event: FormEvent<HTMLInputElement>) {
     pickInputFile(event.currentTarget);
+  }
+
+  function handleFilePickerPointerDown(event: PointerEvent<HTMLInputElement>) {
+    prepareNativeFilePicker(event.currentTarget);
+  }
+
+  function handleFilePickerKeyDown(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key === "Enter" || event.key === " ") prepareNativeFilePicker(event.currentTarget);
   }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -299,6 +349,8 @@ export default function Home() {
               onInputCapture={handleFileInput}
               onChange={handleFileSelect}
               onInput={handleFileInput}
+              onPointerDown={handleFilePickerPointerDown}
+              onKeyDown={handleFilePickerKeyDown}
             />
             <span className="dropIcon">
               {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
