@@ -3604,6 +3604,16 @@ function resolveNonOperatingInterestExpenseAfterNetRevenue(period: string, ctx: 
   const netRevenue = first(period, ctx.duration, C.netRevenue);
   const operatingInterest = first(period, ctx.duration, ["InterestExpenseOperating"]);
   const genericInterest = first(period, ctx.duration, ["InterestExpense"]);
+  const rawGenericStandalone = firstSemanticDurationSource(period, ctx, C.interestExpense, interestExpenseScore);
+  const genericStandalone = acceptedSourceForModelRow(period, ctx, rawGenericStandalone, "Interest Expense") ?? rawGenericStandalone;
+  if (genericStandalone && !operatingInterest && sourceHasStandalonePrimaryIncomeStatementInterestExpenseLine(period, ctx, genericStandalone)) {
+    return {
+      value: expenseAsModelReduction(genericStandalone.value),
+      sources: [genericStandalone],
+      note: "Mapped generic EDGAR interest expense because it is reported as a standalone non-operating interest expense line for this period.",
+      classification: C.interestExpense.includes(genericStandalone.concept) ? "direct" : "grouped"
+    };
+  }
   return {
     value: 0,
     sources: compactSources([zeroSource("InterestExpenseNonOperating"), netRevenue, operatingInterest, genericInterest]),
@@ -4238,8 +4248,15 @@ function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext)
   const primaryStatementItems = primaryIncomeStatementSourcesForPeriod(period, ctx).filter(
     (source) => isExplicitOtherOperatingLineSource(source) || isAcquiredInProcessResearchDevelopmentSource(source) || isOperatingSpecialChargeSource(source)
   );
-  const candidates = uniqueFactSources([...operatingIncomeItems, ...acquiredIprdItems, ...specialChargeItems, ...semanticItems, ...primaryStatementItems]).filter((source) =>
-    sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period, ctx, source)
+  const primaryStatementConcepts = new Set(primaryStatementItems.map((source) => source.concept));
+  const nonPrimaryItems = [...operatingIncomeItems, ...acquiredIprdItems, ...specialChargeItems, ...semanticItems].filter(
+    (source) => !primaryStatementConcepts.has(source.concept)
+  );
+  const candidates = collapseDuplicateExplicitOperatingSources(
+    period,
+    uniqueFactSources([...primaryStatementItems, ...nonPrimaryItems]).filter((source) =>
+      sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period, ctx, source)
+    )
   );
   const accepted = withAcceptedModelRowClassifications(period, ctx, candidates, "Other Operating Income / Expense");
   const items = uniqueFactSources([...accepted, ...candidates]);
@@ -4259,6 +4276,33 @@ function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext)
       "Grouped from explicit primary-income-statement operating income/expense lines that do not have dedicated model rows. Reported operating presentation takes precedence over mathematical tie-outs.",
     classification: "grouped"
   };
+}
+
+function collapseDuplicateExplicitOperatingSources(period: string, sources: FactSource[]) {
+  const groups = new Map<string, FactSource[]>();
+  for (const source of sources) {
+    const group = groups.get(source.concept) ?? [];
+    group.push(source);
+    groups.set(source.concept, group);
+  }
+  return Array.from(groups.values()).map((group) => {
+    if (group.length === 1) return group[0];
+    return group
+      .slice()
+      .sort((a, b) => explicitOperatingSourceRank(a) - explicitOperatingSourceRank(b) || explicitOperatingSourceMagnitudeRank(period, a, b))[0];
+  });
+}
+
+function explicitOperatingSourceRank(source: FactSource) {
+  const text = `${source.label} ${source.note ?? ""}`.toLowerCase();
+  if (/\(note\s*\d+\)|\bnote\s*\d+\b|\bschedule\b|\bdetails?\b/.test(text)) return 2;
+  if (source.sourceLayer === "sec_filing_package") return 0;
+  return 1;
+}
+
+function explicitOperatingSourceMagnitudeRank(period: string, a: FactSource, b: FactSource) {
+  if (isAnnualPeriod(period)) return Math.abs(b.value) - Math.abs(a.value);
+  return Math.abs(a.value) - Math.abs(b.value);
 }
 
 function isExplicitOtherOperatingLineSource(source: FactSource) {
@@ -12165,6 +12209,26 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     "income tax expense"
   );
   refreshFormulaMetricResultsFromResolver(sheet, periods, columns, ctx, auditRows, ["Net Income (Loss)", "Net Income"], resolveNetIncome, "net income");
+  refreshFormulaMetricResultsFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Other Operating Income (Expense)", "Other Operating Income", "Other Operating Expense"],
+    resolveOtherOperatingIncomeExpense,
+    "other operating income/expense"
+  );
+  refreshFormulaMetricResultsFromResolver(
+    sheet,
+    periods,
+    columns,
+    ctx,
+    auditRows,
+    ["Interest (Expense)", "Interest Expense"],
+    resolveInterestExpense,
+    "interest expense"
+  );
 }
 
 function refreshFormulaMetricResultsFromResolver(
@@ -16771,8 +16835,8 @@ function assignPrimaryBalanceSheetLineItem(
       reason: "Excluded parenthetical allowance, accumulated depreciation, accumulated amortization, or per-share capital disclosure because it is not a primary balance sheet carrying amount."
     };
   }
-  if ((section === "equity" || reportedLineItemCategory(source) === "equity") && sourceTextMatches(source, /\bemployee benefits? trust\b|\bother equity\b/)) {
-    return choose("Treasury Stock", ["Treasury & Preferred Stock"], "Employee benefit trust and other contra-equity presentation rows are mapped to treasury stock before generic APIC classification.");
+  if (sourceTextMatches(source, /\bemployee benefits? trust\b/)) {
+    return choose("Treasury Stock", ["Treasury & Preferred Stock"], "Employee benefit trust shares are contra-equity/treasury-style equity and map to treasury stock before generic APIC classification.");
   }
 
   const classifiedAssignment = classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows);
@@ -20120,7 +20184,11 @@ async function validateReturnedWorkbookBuffer(output: Buffer<ArrayBuffer>, optio
     ...options,
     workbook: returnedWorkbook,
     sheet: returnedSheet,
-    warnings
+    warnings,
+    workbookSnapshot: {
+      ...options.workbookSnapshot,
+      protectedCells: new Map()
+    }
   });
 }
 
