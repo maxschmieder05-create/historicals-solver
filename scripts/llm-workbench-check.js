@@ -135,6 +135,22 @@ const toolbox = buildLlmWorkbookToolbox({
       sourceSection: "current liabilities"
     }
   ],
+  incomeStatementAssignments: [
+    {
+      period: "1Q25",
+      sourceLineItemLabel: "Advertising expense",
+      sourceXbrlTag: "AdvertisingExpense",
+      sourceAmount: 12_000_000,
+      sourceAmountMillions: 12,
+      modelAmount: -12_000_000,
+      modelAmountMillions: -12,
+      assignedModelRow: "SG&A",
+      assignmentStatus: "grouped_into_model_row",
+      classificationReason: "Advertising expense is an SG&A operating expense.",
+      validationStatus: "OK!",
+      sourceSection: "operating expenses"
+    }
+  ],
   validationFailures: ["Model!F20 1Q25: hardcoded historical value has no current-company source ledger support."],
   warnings: ["Example warning"],
   limits: {
@@ -143,7 +159,8 @@ const toolbox = buildLlmWorkbookToolbox({
     maxStatementRows: 10,
     maxAuditRows: 10,
     maxSourceLedgerRows: 10,
-    maxBalanceSheetAssignments: 10
+    maxBalanceSheetAssignments: 10,
+    maxIncomeStatementAssignments: 10
   }
 });
 
@@ -160,12 +177,14 @@ assert.deepEqual(
     "workbook.trace_source_ledger",
     "workbook.get_mapping_audit",
     "workbook.get_balance_sheet_assignment_ledger",
+    "workbook.get_income_statement_assignment_ledger",
     "workbook.validate_return"
   ]
 );
 assert.equal(toolbox.omittedCounts.facts, 1);
 assert.equal(toolbox.toolOutputs[0].output.facts[0].concept, "RevenueFromContractWithCustomerExcludingAssessedTax");
 assert.equal(toolbox.toolOutputs[2].output.cells[0].sourceLedgerStatus, "stale_or_unsupported");
+assert.equal(toolbox.toolOutputs[6].output.rows[0].assignedModelRow, "SG&A");
 assert.match(llmWorkbookToolboxSystemInstruction(), /MCP-style tool outputs/);
 assert.match(llmWorkbookToolboxSystemInstruction(), /workbook\.validate_return/);
 

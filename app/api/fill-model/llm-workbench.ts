@@ -97,6 +97,21 @@ export type LlmWorkbenchBalanceAssignment = {
   sourceSection: string;
 };
 
+export type LlmWorkbenchIncomeAssignment = {
+  period: string;
+  sourceLineItemLabel: string;
+  sourceXbrlTag: string;
+  sourceAmount: number;
+  sourceAmountMillions: number;
+  modelAmount: number;
+  modelAmountMillions: number;
+  assignedModelRow: string;
+  assignmentStatus: string;
+  classificationReason: string;
+  validationStatus: string;
+  sourceSection: string;
+};
+
 export type LlmWorkbookToolboxInput = {
   company: {
     ticker: string;
@@ -110,6 +125,7 @@ export type LlmWorkbookToolboxInput = {
   auditRows: LlmWorkbenchAuditRow[];
   sourceLedgerRows: LlmWorkbenchSourceLedgerRow[];
   balanceSheetAssignments: LlmWorkbenchBalanceAssignment[];
+  incomeStatementAssignments?: LlmWorkbenchIncomeAssignment[];
   validationFailures: string[];
   warnings: string[];
   limits?: Partial<LlmWorkbookToolboxLimits>;
@@ -122,6 +138,7 @@ export type LlmWorkbookToolboxLimits = {
   maxAuditRows: number;
   maxSourceLedgerRows: number;
   maxBalanceSheetAssignments: number;
+  maxIncomeStatementAssignments: number;
   maxWarnings: number;
 };
 
@@ -148,6 +165,7 @@ export type LlmWorkbookToolbox = {
     auditRows: number;
     sourceLedgerRows: number;
     balanceSheetAssignments: number;
+    incomeStatementAssignments: number;
     warnings: number;
   };
 };
@@ -159,6 +177,7 @@ const DEFAULT_LIMITS: LlmWorkbookToolboxLimits = {
   maxAuditRows: 500,
   maxSourceLedgerRows: 600,
   maxBalanceSheetAssignments: 500,
+  maxIncomeStatementAssignments: 500,
   maxWarnings: 80
 };
 
@@ -170,6 +189,7 @@ export function buildLlmWorkbookToolbox(input: LlmWorkbookToolboxInput): LlmWork
   const auditRows = rankAuditRows(input.auditRows).slice(0, limits.maxAuditRows);
   const sourceLedgerRows = rankSourceLedgerRows(input.sourceLedgerRows).slice(0, limits.maxSourceLedgerRows);
   const balanceSheetAssignments = rankBalanceAssignments(input.balanceSheetAssignments).slice(0, limits.maxBalanceSheetAssignments);
+  const incomeStatementAssignments = rankIncomeAssignments(input.incomeStatementAssignments ?? []).slice(0, limits.maxIncomeStatementAssignments);
   const warnings = input.warnings.slice(0, limits.maxWarnings);
   const blockingFailures = uniqueStrings(input.validationFailures).filter(Boolean);
 
@@ -217,6 +237,11 @@ export function buildLlmWorkbookToolbox(input: LlmWorkbookToolboxInput): LlmWork
         output: { rows: balanceSheetAssignments }
       },
       {
+        name: "workbook.get_income_statement_assignment_ledger",
+        description: "Primary income-statement source line items and how each was assigned, grouped, excluded, or flagged.",
+        output: { rows: incomeStatementAssignments }
+      },
+      {
         name: "workbook.validate_return",
         description: "Deterministic fail-closed validation gate for returned workbooks.",
         output: {
@@ -233,6 +258,7 @@ export function buildLlmWorkbookToolbox(input: LlmWorkbookToolboxInput): LlmWork
       auditRows: Math.max(0, input.auditRows.length - auditRows.length),
       sourceLedgerRows: Math.max(0, input.sourceLedgerRows.length - sourceLedgerRows.length),
       balanceSheetAssignments: Math.max(0, input.balanceSheetAssignments.length - balanceSheetAssignments.length),
+      incomeStatementAssignments: Math.max(0, (input.incomeStatementAssignments ?? []).length - incomeStatementAssignments.length),
       warnings: Math.max(0, input.warnings.length - warnings.length)
     }
   };
@@ -257,6 +283,13 @@ function rankStatementRows(rows: LlmWorkbenchStatementRow[]) {
   return rows.slice().sort((a, b) => {
     const sourceRank = sourceTableRank(a.sourceTableType) - sourceTableRank(b.sourceTableType);
     return sourceRank || periodSort(a.period, b.period) || (a.rowOrder ?? 0) - (b.rowOrder ?? 0) || materialityValue(b.value) - materialityValue(a.value);
+  });
+}
+
+function rankIncomeAssignments(rows: LlmWorkbenchIncomeAssignment[]) {
+  return rows.slice().sort((a, b) => {
+    const statusRank = assignmentStatusRank(a.assignmentStatus) - assignmentStatusRank(b.assignmentStatus);
+    return statusRank || periodSort(a.period, b.period) || Math.abs(b.modelAmount) - Math.abs(a.modelAmount);
   });
 }
 

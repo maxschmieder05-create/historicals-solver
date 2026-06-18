@@ -61,6 +61,7 @@ import {
   type LlmWorkbenchBalanceAssignment,
   type LlmWorkbenchCell,
   type LlmWorkbenchFact,
+  type LlmWorkbenchIncomeAssignment,
   type LlmWorkbenchSourceLedgerRow,
   type LlmWorkbenchStatementRow,
   type LlmWorkbookToolbox
@@ -194,6 +195,9 @@ type LlmMappingState = {
   warnings: string[];
   calls: number;
   maxCalls: number;
+  startedAt: number;
+  deadlineAt: number;
+  budgetWarningAdded: boolean;
 };
 
 type LlmMappingModelChoice = {
@@ -505,6 +509,35 @@ type PrimaryBalanceSheetAssignment = {
   reason: string;
 };
 
+type IncomeStatementAssignmentStatus =
+  | "mapped_to_model_row"
+  | "grouped_into_model_row"
+  | "subtotal_or_total_excluded"
+  | "explicitly_excluded_with_reason";
+
+type PrimaryIncomeStatementAssignmentLedgerRow = {
+  fiscalPeriod: string;
+  sourceFilingAccession: string;
+  sourceStatement: string;
+  sourceLineItemLabel: string;
+  sourceAmount: number;
+  modelAmount: number;
+  sourceXbrlTag: string;
+  assignedModelRow: string;
+  assignmentStatus: IncomeStatementAssignmentStatus;
+  classificationReason: string;
+  llmUsed: boolean;
+  validationStatus: string;
+  sourceSection: FinancialStatementSection;
+  sourceRowKey: string;
+};
+
+type PrimaryIncomeStatementAssignment = {
+  modelRow: string | null;
+  status: IncomeStatementAssignmentStatus;
+  reason: string;
+};
+
 type RowClassification = "direct" | "grouped" | "partial" | "formula" | "unused";
 
 type WorkbookSnapshot = {
@@ -566,12 +599,14 @@ const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDI
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
 const LLM_MAPPING_TIMEOUT_MS = Number(process.env.LLM_MAPPING_TIMEOUT_MS || 3_000);
+const LLM_TOTAL_TIMEOUT_MS = Number(process.env.LLM_TOTAL_TIMEOUT_MS || 120_000);
 const LLM_WORKBENCH_MAX_FACTS = Number(process.env.LLM_WORKBENCH_MAX_FACTS || 500);
 const LLM_WORKBENCH_MAX_STATEMENT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_STATEMENT_ROWS || 650);
 const LLM_WORKBENCH_MAX_WORKBOOK_CELLS = Number(process.env.LLM_WORKBENCH_MAX_WORKBOOK_CELLS || 700);
 const LLM_WORKBENCH_MAX_AUDIT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_AUDIT_ROWS || 500);
 const LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS = Number(process.env.LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS || 600);
 const LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS = Number(process.env.LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS || 500);
+const LLM_WORKBENCH_MAX_INCOME_ASSIGNMENTS = Number(process.env.LLM_WORKBENCH_MAX_INCOME_ASSIGNMENTS || 500);
 // Stored XLSX entries are larger but avoid minutes of duplicate DEFLATE work during interactive downloads.
 const FAST_XLSX_ZIP_OPTIONS = {
   compression: "STORE" as const
@@ -588,6 +623,7 @@ const LABEL_COLUMNS = [1, 2, 3, 4, 5, 6, 7, 8];
 const MAPPING_AUDIT_SHEET = "Mapping Audit";
 const SOURCE_LEDGER_SHEET = "Source Ledger";
 const BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET = "Balance Sheet Assignment Ledger";
+const INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET = "Income Statement Assignment Ledger";
 const LLM_MAPPING_REVIEW_SHEET = "LLM Mapping Review";
 const SEC_ARCHIVE_MIN_INTERVAL_MS = 150;
 const secArchiveHtmlCache = new Map<string, string>();
@@ -1930,7 +1966,7 @@ function sourceIsSeparatelyModeledOperatingExpense(source: FactSource) {
   if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(source.concept)) return true;
   if (INCOME_STATEMENT_DA_CONCEPTS.includes(source.concept)) return true;
   if (OTHER_OPERATING_INCOME_CONCEPTS.includes(source.concept) || OTHER_OPERATING_EXPENSE_CONCEPTS.includes(source.concept) || source.concept === "OtherOperatingIncomeExpenseNet") return true;
-  if (/\bselling\b|\bmarketing\b|\bgeneral\b.*\badministrative\b|\bsg&a\b/.test(text)) return true;
+  if (sourceLooksLikeSellingGeneralAdministrativeExpense(source)) return true;
   if (/\bresearch\b|\bdevelopment\b|\br&d\b|\btechnology\b.*\bdevelopment\b|\bproduct development\b/.test(text)) return true;
   if (/\bdepreciation\b|\bamortization\b|\bdepletion\b/.test(text)) return true;
   if (/\bother operating\b/.test(text)) return true;
@@ -1938,6 +1974,14 @@ function sourceIsSeparatelyModeledOperatingExpense(source: FactSource) {
     return true;
   }
   return false;
+}
+
+function sourceLooksLikeSellingGeneralAdministrativeExpense(source: FactSource) {
+  const text = sourceSearchText(source);
+  return (
+    /\bsg&a\b|\bselling\b.*\bgeneral\b.*\badministrative\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b/.test(text) ||
+    /\bsales and marketing\b|\bselling and marketing\b|\bmarketing expense\b|\badvertising\b|\bpromotion(?:al)?\b|\bsales expense\b|\bselling expense\b/.test(text)
+  );
 }
 
 function selectPrimaryStatementRevenueSource(period: string, ctx: ResolveContext) {
@@ -2341,7 +2385,7 @@ async function buildLineItemClassificationStore(
     });
     for (const requests of requestGroups) {
       if (!requests.some((request) => lineItemNeedsClassification(request))) continue;
-      const willUseLlm = state.enabled && state.calls < state.maxCalls && lineItemLlmCalls < maxLineItemLlmCalls;
+      const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmCalls < maxLineItemLlmCalls;
       const classificationResult = await classifyFinancialStatementLineItems(requests, {
         llm: {
           enabled: willUseLlm,
@@ -2350,7 +2394,7 @@ async function buildLineItemClassificationStore(
           model: chooseStatementLineItemClassificationModel(requests),
           siteUrl: OPENROUTER_SITE_URL,
           appTitle: OPENROUTER_APP_TITLE,
-          timeoutMs: lineItemLlmTimeoutMs
+          timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
         }
       });
       state.calls += classificationResult.llmCalls;
@@ -2579,10 +2623,19 @@ function statementSectionForRow(
   }
 
   if (statementName === "income_statement") {
-    if (/\brevenue|sales\b/i.test(row.rowLabel)) return "revenue";
-    if (/\bincome tax|tax expense|tax benefit|provision for tax/i.test(row.rowLabel)) return "tax";
-    if (/\bnet income|net loss|net earnings\b/i.test(row.rowLabel)) return "net income";
+    const source: FactSource = {
+      concept: row.xbrlConcept ?? "",
+      label: row.rowLabel,
+      value: typeof row.value === "number" ? row.value : 0
+    };
+    const category = reportedLineItemCategory(source);
+    if (category === "income_tax") return "tax";
+    if (category === "net_income") return "net income";
     if (primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row)) return "below operating income";
+    if (category === "interest_income" || category === "interest_expense" || category === "other_non_operating_income_expense" || category === "pretax_income") {
+      return "below operating income";
+    }
+    if (category === "revenue") return "revenue";
     return "operating expenses";
   }
 
@@ -2664,6 +2717,9 @@ function lineItemClassificationUncertaintyReason(row: SecFilingStatementStructur
   if (/\bdeferred\b/.test(text)) return "Deferred items can be deferred revenue/contract liabilities or deferred income taxes.";
   if (/\bdebt\b|\bnotes?\b|\bborrowings?\b/.test(text)) return "Debt labels require distinguishing true short-term borrowing facilities from current maturities or long-term debt instruments.";
   if (/\bother\b/.test(text) || /other/i.test(deterministicCandidate ?? "")) return "Other buckets are allowed only when no better dedicated model row exists.";
+  if (/\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bselling\b|\badministrative\b/.test(text)) {
+    return "Selling, marketing, advertising, and administrative expense labels require grouping into SG&A when no more dedicated model row exists.";
+  }
   if (/\binvestments?\b|\bsupplies\b|\bcontract\b|\blease\b|\btax\b|\bspecial\b|\bimpairment\b|\brestructuring\b/.test(text)) {
     return "The label contains accounting terms whose model row depends on statement section and template definitions.";
   }
@@ -4198,18 +4254,32 @@ function resolveSellingGeneralAdministrativeExpense(period: string, ctx: Resolve
     };
   }
 
-  const component = resolvedWithAcceptedModelRowClassifications(
+  const facts = ctx.duration.get(period);
+  const componentConceptSources = uniqueFactSources(
+    [...SALES_MARKETING_EXPENSE_CONCEPTS, "GeneralAndAdministrativeExpense"]
+      .map((concept) => facts?.get(concept))
+      .filter((source): source is FactSource => Boolean(source))
+  );
+  const primaryStatementSemanticSources = primaryIncomeStatementSourcesForPeriod(period, ctx).filter(
+    (source) => sourceLooksLikeSellingGeneralAdministrativeExpense(source) && sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period, ctx, source)
+  );
+  const semanticSources = withAcceptedModelRowClassifications(
     period,
     ctx,
-    sumWithNote(
-      period,
-      ctx.duration,
-      [...SALES_MARKETING_EXPENSE_CONCEPTS, "GeneralAndAdministrativeExpense"],
-      "Grouped from EDGAR selling/marketing and general/administrative expense concepts because no broad SG&A concept was reported."
-    ),
+    uniquePrimaryIncomeStatementLineSources(period, ctx, [...componentConceptSources, ...primaryStatementSemanticSources]),
     "SG&A"
   );
-  return signed(component, -1) ?? { value: null, sources: [], note: "No SG&A concept or operating-income bridge inputs were available in SEC facts." };
+  if (semanticSources.length) {
+    return {
+      value: -semanticSources.reduce((total, source) => total + Math.abs(source.value), 0),
+      sources: semanticSources,
+      note:
+        "Grouped from EDGAR selling, marketing, advertising, promotional, and general/administrative operating expense rows because no broad SG&A concept was reported.",
+      classification: semanticSources.length > 1 ? "grouped" : "direct"
+    };
+  }
+
+  return { value: null, sources: [], note: "No SG&A concept or operating-income bridge inputs were available in SEC facts." };
 }
 
 function resolveResearchDevelopmentExpense(period: string, ctx: ResolveContext): ResolvedValue {
@@ -6910,6 +6980,7 @@ export async function POST(request: NextRequest) {
     timing("source ledger validation complete");
 
     const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
+    const incomeStatementAssignmentLedgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(incomeStatementPeriods, ctx, fillRows);
     const llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
       company,
       periods: unique([...periods, ...balanceSheetPeriods, ...incomeStatementPeriods]),
@@ -6919,6 +6990,7 @@ export async function POST(request: NextRequest) {
       ctx,
       sourceLedgerRows,
       balanceSheetAssignmentLedgerRows,
+      incomeStatementAssignmentLedgerRows,
       auditRows,
       warnings,
       validationFailures: []
@@ -6934,6 +7006,7 @@ export async function POST(request: NextRequest) {
     addMappingAuditSheet(workbook, auditRows);
     addSourceLedgerSheet(workbook, sourceLedgerRows);
     addBalanceSheetAssignmentLedgerSheet(workbook, balanceSheetAssignmentLedgerRows);
+    addIncomeStatementAssignmentLedgerSheet(workbook, incomeStatementAssignmentLedgerRows);
     addLlmMappingReviewSheet(workbook, llmMappingReview.rows);
 
     const recalculationSheetNames = unique([
@@ -6944,6 +7017,7 @@ export async function POST(request: NextRequest) {
       MAPPING_AUDIT_SHEET,
       SOURCE_LEDGER_SHEET,
       BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET,
+      INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET,
       LLM_MAPPING_REVIEW_SHEET
     ]);
     timing("audit sheets added; writing workbook");
@@ -11127,7 +11201,11 @@ function expectedReportedLineItemCategory(fillRow: FillRow): ReportedLineItemCat
   if (hasConcept(C.cogs) || hasConcept(C.healthCareCosts) || /costofrevenue|costofsales|costofgood|costofoperation|costofservice|costofproduct|merchandisecost|fulfillmentcost/.test(label)) return "cost_of_revenue";
   if (/acquired.*inprocess.*research.*development|inprocess.*research.*development|iprd/.test(label)) return "research_and_development";
   if (fillRow.resolver === resolveResearchDevelopmentExpense || hasConcept(C.rd) || /research|development|engineering|technologydevelopment|productdevelopment/.test(label)) return "research_and_development";
-  if (fillRow.resolver === resolveSellingGeneralAdministrativeExpense || hasConcept(C.sga) || /sellinggeneraladministrative|sga|generaladministrative|sellingmarketing|corporateoverhead|administrativeexpense/.test(label)) return "selling_general_administrative";
+  if (
+    fillRow.resolver === resolveSellingGeneralAdministrativeExpense ||
+    hasConcept(C.sga) ||
+    /sellinggeneraladministrative|sga|generaladministrative|sellingmarketing|salesmarketing|marketingexpense|advertising|promotion|corporateoverhead|administrativeexpense|salesexpense|sellingexpense/.test(label)
+  ) return "selling_general_administrative";
   if (fillRow.resolver === resolveIncomeStatementDepreciationAmortization || hasConcept(INCOME_STATEMENT_DA_CONCEPTS) || /depreciation(?:and)?amortization|depreciationexpense|amortizationexpense|depreciationdepletionandamortization/.test(label)) return "income_statement_depreciation_amortization";
   if (fillRow.resolver === resolveOtherOperatingIncomeExpense || /otheroperatingincome|otheroperatingexpense|restructuring|litigation|accretion|assetimpairment|specialcharges|integrationcost|businessrealignment|acquisitionrelatedcharge/.test(label)) return "other_operating_income_expense";
   if (fillRow.resolver === resolveInterestIncome || hasConcept(C.interestIncome) || /interestincome|interestearned|investmentinterestincome/.test(label)) return "interest_income";
@@ -11195,7 +11273,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (isRevenueComponentSource(source)) return "revenue";
   if (isAcquiredInProcessResearchDevelopmentSource(source)) return "research_and_development";
   if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(concept) || /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b/.test(text)) return "research_and_development";
-  if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(concept) || /\bselling\b.*\bgeneral\b.*\badministrative\b|\bsg&a\b|\bgeneral and administrative\b|\bselling and marketing\b|\bcorporate overhead\b|\badministrative expense\b/.test(text)) return "selling_general_administrative";
+  if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(concept) || sourceLooksLikeSellingGeneralAdministrativeExpense(source)) return "selling_general_administrative";
   if (INCOME_STATEMENT_DA_CONCEPTS.includes(concept) || /\bdepreciation\b|\bamortization\b|\bdepletion\b/.test(text)) return "income_statement_depreciation_amortization";
   if (OTHER_OPERATING_INCOME_CONCEPTS.includes(concept) || /\bintellectual property\b.*\bcustom development\b/.test(text)) return "other_operating_income_expense";
   if (
@@ -12386,13 +12464,33 @@ function isIncomeStatementReconciliationResidualCellWritable(cell: ExcelJS.Cell)
 function createLlmMappingState(): LlmMappingState {
   const enabledByEnv = llmMappingEnabledByEnv();
   const hasApiKey = Boolean(llmApiKey());
+  const startedAt = Date.now();
+  const maxDurationMs = Number.isFinite(LLM_TOTAL_TIMEOUT_MS) && LLM_TOTAL_TIMEOUT_MS > 0 ? LLM_TOTAL_TIMEOUT_MS : 120_000;
   return {
     enabled: enabledByEnv && hasApiKey,
     decisions: new Map(),
     warnings: enabledByEnv && !hasApiKey ? ["LLM mapping was enabled but OPENROUTER_API_KEY was not set; deterministic EDGAR mapping was used."] : [],
     calls: 0,
-    maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS >= 0 ? LLM_MAPPING_MAX_CALLS : 24
+    maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS >= 0 ? LLM_MAPPING_MAX_CALLS : 24,
+    startedAt,
+    deadlineAt: startedAt + maxDurationMs,
+    budgetWarningAdded: false
   };
+}
+
+function llmTimeRemainingMs(state: LlmMappingState) {
+  return Math.max(0, state.deadlineAt - Date.now());
+}
+
+function llmCanUse(state: LlmMappingState, minRemainingMs = 1_000) {
+  if (!state.enabled) return false;
+  if (state.calls >= state.maxCalls) return false;
+  if (llmTimeRemainingMs(state) >= minRemainingMs) return true;
+  if (!state.budgetWarningAdded) {
+    state.budgetWarningAdded = true;
+    state.warnings.push("LLM mapping budget was exhausted; remaining rows used deterministic EDGAR classification and fail-closed validation.");
+  }
+  return false;
 }
 
 function llmMappingEnabledByEnv() {
@@ -12522,6 +12620,7 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
     "Review every provided mapping and source coverage item using accounting reasoning, SEC statement context, XBRL tag semantics, current/non-current section, subtotal/component relationships, model row definitions, and validation status.",
     "Use only the provided EDGAR source rows, mapping audit rows, source ledger rows, and primary balance-sheet assignment ledger rows. Do not invent facts, line items, or amounts.",
     "Confirm that every material primary SEC line item is either assigned to the correct model row, grouped into the correct Other row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
+    "Advertising, promotional, selling, and marketing expenses presented as operating expenses belong in SG&A unless the model has a more specific dedicated row.",
     "Current marketable securities, available-for-sale securities, and short-term investments belong in Cash & Cash Equivalents when the template has no dedicated current investments row; when the template has a dedicated row, they belong there.",
     "Current maturities/current portion of long-term debt belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, and notes payable current may belong in Revolver/current borrowings.",
     "Deferred revenue or contract liabilities are operating liabilities, not deferred income taxes. Deferred tax assets/liabilities require tax-specific semantics.",
@@ -12616,6 +12715,7 @@ function llmMappingReviewPayload(
       templateRuleExamples: [
         "Marketable securities / short-term investments combine with Cash & Cash Equivalents when no dedicated current investment row exists.",
         "Current maturities of long-term debt combine with LT Debt including current portion.",
+        "Advertising, promotional, selling, and marketing operating expenses group into SG&A when no more specific template row exists.",
         "Deferred revenue is an operating liability, not deferred income taxes."
       ]
     },
@@ -12696,6 +12796,7 @@ function buildLlmWorkbookToolboxForReview(input: {
   ctx: ResolveContext;
   sourceLedgerRows: HistoricalSourceLedgerRow[];
   balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[];
+  incomeStatementAssignmentLedgerRows: PrimaryIncomeStatementAssignmentLedgerRow[];
   auditRows: MappingAuditRow[];
   warnings: string[];
   validationFailures: string[];
@@ -12713,6 +12814,7 @@ function buildLlmWorkbookToolboxForReview(input: {
     auditRows: llmWorkbenchAuditRows(input.auditRows),
     sourceLedgerRows: llmWorkbenchSourceLedgerRows(input.sourceLedgerRows),
     balanceSheetAssignments: llmWorkbenchBalanceAssignments(input.balanceSheetAssignmentLedgerRows),
+    incomeStatementAssignments: llmWorkbenchIncomeAssignments(input.incomeStatementAssignmentLedgerRows),
     validationFailures: input.validationFailures,
     warnings: input.warnings,
     limits: {
@@ -12721,7 +12823,8 @@ function buildLlmWorkbookToolboxForReview(input: {
       maxWorkbookCells: positiveLimit(LLM_WORKBENCH_MAX_WORKBOOK_CELLS, 700),
       maxAuditRows: positiveLimit(LLM_WORKBENCH_MAX_AUDIT_ROWS, 500),
       maxSourceLedgerRows: positiveLimit(LLM_WORKBENCH_MAX_SOURCE_LEDGER_ROWS, 600),
-      maxBalanceSheetAssignments: positiveLimit(LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS, 500)
+      maxBalanceSheetAssignments: positiveLimit(LLM_WORKBENCH_MAX_BALANCE_ASSIGNMENTS, 500),
+      maxIncomeStatementAssignments: positiveLimit(LLM_WORKBENCH_MAX_INCOME_ASSIGNMENTS, 500)
     }
   });
 }
@@ -12903,6 +13006,23 @@ function llmWorkbenchBalanceAssignments(rows: PrimaryBalanceSheetAssignmentLedge
   }));
 }
 
+function llmWorkbenchIncomeAssignments(rows: PrimaryIncomeStatementAssignmentLedgerRow[]): LlmWorkbenchIncomeAssignment[] {
+  return rows.map((row) => ({
+    period: row.fiscalPeriod,
+    sourceLineItemLabel: reviewText(row.sourceLineItemLabel, 500),
+    sourceXbrlTag: row.sourceXbrlTag,
+    sourceAmount: row.sourceAmount,
+    sourceAmountMillions: roundModelValue(row.sourceAmount / 1_000_000),
+    modelAmount: row.modelAmount,
+    modelAmountMillions: roundModelValue(row.modelAmount / 1_000_000),
+    assignedModelRow: row.assignedModelRow,
+    assignmentStatus: row.assignmentStatus,
+    classificationReason: reviewText(row.classificationReason, 700),
+    validationStatus: row.validationStatus,
+    sourceSection: row.sourceSection
+  }));
+}
+
 function positiveLimit(value: number, fallback: number) {
   return Number.isFinite(value) && value > 0 ? value : fallback;
 }
@@ -12976,7 +13096,7 @@ async function llmAssistedFillRow(
   ctx: ResolveContext,
   state: LlmMappingState
 ) {
-  if (!state.enabled || !isLlmMappableRow(fillRow)) return null;
+  if (!llmCanUse(state, Math.max(1_000, Math.min(LLM_MAPPING_TIMEOUT_MS, 3_000))) || !isLlmMappableRow(fillRow)) return null;
   if (state.decisions.has(fillRow.row)) return state.decisions.get(fillRow.row) ?? null;
   if (state.calls >= state.maxCalls) {
     state.decisions.set(fillRow.row, null);
@@ -13814,6 +13934,7 @@ type WorkbookValidationRetryOptions = {
   reportedPeriodPairs: Array<{ period: string; col: number }>;
   actualizedForecastColumns: number[];
   primaryAssignmentRepairTargets?: Set<string>;
+  primaryIncomeAssignmentRepairTargets?: Set<string>;
 };
 
 type ValidationRetryAttempt = {
@@ -13843,7 +13964,7 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
 
     const repairs = repairBalanceSheetValidationFailure(options, errors);
     if (!repairs.changedCells) {
-      options.warnings.push(`Automatic validation retry skipped: ${trigger}; no mutable primary balance-sheet rows matched the diagnostic.`);
+      options.warnings.push(`Automatic validation retry skipped: ${trigger}; no mutable primary statement rows matched the diagnostic.`);
       break;
     }
     filledCells += repairs.filledCells;
@@ -13862,7 +13983,7 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
       diagnoses: repairs.diagnoses
     });
     options.warnings.push(
-      `Automatic validation retry ${attempt}: ${trigger}; ${repairs.rebuiltRows.length ? `rebuilt ${repairs.rebuiltRows.join(", ")}` : "refreshed balance-sheet formulas"}; ${nextErrors.length ? `left ${nextErrors.length} validation error(s)` : "cleared validation"}.`
+      `Automatic validation retry ${attempt}: ${trigger}; ${repairs.rebuiltRows.length ? `rebuilt ${repairs.rebuiltRows.join(", ")}` : "refreshed statement formulas"}; ${nextErrors.length ? `left ${nextErrors.length} validation error(s)` : "cleared validation"}.`
     );
     errors = nextErrors;
   }
@@ -13891,6 +14012,13 @@ function runWorkbookReturnValidation(options: WorkbookValidationRetryOptions) {
 
 function automaticValidationRetryTrigger(errors: string[]) {
   const balanceSheetErrors = errors.filter(isRetriableBalanceSheetValidationError);
+  const incomeStatementErrors = errors.filter(isRetriableIncomeStatementValidationError);
+  if (balanceSheetErrors.length && incomeStatementErrors.length) {
+    return "primary income-statement and balance-sheet assignment ledgers did not reconcile; mapped input rows are being rebuilt";
+  }
+  if (incomeStatementErrors.length) {
+    return "income statement assignment ledger did not reconcile; primary income-statement rows are being rebuilt";
+  }
   if (!balanceSheetErrors.length) return null;
   if (balanceSheetErrors.some((error) => /total assets .*total liabilities plus shareholder|total liabilities plus shareholder|balance sheet check/i.test(error))) {
     return "full balance sheet did not reconcile; subtotal/component double-counting or current-debt classification is suspected";
@@ -13906,16 +14034,25 @@ function isRetriableBalanceSheetValidationError(error: string) {
   return /assignment ledger|does not match|does not equal|check is|could not evaluate|disappeared|current liabilit|total liabilit|equity|assets|debt|borrowings|revolver|no explicit SEC source|stale|hardcoded|not assigned|missing model row/i.test(error);
 }
 
+function isRetriableIncomeStatementValidationError(error: string) {
+  if (!/^Income Statement\b/i.test(error)) return false;
+  return /assignment ledger|primary line|model row|classification failure|does not match|does not equal|could not evaluate|gross profit|operating expense|pre-tax|tax bridge|net income|EBIT|missing model row/i.test(error);
+}
+
 function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOptions, errors: string[]) {
   const beforeAuditRows = options.auditRows.length;
   const warnings: string[] = [];
   const diagnoses = diagnoseValidationFailures(errors);
   const repairTargets = balanceSheetValidationRepairTargets(errors, options.sheet);
+  const incomeRepairTargets = incomeStatementValidationRepairTargets(errors);
   options.primaryAssignmentRepairTargets = repairTargets.assignmentKeys;
+  options.primaryIncomeAssignmentRepairTargets = incomeRepairTargets.assignmentKeys;
   const strictRebuild = strictPrimaryBalanceSheetRebuild(options, { targetRowKeys: repairTargets.rowKeys });
   const ledgerRebuild = rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options, { targetKeys: repairTargets.assignmentKeys });
+  const incomeLedgerRebuild = rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options, { targetKeys: incomeRepairTargets.assignmentKeys });
   const repairsApplied = [
     ...diagnoses.map((diagnosis) => `classified validation failure as ${diagnosis}`),
+    "rebuilt model rows from the primary income-statement assignment ledger when filing presentation was more specific than resolver buckets",
     "rebuilt primary balance-sheet input rows from EDGAR resolver values and cleared unsupported hardcoded values",
     "rebuilt model rows from the primary balance-sheet assignment ledger when filing presentation was more specific than resolver buckets",
     "refreshed dedicated balance-sheet rows from EDGAR resolver values",
@@ -13925,7 +14062,11 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
   ];
   warnings.push(...strictRebuild.warnings);
   warnings.push(...ledgerRebuild.warnings);
+  warnings.push(...incomeLedgerRebuild.warnings);
 
+  refreshFinalIncomeStatementKeyMetrics(options.sheet, options.incomeStatementPeriods, options.incomeStatementColumns, options.ctx, options.auditRows);
+  const postRefreshIncomeLedgerRebuild = rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options, { audit: false, targetKeys: incomeRepairTargets.assignmentKeys });
+  warnings.push(...postRefreshIncomeLedgerRebuild.warnings);
   refreshFinalBalanceSheetKeyMetrics(options.sheet, options.balanceSheetPeriods, options.balanceSheetColumns, options.ctx, options.auditRows);
   const postRefreshLedgerRebuild = rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options, { audit: false, targetKeys: repairTargets.assignmentKeys });
   warnings.push(...postRefreshLedgerRebuild.warnings);
@@ -13945,14 +14086,22 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
     strictRebuild.filledCells +
     ledgerRebuild.filledCells +
     postRefreshLedgerRebuild.filledCells +
+    incomeLedgerRebuild.filledCells +
+    postRefreshIncomeLedgerRebuild.filledCells +
     totalResult.filledCells +
     annualCopyResult.filledCells;
   return {
     filledCells: Math.max(auditDelta, changedCells),
-    commentsAdded: strictRebuild.commentsAdded + ledgerRebuild.commentsAdded + totalResult.commentsAdded,
+    commentsAdded: strictRebuild.commentsAdded + ledgerRebuild.commentsAdded + incomeLedgerRebuild.commentsAdded + totalResult.commentsAdded,
     warnings: unique(warnings),
     repairsApplied: unique(repairsApplied),
-    rebuiltRows: unique([...strictRebuild.rebuiltRows, ...ledgerRebuild.rebuiltRows, ...postRefreshLedgerRebuild.rebuiltRows]),
+    rebuiltRows: unique([
+      ...strictRebuild.rebuiltRows,
+      ...ledgerRebuild.rebuiltRows,
+      ...postRefreshLedgerRebuild.rebuiltRows,
+      ...incomeLedgerRebuild.rebuiltRows,
+      ...postRefreshIncomeLedgerRebuild.rebuiltRows
+    ]),
     diagnoses,
     changedCells: Math.max(auditDelta, changedCells)
   };
@@ -13964,6 +14113,7 @@ function diagnoseValidationFailures(errors: string[]) {
     if (errors.some((error) => pattern.test(error))) diagnoses.push(label);
   };
   add("missing explicit SEC source", /no explicit SEC source|disappeared after prior SEC filings|unsupported|hardcoded/i);
+  add("income-statement classification", /income statement|gross profit|operating expense|pre-tax|tax bridge|net income|ebit|classification failure/i);
   add("subtotal/component double-counting", /component sum|current liabilities excluding debt|plus EDGAR current debt|already include current debt/i);
   add("period mismatch", /period mismatch|4Q .*does not equal annual|wrong quarter|filing period/i);
   add("current/non-current classification", /current liabilit|non-current liabilit|noncurrent liabilit|current debt|borrowings|revolver/i);
@@ -14016,6 +14166,18 @@ function balanceSheetValidationRepairTargets(errors: string[], sheet: ExcelJS.Wo
 
 function balanceSheetRepairRowKey(period: string, rowNumber: number) {
   return `${balanceSheetInstantLookupPeriod(period)}::${rowNumber}`;
+}
+
+function incomeStatementValidationRepairTargets(errors: string[]) {
+  const assignmentKeys = new Set<string>();
+  for (const error of errors) {
+    const assignmentMatch = error.match(/^Income Statement\s+[A-Z]+\d+\s+([^:]+):\s+model row "([^"]+)"/i);
+    if (assignmentMatch) assignmentKeys.add(primaryIncomeStatementAssignmentGroupKey(assignmentMatch[1].trim(), assignmentMatch[2]));
+
+    const missingModelRowMatch = error.match(/^Income Statement\s+([^:]+):\s+assignment ledger mapped .* model row "([^"]+)"/i);
+    if (missingModelRowMatch) assignmentKeys.add(primaryIncomeStatementAssignmentGroupKey(missingModelRowMatch[1].trim(), missingModelRowMatch[2]));
+  }
+  return { assignmentKeys };
 }
 
 function strictPrimaryBalanceSheetRebuild(options: WorkbookValidationRetryOptions, config: { targetRowKeys?: Set<string> } = {}) {
@@ -14152,8 +14314,133 @@ function rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(
   return { filledCells, commentsAdded, warnings, rebuiltRows: Array.from(rebuiltRows) };
 }
 
+function rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(
+  options: WorkbookValidationRetryOptions,
+  config: { audit?: boolean; targetKeys?: Set<string> } = {}
+) {
+  const audit = config.audit !== false;
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const rebuiltRows = new Set<string>();
+  const ledgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(options.incomeStatementPeriods, options.ctx, options.fillRows).filter(
+    (row) => row.assignedModelRow && incomeStatementLedgerModelRowIsComparable(row.assignedModelRow) && row.assignmentStatus !== "explicitly_excluded_with_reason" && row.assignmentStatus !== "subtotal_or_total_excluded"
+  );
+  if (!ledgerRows.length) return { filledCells, commentsAdded, warnings, rebuiltRows: [] };
+  if (config.targetKeys && !config.targetKeys.size) return { filledCells, commentsAdded, warnings, rebuiltRows: [] };
+
+  const periodPairs = uniquePeriodColumnPairs(options.incomeStatementPeriods.map((period, index) => ({ period, col: options.incomeStatementColumns[index] })));
+  const rowsByPeriodAndModelRow = new Map<string, PrimaryIncomeStatementAssignmentLedgerRow[]>();
+  for (const row of ledgerRows) {
+    const key = primaryIncomeStatementAssignmentGroupKey(row.fiscalPeriod, row.assignedModelRow);
+    const group = rowsByPeriodAndModelRow.get(key) ?? [];
+    group.push(row);
+    rowsByPeriodAndModelRow.set(key, group);
+  }
+
+  const evaluator = new FormulaEvaluator(options.sheet);
+  for (const { period, col } of periodPairs) {
+    if (!col) continue;
+    const modelRows = unique(ledgerRows.filter((row) => row.fiscalPeriod === period).map((row) => row.assignedModelRow).filter(Boolean));
+    for (const modelRow of modelRows) {
+      const targetKey = primaryIncomeStatementAssignmentGroupKey(period, modelRow);
+      if (config.targetKeys && !config.targetKeys.has(targetKey)) continue;
+      const assigned = rowsByPeriodAndModelRow.get(targetKey) ?? [];
+      if (!assigned.length) continue;
+      const rowNumber = findIncomeStatementLedgerModelRow(options.sheet, modelRow, options.fillRows);
+      if (!rowNumber) {
+        warnings.push(`Automatic income-statement repair could not find model row "${modelRow}" for ${period}; assignment ledger value was not written.`);
+        continue;
+      }
+
+      const expected = assigned.reduce((total, row) => total + row.modelAmount, 0) / 1_000_000;
+      if (!Number.isFinite(expected)) continue;
+      const cell = options.sheet.getCell(rowNumber, col);
+      const formulaBefore = formulaForCell(cell);
+      const actual = formulaBefore ? evaluator.evaluateCell(cell) ?? numericCellValue(cell) : numericCellValue(cell);
+      if (actual !== null && statementMetricTies(actual, expected)) continue;
+      if (!canRewritePrimaryIncomeStatementAssignmentCell(options.sheet, rowNumber, col, cell)) {
+        warnings.push(
+          `Automatic income-statement repair left ${cell.address} ${period} unchanged because the primary assignment ledger target "${modelRow}" is not a writable reported-period input cell.`
+        );
+        continue;
+      }
+
+      clearEdgarMapperComment(cell);
+      cell.value = expected;
+      evaluator.clear();
+      filledCells += 1;
+      rebuiltRows.add(rowLabel(options.sheet, rowNumber) || modelRow);
+      const note = primaryIncomeStatementAssignmentAuditNote(rowLabel(options.sheet, rowNumber) || modelRow, assigned);
+      if (addComment(cell, note)) commentsAdded += 1;
+      if (audit) {
+        options.auditRows.push(primaryIncomeStatementAssignmentAuditRow(options.sheet, cell, rowLabel(options.sheet, rowNumber) || modelRow, period, expected, assigned, Boolean(formulaBefore), note));
+      }
+    }
+  }
+
+  if (filledCells) warnings.push(`Automatic income-statement repair wrote ${filledCells} historical cell(s) from the primary income-statement assignment ledger.`);
+  return { filledCells, commentsAdded, warnings, rebuiltRows: Array.from(rebuiltRows) };
+}
+
 function primaryBalanceSheetAssignmentGroupKey(period: string, modelRow: string) {
   return `${period}::${normalize(modelRow)}`;
+}
+
+function canRewritePrimaryIncomeStatementAssignmentCell(sheet: ExcelJS.Worksheet, rowNumber: number, col: number, cell: ExcelJS.Cell) {
+  const label = rowLabel(sheet, rowNumber);
+  if (!label || isProtectedCheckRowLabel(label)) return false;
+  if (!findIncomeStatementMetricRow(sheet, [label])) return false;
+  if (isProtectedFormulaOrCheckCell(cell)) return false;
+  if (formulaForCell(cell)) return Boolean(reportedPeriodColumnsBySheet.get(sheet)?.has(col));
+  return isHardcodedFinancialInput(cell);
+}
+
+function primaryIncomeStatementAssignmentAuditNote(modelRow: string, assigned: PrimaryIncomeStatementAssignmentLedgerRow[]) {
+  const labels = unique(assigned.map((row) => row.sourceLineItemLabel).filter(Boolean));
+  return lineItemSentence(modelRow, labels, assigned.length > 1 ? "includes" : "maps");
+}
+
+function primaryIncomeStatementAssignmentAuditRow(
+  sheet: ExcelJS.Worksheet,
+  cell: ExcelJS.Cell,
+  modelRow: string,
+  period: string,
+  valueWritten: number,
+  assigned: PrimaryIncomeStatementAssignmentLedgerRow[],
+  replacedFormula: boolean,
+  note: string
+): MappingAuditRow {
+  return {
+    sheetName: sheet.name,
+    cell: cell.address,
+    modelRowLabel: modelRow,
+    section: "Income Statement",
+    period,
+    valueWritten,
+    mappingType: assigned.length > 1 || assigned.some((row) => row.assignmentStatus === "grouped_into_model_row") ? "grouped" : "direct",
+    conceptsUsed: assigned.map((row) => `${row.sourceXbrlTag}=${roundModelValue(row.modelAmount / 1_000_000)}mm`).join("; "),
+    secLabels: unique(assigned.map((row) => row.sourceLineItemLabel).filter(Boolean)).join("; "),
+    sourceStatement: "income",
+    accession: unique(assigned.map((row) => row.sourceFilingAccession).filter(Boolean)).join("; "),
+    sourceUrl: "",
+    cellWritable: true,
+    formulaPreserved: false,
+    formulaStatus: replacedFormula
+      ? "reported-period formula replaced with primary SEC income-statement assignment"
+      : "historical input refreshed from primary SEC income-statement assignment",
+    writeBlockedReason: "",
+    signConvention: "normalized to model income-statement sign convention",
+    confidence: assigned.some((row) => row.assignmentStatus === "grouped_into_model_row") ? "medium" : "high",
+    validationStatus: "OK!",
+    notes: note,
+    finalSourceLineItems: unique(assigned.map((row) => row.sourceLineItemLabel).filter(Boolean)).join("; "),
+    finalSourceSections: unique(assigned.map((row) => row.sourceSection).filter(Boolean)).join("; "),
+    finalRecommendedModelRows: modelRow,
+    classificationReasons: unique(assigned.map((row) => row.classificationReason).filter(Boolean)).join("; "),
+    llmClassificationUsed: assigned.some((row) => row.llmUsed),
+    mappingPassedValidation: assigned.every((row) => row.validationStatus === "OK!")
+  };
 }
 
 function canRewritePrimaryBalanceSheetAssignmentCell(sheet: ExcelJS.Worksheet, rowNumber: number, col: number, cell: ExcelJS.Cell) {
@@ -14230,12 +14517,16 @@ function prepareWorkbookForValidationRetry(options: WorkbookValidationRetryOptio
   restoreWorkbookLabels(options.workbook, options.workbookSnapshot);
   clearStaleFormulaErrorResults(options.workbook);
   refreshHistoricalFormulaCachedResults(options.workbook, options.formulaCacheColumns, sheetNames);
+  refreshFinalIncomeStatementKeyMetrics(options.sheet, options.incomeStatementPeriods, options.incomeStatementColumns, options.ctx, options.auditRows);
+  rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options, { audit: false, targetKeys: options.primaryIncomeAssignmentRepairTargets });
   refreshFinalBalanceSheetKeyMetrics(options.sheet, options.balanceSheetPeriods, options.balanceSheetColumns, options.ctx, options.auditRows);
   rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options, { audit: false, targetKeys: options.primaryAssignmentRepairTargets });
   ensureFormulaDisplayCaches(options.workbook, options.formulaCacheColumns, sheetNames);
   requestAutomaticWorkbookCalculation(options.workbook);
   restoreProtectedCells(options.workbook, options.workbookSnapshot);
   refreshHistoricalFormulaCachedResults(options.workbook, options.formulaCacheColumns, sheetNames);
+  refreshFinalIncomeStatementKeyMetrics(options.sheet, options.incomeStatementPeriods, options.incomeStatementColumns, options.ctx, options.auditRows);
+  rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options, { audit: false, targetKeys: options.primaryIncomeAssignmentRepairTargets });
   refreshFinalBalanceSheetKeyMetrics(options.sheet, options.balanceSheetPeriods, options.balanceSheetColumns, options.ctx, options.auditRows);
   rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options, { audit: false, targetKeys: options.primaryAssignmentRepairTargets });
   copyBalanceSheetFourthQuarterToAnnualColumns(options.sheet, options.balanceSheetPeriods, options.balanceSheetColumns, options.ctx, options.auditRows);
@@ -14312,6 +14603,7 @@ function validateWorkbookBeforeReturn(
     }
     errors.push(...validateBalanceSheetCheck(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
     if (fillRows.length) {
+      errors.push(...validatePrimaryIncomeStatementAssignmentCoverage(modelSheet, incomeStatementPeriods, incomeStatementColumns, ctx, evaluator, warnings, fillRows));
       errors.push(...validatePrimaryBalanceSheetAssignmentCoverage(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings, fillRows));
     }
 
@@ -16577,6 +16869,325 @@ function balanceSheetModelTotalTiesEdgar(
   return modelValue !== null && statementMetricTies(modelValue, source.value / 1_000_000);
 }
 
+function buildPrimaryIncomeStatementAssignmentLedgerRows(
+  periods: string[],
+  ctx: ResolveContext,
+  fillRows: FillRow[]
+): PrimaryIncomeStatementAssignmentLedgerRow[] {
+  const rows: PrimaryIncomeStatementAssignmentLedgerRow[] = [];
+  for (const period of unique(periods)) {
+    for (const { statement, row } of primaryIncomeStatementRowsForPeriod(period, ctx)) {
+      const source = factSourceFromStatementRow(row, period);
+      if (!source) continue;
+
+      const sourceWithStatementAccession = source.accn ? source : { ...source, accn: row.accession || statement.accession };
+      const section = statementSectionForRow(statement, row, "income_statement");
+      const assignment = assignPrimaryIncomeStatementLineItem(period, ctx, sourceWithStatementAccession, row, section, fillRows);
+      const classification = lineItemClassificationForSource(period, ctx, sourceWithStatementAccession);
+      rows.push({
+        fiscalPeriod: period,
+        sourceFilingAccession: row.accession || statement.accession,
+        sourceStatement: statement.statementName,
+        sourceLineItemLabel: cleanLineItemLabel(row.rowLabel) || sourceWithStatementAccession.label,
+        sourceAmount: sourceWithStatementAccession.value,
+        modelAmount: incomeStatementAssignmentAmount(sourceWithStatementAccession, assignment.modelRow),
+        sourceXbrlTag: row.xbrlConcept || sourceWithStatementAccession.concept,
+        assignedModelRow: assignment.modelRow ?? "",
+        assignmentStatus: assignment.status,
+        classificationReason: /^LLM line-item classification|^Validated line-item classification/.test(assignment.reason)
+          ? assignment.reason
+          : classification?.reason || assignment.reason,
+        llmUsed: Boolean(classification?.llm_used),
+        validationStatus: assignment.modelRow || assignment.status === "subtotal_or_total_excluded" || assignment.status === "explicitly_excluded_with_reason" ? "OK!" : "missing_model_row",
+        sourceSection: section,
+        sourceRowKey: primaryIncomeStatementAssignmentRowKey(statement, row, period)
+      });
+    }
+  }
+  return rows;
+}
+
+function assignPrimaryIncomeStatementLineItem(
+  period: string,
+  ctx: ResolveContext,
+  source: FactSource,
+  row: PrimaryIncomeStatementRow,
+  section: FinancialStatementSection,
+  fillRows: FillRow[]
+): PrimaryIncomeStatementAssignment {
+  const choose = (canonical: string, aliases: string[] = [], reason: string): PrimaryIncomeStatementAssignment => {
+    const modelRow = availableIncomeStatementModelRow(fillRows, canonical, aliases) ?? canonical;
+    return { modelRow, status: incomeStatementAssignmentStatusForModelRow(modelRow, source), reason };
+  };
+  const chooseOther = (canonical: string, aliases: string[], reason: string): PrimaryIncomeStatementAssignment => {
+    const modelRow = availableIncomeStatementModelRow(fillRows, canonical, aliases) ?? canonical;
+    return { modelRow, status: "grouped_into_model_row", reason };
+  };
+
+  if (source.unit && !/usd/i.test(source.unit)) {
+    return {
+      modelRow: null,
+      status: "explicitly_excluded_with_reason",
+      reason: "Excluded non-USD primary income statement presentation row from dollar income-statement coverage."
+    };
+  }
+
+  const exclusionReason = primaryIncomeStatementAssignmentExclusionReason(period, ctx, source, row, section);
+  if (exclusionReason) {
+    return {
+      modelRow: null,
+      status: "subtotal_or_total_excluded",
+      reason: exclusionReason
+    };
+  }
+
+  const classifiedAssignment = classifiedPrimaryIncomeStatementAssignment(period, ctx, source, fillRows);
+  if (classifiedAssignment) return classifiedAssignment;
+
+  const category = reportedLineItemCategory(source);
+  if (category === "revenue") {
+    return choose("Revenue", ["Revenues", "Total Revenue", "Total Revenues", "Sales", "Net Sales", "Net Revenue"], "Revenue rows map to the model revenue row.");
+  }
+  if (category === "cost_of_revenue") {
+    return choose(
+      "COGS / Cost of Goods Sold",
+      ["Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales"],
+      "Cost of revenue, sales, goods, services, and direct operating cost rows map to COGS / Cost of Goods Sold."
+    );
+  }
+  if (category === "research_and_development") {
+    return choose("R&D", ["Research & Development (R&D)", "Research and Development"], "Research, product development, engineering, and technology development operating expenses map to R&D.");
+  }
+  if (category === "selling_general_administrative") {
+    return choose(
+      "SG&A",
+      ["Selling, General & Administration (SG&A)", "Selling General & Administrative", "Sales and Marketing", "Selling and Marketing", "General and Administrative"],
+      "Selling, marketing, advertising, promotional, and administrative operating expenses map to SG&A."
+    );
+  }
+  if (category === "income_statement_depreciation_amortization") {
+    return choose("D&A", ["Depreciation & Amortization", "Depreciation and Amortization"], "Standalone income-statement depreciation and amortization rows map to D&A.");
+  }
+  if (goodwillImpairmentScore(source) >= 9 && primaryIncomeStatementRowIsBelowOperatingBeforePreTaxForSourceRow(row)) {
+    return choose("Goodwill Impairment", ["Impairment of Goodwill", "Goodwill and Intangible Asset Impairment"], "Standalone goodwill impairment rows map to goodwill impairment.");
+  }
+  if (category === "interest_income") {
+    return choose("Interest Income", [], "Standalone interest income rows map to interest income.");
+  }
+  if (category === "interest_expense") {
+    return choose("Interest Expense", ["Interest (Expense)"], "Standalone interest expense rows map to interest expense.");
+  }
+  if (category === "income_tax") {
+    return choose(
+      "Income Tax Benefit / Expense",
+      ["Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"],
+      "Income tax expense/benefit rows map to income tax benefit / expense."
+    );
+  }
+  if (category === "other_non_operating_income_expense" || section === "below operating income") {
+    return chooseOther(
+      "Other Non-Operating Income / Expense",
+      ["Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)"],
+      "Below-operating income, expense, gain, and loss rows with no dedicated model row are grouped into other non-operating income / expense."
+    );
+  }
+  if (category === "other_operating_income_expense" || section === "operating expenses") {
+    return chooseOther(
+      "Other Operating Income / Expense",
+      ["Other Operating Income (Expense)", "Other Operating Income", "Other Operating Expense"],
+      "Operating income/expense rows with no dedicated model row are grouped into other operating income / expense."
+    );
+  }
+
+  return {
+    modelRow: null,
+    status: "explicitly_excluded_with_reason",
+    reason: "Could not determine a reusable income-statement model row from SEC concept, label, and statement section."
+  };
+}
+
+function classifiedPrimaryIncomeStatementAssignment(
+  period: string,
+  ctx: ResolveContext,
+  source: FactSource,
+  fillRows: FillRow[]
+): PrimaryIncomeStatementAssignment | null {
+  const classification = lineItemClassificationForSource(period, ctx, source);
+  const availableRows = fillRows.filter((row) => row.statement === "income" && row.kind === "duration").map((row) => row.label);
+  const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
+  if (!assignment) return null;
+  if (!incomeStatementAssignmentModelRowIsAssignable(assignment.modelRow)) return null;
+
+  return {
+    modelRow: assignment.modelRow,
+    status: assignment.grouped ? "grouped_into_model_row" : incomeStatementAssignmentStatusForModelRow(assignment.modelRow, source),
+    reason: assignment.reason
+  };
+}
+
+function incomeStatementAssignmentAmount(source: FactSource, modelRow: string | null) {
+  if (!modelRow) return 0;
+  if (modelRowsMatch(modelRow, "COGS / Cost of Goods Sold")) return expenseAsModelReduction(source.value);
+  if (modelRowsMatch(modelRow, "SG&A")) return expenseAsModelReduction(source.value);
+  if (modelRowsMatch(modelRow, "R&D")) return expenseAsModelReduction(source.value);
+  if (modelRowsMatch(modelRow, "D&A")) return expenseAsModelReduction(source.value);
+  if (modelRowsMatch(modelRow, "Interest Expense")) return expenseAsModelReduction(source.value);
+  if (modelRowsMatch(modelRow, "Goodwill Impairment")) return expenseAsModelReduction(source.value);
+  if (modelRowsMatch(modelRow, "Income Tax Benefit / Expense")) return -source.value;
+  if (modelRowsMatch(modelRow, "Other Operating Income / Expense")) return otherOperatingLineValue(source);
+  if (modelRowsMatch(modelRow, "Other Non-Operating Income / Expense")) return otherNonOperatingValue(source);
+  return source.value;
+}
+
+function incomeStatementAssignmentStatusForModelRow(modelRow: string, source: FactSource): IncomeStatementAssignmentStatus {
+  if (
+    modelRowsMatch(modelRow, "Other Operating Income / Expense") ||
+    modelRowsMatch(modelRow, "Other Non-Operating Income / Expense") ||
+    (modelRowsMatch(modelRow, "Revenue") && isRevenueComponentSource(source)) ||
+    (modelRowsMatch(modelRow, "COGS / Cost of Goods Sold") && !C.cogs.includes(source.concept)) ||
+    (modelRowsMatch(modelRow, "SG&A") && !C.sga.includes(source.concept))
+  ) {
+    return "grouped_into_model_row";
+  }
+  return "mapped_to_model_row";
+}
+
+function availableIncomeStatementModelRow(fillRows: FillRow[], canonical: string, aliases: string[] = []) {
+  const candidates = [canonical, ...aliases];
+  return (
+    fillRows
+      .filter((row) => row.statement === "income" && row.kind === "duration")
+      .find((row) => candidates.some((candidate) => modelRowsMatch(row.label, candidate) || normalize(row.label) === normalize(candidate)))?.label ?? null
+  );
+}
+
+function incomeStatementAssignmentModelRowIsAssignable(modelRow: string | null) {
+  if (!modelRow) return false;
+  return [
+    "Revenue",
+    "COGS / Cost of Goods Sold",
+    "SG&A",
+    "R&D",
+    "D&A",
+    "Other Operating Income / Expense",
+    "Interest Income",
+    "Interest Expense",
+    "Goodwill Impairment",
+    "Other Non-Operating Income / Expense",
+    "Income Tax Benefit / Expense"
+  ].some((candidate) => modelRowsMatch(modelRow, candidate));
+}
+
+function incomeStatementLedgerModelRowIsComparable(modelRow: string | null) {
+  return incomeStatementAssignmentModelRowIsAssignable(modelRow);
+}
+
+function primaryIncomeStatementAssignmentExclusionReason(
+  period: string,
+  ctx: ResolveContext,
+  source: FactSource,
+  row: PrimaryIncomeStatementRow,
+  section: FinancialStatementSection
+) {
+  if (primaryIncomeStatementRevenueComponentCoveredByTotal(period, ctx, source, row)) {
+    return "Excluded revenue component/detail row because the same primary income statement reports an additive total revenue line that is assigned to the model.";
+  }
+  if (primaryIncomeStatementCostComponentCoveredByTotal(period, ctx, source, row)) {
+    return "Excluded cost component/detail row because the same primary income statement reports an additive total cost of revenue line that is assigned to the model.";
+  }
+  if (sourceLooksLikePerShareOrShareCountIncomeStatementLine(source)) {
+    return "Excluded per-share, share-count, or earnings-per-share presentation row because it is not a dollar income-statement amount.";
+  }
+  const category = reportedLineItemCategory(source);
+  if (category === "operating_income" || category === "pretax_income" || category === "net_income") {
+    return "Excluded income-statement subtotal/total row because the model calculates this row from assigned components.";
+  }
+  if (incomeStatementSourceIsSubtotalOrTotalToExclude(source, section)) {
+    return "Excluded income-statement subtotal/total row because it should not be double-counted with its components.";
+  }
+  return "";
+}
+
+function primaryIncomeStatementRevenueComponentCoveredByTotal(period: string, ctx: ResolveContext, source: FactSource, row: PrimaryIncomeStatementRow) {
+  if (reportedLineItemCategory(source) !== "revenue") return false;
+  if (!isRevenueComponentSource(source) && !row.dimensions.length && !row.parentSubtotal) return false;
+  return primaryIncomeStatementRowsForPeriod(period, ctx).some(({ row: candidateRow }) => {
+    if (candidateRow === row) return false;
+    const candidate = factSourceFromStatementRow(candidateRow, period);
+    if (!candidate || reportedLineItemCategory(candidate) !== "revenue") return false;
+    if (isRevenueComponentSource(candidate) || candidateRow.dimensions.length) return false;
+    return TOTAL_REVENUE_CONCEPTS.includes(candidate.concept) || sourceTextMatches(candidate, /\b(total|net)\b.*\b(revenues?|sales)\b|\b(revenues?|sales)\b.*\b(total|net)\b/);
+  });
+}
+
+function primaryIncomeStatementCostComponentCoveredByTotal(period: string, ctx: ResolveContext, source: FactSource, row: PrimaryIncomeStatementRow) {
+  if (reportedLineItemCategory(source) !== "cost_of_revenue") return false;
+  if (!row.dimensions.length && !row.parentSubtotal && (C.cogs.includes(source.concept) || sourceTextMatches(source, /\b(total )?cost of (revenue|sales|goods|services|products)\b/))) return false;
+  return primaryIncomeStatementRowsForPeriod(period, ctx).some(({ row: candidateRow }) => {
+    if (candidateRow === row) return false;
+    const candidate = factSourceFromStatementRow(candidateRow, period);
+    if (!candidate || reportedLineItemCategory(candidate) !== "cost_of_revenue") return false;
+    if (candidateRow.dimensions.length) return false;
+    return C.cogs.includes(candidate.concept) || sourceTextMatches(candidate, /\b(total )?cost of (revenue|sales|goods|services|products)\b/);
+  });
+}
+
+function sourceLooksLikePerShareOrShareCountIncomeStatementLine(source: FactSource) {
+  return sourceTextMatches(source, /\bper share\b|\bearnings per share\b|\beps\b|\bshares? (?:outstanding|used|weighted)\b|\bweighted average shares?\b/);
+}
+
+function incomeStatementSourceIsSubtotalOrTotalToExclude(source: FactSource, section: FinancialStatementSection) {
+  if (section === "revenue" && reportedLineItemCategory(source) === "revenue") return false;
+  const text = sourceSearchText(source);
+  const compact = sourceCompactText(source);
+  if (/grossprofit|grossmargin|operatingincome|operatingloss|incomefromoperations|pretax|incomebeforetax|netincome|netloss|profitloss/.test(compact)) return true;
+  if (/\b(total|subtotal)\b.*\b(costs?|expenses?|income|loss|earnings|operations?)\b|\b(costs?|expenses?|income|loss|earnings|operations?)\b.*\b(total|subtotal)\b/.test(text)) return true;
+  return false;
+}
+
+function primaryIncomeStatementRowIsBelowOperatingBeforePreTaxForSourceRow(row: PrimaryIncomeStatementRow) {
+  const syntheticStatement: SecFilingStatementStructure = {
+    accession: "",
+    filingDate: "",
+    form: "",
+    reportingPeriod: "",
+    statementName: "Consolidated Statements of Operations",
+    sourceTableType: "primary_statement",
+    rows: [row]
+  };
+  return primaryIncomeStatementRowIsBelowOperatingBeforePreTax(syntheticStatement, row) || isBelowOperatingLineLabel(row.rowLabel);
+}
+
+function primaryIncomeStatementAssignmentRowKey(statement: SecFilingStatementStructure, row: PrimaryIncomeStatementRow, period: string) {
+  return statementLineItemSourceRowKey(statement, "income_statement", period, row);
+}
+
+function primaryIncomeStatementAssignmentGroupKey(period: string, modelRow: string) {
+  return `${period}::${normalize(modelRow)}`;
+}
+
+function duplicateIncomeStatementAssignmentKeys(rows: PrimaryIncomeStatementAssignmentLedgerRow[]) {
+  const seen = new Set<string>();
+  const duplicates = new Set<string>();
+  for (const row of rows) {
+    if (seen.has(row.sourceRowKey)) duplicates.add(row.sourceRowKey);
+    seen.add(row.sourceRowKey);
+  }
+  return Array.from(duplicates);
+}
+
+function allowedPrimaryIncomeStatementAssignmentExclusion(row: PrimaryIncomeStatementAssignmentLedgerRow) {
+  return /non-USD primary income statement|subtotal\/total row|double-counted|component\/detail row|per-share|share-count|earnings-per-share|not a dollar income-statement amount/i.test(
+    row.classificationReason
+  );
+}
+
+function findIncomeStatementLedgerModelRow(sheet: ExcelJS.Worksheet, modelRow: string, fillRows: FillRow[]) {
+  const fillRow = fillRows.find((row) => row.statement === "income" && row.kind === "duration" && modelRowsMatch(row.label, modelRow));
+  if (fillRow) return fillRow.row;
+  return findIncomeStatementMetricRow(sheet, [modelRow]);
+}
+
 function validatePrimaryBalanceSheetAssignmentCoverage(
   sheet: ExcelJS.Worksheet,
   periods: string[],
@@ -16694,6 +17305,109 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
   }
 
   return unique(errors);
+}
+
+function validatePrimaryIncomeStatementAssignmentCoverage(
+  sheet: ExcelJS.Worksheet,
+  periods: string[],
+  columns: number[],
+  ctx: ResolveContext,
+  evaluator: FormulaEvaluator,
+  warnings: string[],
+  fillRows: FillRow[]
+) {
+  const errors: string[] = [];
+  const ledgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(periods, ctx, fillRows);
+  if (!ledgerRows.length) return errors;
+  const periodPairs = uniquePeriodColumnPairs(periods.map((period, index) => ({ period, col: columns[index] })));
+  const latestHardAssignmentPeriod = latestPrimaryIncomeStatementAssignmentPeriod(periodPairs.map((pair) => pair.period), ctx);
+  const duplicateKeys = duplicateIncomeStatementAssignmentKeys(ledgerRows);
+  duplicateKeys.forEach((key) => errors.push(`Income Statement assignment ledger: primary income statement source row ${key} was assigned more than once.`));
+
+  for (const { period, col } of periodPairs) {
+    const hardValidateAssignments = period === latestHardAssignmentPeriod;
+    const rows = ledgerRows.filter((row) => row.fiscalPeriod === period);
+    if (!rows.length) {
+      if (hasReportedFilingPeriod(period, ctx) || hasReportedFinancialStatementPeriod(period, ctx)) {
+        errors.push(`Income Statement ${period}: no primary income statement assignment ledger rows were generated for a reported SEC income statement period.`);
+      }
+      continue;
+    }
+
+    const unsupportedRows = rows.filter(
+      (row) =>
+        row.assignmentStatus === "explicitly_excluded_with_reason" &&
+        Math.abs(row.sourceAmount) > 0.5 &&
+        !allowedPrimaryIncomeStatementAssignmentExclusion(row)
+    );
+    unsupportedRows.forEach((row) => {
+      const message = `Income Statement ${period}: primary line "${row.sourceLineItemLabel}" (${roundModelValue(row.sourceAmount / 1_000_000)}) was not assigned to a model row. Reason: ${row.classificationReason}`;
+      if (hardValidateAssignments) errors.push(message);
+      else warnings.unshift(`${message}. Historical assignment coverage was recorded for audit; hard row-level coverage is enforced on the latest reported income statement period.`);
+    });
+
+    if (!hardValidateAssignments) continue;
+
+    const byModelRow = new Map<string, PrimaryIncomeStatementAssignmentLedgerRow[]>();
+    const assignedRows = rows.filter((row) => row.assignedModelRow && incomeStatementLedgerModelRowIsComparable(row.assignedModelRow));
+    for (const row of assignedRows) {
+      const group = byModelRow.get(row.assignedModelRow) ?? [];
+      group.push(row);
+      byModelRow.set(row.assignedModelRow, group);
+    }
+
+    byModelRow.forEach((assigned, modelRow) => {
+      const rowNumber = findIncomeStatementLedgerModelRow(sheet, modelRow, fillRows);
+      if (!rowNumber) {
+        errors.push(`Income Statement ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`);
+        return;
+      }
+      const expected = assigned.reduce((total, row) => total + row.modelAmount, 0) / 1_000_000;
+      const cell = sheet.getCell(rowNumber, col);
+      const protectedFormula = isProtectedFormulaOrCheckCell(cell);
+      const actual = statementMetricCellValue(cell, evaluator, expected);
+      if (actual === null) {
+        recordIncomeStatementAssignmentValidationIssue(
+          errors,
+          warnings,
+          `Income Statement ${cell.address} ${period}: could not evaluate assigned model row "${modelRow}" against primary statement assignment ledger.`,
+          protectedFormula
+        );
+        return;
+      }
+      if (!statementMetricTies(actual, expected)) {
+        const sourceLabels = assigned.map((row) => row.sourceLineItemLabel).filter(Boolean).join(", ");
+        recordIncomeStatementAssignmentValidationIssue(
+          errors,
+          warnings,
+          `Income Statement ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`,
+          protectedFormula
+        );
+      }
+    });
+  }
+
+  return unique(errors);
+}
+
+function recordIncomeStatementAssignmentValidationIssue(
+  errors: string[],
+  warnings: string[],
+  message: string,
+  protectedFormula: boolean
+) {
+  if (protectedFormula) {
+    warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+    return;
+  }
+  errors.push(message);
+}
+
+function latestPrimaryIncomeStatementAssignmentPeriod(periods: string[], ctx: ResolveContext) {
+  const lookupPeriods = unique(periods.filter(isSupportedPeriodKey));
+  const periodsWithPrimaryRows = lookupPeriods.filter((period) => primaryIncomeStatementRowsForPeriod(period, ctx).length > 0);
+  const candidates = periodsWithPrimaryRows.length ? periodsWithPrimaryRows : lookupPeriods;
+  return candidates.sort(comparePeriods).at(-1) ?? "";
 }
 
 function latestPrimaryBalanceSheetAssignmentPeriod(periods: string[], ctx: ResolveContext) {
@@ -18535,7 +19249,14 @@ function numericCellValue(cell: ExcelJS.Cell) {
 }
 
 function removeGeneratedMetadataSheets(workbook: ExcelJS.Workbook) {
-  for (const sheetName of [MAPPING_AUDIT_SHEET, SOURCE_LEDGER_SHEET, BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET, LLM_MAPPING_REVIEW_SHEET, "Filing Period Map"]) {
+  for (const sheetName of [
+    MAPPING_AUDIT_SHEET,
+    SOURCE_LEDGER_SHEET,
+    BALANCE_SHEET_ASSIGNMENT_LEDGER_SHEET,
+    INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET,
+    LLM_MAPPING_REVIEW_SHEET,
+    "Filing Period Map"
+  ]) {
     const sheet = workbook.getWorksheet(sheetName);
     if (sheet) workbook.removeWorksheet(sheet.id);
   }
@@ -18852,6 +19573,31 @@ function addBalanceSheetAssignmentLedgerSheet(workbook: ExcelJS.Workbook, ledger
     { header: "LLM used", key: "llmUsed", width: 10 },
     { header: "validation status", key: "validationStatus", width: 18 },
     { header: "side", key: "side", width: 20 },
+    { header: "source section", key: "sourceSection", width: 24 },
+    { header: "source row key", key: "sourceRowKey", width: 48 }
+  ];
+  ledgerRows.forEach((row) => sheet.addRow(row));
+  sheet.getRow(1).font = { bold: true };
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+}
+
+function addIncomeStatementAssignmentLedgerSheet(workbook: ExcelJS.Workbook, ledgerRows: PrimaryIncomeStatementAssignmentLedgerRow[]) {
+  const existing = workbook.getWorksheet(INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET);
+  if (existing) workbook.removeWorksheet(existing.id);
+  const sheet = workbook.addWorksheet(INCOME_STATEMENT_ASSIGNMENT_LEDGER_SHEET);
+  sheet.columns = [
+    { header: "fiscal period", key: "fiscalPeriod", width: 14 },
+    { header: "source filing accession", key: "sourceFilingAccession", width: 26 },
+    { header: "source statement", key: "sourceStatement", width: 40 },
+    { header: "source line item label", key: "sourceLineItemLabel", width: 44 },
+    { header: "source amount", key: "sourceAmount", width: 16 },
+    { header: "model amount", key: "modelAmount", width: 16 },
+    { header: "XBRL tag", key: "sourceXbrlTag", width: 44 },
+    { header: "assigned model row", key: "assignedModelRow", width: 36 },
+    { header: "assignment status", key: "assignmentStatus", width: 30 },
+    { header: "classification reason", key: "classificationReason", width: 70 },
+    { header: "LLM used", key: "llmUsed", width: 10 },
+    { header: "validation status", key: "validationStatus", width: 18 },
     { header: "source section", key: "sourceSection", width: 24 },
     { header: "source row key", key: "sourceRowKey", width: 48 }
   ];

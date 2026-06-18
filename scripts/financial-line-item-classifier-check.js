@@ -175,8 +175,49 @@ async function classify(overrides) {
   });
   assert.equal(specialItems.recommended_model_row, "Other Operating Income / Expense");
 
+  const advertising = await classify({
+    label: "Advertising expense",
+    xbrlTag: "AdvertisingExpense",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(advertising.recommended_model_row, "SG&A");
+  assert.equal(advertising.mapping_passed_validation, true);
+
+  const salesAndMarketing = await classify({
+    label: "Sales and marketing",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(salesAndMarketing.recommended_model_row, "SG&A");
+
+  const costOfSales = await classify({
+    label: "Cost of sales",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(costOfSales.recommended_model_row, "COGS / Cost of Goods Sold");
+
   assert.equal(lineItemNeedsClassification(request({ label: "Deferred income", section: "current liabilities" })), true);
   assert.equal(lineItemNeedsClassification(request({ label: "Marketable securities", section: "current assets" })), true);
+  assert.equal(
+    lineItemNeedsClassification(
+      request({
+        label: "Advertising expense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration",
+        uncertaintyReason: ""
+      })
+    ),
+    true
+  );
 
   const llmRequestedPayloads = [];
   const ambiguousLease = await classifyFinancialLineItem(
@@ -267,6 +308,16 @@ async function classify(overrides) {
         xbrlTag: "ShortTermInvestments",
         section: "current assets",
         deterministicCandidate: "Prepaid & Other Current Assets"
+      }),
+      request({
+        sourceRowKey: "row-advertising",
+        rowOrder: 7,
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration",
+        uncertaintyReason: ""
       }),
       request({
         sourceRowKey: "row-lease-financing",
@@ -363,12 +414,20 @@ async function classify(overrides) {
   assert.equal(statementBatchPayloads.length, 1);
   const statementPayload = JSON.parse(statementBatchPayloads[0].messages[1].content);
   assert.deepEqual(statementPayload.targetSourceRowKeys, ["row-lease-financing", "row-notes-payable"]);
-  assert.equal(statementPayload.statementRows.length, 4);
+  assert.equal(statementPayload.statementRows.length, 5);
   assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-cash" && row.target === false), true);
   assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-investments" && row.deterministicClassification), true);
+  assert.equal(
+    statementPayload.statementRows.some(
+      (row) => row.sourceRowKey === "row-advertising" && row.target === false && row.deterministicClassification?.recommendedModelRow === "SG&A"
+    ),
+    true
+  );
+  assert.equal(statementPayload.modelRowDefinitions["SG&A"].includes("advertising"), true);
   assert.equal(statementBatchPayloads[0].response_format.json_schema.schema.properties.classifications.items.properties.source_row_key.type, "string");
   assert.equal(batchResult.llmCalls, 1);
   assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-investments").classification.recommended_model_row, "Cash & Cash Equivalents");
+  assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-advertising").classification.recommended_model_row, "SG&A");
   assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-notes-payable").classification.recommended_model_row, "Revolver");
   const leaseFinancingClassification = batchResult.classifications.find((item) => item.request.sourceRowKey === "row-lease-financing").classification;
   const leaseFinancingAssignment = classificationModelRowAssignmentForPrimaryStatement(leaseFinancingClassification, availableModelRows);

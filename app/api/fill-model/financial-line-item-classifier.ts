@@ -168,7 +168,7 @@ export const MODEL_ROW_DEFINITIONS: Record<string, string> = {
   Revenue: "Revenue, net revenue, net sales, operating revenue, total revenue.",
   "COGS / Cost of Goods Sold":
     "Direct cost of revenue / cost of sales / cost of operations, including industry-specific direct operating costs if presented as direct operating expenses and not better mapped elsewhere.",
-  "SG&A": "Selling, general and administrative, marketing, sales and marketing, G&A, corporate overhead.",
+  "SG&A": "Selling, general and administrative, advertising, marketing, promotional, sales expense, G&A, corporate overhead.",
   "R&D": "Research and development, technology development, product development, engineering expense.",
   "D&A": "Only standalone income-statement depreciation and amortization lines. Do not use cash-flow-only D&A.",
   "Other Operating Income / Expense":
@@ -198,7 +198,13 @@ const AMBIGUOUS_LINE_ITEM_TERMS = [
   "financing",
   "lease",
   "tax",
-  "income"
+  "income",
+  "advertising",
+  "marketing",
+  "promotional",
+  "promotion",
+  "selling",
+  "administrative"
 ];
 
 const MODEL_ROW_ALIASES: Record<string, string[]> = {
@@ -213,7 +219,21 @@ const MODEL_ROW_ALIASES: Record<string, string[]> = {
   "Common Stock & APIC": ["common stock & apic", "common stock and apic", "common stock and additional paid-in capital"],
   "Treasury Stock": ["treasury stock", "treasury & preferred stock"],
   AOCI: ["accumulated other comprehensive income", "accumulated other comprehensive income (aoci)", "accumulated other comprehensive loss"],
-  "SG&A": ["sga", "sg&a", "selling general administrative", "sales and marketing", "general and administrative"],
+  "SG&A": [
+    "sga",
+    "sg&a",
+    "selling general administrative",
+    "sales and marketing",
+    "selling and marketing",
+    "marketing expense",
+    "advertising expense",
+    "promotional expense",
+    "promotion expense",
+    "sales expense",
+    "selling expense",
+    "general and administrative",
+    "administrative expense"
+  ],
   "R&D": ["research and development", "r&d", "research & development"],
   "D&A": ["depreciation and amortization", "depreciation & amortization", "d&a"],
   "Other Operating Income / Expense": ["other operating income expense", "other operating income", "other operating expense"],
@@ -258,6 +278,10 @@ export function lineItemNeedsClassification(request: FinancialLineItemClassifica
   const text = requestSearchText(request);
   if (AMBIGUOUS_LINE_ITEM_TERMS.some((term) => text.includes(term))) return true;
   if (/short[-\s]?term|current investments?|marketable securities|available[-\s]?for[-\s]?sale securities|current maturit|current portion|senior notes?|convertible|contract liabilit|deferred revenue|deferred income|spare parts?|supplies|in[-\s]?process research|special items?|other/.test(text)) return true;
+  if (
+    request.statement === "income_statement" &&
+    /\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bsales and marketing\b|\bselling and marketing\b|\bsales expense\b|\bselling expense\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b/.test(text)
+  ) return true;
   if (request.deterministicCandidate && /other|accrued|revolver|deferred|d&a|depreciation|amortization/i.test(request.deterministicCandidate)) return true;
   return Boolean(request.uncertaintyReason);
 }
@@ -595,6 +619,57 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
+  if (
+    request.statement === "income_statement" &&
+    request.section === "operating expenses" &&
+    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(text)
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("COGS / Cost of Goods Sold"),
+      classification_type: "direct operating cost or cost of revenue",
+      is_current: null,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Primary income-statement cost of revenue/sales/goods/services lines belong in COGS / Cost of Goods Sold."
+    };
+  }
+
+  if (
+    request.statement === "income_statement" &&
+    request.section === "operating expenses" &&
+    /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b|\btechnology and content\b/.test(text)
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("R&D"),
+      classification_type: "research and development operating expense",
+      is_current: null,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Research, product development, engineering, and technology development expenses belong in R&D when reported as operating expenses."
+    };
+  }
+
+  if (
+    request.statement === "income_statement" &&
+    request.section === "operating expenses" &&
+    /\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bsales and marketing\b|\bselling and marketing\b|\bsales expense\b|\bselling expense\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b|\bsg&a\b|\bselling\b.*\bgeneral\b.*\badministrative\b/.test(text)
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("SG&A"),
+      classification_type: "selling general and administrative operating expense",
+      is_current: null,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Advertising, marketing, selling, and administrative expenses are SG&A operating expenses when the template has no more specific row."
+    };
+  }
+
   if (/\bdepreciation\b|\bamortization\b|\bdepletion\b|\bd&a\b/.test(text)) {
     const standaloneIncomeStatementDa = request.statement === "income_statement" && request.section === "operating expenses" && !/\bcash flows?|operating activities|reconciliation|supplemental/.test(text);
     return {
@@ -776,8 +851,10 @@ async function requestLlmClassification(
   const system = [
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Classify the reported source line item into the best model template row using accounting meaning, statement section, XBRL tag semantics, parent subtotal, and template row definitions.",
+    "Think like a human reviewer with the SEC statement and model open side by side: map the source row to the model row whose accounting definition fits, even when labels do not match one-for-one.",
     "Do not use keyword matching alone. Reported statement location and accounting meaning take precedence over mathematical tie-outs.",
     "Use Other buckets only when no dedicated row exists. Do not use residual plugging.",
+    "Advertising, promotional, selling, and marketing expenses presented as operating expenses belong in SG&A unless the model has a more specific dedicated row.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",
@@ -841,9 +918,11 @@ async function requestStatementLlmClassification(
   const system = [
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Do not classify one row in isolation. Review the entire provided statement in row order, including sibling labels, parent subtotals, current/non-current sections, XBRL tag semantics, deterministic classifications, and model row definitions.",
+    "Think like a human reviewer with the SEC statement and model open side by side: the filing labels and model labels will not always match, so assign by accounting substance and template definitions.",
     "Only return classifications for targetSourceRowKeys. Use each source_row_key exactly as provided.",
     "The model template order may differ from the filing statement order. Assign each source line to the model row that best fits the accounting meaning, even if that model row appears much earlier or later in the template.",
     "Use Other buckets only when no dedicated model row exists. Do not use residual plugging.",
+    "Advertising, promotional, selling, and marketing expenses presented as operating expenses belong in SG&A unless the model has a more specific dedicated row.",
     "Current marketable securities, available-for-sale securities, and short-term investments belong in Cash & Cash Equivalents when the template has no dedicated current investments row.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, notes payable current, and revolving facilities may belong in Revolver/current borrowings.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
@@ -913,7 +992,7 @@ function statementLlmClassificationPayload(prepared: PreparedLineItemClassificat
     modelRowDefinitions: first?.modelRowDefinitions ?? {},
     alreadyMappedRows: first?.alreadyMappedRows ?? [],
     classificationGoal:
-      "Classify only the target rows after reviewing the full SEC statement context. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match.",
+      "Classify only the target rows after reviewing the full SEC statement context as if the SEC statement and model template were open side by side. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match.",
     statementRows: prepared
       .slice()
       .sort((a, b) => (a.request.rowOrder ?? 0) - (b.request.rowOrder ?? 0))
@@ -1160,6 +1239,9 @@ function normalizeModelRow(row: string) {
 function rowIsCoreClassificationTarget(row: string) {
   return [
     "Cash & Cash Equivalents",
+    "Revenue",
+    "COGS / Cost of Goods Sold",
+    "SG&A",
     "Inventory",
     "Revolver",
     "LT Debt (Incl. Current Portion)",
