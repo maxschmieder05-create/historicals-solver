@@ -43,6 +43,7 @@
     "test:regression-preflight": "REGRESSION_ROUTING_ONLY=1 node scripts/regression-basket-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",
     "test:cvs-balance-sheet-anchor": "node scripts/cvs-balance-sheet-anchor-regression-check.js",
+    "test:wmt-fiscal-year": "node scripts/wmt-fiscal-year-regression-check.js",
     "test:balance-sheet-conservation": "node scripts/balance-sheet-conservation-check.js",
     "test:first-run-balance-sheet": "BALANCE_SHEET_CONSERVATION_CASES=ORCL node scripts/balance-sheet-conservation-check.js",
     "test:cost-balance-sheet-regression": "npm run test:balance-sheet-instant-regression",

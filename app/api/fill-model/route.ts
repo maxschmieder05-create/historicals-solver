@@ -363,6 +363,8 @@ type FilingRef = {
   form: string;
   primaryDocument: string;
   reportDate?: string;
+  fy?: number | string;
+  fp?: string;
   sourceLayer?: "sec_bulk_submissions" | "sec_live_submissions";
 };
 
@@ -7416,6 +7418,7 @@ function buildFiscalPeriodMap(filings: FilingRef[], payload?: any): FiscalPeriod
   };
   const fiscalYearEndMonth = fiscalYearEnd.month ?? null;
   const fiscalYearEndDay = fiscalYearEnd.day ?? null;
+  const factFiscalFocusByAccession = fiscalQuarterPeriodsByAccessionFromFacts(payload);
   const byAccession = new Map<string, FiscalPeriodEntry>();
   const byReportDate = new Map<string, FiscalPeriodEntry>();
   const reportedPeriods = new Set<string>();
@@ -7423,7 +7426,7 @@ function buildFiscalPeriodMap(filings: FilingRef[], payload?: any): FiscalPeriod
   for (const filing of filings) {
     const reportDate = filingReportDateFromRef(filing);
     if (!reportDate) continue;
-    const quarterPeriod = fiscalQuarterPeriodForFiling(filing, reportDate, fiscalYearEndMonth);
+    const quarterPeriod = fiscalQuarterPeriodForFiling(filing, reportDate, fiscalYearEndMonth, factFiscalFocusByAccession.get(normalizeAccession(filing.accessionNumber)));
     if (!quarterPeriod) continue;
     const fiscalQuarter = periodQuarter(quarterPeriod) as FiscalPeriodEntry["fiscalQuarter"];
     if (![1, 2, 3, 4].includes(fiscalQuarter)) continue;
@@ -7472,13 +7475,58 @@ function filingReportDateFromRef(filing: FilingRef) {
   return fileDate ? `${fileDate[0]}-${fileDate[1]}-${fileDate[2]}` : null;
 }
 
-function fiscalQuarterPeriodForFiling(filing: FilingRef, reportDate: string, fiscalYearEndMonth: number | null) {
+function fiscalQuarterPeriodForFiling(filing: FilingRef, reportDate: string, fiscalYearEndMonth: number | null, factFiscalFocus?: string) {
+  const filingFiscalFocus = fiscalQuarterPeriodFromFilingFocus(filing) ?? factFiscalFocus;
+  if (filingFiscalFocus) return filingFiscalFocus;
   const fiscalPeriod = fiscalYearEndMonth ? fiscalPeriodKeyFromDate(reportDate, fiscalYearEndMonth) : null;
   const fallback = periodKeyFromDate(reportDate);
   const quarterPeriod = fiscalPeriod ?? fallback;
   if (!quarterPeriod) return null;
   if (isTenK(filing.form)) return `4Q${periodYearSuffix(quarterPeriod)}`;
   return quarterPeriod;
+}
+
+function fiscalQuarterPeriodFromFilingFocus(filing: FilingRef) {
+  return fiscalQuarterPeriodFromFiscalFocus(filing.fy, filing.fp);
+}
+
+function fiscalQuarterPeriodFromFiscalFocus(fy?: number | string, fp?: string) {
+  const fiscalYear = Number(fy);
+  const fiscalPeriod = String(fp ?? "").trim().toUpperCase();
+  if (!Number.isFinite(fiscalYear) || !fiscalPeriod) return null;
+  const suffix = String(fiscalYear).slice(-2);
+  if (fiscalPeriod === "FY") return `4Q${suffix}`;
+  const quarter = fiscalPeriod.match(/^Q([1-4])$/);
+  return quarter ? `${quarter[1]}Q${suffix}` : null;
+}
+
+function fiscalQuarterPeriodsByAccessionFromFacts(payload: any) {
+  const counts = new Map<string, Map<string, number>>();
+  const taxonomies = Object.values(payload?.facts ?? {}) as any[];
+  for (const taxonomy of taxonomies) {
+    for (const detail of Object.values<any>(taxonomy)) {
+      const units = detail.units ?? {};
+      for (const unitFacts of Object.values<any>(units)) {
+        if (!Array.isArray(unitFacts)) continue;
+        for (const fact of unitFacts as SecFact[]) {
+          if (!fact.accn || !isUsableFact(fact)) continue;
+          const quarterPeriod = fiscalQuarterPeriodFromFiscalFocus(fact.fy, fact.fp);
+          if (!quarterPeriod) continue;
+          const accession = normalizeAccession(fact.accn);
+          const accessionCounts = counts.get(accession) ?? new Map<string, number>();
+          accessionCounts.set(quarterPeriod, (accessionCounts.get(quarterPeriod) ?? 0) + 1);
+          counts.set(accession, accessionCounts);
+        }
+      }
+    }
+  }
+
+  const byAccession = new Map<string, string>();
+  counts.forEach((periodCounts, accession) => {
+    const best = Array.from(periodCounts.entries()).sort((a, b) => b[1] - a[1] || comparePeriods(b[0], a[0]))[0];
+    if (best) byAccession.set(accession, best[0]);
+  });
+  return byAccession;
 }
 
 function fiscalPeriodEntryPreference(entry: FiscalPeriodEntry) {
@@ -7792,6 +7840,8 @@ function collectFilingRefs(source: any, filings: FilingRef[], sourceLayer: Filin
       accessionNumber: source.accessionNumber[index],
       primaryDocument: source.primaryDocument[index],
       reportDate: source.reportDate?.[index],
+      fy: source.fy?.[index],
+      fp: source.fp?.[index],
       sourceLayer
     };
     if ((isTenQ(filing.form) || isTenK(filing.form)) && filing.primaryDocument?.endsWith(".htm")) {
@@ -7818,6 +7868,7 @@ function filingRefPreference(filing: FilingRef) {
   let score = filing.sourceLayer === "sec_live_submissions" ? 2 : 1;
   if (filing.form.endsWith("/A")) score += 1;
   if (filing.reportDate) score += 1;
+  if (fiscalQuarterPeriodFromFilingFocus(filing)) score += 2;
   return score;
 }
 
