@@ -98,6 +98,10 @@ async function classify(overrides) {
     deterministicCandidate: "Revolver"
   });
   assert.equal(currentMaturities.recommended_model_row, "LT Debt (Incl. Current Portion)");
+  assert.equal(
+    classificationModelRowAssignmentForPrimaryStatement(currentMaturities, availableModelRows).modelRow,
+    "LT Debt (Incl. Current Portion)"
+  );
 
   const shortTermBorrowings = await classify({
     label: "Short-term borrowings",
@@ -123,6 +127,15 @@ async function classify(overrides) {
   assert.equal(deferredTax.recommended_model_row, "Deferred Income Taxes");
   assert.equal(deferredTax.is_deferred_tax, true);
 
+  const deferredTaxAssetUnknownSection = await classify({
+    label: "Deferred income tax assets",
+    xbrlTag: "DeferredIncomeTaxAssetsNet",
+    section: "unknown",
+    deterministicCandidate: "Deferred Income Taxes"
+  });
+  assert.equal(deferredTaxAssetUnknownSection.recommended_model_row, "Other Non-Current Assets");
+  assert.equal(deferredTaxAssetUnknownSection.is_deferred_tax, true);
+
   const supplies = await classify({
     label: "Aircraft fuel, spare parts and supplies",
     section: "current assets",
@@ -137,6 +150,10 @@ async function classify(overrides) {
     availableModelRows: availableModelRows.filter((row) => !/short[-\s]?term investments?|current investments?|marketable securities/i.test(row))
   });
   assert.equal(shortTermInvestments.recommended_model_row, "Cash & Cash Equivalents");
+  assert.equal(
+    classificationModelRowAssignmentForPrimaryStatement(shortTermInvestments, availableModelRows).modelRow,
+    "Cash & Cash Equivalents"
+  );
 
   const marketableSecurities = await classify({
     label: "Marketable securities",
@@ -359,6 +376,27 @@ async function classify(overrides) {
                     content: JSON.stringify({
                       classifications: [
                         {
+                          source_row_key: "row-investments",
+                          source_line_item: "Short-term investments",
+                          recommended_action: "remap",
+                          recommended_model_row: "Cash & Cash Equivalents",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "cash and marketable securities current investment",
+                          is_current: true,
+                          is_debt: false,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Whole-statement context shows no dedicated current investments row, so short-term investments group with cash.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        },
+                        {
                           source_row_key: "row-lease-financing",
                           source_line_item: "Other lease financing obligations",
                           recommended_action: "remap",
@@ -413,10 +451,10 @@ async function classify(overrides) {
   );
   assert.equal(statementBatchPayloads.length, 1);
   const statementPayload = JSON.parse(statementBatchPayloads[0].messages[1].content);
-  assert.deepEqual(statementPayload.targetSourceRowKeys, ["row-lease-financing", "row-notes-payable"]);
+  assert.deepEqual(statementPayload.targetSourceRowKeys, ["row-investments", "row-lease-financing", "row-notes-payable"]);
   assert.equal(statementPayload.statementRows.length, 5);
   assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-cash" && row.target === false), true);
-  assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-investments" && row.deterministicClassification), true);
+  assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-investments" && row.target === true && row.deterministicClassification), true);
   assert.equal(
     statementPayload.statementRows.some(
       (row) => row.sourceRowKey === "row-advertising" && row.target === false && row.deterministicClassification?.recommendedModelRow === "SG&A"
@@ -426,7 +464,9 @@ async function classify(overrides) {
   assert.equal(statementPayload.modelRowDefinitions["SG&A"].includes("advertising"), true);
   assert.equal(statementBatchPayloads[0].response_format.json_schema.schema.properties.classifications.items.properties.source_row_key.type, "string");
   assert.equal(batchResult.llmCalls, 1);
-  assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-investments").classification.recommended_model_row, "Cash & Cash Equivalents");
+  const investmentsClassification = batchResult.classifications.find((item) => item.request.sourceRowKey === "row-investments").classification;
+  assert.equal(investmentsClassification.recommended_model_row, "Cash & Cash Equivalents");
+  assert.equal(investmentsClassification.llm_used, true);
   assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-advertising").classification.recommended_model_row, "SG&A");
   assert.equal(batchResult.classifications.find((item) => item.request.sourceRowKey === "row-notes-payable").classification.recommended_model_row, "Revolver");
   const leaseFinancingClassification = batchResult.classifications.find((item) => item.request.sourceRowKey === "row-lease-financing").classification;
@@ -450,7 +490,9 @@ async function classify(overrides) {
     },
     availableModelRows
   );
-  assert.equal(deterministicAssignment, null);
+  assert.equal(deterministicAssignment.modelRow, "LT Debt (Incl. Current Portion)");
+  assert.equal(deterministicAssignment.llmUsed, false);
+  assert.equal(deterministicAssignment.reason.startsWith("Validated line-item classification:"), true);
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {

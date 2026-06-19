@@ -296,6 +296,10 @@ export function lineItemNeedsClassification(request: FinancialLineItemClassifica
   return Boolean(request.uncertaintyReason);
 }
 
+function primaryBalanceSheetLineItemNeedsLlmReview(request: FinancialLineItemClassificationRequest) {
+  return request.statement === "balance_sheet" && request.sourceTableType === "primary_statement" && lineItemNeedsClassification(request);
+}
+
 export async function classifyFinancialLineItem(
   request: FinancialLineItemClassificationRequest,
   options: ClassifierOptions = {}
@@ -313,7 +317,7 @@ export async function classifyFinancialLineItem(
       options.llm.apiKey &&
       options.llm.model &&
       lineItemNeedsClassification(request) &&
-      !deterministicIsValidated
+      (!deterministicIsValidated || primaryBalanceSheetLineItemNeedsLlmReview(request))
   );
 
   if (!shouldCallLlm) return finalizeClassification(request, fallback);
@@ -413,7 +417,7 @@ function prepareLineItemClassification(
       options.llm.apiKey &&
       options.llm.model &&
       needsClassification &&
-      !deterministicIsValidated
+      (!deterministicIsValidated || primaryBalanceSheetLineItemNeedsLlmReview(request))
   );
 
   return {
@@ -445,7 +449,6 @@ export function classificationModelRowAssignmentForPrimaryStatement(
   availableModelRows: string[]
 ) {
   if (!classification) return null;
-  if (!classification.llm_used) return null;
   if (classification.confidence === "low") return null;
   if (classification.recommended_action === "exclude" || classification.recommended_action === "set_zero") return null;
   if (!classification.mapping_passed_validation) return null;
@@ -461,7 +464,7 @@ export function classificationModelRowAssignmentForPrimaryStatement(
     modelRow,
     grouped,
     llmUsed: classification.llm_used,
-    reason: `LLM line-item classification: ${shortReason(classification.reason)}`
+    reason: `${classification.llm_used ? "LLM" : "Validated"} line-item classification: ${shortReason(classification.reason)}`
   };
 }
 
@@ -484,22 +487,11 @@ function deterministicFinancialLineItemClassification(
   const base = baseClassification(request);
   const preferred = (...rows: string[]) => rows.find((row) => modelRowAvailable(row, request.availableModelRows)) ?? rows[0];
   const hasCurrentInvestmentsRow = request.availableModelRows.some((row) => /short[-\s]?term investments?|current investments?|marketable securities/i.test(row));
+  const isDeferredTaxLine = /\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text);
+  const textLooksDeferredTaxAsset = /\bassets?\b/.test(text);
+  const textLooksDeferredTaxLiability = /\bliabilit/.test(text);
 
-  if (/\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text) && !/assets?/.test(section)) {
-    return {
-      ...base,
-      recommended_model_row: preferred("Deferred Income Taxes"),
-      classification_type: "deferred tax liability",
-      is_current: current,
-      is_tax_related: true,
-      is_deferred_tax: true,
-      should_exclude_from_other_bucket: true,
-      confidence: "high",
-      reason: "Deferred tax liabilities are true deferred income taxes and belong in the deferred tax row when available."
-    };
-  }
-
-  if (/\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text) && /assets?/.test(section)) {
+  if (isDeferredTaxLine && (/assets?/.test(section) || (textLooksDeferredTaxAsset && !/liabilit/.test(section)))) {
     return {
       ...base,
       recommended_model_row: preferred("Other Non-Current Assets"),
@@ -510,6 +502,20 @@ function deterministicFinancialLineItemClassification(
       should_exclude_from_other_bucket: false,
       confidence: "high",
       reason: "Deferred tax assets are asset balances and belong in Other Non-Current Assets when the template has no dedicated deferred tax asset row."
+    };
+  }
+
+  if (isDeferredTaxLine && (textLooksDeferredTaxLiability || /liabilit/.test(section) || !textLooksDeferredTaxAsset)) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Deferred Income Taxes"),
+      classification_type: "deferred tax liability",
+      is_current: current,
+      is_tax_related: true,
+      is_deferred_tax: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Deferred tax liabilities are true deferred income taxes and belong in the deferred tax row when available."
     };
   }
 

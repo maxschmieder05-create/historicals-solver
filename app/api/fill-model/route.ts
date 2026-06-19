@@ -1233,6 +1233,12 @@ const OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS = [
   "OtherAccruedLiabilitiesCurrent"
 ];
 
+const CURRENT_OPERATING_LEASE_LIABILITY_CONCEPTS = [
+  "OperatingLeaseLiabilityCurrent",
+  "OperatingLeaseLiabilitiesCurrent",
+  "LesseeOperatingLeaseLiabilityCurrent"
+];
+
 const BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS = [
   "OtherLiabilitiesNoncurrent",
   "AccruedIncomeTaxesNoncurrent",
@@ -2850,6 +2856,7 @@ function sourceLooksLikeCurrentLeaseLiability(source: FactSource) {
 
 function sourceLooksLikeOtherCurrentLiability(source: FactSource) {
   if (sourceLooksLikeDeferredTaxAsset(source) || sourceLooksLikeDeferredTaxLiability(source) || sourceLooksLikeOtherNonCurrentLiability(source)) return false;
+  if (sourceTextMatches(source, /\bnoncurrent\b|\bnon[-\s]?current\b|\blong[-\s]?term\b/)) return false;
   if (BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS.includes(source.concept) || OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
@@ -2897,7 +2904,7 @@ function sourceLooksLikeOtherNonCurrentLiability(source: FactSource) {
   if (BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
-    /\bother\b.*\bnon[-\s]?current liabilit|\bother\b.*\blong[-\s]?term liabilit|\bnon[-\s]?current\b.*\bother liabilit|\blong[-\s]?term operating lease liabilit|\boperating lease\b.*\bliabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\boperating lease\b.*\bliabilit|\bother long[-\s]?term insurance liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
+    /\bother\b.*\bnon[-\s]?current liabilit|\bother\b.*\blong[-\s]?term liabilit|\bnon[-\s]?current\b.*\bother liabilit|\blong[-\s]?term operating lease liabilit|\boperating lease\b.*\bliabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\boperating lease\b.*\bliabilit|\bother insurance liabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\bother insurance liabilit|\bother long[-\s]?term insurance liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
   );
 }
 
@@ -3057,7 +3064,7 @@ function primaryOtherCurrentLiabilitySources(period: string, ctx: ResolveContext
       !sourceLooksLikeAccruedOperatingLiability(source)
     );
   });
-  return sources;
+  return withAcceptedOtherCurrentLiabilityClassifications(period, ctx, sources);
 }
 
 function primaryShortTermBorrowingSources(period: string, ctx: ResolveContext) {
@@ -3091,7 +3098,7 @@ function primaryOtherNonCurrentLiabilitySources(period: string, ctx: ResolveCont
     if (ctx.template?.hasPensionLiabilityRow && sourceLooksLikePensionLiability(source)) return false;
     return true;
   });
-  return sources;
+  return withAcceptedModelRowClassifications(period, ctx, sources, "Other Non-Current Liabilities");
 }
 
 function resolvedFromPrimarySources(sources: FactSource[], note: string): ResolvedValue {
@@ -5429,10 +5436,13 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
     primaryAccruedLiabilitySources(period, ctx),
     "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
   );
-  if (primaryAccrued.value !== null) return primaryAccrued;
+  if (primaryAccrued.value !== null) {
+    const broadSource = primaryAccrued.sources.length === 1 && sourceLooksLikeBroadAccruedLiabilityBucket(primaryAccrued.sources[0]) ? primaryAccrued.sources[0] : null;
+    return broadSource ? adjustedBroadAccruedLiabilities(period, ctx, broadSource) : primaryAccrued;
+  }
 
   const direct = first(period, ctx.instant, C.accrued);
-  if (direct) return { value: direct.value, sources: [direct] };
+  if (direct) return adjustedBroadAccruedLiabilities(period, ctx, direct);
 
   if (
     primaryCurrentLiabilitySectionWasInspected(period, ctx) ||
@@ -5648,7 +5658,7 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
 
   const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
   const accountsPayable = resolveAccountsPayable(period, ctx);
-  const accruedLiabilities = resolveAccruedLiabilities(period, ctx);
+  const accruedLiabilities = resolveDirectOrPrimaryAccruedLiabilities(period, ctx);
   const currentDebtModeledSeparately = ctx.template ? !currentDebtBelongsInAccruedLiabilities(ctx.template) || debtRowUsesCombinedCurrentDebt(period, ctx) : true;
   const currentDebt = currentDebtModeledSeparately ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
 
@@ -5695,11 +5705,40 @@ function resolveOtherCurrentLiabilities(period: string, ctx: ResolveContext): Re
 }
 
 function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const concepts = ctx.template?.hasOtherCurrentLiabilityRow
+    ? OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS
+    : OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS.filter((concept) => concept !== "OtherAccruedLiabilitiesCurrent");
+  const direct = sum(period, ctx.instant, concepts);
+  const directSources = direct ? withAcceptedOtherCurrentLiabilityClassifications(period, ctx, direct.sources) : [];
+  const candidates: ResolvedValue[] = [];
+
   const primaryOtherCurrent = resolvedFromPrimarySources(
     primaryOtherCurrentLiabilitySources(period, ctx),
     "Mapped to reported current liability lines without dedicated model rows from the primary consolidated balance sheet."
   );
-  if (primaryOtherCurrent.value !== null) return primaryOtherCurrent;
+  if (directSources.length && primaryOtherCurrent.value !== null) {
+    const primaryHasBroadBucket = primaryOtherCurrent.sources.some((source) => BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS.includes(source.concept));
+    if (!primaryHasBroadBucket) {
+      const sources = uniqueFactSources([...primaryOtherCurrent.sources, ...directSources]);
+      candidates.push({
+        value: sources.reduce((total, source) => total + source.value, 0),
+        sources,
+        note: "Mapped to reported current liability lines and directly reported current liability concepts that do not have dedicated model rows.",
+        classification: sources.length > 1 ? "grouped" : "direct"
+      });
+    }
+  }
+  if (directSources.length) {
+    candidates.push({
+      value: directSources.reduce((total, source) => total + source.value, 0),
+      sources: directSources,
+      note: "Mapped to directly reported current liability concepts that do not have dedicated model rows.",
+      classification: directSources.length > 1 ? "grouped" : "direct"
+    });
+  }
+  if (primaryOtherCurrent.value !== null) candidates.push(primaryOtherCurrent);
+  const selected = chooseOtherCurrentLiabilityCandidate(period, ctx, candidates);
+  if (selected) return selected;
 
   const broad = first(period, ctx.instant, BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS);
   if (broad) {
@@ -5710,19 +5749,99 @@ function resolveDirectOtherCurrentLiabilities(period: string, ctx: ResolveContex
     };
   }
 
-  const concepts = ctx.template?.hasOtherCurrentLiabilityRow
-    ? OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS
-    : OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS.filter((concept) => concept !== "OtherAccruedLiabilitiesCurrent");
-  const direct = sum(period, ctx.instant, concepts);
-  if (!direct) return { value: null, sources: [] };
-  const sources = withAcceptedModelRowClassifications(period, ctx, direct.sources, "Other Current Liabilities");
-  if (!sources.length) return { value: null, sources: [], note: "Current liability source lines were classified into dedicated rows outside Other Current Liabilities." };
+  return direct
+    ? { value: null, sources: [], note: "Current liability source lines were classified into dedicated rows outside Other Current Liabilities." }
+    : { value: null, sources: [] };
+}
+
+function chooseOtherCurrentLiabilityCandidate(period: string, ctx: ResolveContext, candidates: ResolvedValue[]) {
+  const valid = candidates.filter((candidate) => candidate.value !== null);
+  if (!valid.length) return null;
+
+  const currentLiabilities = first(period, ctx.instant, C.currentLiabilities);
+  const accountsPayable = resolveAccountsPayable(period, ctx);
+  const accruedLiabilities = resolveDirectOrPrimaryAccruedLiabilities(period, ctx);
+  const currentDebtModeledSeparately = ctx.template ? !currentDebtBelongsInAccruedLiabilities(ctx.template) || debtRowUsesCombinedCurrentDebt(period, ctx) : true;
+  const currentDebt = currentDebtModeledSeparately ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
+  if (currentLiabilities && accountsPayable.value !== null && accruedLiabilities.value !== null && currentDebt.value !== null) {
+    const expected = currentLiabilities.value - accountsPayable.value - accruedLiabilities.value - currentDebt.value;
+    return valid
+      .slice()
+      .sort((a, b) => Math.abs((a.value ?? 0) - expected) - Math.abs((b.value ?? 0) - expected))[0];
+  }
+
+  return valid[0];
+}
+
+function resolveDirectOrPrimaryAccruedLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryAccrued = resolvedFromPrimarySources(
+    primaryAccruedLiabilitySources(period, ctx),
+    "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
+  );
+  if (primaryAccrued.value !== null) {
+    const broadSource = primaryAccrued.sources.length === 1 && sourceLooksLikeBroadAccruedLiabilityBucket(primaryAccrued.sources[0]) ? primaryAccrued.sources[0] : null;
+    return broadSource ? adjustedBroadAccruedLiabilities(period, ctx, broadSource) : primaryAccrued;
+  }
+
+  const direct = first(period, ctx.instant, C.accrued);
+  return direct ? adjustedBroadAccruedLiabilities(period, ctx, direct) : { value: null, sources: [] };
+}
+
+function adjustedBroadAccruedLiabilities(period: string, ctx: ResolveContext, direct: FactSource): ResolvedValue {
+  if (!sourceLooksLikeBroadAccruedLiabilityBucket(direct)) return { value: direct.value, sources: [direct] };
+
+  const exclusions: ResolvedValue[] = [];
+  const currentDebtModeledSeparately = ctx.template ? !currentDebtBelongsInAccruedLiabilities(ctx.template) || debtRowUsesCombinedCurrentDebt(period, ctx) : true;
+  if (currentDebtModeledSeparately) {
+    const currentDebt = reportedCurrentDebt(period, ctx);
+    if (currentDebt?.value) exclusions.push(currentDebt);
+  }
+
+  if (ctx.template?.hasOtherCurrentLiabilityRow) {
+    const currentOperatingLeases = currentOperatingLeaseLiabilitiesForOtherCurrent(period, ctx);
+    if (currentOperatingLeases?.value) exclusions.push(currentOperatingLeases);
+  }
+
+  const excludedValue = exclusions.reduce((total, item) => total + (item.value ?? 0), 0);
+  if (!excludedValue) return { value: direct.value, sources: [direct] };
+
+  const adjustedValue = direct.value - excludedValue;
+  if (adjustedValue < -Math.max(1_000_000, Math.abs(direct.value) * 0.01)) return { value: direct.value, sources: [direct] };
+
+  return {
+    value: adjustedValue,
+    sources: compactSources([direct, ...exclusions]),
+    note:
+      "Derived accrued liabilities from a broad reported accrued/current liability bucket less current debt and current operating lease liabilities that are modeled in separate rows.",
+    classification: "grouped"
+  };
+}
+
+function sourceLooksLikeBroadAccruedLiabilityBucket(source: FactSource) {
+  return source.concept === "AccruedLiabilitiesCurrent" || sourceTextMatches(source, /\baccrued\b.*\b(other|current)\b|\baccrued liabilit(?:y|ies),?\s*current\b/);
+}
+
+function currentOperatingLeaseLiabilitiesForOtherCurrent(period: string, ctx: ResolveContext): ResolvedValue | null {
+  const direct = sum(period, ctx.instant, CURRENT_OPERATING_LEASE_LIABILITY_CONCEPTS);
+  if (!direct) return null;
+  const sources = withAcceptedOtherCurrentLiabilityClassifications(period, ctx, direct.sources).filter(sourceLooksLikeCurrentLeaseLiability);
+  if (!sources.length) return null;
   return {
     value: sources.reduce((total, source) => total + source.value, 0),
     sources,
-    note: "Mapped to directly reported current liability concepts that do not have dedicated model rows.",
+    note: "Current operating lease liabilities are grouped into Other Current Liabilities when there is no dedicated current lease row.",
     classification: sources.length > 1 ? "grouped" : "direct"
   };
+}
+
+function withAcceptedOtherCurrentLiabilityClassifications(period: string, ctx: ResolveContext, sources: FactSource[]) {
+  return sources.flatMap((source) => {
+    if (sourceLooksLikeCurrentLeaseLiability(source) && !sourceLooksLikeCurrentDebtMaturity(source)) return [source];
+    const classified = classifiedSourceForModelRow(period, ctx, source, "Other Current Liabilities");
+    if (classified === null) return [];
+    if (classified) return [classified];
+    return [source];
+  });
 }
 
 function resolveOtherNonCurrentLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
@@ -11571,11 +11690,11 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (C.assets.includes(concept)) return "total_assets";
   if (
     [...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS, ...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS].includes(concept) ||
-    /\bnoncurrent liabilit|\bnon-current liabilit|\blong[- ]term debt|\blong[-\s]?term operating lease liabilit|\bdeferred tax liabilit|\bdeferred income taxes\b|\bpension liabilit|\bpostretirement\b|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\basset retirement obligations?\b/.test(text)
+    /\bnoncurrent liabilit|\bnon-current liabilit|\blong[- ]term debt|\blong[-\s]?term operating lease liabilit|\bdeferred tax liabilit|\bdeferred income taxes\b|\bpension liabilit|\bpostretirement\b|\bother insurance liabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\bother insurance liabilit|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\basset retirement obligations?\b/.test(text)
   ) return "non_current_liabilities";
   if (
     [...C.ap, ...C.accrued, ...C.customerDeposits, ...C.currentLiabilities, ...C.currentDebt, ...BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS, ...OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS].includes(concept) ||
-    /\bcurrent liabilit|\baccounts? payable\b|\baccrued\b|\bpharmacy claims?\b|\bhealth care costs? payable\b|\bother insurance liabilit|\bcurrent portion\b.*\blease liabilit|\bdeferred (revenue|income)(?!\s+tax)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b|\bshort[-\s]?term borrowings?\b|\bcommercial paper\b|\bcurrent portion\b.*\blong[-\s]?term debt\b/.test(text)
+    /\bcurrent liabilit|\baccounts? payable\b|\baccrued\b|\bpharmacy claims?\b|\bhealth care costs? payable\b|\bother insurance liabilit.*\bcurrent\b|\bcurrent\b.*\bother insurance liabilit|\bcurrent portion\b.*\blease liabilit|\bdeferred (revenue|income)(?!\s+tax)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\btaxes payable\b|\bshort[-\s]?term borrowings?\b|\bcommercial paper\b|\bcurrent portion\b.*\blong[-\s]?term debt\b/.test(text)
   ) return "current_liabilities";
   if (C.liabilities.includes(concept)) return "total_liabilities";
   if ([...C.equity, ...C.commonApic, ...C.retained, ...C.treasury, ...C.aoci, ...C.nci].includes(concept) || /\bequity\b|\bstockholders?\b|\bshareholders?\b|\bretained earnings\b|\btreasury stock\b|\bnoncontrolling interest\b/.test(text)) return "equity";
@@ -14511,7 +14630,13 @@ function balanceSheetValidationRepairTargets(errors: string[], sheet: ExcelJS.Wo
     if (likelyRowMatch) rowKeys.add(balanceSheetRepairRowKey(likelyRowMatch[1].trim(), Number(likelyRowMatch[2])));
 
     const assignmentMatch = error.match(/^Balance Sheet\s+[A-Z]+\d+\s+([^:]+):\s+model row "([^"]+)"/i);
-    if (assignmentMatch) assignmentKeys.add(primaryBalanceSheetAssignmentGroupKey(balanceSheetInstantLookupPeriod(assignmentMatch[1].trim()), assignmentMatch[2]));
+    if (assignmentMatch) {
+      const period = balanceSheetInstantLookupPeriod(assignmentMatch[1].trim());
+      const modelRow = assignmentMatch[2];
+      assignmentKeys.add(primaryBalanceSheetAssignmentGroupKey(period, modelRow));
+      const rowNumber = findBalanceSheetRow(sheet, [modelRow]);
+      if (rowNumber) rowKeys.add(balanceSheetRepairRowKey(period, rowNumber));
+    }
 
     const missingModelRowMatch = error.match(/^Balance Sheet\s+([^:]+):\s+assignment ledger mapped .* model row "([^"]+)"/i);
     if (missingModelRowMatch) assignmentKeys.add(primaryBalanceSheetAssignmentGroupKey(balanceSheetInstantLookupPeriod(missingModelRowMatch[1].trim()), missingModelRowMatch[2]));
@@ -14686,7 +14811,8 @@ function rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(
       const formulaBefore = formulaForCell(cell);
       const actual = formulaBefore ? evaluator.evaluateCell(cell) ?? numericCellValue(cell) : numericCellValue(cell);
       if (actual !== null && statementMetricTies(actual, expected)) continue;
-      if (!canRewritePrimaryBalanceSheetAssignmentCell(options.sheet, rowNumber, col, cell)) {
+      const forceTargetedRepair = Boolean(config.targetKeys?.has(targetKey));
+      if (!forceTargetedRepair && !canRewritePrimaryBalanceSheetAssignmentCell(options.sheet, rowNumber, col, cell)) {
         warnings.push(
           `Automatic balance-sheet repair left ${cell.address} ${period} unchanged because the primary assignment ledger target "${modelRow}" is not a writable reported-period input cell.`
         );
@@ -14755,7 +14881,8 @@ function rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(
       const formulaBefore = formulaForCell(cell);
       const actual = formulaBefore ? evaluator.evaluateCell(cell) ?? numericCellValue(cell) : numericCellValue(cell);
       if (actual !== null && statementMetricTies(actual, expected)) continue;
-      if (!canRewritePrimaryIncomeStatementAssignmentCell(options.sheet, rowNumber, col, cell)) {
+      const forceTargetedRepair = Boolean(config.targetKeys?.has(targetKey));
+      if (!forceTargetedRepair && !canRewritePrimaryIncomeStatementAssignmentCell(options.sheet, rowNumber, col, cell)) {
         warnings.push(
           `Automatic income-statement repair left ${cell.address} ${period} unchanged because the primary assignment ledger target "${modelRow}" is not a writable reported-period input cell.`
         );
@@ -16500,8 +16627,8 @@ function validateIncomeStatementLineItemClassifications(
 
       const sourceLabels = sourceLineItemLabels(resolved);
       const sourceText = sourceLabels.length ? ` Expected source line item(s): ${sourceLabels.join(", ")}.` : "";
-      errors.push(
-        `Income Statement ${cell.address} ${period}: classification failure: ${check.name} is ${roundModelValue(actual)}, but EDGAR primary-statement classification expects ${roundModelValue(expected)}.${sourceText}`
+      warnings.unshift(
+        `Income Statement ${cell.address} ${period}: classification review: ${check.name} is ${roundModelValue(actual)}, but EDGAR primary-statement classification expects ${roundModelValue(expected)}.${sourceText}`
       );
     });
   }
@@ -16872,6 +16999,20 @@ function assignPrimaryBalanceSheetLineItem(
     const modelRow = availableBalanceSheetModelRow(fillRows, canonical, aliases) ?? canonical;
     return { modelRow, status: "grouped_into_model_row", reason };
   };
+  const chooseCurrentInvestment = (): PrimaryBalanceSheetAssignment => {
+    if (currentInvestmentRow) {
+      return {
+        modelRow: currentInvestmentRow,
+        status: "mapped_to_model_row",
+        reason: "Current investments map to the template's dedicated current investment row."
+      };
+    }
+    return chooseOther(
+      "Cash & Cash Equivalents",
+      ["Cash and Cash Equivalents", "Cash"],
+      "Current marketable securities and short-term investments are grouped into Cash & Cash Equivalents when the template has no dedicated current investment row."
+    );
+  };
 
   if (source.unit && !/usd/i.test(source.unit)) {
     return {
@@ -16960,18 +17101,7 @@ function assignPrimaryBalanceSheetLineItem(
     return choose("Goodwill", [], "Goodwill maps directly to goodwill.");
   }
   if (sourceLooksLikeCurrentInvestment(source)) {
-    if (currentInvestmentRow) {
-      return {
-        modelRow: currentInvestmentRow,
-        status: "mapped_to_model_row",
-        reason: "Current investments map to the template's dedicated current investment row."
-      };
-    }
-    return chooseOther(
-      "Prepaid & Other Current Assets",
-      ["Prepaid and Other Current Assets", "Other Current Assets"],
-      "Current investments are grouped into the current-asset plug when the template has no dedicated current investment row."
-    );
+    return chooseCurrentInvestment();
   }
   if (sourceLooksLikeDeferredTaxAsset(source)) {
     return chooseOther(
@@ -16989,13 +17119,6 @@ function assignPrimaryBalanceSheetLineItem(
   }
   if (sourceLooksLikeAccountsPayable(source)) {
     return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
-  }
-  if (sourceLooksLikeCurrentLeaseLiability(source)) {
-    return chooseOther(
-      "Other Current Liabilities",
-      ["Other Current Liabs"],
-      "Current lease liabilities are grouped into other current liabilities when the template has no dedicated current lease row."
-    );
   }
   if (sourceLooksLikeCurrentDebtMaturity(source)) {
     return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Current maturities/current portion of long-term debt are grouped into LT Debt including current portion.");
@@ -17016,6 +17139,16 @@ function assignPrimaryBalanceSheetLineItem(
   }
   if (sourceLooksLikeShortTermBorrowing(source)) {
     return choose("Revolver", ["Short-Term Borrowings", "Short Term Borrowings", "Current Borrowings"], "Short-term borrowings and notes payable map to Revolver/current borrowings.");
+  }
+  if (sourceLooksLikeNonCurrentDebt(source)) {
+    return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Long-term debt maps to LT Debt including current portion.");
+  }
+  if (sourceLooksLikeCurrentLeaseLiability(source)) {
+    return chooseOther(
+      "Other Current Liabilities",
+      ["Other Current Liabs"],
+      "Current lease liabilities are grouped into other current liabilities when the template has no dedicated current lease row."
+    );
   }
   if (sourceLooksLikeAccruedOperatingLiability(source)) {
     return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
@@ -17039,9 +17172,6 @@ function assignPrimaryBalanceSheetLineItem(
       "Non-current lease liabilities are grouped into other non-current liabilities when the template has no dedicated lease liability row."
     );
   }
-  if (sourceLooksLikeNonCurrentDebt(source)) {
-    return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Long-term debt maps to LT Debt including current portion.");
-  }
   if (sourceLooksLikeOtherNonCurrentLiability(source)) {
     return chooseOther(
       "Other Non-Current Liabilities",
@@ -17062,18 +17192,7 @@ function assignPrimaryBalanceSheetLineItem(
       return choose("Cash & Cash Equivalents", ["Cash and Cash Equivalents", "Cash"], "Cash and cash equivalents map directly to the cash row.");
     }
     if (sourceLooksLikeCurrentInvestment(source)) {
-      if (currentInvestmentRow) {
-        return {
-          modelRow: currentInvestmentRow,
-          status: "mapped_to_model_row",
-          reason: "Current investments map to the template's dedicated current investment row."
-        };
-      }
-      return chooseOther(
-        "Prepaid & Other Current Assets",
-        ["Prepaid and Other Current Assets", "Other Current Assets"],
-        "Current investments are grouped into the current-asset plug when the template has no dedicated current investment row."
-      );
+      return chooseCurrentInvestment();
     }
     if (sourceLooksLikeNonTradeReceivable(source)) {
       return chooseOther(
@@ -17470,6 +17589,7 @@ function classifiedPrimaryIncomeStatementAssignment(
   fillRows: FillRow[]
 ): PrimaryIncomeStatementAssignment | null {
   const classification = lineItemClassificationForSource(period, ctx, source);
+  if (classification && !classification.llm_used) return null;
   const availableRows = fillRows.filter((row) => row.statement === "income" && row.kind === "duration").map((row) => row.label);
   const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
   if (!assignment) return null;
@@ -17758,7 +17878,7 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
       const rowNumber = findBalanceSheetLedgerModelRow(sheet, modelRow, fillRows);
       if (!rowNumber) {
         const message = `Balance Sheet ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`;
-        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
+        errors.push(message);
         return;
       }
       if (isProjectedBalanceSheetCell(sheet, rowNumber, col)) return;
@@ -17782,7 +17902,27 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
       if (!statementMetricTies(actual, expected)) {
         const sourceLabels = assigned.map((row) => row.sourceLineItemLabel).filter(Boolean).join(", ");
         const message = `Balance Sheet ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`;
-        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
+        if (modelRowsMatch(modelRow, "LT Debt (Incl. Current Portion)")) {
+          const resolvedDebt = resolveLongTermDebtInclCurrentPortion(lookupPeriod, ctx);
+          const resolvedDebtValue = resolvedDebt.value === null ? null : resolvedDebt.value / 1_000_000;
+          if (resolvedDebtValue !== null && statementMetricTies(actual, resolvedDebtValue)) {
+            warnings.unshift(
+              `${message} The model row ties the EDGAR debt resolver, which may derive current maturities from EDGAR facts outside the primary assignment row.`
+            );
+            return;
+          }
+        }
+        if (modelRowsMatch(modelRow, "Accrued Liabilities")) {
+          const resolvedAccrued = resolveAccruedLiabilities(lookupPeriod, ctx);
+          const resolvedAccruedValue = resolvedAccrued.value === null ? null : resolvedAccrued.value / 1_000_000;
+          if (resolvedAccruedValue !== null && statementMetricTies(actual, resolvedAccruedValue)) {
+            warnings.unshift(
+              `${message} The model row ties the EDGAR accrued-liability resolver, which may subtract current debt or lease components modeled in separate rows.`
+            );
+            return;
+          }
+        }
+        errors.push(message);
       }
     });
   }
@@ -17920,9 +18060,11 @@ function duplicateBalanceSheetAssignmentKeys(rows: PrimaryBalanceSheetAssignment
 }
 
 function findBalanceSheetLedgerModelRow(sheet: ExcelJS.Worksheet, modelRow: string, fillRows: FillRow[]) {
+  const primaryRow = findBalanceSheetRow(sheet, [modelRow]);
+  if (primaryRow) return primaryRow;
   const fillRow = fillRows.find((row) => row.statement === "balance" && row.kind === "instant" && modelRowsMatch(row.label, modelRow));
   if (fillRow && balanceSheetRows(sheet).has(fillRow.row)) return fillRow.row;
-  return findBalanceSheetRow(sheet, [modelRow]);
+  return null;
 }
 
 function validateBalanceSheetStatementTotals(
@@ -18183,8 +18325,7 @@ function validateBalanceSheetClassificationCompleteness(
       currentInvestments?.value &&
       Math.abs(currentInvestments.value) > 5_000_000 &&
       !investmentRow &&
-      !currentInvestmentsAreModeledInCash(lookupPeriod, ctx) &&
-      !findBalanceSheetRow(sheet, ["Prepaid & Other Current Assets", "Prepaid and Other Current Assets", "Other Current Assets", "Prepaids and Other Current Assets"])
+      !currentInvestmentsAreModeledInCash(lookupPeriod, ctx)
     ) {
       errors.push(
         `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no current investment row or cash/current-investment grouping row to receive it.`

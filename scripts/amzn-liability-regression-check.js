@@ -55,6 +55,8 @@ async function main() {
   if (audit) {
     for (let row = 1; row <= audit.rowCount; row += 1) {
       const cell = String(cellValue(audit.getCell(row, 2)) ?? "");
+      const mappingType = String(cellValue(audit.getCell(row, 7)) ?? "");
+      if (/cleared/i.test(mappingType)) continue;
       const concepts = String(cellValue(audit.getCell(row, 8)) ?? "");
       if (cell === "F135" && !/(?:LongTermDebtCurrent|FinanceLeaseLiabilityCurrent|ShortTermBorrowings)=/.test(concepts)) {
         errors.push("Model!F135 should exclude separately disclosed current debt from current liabilities excluding debt.");
