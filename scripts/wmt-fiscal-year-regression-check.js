@@ -27,6 +27,13 @@ function cellValue(cell) {
   return value;
 }
 
+function cellFormula(cell) {
+  const value = cell.value;
+  if (value && typeof value === "object" && typeof value.formula === "string") return value.formula;
+  if (value && typeof value === "object" && typeof value.sharedFormula === "string") return value.sharedFormula;
+  return null;
+}
+
 function normalize(value) {
   return String(value ?? "")
     .trim()
@@ -219,6 +226,10 @@ async function main() {
         errors.push(
           `1Q27 ${check.label}: expected ${expected.value} from EDGAR ${expected.concept} at ${filing.reportDate}, got ${actual ?? "[blank]"}.`
         );
+      }
+      const formula = cellFormula(model.getCell(row, col));
+      if (check.label === "Revenue" && formula) {
+        errors.push(`1Q27 Revenue should be a durable SEC actual after recalculation, but ${model.getCell(row, col).address} still contains formula "${formula}".`);
       }
     }
   }

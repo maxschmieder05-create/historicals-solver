@@ -12108,6 +12108,7 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
   const warnings: string[] = [];
   const rowNumber = findIncomeStatementMetricRow(sheet, labels);
   if (!rowNumber) return { filledCells, commentsAdded, warnings };
+  const evaluator = new FormulaEvaluator(sheet, { useCachedFormulaResults: false });
 
   periods.forEach((period, index) => {
     const resolved = resolver(period, ctx);
@@ -12116,10 +12117,38 @@ function reconcileIncomeStatementFormulaMetricToEdgar(
     const cell = sheet.getCell(rowNumber, columns[index]);
     const formula = formulaForCell(cell);
     if (!formula) return;
-    if (isProtectedFormulaOrCheckCell(cell)) return;
+    const colNumber = Number(cell.col);
+    const actualizedForecastCell = isActualizedForecastPeriodCell(sheet, colNumber, period, ctx);
+    const reportedPeriodFormula = Boolean(reportedPeriodColumnsBySheet.get(sheet)?.has(colNumber));
+    if (isProtectedFormulaOrCheckCell(cell) && !actualizedForecastCell && !reportedPeriodFormula) return;
     const value = resolved.value / 1_000_000;
     const current = numericCellValue(cell);
-    if (current !== null && incomeStatementFormulaTies(current, value)) return;
+    const evaluated = evaluator.evaluateCell(cell);
+    if ((formula.includes("!") || actualizedForecastCell) && (reportedPeriodFormula || actualizedForecastCell)) {
+      cell.value = value;
+      filledCells += 1;
+      const note = lineItemSentence(rowLabel(sheet, rowNumber), [sourceLineItemLabel(source)], "maps");
+      if (addComment(cell, note)) commentsAdded += 1;
+      const auditRow = statementTotalAuditRow(
+        sheet,
+        cell,
+        rowLabel(sheet, rowNumber),
+        period,
+        value,
+        source,
+        "income",
+        `${metricName} formula evaluated to ${evaluated === null ? "an unsupported/stale value" : roundModelValue(evaluated)}, so the reported-period formula was replaced with the SEC filing actual.`,
+        "formula replaced"
+      );
+      auditRow.formulaPreserved = false;
+      auditRow.formulaStatus = actualizedForecastCell
+        ? "actualized forecast formula replaced with SEC filing actual"
+        : "reported-period formula replaced with SEC filing actual";
+      auditRows.push(auditRow);
+      evaluator.clear();
+      return;
+    }
+    if (current !== null && incomeStatementFormulaTies(current, value) && (evaluated === null || incomeStatementFormulaTies(evaluated, value))) return;
 
     cell.value = { formula, result: value };
     filledCells += 1;
