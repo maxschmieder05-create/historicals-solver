@@ -143,6 +143,34 @@ async function classify(overrides) {
   });
   assert.equal(supplies.recommended_model_row, "Inventory");
 
+  const workInProcess = await classify({
+    label: "Work-in-process",
+    section: "unknown",
+    deterministicCandidate: "Unmapped / Needs Review"
+  });
+  assert.equal(workInProcess.recommended_model_row, "Inventory");
+
+  const finishedGoods = await classify({
+    label: "Finished goods",
+    section: "unknown",
+    deterministicCandidate: "Unmapped / Needs Review"
+  });
+  assert.equal(finishedGoods.recommended_model_row, "Inventory");
+
+  const landBuildings = await classify({
+    label: "Land, buildings and improvements",
+    section: "unknown",
+    deterministicCandidate: "Unmapped / Needs Review"
+  });
+  assert.equal(landBuildings.recommended_model_row, "PP&E, Net");
+
+  const machineryEquipment = await classify({
+    label: "Machinery and equipment",
+    section: "unknown",
+    deterministicCandidate: "Unmapped / Needs Review"
+  });
+  assert.equal(machineryEquipment.recommended_model_row, "PP&E, Net");
+
   const shortTermInvestments = await classify({
     label: "Short-term investments",
     section: "current assets",

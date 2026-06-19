@@ -5355,10 +5355,52 @@ function inventoryLikeCurrentAssetScore(source: FactSource) {
   let score = conceptScore(source, C.inventory, 10);
   if (/\binventor(?:y|ies)\b/.test(text)) score += 7;
   if (/\baircraft fuel\b|\bspare parts?\b|\bparts and supplies\b|\bsupplies inventory\b|\bmerchandise inventory\b/.test(text)) score += 7;
-  if (/\braw materials?\b|\bwork in process\b|\bfinished goods?\b/.test(text)) score += 5;
+  if (/\braw materials?\b|\bwork[-\s]?in[-\s]?process\b|\bfinished goods?\b/.test(text)) score += 6;
   if (/\bcurrent\b/.test(text)) score += 1;
   if (/\bnoncurrent\b|\bproperty\b|\bplant\b|\bequipment\b/.test(text)) score -= 5;
   return score;
+}
+
+function primaryBalanceSheetRowLooksLikeInventoryComponent(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const text = `${row.rowLabel || ""} ${cleanLineItemLabel(row.rowLabel)} ${source.label || ""} ${source.concept || ""} ${sourceDisplayLabel(source)}`
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+  const compact = normalize(text);
+  if (/liabilit|expense|cashflow/.test(compact)) return false;
+  if (/inventory|inventories|rawmaterials|workinprocess|finishedgoods|merchandise|spareparts|partsandsupplies/.test(compact)) return true;
+  return /\binventor(?:y|ies)\b|\braw materials?\b|\bwork[-\s]?in[-\s]?process\b|\bfinished goods?\b|\bmerchandise\b|\bspare parts?\b|\bparts and supplies\b/.test(text);
+}
+
+function primaryBalanceSheetRowLooksLikePpeComponent(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const text = `${row.rowLabel || ""} ${cleanLineItemLabel(row.rowLabel)} ${source.label || ""} ${source.concept || ""} ${sourceDisplayLabel(source)}`
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+  const compact = normalize(text);
+  if (/liabilit|expense|cashflow|leaseobligation|debtdue|borrowings?/.test(compact)) return false;
+  if (C.ppe.includes(source.concept)) return true;
+  return (
+    /propertyplantandequipment|propertyandequipment|landbuildings?improvements?|buildings?improvements?|machineryandequipment|furniturefixtures?equipment|constructioninprogress|leaseholdimprovements?/.test(
+      compact
+    ) || /\bland\b.*\bbuilding|\bbuildings?\b.*\bimprovements?\b|\bmachinery\b.*\bequipment\b|\bfurniture\b.*\bfixtures?\b|\bconstruction in progress\b|\bleasehold improvements?\b/.test(text)
+  );
+}
+
+function primaryBalanceSheetHasSeparateNetPpeRow(period: string, ctx: ResolveContext, currentRow: PrimaryBalanceSheetRow) {
+  return primaryBalanceSheetRowsForPeriod(period, ctx).some((candidate) => {
+    if (candidate === currentRow) return false;
+    const source = primaryBalanceSheetFactSource(candidate, period);
+    if (!source) return false;
+    return primaryBalanceSheetRowLooksLikeNetPpeCarryingAmount(candidate, source);
+  });
+}
+
+function primaryBalanceSheetRowLooksLikeNetPpeCarryingAmount(row: PrimaryBalanceSheetRow, source: FactSource) {
+  if (C.ppe.includes(source.concept)) return true;
+  const text = `${row.rowLabel || ""} ${cleanLineItemLabel(row.rowLabel)} ${source.label || ""} ${source.concept || ""} ${sourceDisplayLabel(source)}`
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+  const compact = normalize(text);
+  return /propertyplantandequipmentnet|propertyandequipmentnet|ppe?net|propertyplantandequipmentafteraccumulateddepreciation|propertyplantandequipmentlessaccumulateddepreciation/.test(compact);
 }
 
 function resolvePrepaidAndOtherCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
@@ -7184,6 +7226,11 @@ export async function POST(request: NextRequest) {
       reportedPeriodPairs,
       actualizedForecastColumns: Array.from(actualizedForecastPeriodColumnsBySheet.get(sheet) ?? [])
     };
+    const primaryAssignmentFinalization = finalizePrimaryAssignmentLedgersForValidation(validationOptions);
+    filledCells += primaryAssignmentFinalization.filledCells;
+    commentsAdded += primaryAssignmentFinalization.commentsAdded;
+    warnings.push(...primaryAssignmentFinalization.warnings);
+
     const validationResult = validateWorkbookWithAutomaticRetries(validationOptions);
     filledCells += validationResult.filledCells;
     commentsAdded += validationResult.commentsAdded;
@@ -14444,6 +14491,8 @@ type ValidationRetryAttempt = {
   diagnoses: string[];
 };
 
+const MAX_AUTOMATIC_VALIDATION_RETRIES = 8;
+
 function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOptions): {
   errors: string[];
   attempts: ValidationRetryAttempt[];
@@ -14455,7 +14504,7 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
   let filledCells = 0;
   let commentsAdded = 0;
 
-  for (let attempt = 1; attempt <= 2 && errors.length; attempt += 1) {
+  for (let attempt = 1; attempt <= MAX_AUTOMATIC_VALIDATION_RETRIES && errors.length; attempt += 1) {
     const trigger = automaticValidationRetryTrigger(errors);
     if (!trigger) break;
 
@@ -14486,6 +14535,23 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
   }
 
   return { errors, attempts, filledCells, commentsAdded };
+}
+
+function finalizePrimaryAssignmentLedgersForValidation(options: WorkbookValidationRetryOptions) {
+  const balanceSheetRebuild = rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options);
+  const incomeStatementRebuild = rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options);
+  const filledCells = balanceSheetRebuild.filledCells + incomeStatementRebuild.filledCells;
+  return {
+    filledCells,
+    commentsAdded: balanceSheetRebuild.commentsAdded + incomeStatementRebuild.commentsAdded,
+    warnings: filledCells
+      ? unique([
+          ...balanceSheetRebuild.warnings,
+          ...incomeStatementRebuild.warnings,
+          "Final validation prep reconciled writable primary statement rows to the primary assignment ledgers before self-checking."
+        ])
+      : []
+  };
 }
 
 function runWorkbookReturnValidation(options: WorkbookValidationRetryOptions) {
@@ -14542,8 +14608,8 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
   const diagnoses = diagnoseValidationFailures(errors);
   const repairTargets = balanceSheetValidationRepairTargets(errors, options.sheet);
   const incomeRepairTargets = incomeStatementValidationRepairTargets(errors);
-  options.primaryAssignmentRepairTargets = repairTargets.assignmentKeys;
-  options.primaryIncomeAssignmentRepairTargets = incomeRepairTargets.assignmentKeys;
+  options.primaryAssignmentRepairTargets = mergeRepairTargetKeys(options.primaryAssignmentRepairTargets, repairTargets.assignmentKeys);
+  options.primaryIncomeAssignmentRepairTargets = mergeRepairTargetKeys(options.primaryIncomeAssignmentRepairTargets, incomeRepairTargets.assignmentKeys);
   const strictRebuild = strictPrimaryBalanceSheetRebuild(options, { targetRowKeys: repairTargets.rowKeys });
   const ledgerRebuild = rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options, { targetKeys: repairTargets.assignmentKeys });
   const incomeLedgerRebuild = rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options, { targetKeys: incomeRepairTargets.assignmentKeys });
@@ -14604,6 +14670,13 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
   };
 }
 
+function mergeRepairTargetKeys(existing: Set<string> | undefined, next: Set<string>) {
+  if (!existing?.size) return new Set(next);
+  const merged = new Set(existing);
+  next.forEach((key) => merged.add(key));
+  return merged;
+}
+
 function diagnoseValidationFailures(errors: string[]) {
   const diagnoses: string[] = [];
   const add = (label: string, pattern: RegExp) => {
@@ -14633,6 +14706,15 @@ function balanceSheetValidationRepairTargets(errors: string[], sheet: ExcelJS.Wo
     if (assignmentMatch) {
       const period = balanceSheetInstantLookupPeriod(assignmentMatch[1].trim());
       const modelRow = assignmentMatch[2];
+      assignmentKeys.add(primaryBalanceSheetAssignmentGroupKey(period, modelRow));
+      const rowNumber = findBalanceSheetRow(sheet, [modelRow]);
+      if (rowNumber) rowKeys.add(balanceSheetRepairRowKey(period, rowNumber));
+    }
+
+    const genericModelRowMatch = error.match(/^Balance Sheet\s+[A-Z]+\d+\s+([^:]+):[\s\S]*?model row "([^"]+)"/i);
+    if (genericModelRowMatch) {
+      const period = balanceSheetInstantLookupPeriod(genericModelRowMatch[1].trim());
+      const modelRow = genericModelRowMatch[2];
       assignmentKeys.add(primaryBalanceSheetAssignmentGroupKey(period, modelRow));
       const rowNumber = findBalanceSheetRow(sheet, [modelRow]);
       if (rowNumber) rowKeys.add(balanceSheetRepairRowKey(period, rowNumber));
@@ -15122,7 +15204,7 @@ function validateWorkbookBeforeReturn(
     const isFinancialCompanyStatementContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, incomeStatementPeriods, incomeStatementColumns, ctx, evaluator, warnings, profile));
     if (!isFinancialCompanyStatementContext) {
-      errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
+      errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings, fillRows));
     }
     errors.push(...validateBalanceSheetCheck(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
     if (fillRows.length) {
@@ -15863,10 +15945,11 @@ function refreshBalanceSheetTotalFormulaResult(
   const formula = formulaForCell(cell);
   const actualizedForecastCell = Boolean(formula) && isActualizedForecastPeriodCell(sheet, col, period, ctx);
   const currentValue = numericCellValue(cell);
-  if (!actualizedForecastCell && currentValue !== null && incomeStatementFormulaTies(currentValue, value)) return;
+  if (!formula && !actualizedForecastCell && currentValue !== null && incomeStatementFormulaTies(currentValue, value)) return;
   if (formula && !actualizedForecastCell) {
     const reportedPeriodFormula = reportedPeriodColumnsBySheet.get(sheet)?.has(col);
-    if (reportedPeriodFormula) {
+    const replaceStaleReportedFormula = reportedPeriodFormula || isAnnualPeriod(period);
+    if (replaceStaleReportedFormula) {
       const formulaValue = new FormulaEvaluator(sheet).evaluateCell(cell);
       if (formulaValue === null || !statementMetricTies(formulaValue, value)) {
         cell.value = value;
@@ -15881,7 +15964,9 @@ function refreshBalanceSheetTotalFormulaResult(
           `Replaced stale reported-period ${metricName} formula with EDGAR actual.`
         );
         auditRow.formulaPreserved = false;
-        auditRow.formulaStatus = "reported-period balance-sheet total formula replaced with SEC filing actual";
+        auditRow.formulaStatus = isAnnualPeriod(period)
+          ? "annual balance-sheet total formula replaced with SEC filing actual"
+          : "reported-period balance-sheet total formula replaced with SEC filing actual";
         auditRows.push(auditRow);
         return;
       }
@@ -15933,33 +16018,43 @@ function copyBalanceSheetFourthQuarterToAnnualColumns(
       const resolver = balanceSheetDiagnosticResolverForLabel(rowLabel(sheet, rowNumber));
       const annualResolved = resolver ? resolver(balanceSheetInstantLookupPeriod(period), ctx) : null;
       const annualExpected = annualResolved?.value !== null && annualResolved?.value !== undefined ? annualResolved.value / 1_000_000 : null;
+      const targetValue = annualExpected ?? value;
+      const targetSource =
+        annualExpected !== null && annualResolved
+          ? resolvedAuditSource(period, "AnnualBalanceSheetResolved", `Resolved ${rowLabel(sheet, rowNumber)} annual balance sheet value`, annualResolved)
+          : bridgeSource(period, "AnnualBalanceSheetCopiedFromFourthQuarter", `Copied ${columnLetter(fourthQuarterCol)}${rowNumber} year-end balance sheet value`, value * 1_000_000, []);
       const currentAnnualValue = annualExpected !== null ? statementMetricCellValue(targetCell, evaluator, annualExpected) : evaluatedCellNumber(targetCell, evaluator);
       if (annualExpected !== null && currentAnnualValue !== null && statementMetricTies(currentAnnualValue, annualExpected)) continue;
       const targetFormula = formulaForCell(targetCell);
       if (targetFormula) {
         const currentValue = numericCellValue(targetCell);
-        if (currentValue !== null && exactModelValueTies(currentValue, value)) continue;
-        setFormulaResult(targetCell, value);
+        if (currentValue !== null && exactModelValueTies(currentValue, targetValue)) continue;
+        setFormulaResult(targetCell, targetValue);
         filledCells += 1;
         const auditRow = statementTotalAuditRow(
           sheet,
           targetCell,
           rowLabel(sheet, rowNumber),
           period,
-          value,
-          bridgeSource(period, "AnnualBalanceSheetCopiedFromFourthQuarter", `Copied ${columnLetter(fourthQuarterCol)}${rowNumber} year-end balance sheet value`, value * 1_000_000, []),
+          targetValue,
+          targetSource,
           "balance",
-          "Annual balance sheet formula cached result was refreshed from the matching 4Q point-in-time balance."
+          annualExpected !== null
+            ? "Annual balance sheet formula cached result was refreshed from the SEC annual point-in-time balance."
+            : "Annual balance sheet formula cached result was refreshed from the matching 4Q point-in-time balance."
         );
         auditRow.formulaPreserved = true;
-        auditRow.formulaStatus = "annual balance sheet formula cached result refreshed from 4Q year-end value";
+        auditRow.formulaStatus =
+          annualExpected !== null
+            ? "annual balance sheet formula cached result refreshed from SEC annual value"
+            : "annual balance sheet formula cached result refreshed from 4Q year-end value";
         auditRows.push(auditRow);
         continue;
       }
       if (isProtectedFormulaOrCheckCell(targetCell)) continue;
-      if (!hasFormula(targetCell) && numericCellValue(targetCell) !== null && exactModelValueTies(numericCellValue(targetCell)!, value)) continue;
+      if (!hasFormula(targetCell) && numericCellValue(targetCell) !== null && exactModelValueTies(numericCellValue(targetCell)!, targetValue)) continue;
       if (!isHardcodedFinancialInput(targetCell)) continue;
-      targetCell.value = value;
+      targetCell.value = targetValue;
       filledCells += 1;
       auditRows.push({
         sheetName: sheet.name,
@@ -15967,21 +16062,24 @@ function copyBalanceSheetFourthQuarterToAnnualColumns(
         modelRowLabel: rowLabel(sheet, rowNumber),
         section: "Balance Sheet",
         period,
-        valueWritten: value,
-        mappingType: "calculated",
-        conceptsUsed: `Copied ${columnLetter(fourthQuarterCol)}${rowNumber} year-end balance sheet value`,
-        secLabels: "",
+        valueWritten: targetValue,
+        mappingType: annualExpected !== null ? "direct" : "calculated",
+        conceptsUsed: annualExpected !== null ? targetSource.concept : `Copied ${columnLetter(fourthQuarterCol)}${rowNumber} year-end balance sheet value`,
+        secLabels: annualExpected !== null ? targetSource.label : "",
         sourceStatement: "balance",
-        accession: "",
-        sourceUrl: "",
+        accession: annualExpected !== null ? targetSource.accn ?? "" : "",
+        sourceUrl: annualExpected !== null ? targetSource.sourceUrl ?? "" : "",
         cellWritable: true,
         formulaPreserved: false,
-        formulaStatus: "annual balance sheet copied from 4Q year-end value",
+        formulaStatus: annualExpected !== null ? "annual balance sheet refreshed from SEC annual value" : "annual balance sheet copied from 4Q year-end value",
         writeBlockedReason: "",
         signConvention: "copied",
         confidence: "high",
         validationStatus: "OK!",
-        notes: "Annual balance sheet columns are point-in-time balances and were copied from the matching 4Q year-end balance sheet column."
+        notes:
+          annualExpected !== null
+            ? "Annual balance sheet columns are point-in-time balances and were refreshed from the SEC annual balance sheet fact."
+            : "Annual balance sheet columns are point-in-time balances and were copied from the matching 4Q year-end balance sheet column."
       });
     }
   }
@@ -17031,6 +17129,19 @@ function assignPrimaryBalanceSheetLineItem(
   if (sourceTextMatches(source, /\bemployee benefits? trust\b/)) {
     return choose("Treasury Stock", ["Treasury & Preferred Stock"], "Employee benefit trust shares are contra-equity/treasury-style equity and map to treasury stock before generic APIC classification.");
   }
+  if (primaryBalanceSheetRowLooksLikeInventoryComponent(row, source)) {
+    return choose("Inventory", ["Inventories"], "Inventory component rows such as raw materials, work-in-process, and finished goods map to inventory even when SEC section context is weak.");
+  }
+  if (primaryBalanceSheetRowLooksLikePpeComponent(row, source)) {
+    if (primaryBalanceSheetHasSeparateNetPpeRow(period, ctx, row)) {
+      return {
+        modelRow: null,
+        status: "explicitly_excluded_with_reason",
+        reason: "Excluded PP&E gross component detail because a separate net PP&E carrying amount is reported for the same balance sheet period."
+      };
+    }
+    return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E component rows such as land, buildings, improvements, machinery, and equipment map to PP&E even when SEC section context is weak.");
+  }
 
   const classifiedAssignment = classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows);
   if (classifiedAssignment) return classifiedAssignment;
@@ -18044,7 +18155,7 @@ function latestPrimaryBalanceSheetAssignmentPeriod(periods: string[], ctx: Resol
 }
 
 function allowedPrimaryBalanceSheetAssignmentExclusion(row: PrimaryBalanceSheetAssignmentLedgerRow) {
-  return /non-USD primary balance sheet presentation row|parenthetical allowance|accumulated depreciation|accumulated amortization|redeemable noncontrolling interests are mezzanine equity/i.test(
+  return /non-USD primary balance sheet presentation row|parenthetical allowance|accumulated depreciation|accumulated amortization|redeemable noncontrolling interests are mezzanine equity|PP&E gross component detail/i.test(
     row.classificationReason
   );
 }
@@ -18073,9 +18184,11 @@ function validateBalanceSheetStatementTotals(
   columns: number[],
   ctx: ResolveContext,
   evaluator: FormulaEvaluator,
-  warnings: string[]
+  warnings: string[],
+  fillRows: FillRow[]
 ) {
   const errors: string[] = [];
+  const primaryAssignmentLedgerRows = fillRows.length ? buildPrimaryBalanceSheetAssignmentLedgerRows(periods, ctx, fillRows) : [];
   errors.push(
     ...validateBalanceSheetMetricAgainstEdgar(sheet, periods, columns, ctx, evaluator, warnings, "total assets", ["Total Assets"], C.assets)
   );
@@ -18089,7 +18202,8 @@ function validateBalanceSheetStatementTotals(
       warnings,
       "total current assets",
       ["Total Current Assets"],
-      resolveTotalCurrentAssets
+      resolveTotalCurrentAssets,
+      primaryAssignmentLedgerRows
     )
   );
   errors.push(
@@ -18102,7 +18216,8 @@ function validateBalanceSheetStatementTotals(
       warnings,
       "total non-current assets",
       ["Total Non-Current Assets", "Total Noncurrent Assets", "Total Long-Term Assets", "Total Long Term Assets"],
-      resolveTotalNonCurrentAssets
+      resolveTotalNonCurrentAssets,
+      primaryAssignmentLedgerRows
     )
   );
   errors.push(...validateBalanceSheetCurrentLiabilitiesSubtotal(sheet, periods, columns, ctx, evaluator, warnings));
@@ -18117,7 +18232,8 @@ function validateBalanceSheetStatementTotals(
       warnings,
       "modeled non-current liabilities",
       ["Total Non-Current Liabilities", "Total Noncurrent Liabilities", "Total Long-Term Liabilities", "Total Long Term Liabilities"],
-      resolveModeledNonCurrentLiabilitiesSubtotal
+      resolveModeledNonCurrentLiabilitiesSubtotal,
+      primaryAssignmentLedgerRows
     )
   );
   errors.push(
@@ -18139,11 +18255,23 @@ function validateBalanceSheetStatementTotals(
         "Total Stockholders' Equity",
         "Total Stockholders Equity"
       ],
-      resolveStockholdersEquity
+      resolveStockholdersEquity,
+      primaryAssignmentLedgerRows
     )
   );
   errors.push(
-    ...validateBalanceSheetMetricAgainstResolver(sheet, periods, columns, ctx, evaluator, warnings, "total equity", ["Total Equity"], resolveTotalEquityIncludingNci)
+    ...validateBalanceSheetMetricAgainstResolver(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "total equity",
+      ["Total Equity"],
+      resolveTotalEquityIncludingNci,
+      primaryAssignmentLedgerRows
+    )
   );
   errors.push(
     ...validateBalanceSheetMetricAgainstEdgar(
@@ -18158,8 +18286,8 @@ function validateBalanceSheetStatementTotals(
       LIABILITIES_AND_EQUITY_CONCEPTS
     )
   );
-  errors.push(...validateBalanceSheetOtherBucketMetrics(sheet, periods, columns, ctx, evaluator, warnings));
-  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator, warnings));
+  errors.push(...validateBalanceSheetOtherBucketMetrics(sheet, periods, columns, ctx, evaluator, warnings, primaryAssignmentLedgerRows));
+  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator, warnings, primaryAssignmentLedgerRows));
   errors.push(...validateBalanceSheetFourthQuarterAnnualTies(sheet, periods, columns, ctx, evaluator));
   errors.push(
     ...validateBalanceSheetSubtotalEqualsComponents(
@@ -18313,7 +18441,8 @@ function validateBalanceSheetClassificationCompleteness(
   columns: number[],
   ctx: ResolveContext,
   evaluator: FormulaEvaluator,
-  warnings: string[]
+  warnings: string[],
+  primaryAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[]
 ) {
   const errors: string[] = [];
   const investmentRow = findBalanceSheetRow(sheet, CURRENT_INVESTMENT_ROW_LABELS);
@@ -18371,6 +18500,11 @@ function validateBalanceSheetClassificationCompleteness(
       const protectedFormula = isProtectedFormulaOrCheckCell(cell);
       const modelValue = evaluatedCellNumber(cell, evaluator);
       if (resolved.value === null) {
+        const primaryLedgerTie = primaryBalanceSheetAssignmentLedgerTie(sheet, period, col, primaryAssignmentLedgerRows, rowNumber, rowLabel(sheet, rowNumber), evaluator);
+        if (primaryLedgerTie) {
+          warnings.unshift(primaryAssignmentLedgerResolverWarning(period, check.metricName, primaryLedgerTie));
+          return;
+        }
         const prior = mostRecentPriorResolvedBalanceSheetValue(lookupPeriod, ctx, check.resolver);
         if (prior && Math.abs(prior.value ?? 0) > 5_000_000 && (modelValue === null || Math.abs(modelValue) <= 0.5)) {
           const message = `Balance Sheet ${period}: ${check.metricName} disappeared after prior SEC filings reported ${roundModelValue((prior.value ?? 0) / 1_000_000)}. The row must be remapped or explicitly sourced as zero before writing output.`;
@@ -18386,6 +18520,11 @@ function validateBalanceSheetClassificationCompleteness(
       const resolvedModelValue = statementMetricCellValue(cell, evaluator, expected);
       if (resolvedModelValue === null) return;
       if (!statementMetricTies(resolvedModelValue, expected)) {
+        const primaryLedgerTie = primaryBalanceSheetAssignmentLedgerTie(sheet, period, col, primaryAssignmentLedgerRows, rowNumber, rowLabel(sheet, rowNumber), evaluator);
+        if (primaryLedgerTie) {
+          warnings.unshift(primaryAssignmentLedgerResolverWarning(period, check.metricName, primaryLedgerTie));
+          return;
+        }
         const message = `Balance Sheet ${columnLetter(col)}${rowNumber} ${period}: ${check.metricName} ${roundModelValue(resolvedModelValue)} does not match SEC-sourced value ${roundModelValue(expected)} from ${resolvedSourceSummary(resolved)}.`;
         if (hasFormula(cell)) {
           warnings.unshift(`${message} Preserved formula cell was left for review.`);
@@ -18681,7 +18820,8 @@ function validateBalanceSheetOtherBucketMetrics(
   columns: number[],
   ctx: ResolveContext,
   evaluator: FormulaEvaluator,
-  warnings: string[]
+  warnings: string[],
+  primaryAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[]
 ) {
   const errors: string[] = [];
   const checks: Array<{
@@ -18717,7 +18857,20 @@ function validateBalanceSheetOtherBucketMetrics(
   ];
 
   for (const check of checks) {
-    errors.push(...validateBalanceSheetMetricAgainstResolver(sheet, periods, columns, ctx, evaluator, warnings, check.metricName, check.labels, check.resolver));
+    errors.push(
+      ...validateBalanceSheetMetricAgainstResolver(
+        sheet,
+        periods,
+        columns,
+        ctx,
+        evaluator,
+        warnings,
+        check.metricName,
+        check.labels,
+        check.resolver,
+        primaryAssignmentLedgerRows
+      )
+    );
   }
   return errors;
 }
@@ -18832,7 +18985,8 @@ function validateBalanceSheetMetricAgainstResolver(
   warnings: string[],
   metricName: string,
   labels: string[],
-  resolver: (period: string, ctx: ResolveContext) => ResolvedValue
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue,
+  primaryAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[] = []
 ) {
   const errors: string[] = [];
   const rowNumber = findRowInSection(sheet, "Balance Sheet", labels, (label) =>
@@ -18861,6 +19015,11 @@ function validateBalanceSheetMetricAgainstResolver(
     if (!otherBucketMetricTies(modelValue, expected)) {
       const concepts = resolved.sources.map((source) => source.concept).filter(Boolean).join("/");
       const message = `Balance Sheet ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR residual bucket ${roundModelValue(expected)}${concepts ? ` from ${concepts}` : ""}. Difference ${roundModelValue(modelValue - expected)}.${balanceSheetMismatchDiagnostic(sheet, period, columns[index], ctx, evaluator)}`;
+      const primaryLedgerTie = primaryBalanceSheetAssignmentLedgerTie(sheet, period, columns[index], primaryAssignmentLedgerRows, rowNumber, rowLabel(sheet, rowNumber), evaluator);
+      if (primaryLedgerTie) {
+        warnings.unshift(`${message} ${primaryAssignmentLedgerResolverWarning(period, metricName, primaryLedgerTie)}`);
+        return;
+      }
       if (protectedFormula) {
         recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx);
         return;
@@ -18878,6 +19037,43 @@ function validateBalanceSheetMetricAgainstResolver(
 
 function otherBucketMetricTies(actual: number, expected: number) {
   return Math.abs(actual - expected) <= Math.max(5, Math.abs(expected) * 0.00075);
+}
+
+function primaryBalanceSheetAssignmentLedgerTie(
+  sheet: ExcelJS.Worksheet,
+  period: string,
+  col: number,
+  primaryAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[],
+  rowNumber: number,
+  modelRow: string,
+  evaluator: FormulaEvaluator
+) {
+  if (!primaryAssignmentLedgerRows.length || !modelRow) return null;
+  const lookupPeriod = balanceSheetInstantLookupPeriod(period);
+  const assigned = primaryAssignmentLedgerRows.filter(
+    (row) =>
+      row.fiscalPeriod === lookupPeriod &&
+      row.assignedModelRow &&
+      row.assignmentStatus !== "explicitly_excluded_with_reason" &&
+      modelRowsMatch(row.assignedModelRow, modelRow)
+  );
+  if (!assigned.length) return null;
+  const expected = assigned.reduce((total, row) => total + row.amount, 0) / 1_000_000;
+  const actual = statementMetricCellValue(sheet.getCell(rowNumber, col), evaluator, expected);
+  if (actual === null || !statementMetricTies(actual, expected)) return null;
+  return {
+    expected,
+    sourceLabels: unique(assigned.map((row) => row.sourceLineItemLabel).filter(Boolean))
+  };
+}
+
+function primaryAssignmentLedgerResolverWarning(
+  period: string,
+  metricName: string,
+  tie: { expected: number; sourceLabels: string[] }
+) {
+  const sources = tie.sourceLabels.length ? ` from ${summarizeList(tie.sourceLabels, 4)}` : "";
+  return `Balance Sheet ${period}: ${metricName} tied the primary assignment ledger at ${roundModelValue(tie.expected)}${sources}; the resolver mismatch was kept as a review warning because primary-statement row coverage is stricter for the latest filing period.`;
 }
 
 function isPartialOtherBucketResolver(metricName: string, resolved: ResolvedValue) {

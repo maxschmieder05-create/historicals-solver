@@ -17,7 +17,7 @@ const expectedCells = [
   ["Model", "F42", 679, "1Q23 pre-tax income"],
   ["Model", "F44", -87, "1Q23 tax expense"],
   ["Model", "F45", 592, "1Q23 net income"],
-  ["Model", "F59", 894, "1Q23 analysis EBIT"],
+  ["Model", "F59", 735, "1Q23 analysis EBIT"],
   ["Model", "F123", 850, "1Q23 prepaid and other current assets"],
   ["Model", "F124", 10155, "1Q23 total current assets"],
   ["Model", "F129", 4010, "1Q23 other non-current assets"],

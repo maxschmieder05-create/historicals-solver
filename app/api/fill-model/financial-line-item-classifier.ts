@@ -576,7 +576,7 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
-  if (/\baircraft fuel\b|\bspare parts?\b|\bparts and supplies\b|\bmerchandise inventory\b|\braw materials?\b|\bwork in process\b|\bfinished goods?\b|\binventor(?:y|ies)\b/.test(text)) {
+  if (/\baircraft fuel\b|\bspare parts?\b|\bparts and supplies\b|\bmerchandise inventory\b|\braw materials?\b|\bwork[-\s]?in[-\s]?process\b|\bfinished goods?\b|\binventor(?:y|ies)\b/.test(text)) {
     return {
       ...base,
       recommended_model_row: preferred("Inventory"),
@@ -616,6 +616,19 @@ function deterministicFinancialLineItemClassification(
       should_exclude_from_other_bucket: false,
       confidence: "high",
       reason: "Current assets held for sale are current assets without a dedicated template row and should be grouped into Prepaid & Other Current Assets."
+    };
+  }
+
+  if (/\bland\b.*\bbuilding|\bbuildings?\b.*\bimprovements?\b|\bmachinery\b.*\bequipment\b|\bfurniture\b.*\bfixtures?\b|\bconstruction in progress\b|\bleasehold improvements?\b|\bproperty\b.*\bplant\b.*\bequipment\b|\bproperty and equipment\b|\bpp&e\b/.test(text)) {
+    return {
+      ...base,
+      recommended_model_row: preferred("PP&E, Net"),
+      classification_type: "property plant and equipment component",
+      is_current: false,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Land, buildings, improvements, machinery, equipment, and construction-in-progress are PP&E component rows."
     };
   }
 
