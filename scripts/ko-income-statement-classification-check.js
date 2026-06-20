@@ -179,8 +179,11 @@ async function main() {
   }
 
   const otherOperatingRows = auditRowsFor(audit, `${colLetter}${row("Other Operating Income (Expense)")}`, period);
-  if (!otherOperatingRows.some((entry) => /OtherOperatingIncomeExpenseDerivedFromOperatingIncomeBridge/i.test(entry.concepts) && valuesMatch(entry.value, -21))) {
-    errors.push(`Mapping Audit ${colLetter}${row("Other Operating Income (Expense)")} should derive KO's other operating charges as -21 from the EDGAR operating-income bridge. Entries: ${JSON.stringify(otherOperatingRows)}`);
+  if (!otherOperatingRows.some((entry) => /(OtherOperatingIncomeExpenseDerivedFromOperatingIncomeBridge|OtherSellingGeneralAndAdministrativeExpense|OtherCostAndExpenseOperating)/i.test(entry.concepts) && valuesMatch(entry.value, -21))) {
+    errors.push(`Mapping Audit ${colLetter}${row("Other Operating Income (Expense)")} should support KO's other operating charges as -21 from EDGAR explicit other-operating charges or the operating-income bridge. Entries: ${JSON.stringify(otherOperatingRows)}`);
+  }
+  if (otherOperatingRows.some((entry) => /OtherComprehensiveIncomeLoss|AOCI/i.test(`${entry.concepts} ${entry.labels}`))) {
+    errors.push(`Mapping Audit ${colLetter}${row("Other Operating Income (Expense)")} should not include OCI/AOCI reclassification rows. Entries: ${JSON.stringify(otherOperatingRows)}`);
   }
 
   const otherNonOperatingRows = auditRowsFor(audit, `${colLetter}${row("Other Non-Operating Income (Expense)")}`, period);

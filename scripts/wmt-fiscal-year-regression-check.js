@@ -20,6 +20,41 @@ const anchorRows = [
   { label: "Total Liabilities & Shareholder's Equity", concepts: ["LiabilitiesAndStockholdersEquity", "Assets"], kind: "instant" }
 ];
 
+const expectedIncomeStatementBridge = {
+  "1Q25": {
+    EBIT: 6841,
+    "Interest Income": 114,
+    "Interest (Expense)": -714,
+    "Goodwill Impairment": 0,
+    "Other Non-Operating Income (Expense)": 794,
+    "Pre-Tax Income (Loss)": 7035
+  },
+  "2Q25": {
+    EBIT: 7940,
+    "Interest Income": 114,
+    "Interest (Expense)": -679,
+    "Goodwill Impairment": 0,
+    "Other Non-Operating Income (Expense)": -1162,
+    "Pre-Tax Income (Loss)": 6213
+  },
+  "1Q26": {
+    EBIT: 7135,
+    "Interest Income": 93,
+    "Interest (Expense)": -637,
+    "Goodwill Impairment": 0,
+    "Other Non-Operating Income (Expense)": -597,
+    "Pre-Tax Income (Loss)": 5994
+  },
+  "2Q26": {
+    EBIT: 7286,
+    "Interest Income": 94,
+    "Interest (Expense)": -769,
+    "Goodwill Impairment": 0,
+    "Other Non-Operating Income (Expense)": 2708,
+    "Pre-Tax Income (Loss)": 9319
+  }
+};
+
 function cellValue(cell) {
   const value = cell.value;
   if (typeof value === "number" || typeof value === "string") return value;
@@ -178,6 +213,26 @@ function filingMapRowsFor(sheet, period) {
   return rows;
 }
 
+function assignmentRowsFor(sheet, period, labelPattern) {
+  const rows = [];
+  if (!sheet) return rows;
+  for (let row = 2; row <= sheet.rowCount; row += 1) {
+    const fiscalPeriod = String(cellValue(sheet.getCell(row, 1)) ?? "");
+    const label = String(cellValue(sheet.getCell(row, 4)) ?? "");
+    if (fiscalPeriod !== period || !labelPattern.test(label)) continue;
+    rows.push({
+      sourceLineItemLabel: label,
+      sourceAmount: cellValue(sheet.getCell(row, 5)),
+      sourceXbrlTag: String(cellValue(sheet.getCell(row, 7)) ?? ""),
+      assignedModelRow: String(cellValue(sheet.getCell(row, 8)) ?? ""),
+      assignmentStatus: String(cellValue(sheet.getCell(row, 9)) ?? ""),
+      classificationReason: String(cellValue(sheet.getCell(row, 10)) ?? ""),
+      sourceSection: String(cellValue(sheet.getCell(row, 13)) ?? "")
+    });
+  }
+  return rows;
+}
+
 async function main() {
   const facts = await fetchCompanyFacts();
   const filing = fiscalFocusFilingFromFacts(facts);
@@ -186,8 +241,10 @@ async function main() {
   const workbook = await readWorkbook(outputWorkbook);
   const model = workbook.getWorksheet("Model");
   const filingMap = workbook.getWorksheet("Filing Period Map");
+  const incomeStatementLedger = workbook.getWorksheet("Income Stmt Assignment Ledger");
   if (!model) throw new Error("Output workbook does not contain a Model sheet.");
   if (!filingMap) throw new Error("Output workbook does not contain a Filing Period Map sheet.");
+  if (!incomeStatementLedger) throw new Error("Output workbook does not contain an Income Stmt Assignment Ledger sheet.");
 
   const errors = [];
   const col = findPeriodColumn(model, "1Q27");
@@ -231,6 +288,53 @@ async function main() {
       if (check.label === "Revenue" && formula) {
         errors.push(`1Q27 Revenue should be a durable SEC actual after recalculation, but ${model.getCell(row, col).address} still contains formula "${formula}".`);
       }
+    }
+  }
+
+  for (const [period, expectedRows] of Object.entries(expectedIncomeStatementBridge)) {
+    const periodCol = findPeriodColumn(model, period);
+    if (!periodCol) {
+      errors.push(`Could not find ${period} column in Model sheet.`);
+      continue;
+    }
+
+    const values = {};
+    for (const [label, expected] of Object.entries(expectedRows)) {
+      const row = findRow(model, label);
+      if (!row) {
+        errors.push(`Could not find income statement row "${label}" for ${period}.`);
+        continue;
+      }
+      const actual = cellValue(model.getCell(row, periodCol));
+      values[label] = actual;
+      if (!valuesMatch(actual, expected)) {
+        errors.push(`${period} ${label}: expected ${expected}, got ${actual ?? "[blank]"}.`);
+      }
+    }
+
+    const bridge = ["EBIT", "Interest Income", "Interest (Expense)", "Goodwill Impairment", "Other Non-Operating Income (Expense)"]
+      .map((label) => values[label])
+      .reduce((total, value) => (typeof value === "number" ? total + value : NaN), 0);
+    if (!valuesMatch(bridge, expectedRows["Pre-Tax Income (Loss)"])) {
+      errors.push(`${period} pre-tax bridge should equal EBIT plus below-operating rows, got ${bridge}.`);
+    }
+  }
+
+  for (const period of Object.keys(expectedIncomeStatementBridge)) {
+    const membershipRows = assignmentRowsFor(incomeStatementLedger, period, /membership and other income/i);
+    if (!membershipRows.length) {
+      errors.push(`${period} Income Stmt Assignment Ledger should include WMT Membership and other income.`);
+    }
+    if (membershipRows.some((row) => /Other Non-Operating Income/i.test(row.assignedModelRow))) {
+      errors.push(`${period} Membership and other income should be treated as revenue-section detail, not other non-operating: ${JSON.stringify(membershipRows)}`);
+    }
+    if (!membershipRows.some((row) => row.assignmentStatus === "subtotal_or_total_excluded" && row.sourceSection === "revenue")) {
+      errors.push(`${period} Membership and other income should be excluded as revenue detail covered by total revenues: ${JSON.stringify(membershipRows)}`);
+    }
+
+    const otherGainLossRows = assignmentRowsFor(incomeStatementLedger, period, /other .*gains.*losses|other .*losses.*gains/i);
+    if (!otherGainLossRows.some((row) => /Other Non-Operating Income/i.test(row.assignedModelRow))) {
+      errors.push(`${period} Other gains/losses should map to Other Non-Operating Income (Expense): ${JSON.stringify(otherGainLossRows)}`);
     }
   }
 
