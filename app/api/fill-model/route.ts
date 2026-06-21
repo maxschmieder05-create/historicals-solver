@@ -1793,13 +1793,35 @@ function resolveTotalRevenue(period: string, ctx: ResolveContext): ResolvedValue
 
 function resolveGrossProfit(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.duration, C.grossProfit);
-  if (!direct) return { value: null, sources: [], note: "No EDGAR gross profit fact was available for this period." };
-  return {
-    value: direct.value,
-    sources: [direct],
-    note: "Mapped to EDGAR gross profit from the primary consolidated income statement.",
-    classification: "direct"
-  };
+  if (direct) {
+    return {
+      value: direct.value,
+      sources: [direct],
+      note: "Mapped to EDGAR gross profit from the primary consolidated income statement.",
+      classification: "direct"
+    };
+  }
+
+  const revenue = resolveTotalRevenue(period, ctx);
+  const costOfRevenue = resolveCostOfRevenue(period, ctx);
+  if (revenue.value !== null && costOfRevenue.value !== null) {
+    const value = revenue.value + costOfRevenue.value;
+    const sources = compactSources([revenue, costOfRevenue]);
+    return {
+      value,
+      sources: [
+        bridgeSource(period, "GrossProfitDerivedFromRevenueAndCostOfRevenue", "Gross profit derived from EDGAR revenue less EDGAR cost of revenue", value, [
+          revenue,
+          costOfRevenue
+        ]),
+        ...sources
+      ],
+      note: "Derived from EDGAR total revenue plus EDGAR cost of revenue because no standalone gross profit tag was reported.",
+      classification: "grouped"
+    };
+  }
+
+  return { value: null, sources: compactSources([revenue, costOfRevenue]), note: "No EDGAR gross profit fact or derivable revenue/cost-of-revenue bridge was available for this period." };
 }
 
 const PRIMARY_COST_OF_REVENUE_CONCEPTS = [
@@ -6929,6 +6951,12 @@ export async function POST(request: NextRequest) {
     );
     const incomeStatementPeriods = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.period) : periods;
     const incomeStatementColumns = incomeStatementPairs.length ? incomeStatementPairs.map((pair) => pair.col) : columns;
+    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
+    const segmentPeriodPairs = uniquePeriodColumnPairs(
+      incomeStatementPairs.length ? incomeStatementPairs : periods.map((period, index) => ({ period, col: columns[index] }))
+    );
+    const segmentPeriods = segmentPeriodPairs.map((pair) => pair.period);
+    const segmentColumns = segmentPeriodPairs.map((pair) => pair.col);
     const reportedPeriodPairs = uniquePeriodColumnPairs([...periods.map((period, index) => ({ period, col: columns[index] })), ...balanceSheetPairs, ...incomeStatementPairs]);
     balanceSheetPairs = uniquePeriodColumnPairs([...balanceSheetPairs, ...reportedPeriodPairs]);
     balanceSheetPeriods = balanceSheetPairs.map((pair) => pair.period);
@@ -6948,17 +6976,21 @@ export async function POST(request: NextRequest) {
     timing("periods and filing package loaded");
     markReportedPeriodColumns(sheet, reportedPeriodPairs);
     normalizeReportedPeriodHeaderLabels(sheet, reportedPeriodPairs);
+    if (segmentSheet) {
+      markReportedPeriodColumns(segmentSheet, segmentPeriodPairs);
+      normalizeReportedPeriodHeaderLabels(segmentSheet, segmentPeriodPairs);
+    }
     normalizeSharedFormulas(workbook);
     timing("reported period headers normalized");
     const workbookSnapshot = snapshotWorkbook(workbook, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]), Math.min(...columns));
     timing("workbook snapshot captured");
-    if (periods.some(isQuarterPeriod)) {
-      const inlineCtx = await fetchInlineFactContext(company, periods, bulkSupport, fiscalPeriods);
+    const inlinePeriods = unique([...periods, ...incomeStatementPeriods]);
+    if (inlinePeriods.some(isQuarterPeriod)) {
+      const inlineCtx = await fetchInlineFactContext(company, inlinePeriods, bulkSupport, fiscalPeriods);
       mergeContexts(ctx, inlineCtx);
       timing("inline SEC fact context loaded");
     }
-    const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
-    const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, periods, bulkSupport, fiscalPeriods) : [];
+    const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, segmentPeriods, bulkSupport, fiscalPeriods) : [];
     timing("segment revenue loaded");
     const profile = detectTemplateProfile(workbook, sheet, ctx);
     timing("template profile detected");
@@ -7171,7 +7203,7 @@ export async function POST(request: NextRequest) {
     if (isStandardModelSheet) refreshDividendCachedResults(sheet, periods, columns);
 
     if (segmentSheet) {
-      const segmentResult = fillSegmentAnalysis(segmentSheet, company, periods, columns, segmentRevenue, ctx, auditRows, {
+      const segmentResult = fillSegmentAnalysis(segmentSheet, company, segmentPeriods, segmentColumns, segmentRevenue, ctx, auditRows, {
         preserveExistingLabels: profile.kind === "financial_company"
       });
       filledCells += segmentResult.filledCells;
@@ -7348,7 +7380,7 @@ export async function POST(request: NextRequest) {
     const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
     const incomeStatementAssignmentLedgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(incomeStatementPeriods, ctx, fillRows);
     const segmentAnalysisAssignmentLedgerRows = segmentSheet
-      ? buildSegmentAnalysisAssignmentLedgerRows(segmentSheet, periods, columns, segmentRevenue, ctx, {
+      ? buildSegmentAnalysisAssignmentLedgerRows(segmentSheet, segmentPeriods, segmentColumns, segmentRevenue, ctx, {
           preserveExistingLabels: profile.kind === "financial_company"
         })
       : [];
@@ -10508,8 +10540,11 @@ function fillSegmentStatementTotalRow(
     if (resolved.value === null) return;
     const value = resolved.value / 1_000_000;
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-    if (isProtectedFormulaOrCheckCell(cell)) return;
-    if (!writeSegmentMetricCell(cell, value)) {
+    const reportedFormulaCell = isReportedSegmentStatementTotalFormulaCell(sheet, cell, period, ctx);
+    if (isProtectedFormulaOrCheckCell(cell) && !reportedFormulaCell) return;
+    if (reportedFormulaCell) {
+      cell.value = value;
+    } else if (!writeSegmentMetricCell(cell, value)) {
       if (!isHardcodedFinancialInput(cell)) return;
       cell.value = value;
     }
@@ -10877,7 +10912,6 @@ function fillSegmentTotalRow(
 
   periods.forEach((period, periodIndex) => {
     const cell = sheet.getCell(rowNumber, columns[periodIndex]);
-    if (!isHardcodedFinancialInput(cell)) return;
     const col = columns[periodIndex];
     const statementResolved = ctx && statementResolver ? statementResolver(period, ctx) : null;
     const statementSource =
@@ -10893,6 +10927,8 @@ function fillSegmentTotalRow(
       segmentTotalIsUsable
         ? segmentTotal
         : statementValue ?? segmentTotalFromModelRows(sheet, rowNumber, col, label) ?? segmentTotal;
+    const reportedFormulaCell = ctx ? isReportedSegmentStatementTotalFormulaCell(sheet, cell, period, ctx) : false;
+    if (!reportedFormulaCell && !isHardcodedFinancialInput(cell)) return;
     cell.value = value;
     filledCells += 1;
     auditRows.push({
@@ -10927,6 +10963,17 @@ function segmentMetricDisplayLabel(metric: SegmentMetricMapKey) {
   if (metric === "operatingIncome") return "Operating Income";
   if (metric === "depreciationAmortization") return "D&A";
   return "Revenue";
+}
+
+function isReportedSegmentStatementTotalFormulaCell(sheet: ExcelJS.Worksheet, cell: ExcelJS.Cell, period: string, ctx: ResolveContext) {
+  if (!formulaForCell(cell)) return false;
+  const col = Number(cell.col);
+  return (
+    isActualizedForecastPeriodCell(sheet, col, period, ctx) ||
+    Boolean(reportedPeriodColumnsBySheet.get(sheet)?.has(col)) ||
+    hasReportedFilingPeriod(period, ctx) ||
+    hasReportedFinancialStatementPeriod(period, ctx)
+  );
 }
 
 function restoreSegmentTotalFormula(
@@ -15086,7 +15133,20 @@ function rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(
       const note = primaryBalanceSheetAssignmentAuditNote(rowLabel(options.sheet, rowNumber) || modelRow, assigned);
       if (addComment(cell, note)) commentsAdded += 1;
       if (audit) {
-        options.auditRows.push(primaryBalanceSheetAssignmentAuditRow(options.sheet, cell, rowLabel(options.sheet, rowNumber) || modelRow, period, expected, assigned, Boolean(formulaBefore), note));
+        const actualizedForecastFormula = Boolean(formulaBefore) && isActualizedForecastPeriodCell(options.sheet, col, period, options.ctx);
+        options.auditRows.push(
+          primaryBalanceSheetAssignmentAuditRow(
+            options.sheet,
+            cell,
+            rowLabel(options.sheet, rowNumber) || modelRow,
+            period,
+            expected,
+            assigned,
+            Boolean(formulaBefore),
+            note,
+            actualizedForecastFormula
+          )
+        );
       }
     }
   }
@@ -15260,7 +15320,8 @@ function primaryBalanceSheetAssignmentAuditRow(
   valueWritten: number,
   assigned: PrimaryBalanceSheetAssignmentLedgerRow[],
   replacedFormula: boolean,
-  note: string
+  note: string,
+  actualizedForecastFormula = false
 ): MappingAuditRow {
   return {
     sheetName: sheet.name,
@@ -15277,9 +15338,11 @@ function primaryBalanceSheetAssignmentAuditRow(
     sourceUrl: "",
     cellWritable: true,
     formulaPreserved: false,
-    formulaStatus: replacedFormula
-      ? "reported-period formula replaced with primary SEC balance-sheet assignment"
-      : "historical input refreshed from primary SEC balance-sheet assignment",
+    formulaStatus: actualizedForecastFormula
+      ? "actualized forecast formula replaced with primary SEC balance-sheet assignment"
+      : replacedFormula
+        ? "reported-period formula replaced with primary SEC balance-sheet assignment"
+        : "historical input refreshed from primary SEC balance-sheet assignment",
     writeBlockedReason: "",
     signConvention: "copied",
     confidence: assigned.some((row) => row.assignmentStatus === "grouped_into_model_row") ? "medium" : "high",

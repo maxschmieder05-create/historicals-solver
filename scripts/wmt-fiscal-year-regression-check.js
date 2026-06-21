@@ -52,7 +52,26 @@ const expectedIncomeStatementBridge = {
     "Goodwill Impairment": 0,
     "Other Non-Operating Income (Expense)": 2708,
     "Pre-Tax Income (Loss)": 9319
+  },
+  "1Q27": {
+    EBIT: 7493,
+    "Interest Income": 79,
+    "Interest (Expense)": -699,
+    "Goodwill Impairment": 0,
+    "Other Non-Operating Income (Expense)": 275,
+    "Pre-Tax Income (Loss)": 7148
   }
+};
+
+const expected1Q27ActualizedRows = {
+  "Revenue": 177751,
+  "Cost of Goods Sold": -133058,
+  "Gross Profit": 44693,
+  "Selling, General & Administration (SG&A)": -37200,
+  "EBIT": 7493,
+  "Pre-Tax Income (Loss)": 7148,
+  "Income Tax Benefit (Expense)": -1658,
+  "Net Income (Loss)": 5490
 };
 
 function cellValue(cell) {
@@ -89,6 +108,14 @@ function normalizePeriodLabel(label) {
   const fiscalYear = compact.match(/^(?:FY(\d{2}|\d{4})|(\d{4}))A?$/i);
   if (fiscalYear) return `FY${(fiscalYear[1] ?? fiscalYear[2]).slice(-2)}`.toUpperCase();
   return compact.toUpperCase();
+}
+
+function isEstimatePeriodLabel(label) {
+  const compact = String(label ?? "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/['\u2019]/g, "");
+  return /(?:^|[^a-z])(?:E|EST|ESTIMATE)$/i.test(compact) || /(?:\d{2}|\d{4})E$/i.test(compact);
 }
 
 function bestPeriodHeaderRow(sheet) {
@@ -240,15 +267,22 @@ async function main() {
 
   const workbook = await readWorkbook(outputWorkbook);
   const model = workbook.getWorksheet("Model");
+  const segmentAnalysis = workbook.getWorksheet("Segment Analysis");
   const filingMap = workbook.getWorksheet("Filing Period Map");
   const incomeStatementLedger = workbook.getWorksheet("Income Stmt Assignment Ledger");
   if (!model) throw new Error("Output workbook does not contain a Model sheet.");
+  if (!segmentAnalysis) throw new Error("Output workbook does not contain a Segment Analysis sheet.");
   if (!filingMap) throw new Error("Output workbook does not contain a Filing Period Map sheet.");
   if (!incomeStatementLedger) throw new Error("Output workbook does not contain an Income Stmt Assignment Ledger sheet.");
 
   const errors = [];
+  const modelHeader = bestPeriodHeaderRow(model);
   const col = findPeriodColumn(model, "1Q27");
   if (!col) errors.push("Could not find 1Q27 column in Model sheet.");
+  if (modelHeader && col) {
+    const headerLabel = cellValue(model.getCell(modelHeader.row, col));
+    if (isEstimatePeriodLabel(headerLabel)) errors.push(`Model 1Q27 header should be actualized, got "${headerLabel}".`);
+  }
 
   const filingRows = filingMapRowsFor(filingMap, "1Q27");
   if (
@@ -288,6 +322,54 @@ async function main() {
       if (check.label === "Revenue" && formula) {
         errors.push(`1Q27 Revenue should be a durable SEC actual after recalculation, but ${model.getCell(row, col).address} still contains formula "${formula}".`);
       }
+    }
+
+    for (const [label, expected] of Object.entries(expected1Q27ActualizedRows)) {
+      const row = findRow(model, label);
+      if (!row) {
+        errors.push(`Could not find 1Q27 actualized row "${label}" in Model sheet.`);
+        continue;
+      }
+      const actual = cellValue(model.getCell(row, col));
+      if (!valuesMatch(actual, expected)) {
+        errors.push(`1Q27 ${label}: expected ${expected}, got ${actual ?? "[blank]"}.`);
+      }
+    }
+
+    const revenueRow = findRow(model, "Revenue");
+    const cogsRow = findRow(model, "Cost of Goods Sold");
+    const grossProfitRow = findRow(model, "Gross Profit");
+    if (revenueRow && cogsRow && grossProfitRow) {
+      const revenue = cellValue(model.getCell(revenueRow, col));
+      const cogs = cellValue(model.getCell(cogsRow, col));
+      const grossProfit = cellValue(model.getCell(grossProfitRow, col));
+      if (typeof revenue === "number" && typeof cogs === "number" && !valuesMatch(grossProfit, revenue + cogs)) {
+        errors.push(`1Q27 Gross Profit should equal Revenue plus COGS (${revenue + cogs}), got ${grossProfit ?? "[blank]"}.`);
+      }
+    }
+  }
+
+  const segmentHeader = bestPeriodHeaderRow(segmentAnalysis);
+  const segmentCol = findPeriodColumn(segmentAnalysis, "1Q27");
+  if (!segmentCol) {
+    errors.push("Could not find 1Q27 column in Segment Analysis sheet.");
+  } else {
+    if (segmentHeader) {
+      const segmentHeaderLabel = cellValue(segmentAnalysis.getCell(segmentHeader.row, segmentCol));
+      if (isEstimatePeriodLabel(segmentHeaderLabel)) errors.push(`Segment Analysis 1Q27 header should be actualized, got "${segmentHeaderLabel}".`);
+      if (cellFormula(segmentAnalysis.getCell(segmentHeader.row, segmentCol))) {
+        errors.push(`Segment Analysis 1Q27 header should not preserve a forecast header formula.`);
+      }
+    }
+    const segmentRevenueRow = findRow(segmentAnalysis, "Total Company Revenue");
+    const segmentOperatingIncomeRow = findRow(segmentAnalysis, "Total Company Operating Income");
+    if (!segmentRevenueRow) errors.push("Could not find Total Company Revenue row in Segment Analysis sheet.");
+    if (!segmentOperatingIncomeRow) errors.push("Could not find Total Company Operating Income row in Segment Analysis sheet.");
+    if (segmentRevenueRow && !valuesMatch(cellValue(segmentAnalysis.getCell(segmentRevenueRow, segmentCol)), expected1Q27ActualizedRows.Revenue)) {
+      errors.push(`Segment Analysis 1Q27 Total Company Revenue should equal SEC revenue ${expected1Q27ActualizedRows.Revenue}.`);
+    }
+    if (segmentOperatingIncomeRow && !valuesMatch(cellValue(segmentAnalysis.getCell(segmentOperatingIncomeRow, segmentCol)), expected1Q27ActualizedRows.EBIT)) {
+      errors.push(`Segment Analysis 1Q27 Total Company Operating Income should equal SEC EBIT ${expected1Q27ActualizedRows.EBIT}.`);
     }
   }
 

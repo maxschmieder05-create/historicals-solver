@@ -194,15 +194,31 @@ function formScore(form) {
 function auditRowsFor(audit, cell, period) {
   const rows = [];
   if (!audit) return rows;
+  const headers = auditHeaderColumns(audit);
+  const cellCol = headers.get("cell/range") ?? 2;
+  const periodCol = headers.get("period") ?? 5;
+  const formulaStatusCol = headers.get("formula status") ?? 19;
+  const notesCol = headers.get("notes") ?? 24;
   for (let row = 2; row <= audit.rowCount; row += 1) {
-    if (String(cellValue(audit.getCell(row, 2)) ?? "") !== cell) continue;
-    if (String(cellValue(audit.getCell(row, 5)) ?? "").toUpperCase() !== period.toUpperCase()) continue;
+    if (String(cellValue(audit.getCell(row, cellCol)) ?? "") !== cell) continue;
+    if (String(cellValue(audit.getCell(row, periodCol)) ?? "").toUpperCase() !== period.toUpperCase()) continue;
     rows.push({
-      formulaStatus: String(cellValue(audit.getCell(row, 18)) ?? ""),
-      notes: String(cellValue(audit.getCell(row, 24)) ?? "")
+      formulaStatus: String(cellValue(audit.getCell(row, formulaStatusCol)) ?? ""),
+      notes: String(cellValue(audit.getCell(row, notesCol)) ?? "")
     });
   }
   return rows;
+}
+
+function auditHeaderColumns(audit) {
+  const headers = new Map();
+  for (let col = 1; col <= audit.columnCount; col += 1) {
+    const header = String(cellValue(audit.getCell(1, col)) ?? "")
+      .trim()
+      .toLowerCase();
+    if (header) headers.set(header, col);
+  }
+  return headers;
 }
 
 function filingMapRowsFor(filingMap, period) {
