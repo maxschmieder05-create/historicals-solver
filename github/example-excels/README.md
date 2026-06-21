@@ -7,3 +7,5 @@ the same ticker filenames can appear in multiple output sets.
 
 - `verification/`: filled workbook examples from the verification run.
 - `verification-formula-preserved/`: filled workbook examples from the formula-preservation verification run.
+- `downloads/`: additional downloaded filled workbook outputs, including numbered
+  retry/failure variants where present. Excel temporary lock files are omitted.
