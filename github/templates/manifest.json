@@ -1,0 +1,47 @@
+{
+  "general": [
+    {
+      "ticker": null,
+      "company": "General operating-company template",
+      "file": "general/Owl Fund Integrated Model Template (03-Sep-2025)_v25 (3).xlsx",
+      "notes": "Attached general template for standard operating companies."
+    }
+  ],
+  "fig": [
+    {
+      "ticker": "JEF",
+      "company": "Jefferies Financial Group Inc.",
+      "file": "fig/Jefferies Financial Group Inc. (JEF)_Valuation Workbook (10-Mar-2026) (1).xlsx",
+      "model_type": "financial_services_broker_dealer",
+      "notes": "Current configured financial-services / broker-dealer reference template."
+    },
+    {
+      "ticker": "AXP",
+      "company": "American Express Company",
+      "file": "fig/American Express Company (AXP)_Valuation Workbook (05-May-2026).xlsx",
+      "model_type": "fig",
+      "notes": "FIG-oriented valuation workbook."
+    },
+    {
+      "ticker": "EVR",
+      "company": "Evercore, Inc.",
+      "file": "fig/Evercore, Inc. (EVR)_Valuation Workbook (08-May-2026).xlsx",
+      "model_type": "fig",
+      "notes": "FIG-oriented valuation workbook."
+    },
+    {
+      "ticker": "HLNE",
+      "company": "Hamilton Lane Inc.",
+      "file": "fig/Hamilton Lane Inc. (HLNE)_Valuation Workbook (10-Oct-2025) (2).xlsx",
+      "model_type": "fig",
+      "notes": "FIG-oriented valuation workbook."
+    },
+    {
+      "ticker": "KKR",
+      "company": "KKR & Co., Inc.",
+      "file": "fig/KKR & Co., Inc. (KKR)_Valuation Workbook (10-Mar-2026).xlsx",
+      "model_type": "fig",
+      "notes": "FIG-oriented valuation workbook."
+    }
+  ]
+}
