@@ -5,7 +5,7 @@ const Module = require("node:module");
 const ts = require("typescript");
 
 const repoRoot = path.resolve(__dirname, "..");
-const sourcePath = path.join(repoRoot, "app", "api", "fill-model", "financial-line-item-classifier.ts");
+const sourcePath = path.join(repoRoot, "server", "fill-model", "financial-line-item-classifier.ts");
 
 function compileTypeScript(source) {
   return ts.transpileModule(source, {

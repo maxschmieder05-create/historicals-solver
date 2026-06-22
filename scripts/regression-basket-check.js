@@ -257,7 +257,7 @@ function loadTypeScriptModule(file) {
 
 async function main() {
   await fs.mkdir(outputDir, { recursive: true });
-  const library = loadTypeScriptModule(path.join(repoRoot, "app", "api", "fill-model", "gold-model-library.ts"));
+  const library = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "gold-model-library.ts"));
   logProgress("Scanning verified gold-model library");
   const goldScan = await scanGoldLibrary(library);
   logProgress(`Gold-model scan found ${goldScan.models.length} usable candidate(s), ${goldScan.excluded.length} excluded candidate(s)`);

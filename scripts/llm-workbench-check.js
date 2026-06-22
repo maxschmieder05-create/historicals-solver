@@ -5,7 +5,7 @@ const Module = require("node:module");
 const ts = require("typescript");
 
 const repoRoot = path.resolve(__dirname, "..");
-const sourcePath = path.join(repoRoot, "app", "api", "fill-model", "llm-workbench.ts");
+const sourcePath = path.join(repoRoot, "server", "fill-model", "llm-workbench.ts");
 
 function loadTypeScriptModule(file) {
   const source = fs.readFileSync(file, "utf8");

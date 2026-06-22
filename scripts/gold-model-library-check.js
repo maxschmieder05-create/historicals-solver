@@ -7,7 +7,7 @@ const ts = require("typescript");
 const ExcelJS = require("exceljs");
 
 const repoRoot = path.resolve(__dirname, "..");
-const sourcePath = path.join(repoRoot, "app", "api", "fill-model", "gold-model-library.ts");
+const sourcePath = path.join(repoRoot, "server", "fill-model", "gold-model-library.ts");
 
 function loadTypescriptModule(filePath) {
   const source = require("node:fs").readFileSync(filePath, "utf8");

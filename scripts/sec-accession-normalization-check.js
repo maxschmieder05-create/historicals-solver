@@ -4,7 +4,7 @@ const path = require("node:path");
 const ts = require("typescript");
 
 const repoRoot = path.resolve(__dirname, "..");
-const helperPath = path.join(repoRoot, "app/api/fill-model/sec-accession.ts");
+const helperPath = path.join(repoRoot, "server/fill-model/sec-accession.ts");
 const source = fs.readFileSync(helperPath, "utf8");
 const output = ts.transpileModule(source, {
   compilerOptions: {
