@@ -48,16 +48,17 @@ const checks = [
     message: "Window-level file drops must use the normalized drag payload extractor."
   },
   {
-    ok: /const selectedFile =\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
-    message: "Submit must prefer the displayed selected file state over the native input value."
+    ok: /const selectedFile =\s*selectedFileRef\.current\s*\?\?\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
+    message: "Submit must prefer the synchronously stored selected file over the displayed state and native input value."
   },
   {
-    ok: /setFile\(nextFile\);/.test(source) && !/resetFileInputAfterSelection/.test(source),
-    message: "A valid workbook selection must store the selected File without scheduling a native input reset."
+    ok: /const selectedFileRef = useRef<File \| null>\(null\);/.test(source)
+      && /selectedFileRef\.current = nextFile;\s*setFile\(nextFile\);/.test(source),
+    message: "A valid workbook selection must synchronously store the selected File before updating visible state."
   },
   {
-    ok: !/setFile\(nextFile\);[\s\S]{0,160}clearFileInput\(\);/.test(source),
-    message: "Valid workbook selection must not clear the native input during or after the picker event."
+    ok: /fileInputResetTimerRef\.current = window\.setTimeout\(\(\) => \{\s*clearFileInput\(\);\s*fileInputResetTimerRef\.current = null;\s*\}, 0\);/.test(source),
+    message: "Valid workbook selection must defer the native input reset until after the selected File is stored."
   },
   {
     ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
@@ -68,16 +69,20 @@ const checks = [
     message: "Dropzone must resync from the native file input on mount and page-show after app reloads or browser restores."
   },
   {
-    ok: /const prepareNativeFilePicker = useCallback\(\(input: HTMLInputElement\) => \{\s*syncInputSelectionSoon\(input\);\s*input\.value = "";\s*\}/.test(source),
-    message: "Native picker reset must first sync the current file so same-path reselection works without losing displayed state."
+    ok: !/prepareNativeFilePicker/.test(source)
+      && !/function handleFilePicker(Pointer|Key)Down/.test(source)
+      && !/onPointerDown=\{handleFilePickerPointerDown\}/.test(source)
+      && !/onKeyDown=\{handleFilePickerKeyDown\}/.test(source),
+    message: "Picker-opening pointer and keyboard events must not reset the native input before selection resolves."
   },
   {
-    ok: /onPointerDown=\{handleFilePickerPointerDown\}[\s\S]*onKeyDown=\{handleFilePickerKeyDown\}/.test(source),
-    message: "File input must prepare the native picker for pointer and keyboard activation."
+    ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source)
+      && !/(onClick|onPointerDown|onKeyDown)=\{handleFilePicker/.test(source),
+    message: "Native picker resets must stay out of picker-opening handlers that can erase picker results."
   },
   {
-    ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source),
-    message: "Native picker resets must stay centralized instead of inline event handlers that can erase picker results."
+    ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not an \.xlsx workbook/.test(source),
+    message: "Invalid workbook selections must clear both selected-file state and the native input."
   },
   {
     ok: /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),

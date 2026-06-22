@@ -4,8 +4,6 @@ import {
   ChangeEvent,
   DragEvent,
   FormEvent,
-  KeyboardEvent,
-  PointerEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -49,14 +47,22 @@ export default function Home() {
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const selectedFileRef = useRef<File | null>(null);
   const inputSyncFrameRef = useRef<number | null>(null);
   const inputSyncTimersRef = useRef<number[]>([]);
+  const fileInputResetTimerRef = useRef<number | null>(null);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
   const clearFileInput = useCallback(() => {
     if (!fileInputRef.current) return;
     fileInputRef.current.value = "";
+  }, []);
+
+  const clearPendingFileInputReset = useCallback(() => {
+    if (fileInputResetTimerRef.current === null) return;
+    window.clearTimeout(fileInputResetTimerRef.current);
+    fileInputResetTimerRef.current = null;
   }, []);
 
   function formatFileSize(bytes: number) {
@@ -69,13 +75,21 @@ export default function Home() {
     setError("");
     setSummary(null);
     if (!nextFile.name.toLowerCase().endsWith(".xlsx")) {
+      selectedFileRef.current = null;
       setFile(null);
+      clearPendingFileInputReset();
       clearFileInput();
       setError(`${nextFile.name} is not an .xlsx workbook.`);
       return;
     }
+    selectedFileRef.current = nextFile;
     setFile(nextFile);
-  }, [clearFileInput]);
+    clearPendingFileInputReset();
+    fileInputResetTimerRef.current = window.setTimeout(() => {
+      clearFileInput();
+      fileInputResetTimerRef.current = null;
+    }, 0);
+  }, [clearFileInput, clearPendingFileInputReset]);
 
   const clearPendingInputSync = useCallback(() => {
     if (inputSyncFrameRef.current !== null) {
@@ -101,11 +115,6 @@ export default function Home() {
     });
     inputSyncTimersRef.current = [100, 300, 1000].map((delay) => window.setTimeout(() => syncInputSelection(input), delay));
   }, [clearPendingInputSync, syncInputSelection]);
-
-  const prepareNativeFilePicker = useCallback((input: HTMLInputElement) => {
-    syncInputSelectionSoon(input);
-    input.value = "";
-  }, [syncInputSelectionSoon]);
 
   useEffect(() => {
     function handleWindowDragOver(event: globalThis.DragEvent) {
@@ -150,6 +159,8 @@ export default function Home() {
       clearPendingInputSync();
     };
   }, [clearPendingInputSync, handleWorkbookSelected, syncInputSelectionSoon]);
+
+  useEffect(() => clearPendingFileInputReset, [clearPendingFileInputReset]);
 
   useEffect(() => {
     const input = fileInputRef.current;
@@ -201,14 +212,6 @@ export default function Home() {
     pickInputFile(event.currentTarget);
   }
 
-  function handleFilePickerPointerDown(event: PointerEvent<HTMLInputElement>) {
-    prepareNativeFilePicker(event.currentTarget);
-  }
-
-  function handleFilePickerKeyDown(event: KeyboardEvent<HTMLInputElement>) {
-    if (event.key === "Enter" || event.key === " ") prepareNativeFilePicker(event.currentTarget);
-  }
-
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -216,7 +219,8 @@ export default function Home() {
     const query = String(nativeFormData.get("ticker") ?? ticker).trim();
     const nativeFile = nativeFormData.get("file");
     const selectedFile =
-      file
+      selectedFileRef.current
+        ?? file
         ?? (nativeFile instanceof File && nativeFile.size > 0 ? nativeFile : null)
         ?? fileInputRef.current?.files?.item(0)
         ?? null;
@@ -349,8 +353,6 @@ export default function Home() {
               onInputCapture={handleFileInput}
               onChange={handleFileSelect}
               onInput={handleFileInput}
-              onPointerDown={handleFilePickerPointerDown}
-              onKeyDown={handleFilePickerKeyDown}
             />
             <span className="dropIcon">
               {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
