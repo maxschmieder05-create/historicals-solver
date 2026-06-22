@@ -15183,6 +15183,7 @@ type ValidationRetryAttempt = {
   repairsApplied: string[];
   rebuiltRows: string[];
   diagnoses: string[];
+  strategy: "broad" | "targeted";
 };
 
 const MAX_AUTOMATIC_VALIDATION_RETRIES = 8;
@@ -15197,14 +15198,21 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
   const attempts: ValidationRetryAttempt[] = [];
   let filledCells = 0;
   let commentsAdded = 0;
+  let previousAttemptInputSignature: string | null = null;
 
   for (let attempt = 1; attempt <= MAX_AUTOMATIC_VALIDATION_RETRIES && errors.length; attempt += 1) {
     const trigger = automaticValidationRetryTrigger(errors);
     if (!trigger) break;
 
-    const repairs = repairBalanceSheetValidationFailure(options, errors);
+    const failureSignature = validationFailureSignature(errors, options.sheet);
+    const strategy = previousAttemptInputSignature === failureSignature ? "targeted" : "broad";
+    const repairs = repairBalanceSheetValidationFailure(options, errors, { strategy });
     if (!repairs.changedCells) {
-      options.warnings.push(`Automatic validation retry skipped: ${trigger}; no mutable primary statement rows matched the diagnostic.`);
+      options.warnings.push(
+        strategy === "targeted"
+          ? `Automatic validation retry stopped: ${trigger}; same failed rows repeated and no targeted row-level repair could change them.`
+          : `Automatic validation retry skipped: ${trigger}; no mutable primary statement rows matched the diagnostic.`
+      );
       break;
     }
     filledCells += repairs.filledCells;
@@ -15220,11 +15228,21 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
       errorsAfter: nextErrors.length,
       repairsApplied: repairs.repairsApplied,
       rebuiltRows: repairs.rebuiltRows,
-      diagnoses: repairs.diagnoses
+      diagnoses: repairs.diagnoses,
+      strategy
     });
     options.warnings.push(
-      `Automatic validation retry ${attempt}: ${trigger}; ${repairs.rebuiltRows.length ? `rebuilt ${repairs.rebuiltRows.join(", ")}` : "refreshed statement formulas"}; ${nextErrors.length ? `left ${nextErrors.length} validation error(s)` : "cleared validation"}.`
+      `Automatic validation retry ${attempt}: ${trigger}; ${strategy === "targeted" ? "targeted failed rows" : "broad primary statement repair"}; ${repairs.rebuiltRows.length ? `rebuilt ${repairs.rebuiltRows.join(", ")}` : "refreshed statement formulas"}; ${nextErrors.length ? `left ${nextErrors.length} validation error(s)` : "cleared validation"}.`
     );
+    const nextFailureSignature = validationFailureSignature(nextErrors, options.sheet);
+    if (strategy === "targeted" && nextErrors.length && nextFailureSignature === failureSignature) {
+      errors = nextErrors;
+      options.warnings.push(
+        "Automatic validation retry stopped after targeted repair because the same error count and failed rows remained; no further broad rebuilds were run."
+      );
+      break;
+    }
+    previousAttemptInputSignature = failureSignature;
     errors = nextErrors;
   }
 
@@ -15261,7 +15279,8 @@ function runWorkbookReturnValidation(options: WorkbookValidationRetryOptions) {
     options.balanceSheetColumns,
     options.incomeStatementPeriods,
     options.incomeStatementColumns,
-    options.fillRows
+    options.fillRows,
+    options.auditRows
   );
   errors.push(...validateWorkbookPreservation(options.workbook, options.workbookSnapshot));
   return unique(errors);
@@ -15296,7 +15315,40 @@ function isRetriableIncomeStatementValidationError(error: string) {
   return /assignment ledger|primary line|model row|classification failure|does not match|does not equal|could not evaluate|gross profit|operating expense|pre-tax|tax bridge|net income|EBIT|missing model row/i.test(error);
 }
 
-function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOptions, errors: string[]) {
+function validationFailureSignature(errors: string[], sheet: ExcelJS.Worksheet) {
+  const failedRows = validationFailedRowKeys(errors, sheet);
+  const rowPart = failedRows.length ? failedRows.join("|") : errors.map(canonicalValidationErrorSignature).sort().join("|");
+  return `${errors.length}:${rowPart}`;
+}
+
+function validationFailedRowKeys(errors: string[], sheet: ExcelJS.Worksheet) {
+  const keys = new Set<string>();
+  const targetRows = targetedBalanceSheetSourceRepairTargets(errors, sheet);
+  targetRows.forEach((target) => keys.add(balanceSheetRepairRowKey(target.period, target.rowNumber)));
+
+  const repairTargets = balanceSheetValidationRepairTargets(errors, sheet);
+  repairTargets.rowKeys.forEach((key) => keys.add(key));
+  repairTargets.assignmentKeys.forEach((key) => keys.add(`assignment::${key}`));
+  return Array.from(keys).sort();
+}
+
+function canonicalValidationErrorSignature(error: string) {
+  return error
+    .replace(/\b-?\d+(?:\.\d+)?\b/g, "#")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function emptyValidationRepairResult() {
+  return { filledCells: 0, commentsAdded: 0, warnings: [] as string[], rebuiltRows: [] as string[] };
+}
+
+function repairBalanceSheetValidationFailure(
+  options: WorkbookValidationRetryOptions,
+  errors: string[],
+  config: { strategy?: "broad" | "targeted" } = {}
+) {
   const beforeAuditRows = options.auditRows.length;
   const warnings: string[] = [];
   const diagnoses = diagnoseValidationFailures(errors);
@@ -15304,11 +15356,23 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
   const incomeRepairTargets = incomeStatementValidationRepairTargets(errors);
   options.primaryAssignmentRepairTargets = mergeRepairTargetKeys(options.primaryAssignmentRepairTargets, repairTargets.assignmentKeys);
   options.primaryIncomeAssignmentRepairTargets = mergeRepairTargetKeys(options.primaryIncomeAssignmentRepairTargets, incomeRepairTargets.assignmentKeys);
-  const strictRebuild = strictPrimaryBalanceSheetRebuild(options, { targetRowKeys: repairTargets.rowKeys });
+  const strategy = config.strategy ?? "broad";
+  const targetedSourceRepair = strategy === "targeted" ? repairTargetedBalanceSheetSourceRows(options, errors) : emptyValidationRepairResult();
+  const targetedFormulaRepair = strategy === "targeted" ? repairTargetedBalanceSheetFormulaRows(options, errors) : emptyValidationRepairResult();
+  const strictRebuild =
+    strategy === "targeted"
+      ? emptyValidationRepairResult()
+      : strictPrimaryBalanceSheetRebuild(options, { targetRowKeys: repairTargets.rowKeys });
   const ledgerRebuild = rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(options, { targetKeys: repairTargets.assignmentKeys });
   const incomeLedgerRebuild = rebuildPrimaryIncomeStatementRowsFromAssignmentLedger(options, { targetKeys: incomeRepairTargets.assignmentKeys });
   const repairsApplied = [
     ...diagnoses.map((diagnosis) => `classified validation failure as ${diagnosis}`),
+    ...(strategy === "targeted"
+      ? [
+          "switched to targeted row-level repair because the same error count and failed rows repeated",
+          "classified failed rows as SEC-remapped, formula-derived, stale/unsupported, or explicit zero"
+        ]
+      : []),
     "rebuilt model rows from the primary income-statement assignment ledger when filing presentation was more specific than resolver buckets",
     "rebuilt primary balance-sheet input rows from EDGAR resolver values and cleared unsupported hardcoded values",
     "rebuilt model rows from the primary balance-sheet assignment ledger when filing presentation was more specific than resolver buckets",
@@ -15317,6 +15381,8 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
     "refreshed balance-sheet section totals and formula caches",
     "copied annual balance-sheet values from matching 4Q point-in-time balances"
   ];
+  warnings.push(...targetedSourceRepair.warnings);
+  warnings.push(...targetedFormulaRepair.warnings);
   warnings.push(...strictRebuild.warnings);
   warnings.push(...ledgerRebuild.warnings);
   warnings.push(...incomeLedgerRebuild.warnings);
@@ -15341,6 +15407,8 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
   const auditDelta = Math.max(0, options.auditRows.length - beforeAuditRows);
   const changedCells =
     strictRebuild.filledCells +
+    targetedSourceRepair.filledCells +
+    targetedFormulaRepair.filledCells +
     ledgerRebuild.filledCells +
     postRefreshLedgerRebuild.filledCells +
     incomeLedgerRebuild.filledCells +
@@ -15349,11 +15417,19 @@ function repairBalanceSheetValidationFailure(options: WorkbookValidationRetryOpt
     annualCopyResult.filledCells;
   return {
     filledCells: Math.max(auditDelta, changedCells),
-    commentsAdded: strictRebuild.commentsAdded + ledgerRebuild.commentsAdded + incomeLedgerRebuild.commentsAdded + totalResult.commentsAdded,
+    commentsAdded:
+      targetedSourceRepair.commentsAdded +
+      targetedFormulaRepair.commentsAdded +
+      strictRebuild.commentsAdded +
+      ledgerRebuild.commentsAdded +
+      incomeLedgerRebuild.commentsAdded +
+      totalResult.commentsAdded,
     warnings: unique(warnings),
     repairsApplied: unique(repairsApplied),
     rebuiltRows: unique([
       ...strictRebuild.rebuiltRows,
+      ...targetedSourceRepair.rebuiltRows,
+      ...targetedFormulaRepair.rebuiltRows,
       ...ledgerRebuild.rebuiltRows,
       ...postRefreshLedgerRebuild.rebuiltRows,
       ...incomeLedgerRebuild.rebuiltRows,
@@ -15389,6 +15465,11 @@ function diagnoseValidationFailures(errors: string[]) {
 function balanceSheetValidationRepairTargets(errors: string[], sheet: ExcelJS.Worksheet) {
   const rowKeys = new Set<string>();
   const assignmentKeys = new Set<string>();
+  for (const target of targetedBalanceSheetSourceRepairTargets(errors, sheet)) {
+    rowKeys.add(balanceSheetRepairRowKey(target.period, target.rowNumber));
+    assignmentKeys.add(primaryBalanceSheetAssignmentGroupKey(balanceSheetInstantLookupPeriod(target.period), target.label));
+  }
+
   for (const error of errors) {
     const cellMatch = error.match(/^Balance Sheet\s+[A-Z]+(\d+)\s+([^:]+):/i);
     if (cellMatch) rowKeys.add(balanceSheetRepairRowKey(cellMatch[2].trim(), Number(cellMatch[1])));
@@ -15443,6 +15524,75 @@ function balanceSheetValidationRepairTargets(errors: string[], sheet: ExcelJS.Wo
   return { rowKeys, assignmentKeys };
 }
 
+type BalanceSheetSourceRepairTarget = {
+  period: string;
+  rowNumber: number;
+  label: string;
+  metricName: string;
+  reason: "missing_source" | "prior_disappeared";
+};
+
+function targetedBalanceSheetSourceRepairTargets(errors: string[], sheet: ExcelJS.Worksheet) {
+  const targets = new Map<string, BalanceSheetSourceRepairTarget>();
+  const addTarget = (period: string, metricName: string, reason: BalanceSheetSourceRepairTarget["reason"], rowNumber?: number | null) => {
+    const targetRow = rowNumber ?? findBalanceSheetValidationMetricRow(sheet, metricName);
+    if (!targetRow) return;
+    const label = rowLabel(sheet, targetRow) || metricName;
+    const key = `${balanceSheetInstantLookupPeriod(period)}::${targetRow}`;
+    targets.set(key, { period, rowNumber: targetRow, label, metricName, reason });
+  };
+
+  for (const error of errors) {
+    const cellMissingSource = error.match(/^Balance Sheet\s+[A-Z]{1,3}(\d+)\s+([^:]+):\s+(.+?)\s+has model value\b[\s\S]*?\bno explicit SEC source/i);
+    if (cellMissingSource) {
+      addTarget(cellMissingSource[2].trim(), cellMissingSource[3].trim(), "missing_source", Number(cellMissingSource[1]));
+      continue;
+    }
+
+    const missingSource = error.match(/^Balance Sheet\s+([^:]+):\s+(.+?)\s+has model value\b[\s\S]*?\bno explicit SEC source/i);
+    if (missingSource) {
+      addTarget(missingSource[1].trim(), missingSource[2].trim(), "missing_source");
+      continue;
+    }
+
+    const priorDisappeared = error.match(/^Balance Sheet\s+([^:]+):\s+(.+?)\s+disappeared after prior SEC filings reported\b/i);
+    if (priorDisappeared) addTarget(priorDisappeared[1].trim(), priorDisappeared[2].trim(), "prior_disappeared");
+  }
+
+  return Array.from(targets.values());
+}
+
+function findBalanceSheetValidationMetricRow(sheet: ExcelJS.Worksheet, metricName: string) {
+  const labels = balanceSheetValidationMetricLabels(metricName);
+  return (
+    findRowInSection(sheet, "Balance Sheet", labels, (label) =>
+      /working capital|cash flow statement|cashflow statement|income statement|schedule|analysis|drivers/i.test(label)
+    ) ?? findBalanceSheetRow(sheet, labels)
+  );
+}
+
+function balanceSheetValidationMetricLabels(metricName: string) {
+  const normalizedMetric = normalize(metricName);
+  if (/^inventory$/.test(normalizedMetric)) return ["Inventory"];
+  if (/^intangibles?assets?$|^intangibleassets$/.test(normalizedMetric)) return ["Intangible Assets, Net", "Intangibles, Net"];
+  if (/^goodwill$/.test(normalizedMetric)) return ["Goodwill"];
+  if (/^accountspayable$/.test(normalizedMetric)) return ["Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities", "Pharmacy Costs Payable"];
+  if (/^accruedliabilities$/.test(normalizedMetric)) return ["Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other", "Accrued Expenses and Other Current Liabilities"];
+  if (/^othercurrentliabilities$/.test(normalizedMetric)) return ["Other Current Liabilities", "Other Current Liabs"];
+  if (/shorttermborrowings|revolver/.test(normalizedMetric)) return ["Short Term Borrowings", "Short-term Borrowings", "Short-Term Debt", "Short Term Debt", "Current Borrowings", "Revolver"];
+  if (/^currentdebt$/.test(normalizedMetric)) return ["Current Debt"];
+  if (/currentmaturities|currentportion|debtduewithinoneyear/.test(normalizedMetric)) return ["Current Portion of Long-Term Debt", "Current Maturities of Long-Term Debt", "Debt Due Within One Year"];
+  if (/^debt$|longtermdebt|borrowings/.test(normalizedMetric)) return ["LT Debt (Incl. Current Portion)", "Long Term Debt", "Long-Term Debt", "Senior Notes", "Borrowings", "Total Debt"];
+  if (/deferredincometaxes|deferredtax/.test(normalizedMetric)) return ["Deferred Income Taxes", "Deferred Tax Liabilities", "Deferred Taxes"];
+  if (/lease/.test(normalizedMetric)) return ["Lease Liabilities", "Operating Lease Liabilities", "Finance Lease Liabilities", "Lease Obligations"];
+  if (/commonstock|apic/.test(normalizedMetric)) return ["Common Stock & APIC", "Common Stock and APIC", "Common Stock and Additional Paid-In Capital", "Common Stock & Additional Paid-In Capital"];
+  if (/retainedearnings/.test(normalizedMetric)) return ["Retained Earnings", "Accumulated Deficit"];
+  if (/treasurystock/.test(normalizedMetric)) return ["Treasury Stock"];
+  if (/aoci|accumulatedothercomprehensive/.test(normalizedMetric)) return ["Accumulated Other Comprehensive Income (AOCI)", "Accumulated Other Comprehensive Income", "Accumulated Other Comprehensive Income (Loss)", "AOCI"];
+  if (/noncontrolling/.test(normalizedMetric)) return ["Noncontrolling Interests", "Non-Controlling Interests"];
+  return [metricName];
+}
+
 function balanceSheetRepairRowKey(period: string, rowNumber: number) {
   return `${balanceSheetInstantLookupPeriod(period)}::${rowNumber}`;
 }
@@ -15475,6 +15625,379 @@ function incomeStatementClassificationFailureModelRow(name: string) {
   if (/goodwillimpairment/.test(normalized)) return "Goodwill Impairment";
   if (/othernonoperating|otherincomeexpense/.test(normalized)) return "Other Non-Operating Income / Expense";
   return null;
+}
+
+function repairTargetedBalanceSheetSourceRows(options: WorkbookValidationRetryOptions, errors: string[]) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const rebuiltRows = new Set<string>();
+  const targets = targetedBalanceSheetSourceRepairTargets(errors, options.sheet);
+  if (!targets.length) return { filledCells, commentsAdded, warnings, rebuiltRows: [] };
+
+  const assignmentRows = buildPrimaryBalanceSheetAssignmentLedgerRows(options.balanceSheetPeriods, options.ctx, options.fillRows).filter(
+    (row) => row.assignedModelRow && row.assignmentStatus !== "explicitly_excluded_with_reason"
+  );
+  const evaluator = new FormulaEvaluator(options.sheet, { useCachedFormulaResults: true });
+
+  for (const target of targets) {
+    const col = balanceSheetColumnForTargetPeriod(options, target.period);
+    if (!col) {
+      warnings.push(`Automatic targeted balance-sheet repair could not find a model column for ${target.period} ${target.label}.`);
+      continue;
+    }
+    if (isProjectedBalanceSheetCell(options.sheet, target.rowNumber, col)) continue;
+
+    const cell = options.sheet.getCell(target.rowNumber, col);
+    const label = rowLabel(options.sheet, target.rowNumber) || target.label;
+    const fillRow = fillRowForTargetedBalanceSheetRepair(options, target.rowNumber, label);
+    const lookupPeriod = balanceSheetInstantLookupPeriod(target.period);
+    const resolver = fillRow.resolver ?? balanceSheetDiagnosticResolverForLabel(label);
+    const resolved = resolver ? resolver(lookupPeriod, options.ctx) : { value: null, sources: [] };
+    const sourceBackedResolvedValue = resolved.value !== null && Number.isFinite(resolved.value) && resolvedHasCurrentSourceSupport(resolved);
+
+    if (sourceBackedResolvedValue) {
+      const result = writeTargetedResolvedBalanceSheetCell(options, cell, fillRow, target.period, resolved, evaluator);
+      filledCells += result.filledCells;
+      commentsAdded += result.commentsAdded;
+      if (result.filledCells) {
+        rebuiltRows.add(label);
+        warnings.push(`Automatic targeted balance-sheet repair remapped ${label} ${target.period} to current SEC source support.`);
+      }
+      continue;
+    }
+
+    const assigned = assignmentRows.filter(
+      (row) => row.fiscalPeriod === lookupPeriod && row.assignedModelRow && modelRowsMatch(row.assignedModelRow, label)
+    );
+    if (assigned.length) {
+      const result = writeTargetedAssignmentBalanceSheetCell(options, cell, label, target.period, assigned);
+      filledCells += result.filledCells;
+      commentsAdded += result.commentsAdded;
+      if (result.filledCells) {
+        evaluator.clear();
+        rebuiltRows.add(label);
+        warnings.push(`Automatic targeted balance-sheet repair rebuilt ${label} ${target.period} from grouped primary balance-sheet assignment rows.`);
+      }
+      continue;
+    }
+
+    const derivedFormula = targetedDerivedFormulaAuditRow(options, cell, fillRow, target.period, evaluator);
+    if (derivedFormula) {
+      setFormulaResult(cell, derivedFormula.valueWritten);
+      options.auditRows.push(derivedFormula);
+      filledCells += 1;
+      rebuiltRows.add(label);
+      warnings.push(`Automatic targeted balance-sheet repair created derived source-ledger support for ${label} ${target.period}.`);
+      continue;
+    }
+
+    const zeroResult = writeTargetedExplicitZeroBalanceSheetCell(options, cell, fillRow, target.period, target.reason);
+    filledCells += zeroResult.filledCells;
+    commentsAdded += zeroResult.commentsAdded;
+    if (zeroResult.filledCells) {
+      evaluator.clear();
+      rebuiltRows.add(label);
+      warnings.push(`Automatic targeted balance-sheet repair set ${label} ${target.period} to explicit zero because no current SEC source was available.`);
+    }
+  }
+
+  return { filledCells, commentsAdded, warnings: unique(warnings), rebuiltRows: Array.from(rebuiltRows) };
+}
+
+type BalanceSheetFormulaRepairTarget = {
+  period: string;
+  rowNumber: number;
+  label: string;
+};
+
+function repairTargetedBalanceSheetFormulaRows(options: WorkbookValidationRetryOptions, errors: string[]) {
+  let filledCells = 0;
+  let commentsAdded = 0;
+  const warnings: string[] = [];
+  const rebuiltRows = new Set<string>();
+  const targets = targetedBalanceSheetFormulaRepairTargets(errors, options.sheet);
+  if (!targets.length) return { filledCells, commentsAdded, warnings, rebuiltRows: [] };
+
+  for (const target of targets) {
+    const col = balanceSheetColumnForTargetPeriod(options, target.period);
+    if (!col || isProjectedBalanceSheetCell(options.sheet, target.rowNumber, col)) continue;
+    const cell = options.sheet.getCell(target.rowNumber, col);
+    const label = rowLabel(options.sheet, target.rowNumber) || target.label;
+    const resolver = balanceSheetDiagnosticResolverForLabel(label);
+    const resolved = resolver ? resolver(balanceSheetInstantLookupPeriod(target.period), options.ctx) : null;
+    if (!resolved || resolved.value === null || !Number.isFinite(resolved.value) || !resolvedHasCurrentSourceSupport(resolved)) continue;
+
+    const value = resolved.value / 1_000_000;
+    clearEdgarMapperComment(cell);
+    cell.value = value;
+    const source = resolvedAuditSource(target.period, `Targeted${normalize(label)}Resolved`, `Targeted ${label} resolved from SEC balance sheet`, resolved);
+    const note = `Replaced repeated failing reported-period ${label} formula with the SEC balance-sheet value.`;
+    const auditRow = statementTotalAuditRow(options.sheet, cell, label, target.period, value, source, "balance", note);
+    auditRow.formulaStatus = "reported-period balance-sheet formula replaced by targeted validation repair";
+    auditRow.mappingType = resolved.sources.some((item) => item.sourceLayer === "derived") ? "derived" : "calculated";
+    options.auditRows.push(auditRow);
+    if (addComment(cell, auditRow.notes)) commentsAdded += 1;
+    filledCells += 1;
+    rebuiltRows.add(label);
+    warnings.push(`Automatic targeted balance-sheet repair rebuilt ${label} ${target.period} from SEC primary-statement totals.`);
+  }
+
+  return { filledCells, commentsAdded, warnings: unique(warnings), rebuiltRows: Array.from(rebuiltRows) };
+}
+
+function targetedBalanceSheetFormulaRepairTargets(errors: string[], sheet: ExcelJS.Worksheet) {
+  const targets = new Map<string, BalanceSheetFormulaRepairTarget>();
+  const addTarget = (period: string, rowNumber: number, label?: string) => {
+    const targetLabel = rowLabel(sheet, rowNumber) || label || "";
+    if (!targetLabel || !balanceSheetDiagnosticResolverForLabel(targetLabel)) return;
+    const key = `${balanceSheetInstantLookupPeriod(period)}::${rowNumber}`;
+    targets.set(key, { period, rowNumber, label: targetLabel });
+  };
+
+  for (const error of errors) {
+    const likelyRowMatch = error.match(/^Balance Sheet\s+[A-Z]{1,3}\d+\s+([^:]+):[\s\S]*?Likely row:\s+(.+?)\s+\([A-Z]{1,3}(\d+)\)/i);
+    if (likelyRowMatch) {
+      addTarget(likelyRowMatch[1].trim(), Number(likelyRowMatch[3]), likelyRowMatch[2].trim());
+      continue;
+    }
+
+    const directFormulaMatch = error.match(/^Balance Sheet\s+[A-Z]{1,3}(\d+)\s+([^:]+):\s+(.+?)\s+(?:does not match|is|formula evaluates)/i);
+    if (directFormulaMatch) addTarget(directFormulaMatch[2].trim(), Number(directFormulaMatch[1]), directFormulaMatch[3].trim());
+  }
+
+  return Array.from(targets.values());
+}
+
+function balanceSheetColumnForTargetPeriod(options: WorkbookValidationRetryOptions, targetPeriod: string) {
+  const exactIndex = options.balanceSheetPeriods.findIndex((period) => period === targetPeriod);
+  if (exactIndex >= 0) return options.balanceSheetColumns[exactIndex];
+  const lookupPeriod = balanceSheetInstantLookupPeriod(targetPeriod);
+  const lookupIndex = options.balanceSheetPeriods.findIndex((period) => balanceSheetInstantLookupPeriod(period) === lookupPeriod);
+  return lookupIndex >= 0 ? options.balanceSheetColumns[lookupIndex] : null;
+}
+
+function fillRowForTargetedBalanceSheetRepair(options: WorkbookValidationRetryOptions, rowNumber: number, label: string): FillRow {
+  const existing = options.fillRows.find((row) => row.row === rowNumber);
+  if (existing) return existing;
+  return (
+    fillRowForLabel(rowNumber, label) ?? {
+      row: rowNumber,
+      label,
+      classification: "grouped",
+      statement: "balance",
+      kind: "instant",
+      resolver: balanceSheetDiagnosticResolverForLabel(label) ?? undefined,
+      scale: 1_000_000
+    }
+  );
+}
+
+function resolvedHasCurrentSourceSupport(resolved: ResolvedValue) {
+  return resolved.sources.some((source) => source.sourceLayer !== "model" && !/NotReported|NoSource|NoCurrentSecSource/i.test(source.concept));
+}
+
+function writeTargetedResolvedBalanceSheetCell(
+  options: WorkbookValidationRetryOptions,
+  cell: ExcelJS.Cell,
+  fillRow: FillRow,
+  period: string,
+  resolved: ResolvedValue,
+  evaluator: FormulaEvaluator
+) {
+  const value = (resolved.value ?? 0) / (fillRow.scale ?? 1);
+  const existingFormula = formulaForCell(cell);
+  const existingValue = existingFormula ? evaluator.evaluateCell(cell) ?? numericCellValue(cell) : numericCellValue(cell);
+  const sourceDerived = resolved.sources.some((source) => source.sourceLayer === "derived");
+  clearEdgarMapperComment(cell);
+  if (existingFormula) cell.value = value;
+  else if (existingValue === null || !statementMetricTies(existingValue, value)) cell.value = value;
+  const note = lineItemMappingSentence(fillRow.label, resolved);
+  const commentsAdded = addComment(cell, note) ? 1 : 0;
+  const auditRow = mappingAuditRow(options.sheet, cell, fillRow, period, value, resolved, sourceDerived ? "medium" : "high", note);
+  auditRow.mappingType = sourceDerived ? "derived" : auditRow.mappingType;
+  auditRow.formulaPreserved = false;
+  auditRow.formulaStatus = existingFormula
+    ? "reported-period formula replaced with targeted SEC-backed balance-sheet value"
+    : "historical input refreshed by targeted SEC-backed balance-sheet repair";
+  auditRow.validationStatus = "OK!";
+  options.auditRows.push(auditRow);
+  return { filledCells: 1, commentsAdded };
+}
+
+function writeTargetedAssignmentBalanceSheetCell(
+  options: WorkbookValidationRetryOptions,
+  cell: ExcelJS.Cell,
+  label: string,
+  period: string,
+  assigned: PrimaryBalanceSheetAssignmentLedgerRow[]
+) {
+  const expected = assigned.reduce((total, row) => total + row.amount, 0) / 1_000_000;
+  if (!Number.isFinite(expected)) return { filledCells: 0, commentsAdded: 0 };
+  const formulaBefore = Boolean(formulaForCell(cell));
+  clearEdgarMapperComment(cell);
+  cell.value = expected;
+  const note = primaryBalanceSheetAssignmentAuditNote(label, assigned);
+  const commentsAdded = addComment(cell, note) ? 1 : 0;
+  options.auditRows.push(
+    primaryBalanceSheetAssignmentAuditRow(
+      options.sheet,
+      cell,
+      label,
+      period,
+      expected,
+      assigned,
+      formulaBefore,
+      note,
+      formulaBefore && isActualizedForecastPeriodCell(options.sheet, Number(cell.col), period, options.ctx)
+    )
+  );
+  return { filledCells: 1, commentsAdded };
+}
+
+function writeTargetedExplicitZeroBalanceSheetCell(
+  options: WorkbookValidationRetryOptions,
+  cell: ExcelJS.Cell,
+  fillRow: FillRow,
+  period: string,
+  reason: BalanceSheetSourceRepairTarget["reason"]
+) {
+  const existing = numericCellValue(cell);
+  clearEdgarMapperComment(cell);
+  cell.value = 0;
+  const auditRow = explicitZeroBalanceSheetAuditRow(options.sheet, cell, fillRow, period, reason, existing);
+  options.auditRows.push(auditRow);
+  const commentsAdded = addComment(cell, auditRow.notes) ? 1 : 0;
+  return { filledCells: 1, commentsAdded };
+}
+
+function explicitZeroBalanceSheetAuditRow(
+  sheet: ExcelJS.Worksheet,
+  cell: ExcelJS.Cell,
+  fillRow: FillRow,
+  period: string,
+  reason: BalanceSheetSourceRepairTarget["reason"],
+  existing: number | null
+): MappingAuditRow {
+  const note =
+    reason === "prior_disappeared"
+      ? "Explicitly set to zero because the current SEC filing has no source for this row after prior filings reported a balance."
+      : "Explicitly set to zero because no current SEC source or supported derived formula exists for this row.";
+  return {
+    sheetName: sheet.name,
+    cell: cell.address,
+    modelRowLabel: fillRow.label,
+    section: fillRow.modelContext?.sectionHeader ?? "Balance Sheet",
+    period,
+    valueWritten: 0,
+    mappingType: "direct",
+    conceptsUsed: "NoCurrentSecSource=0mm",
+    secLabels: "No current SEC source disclosed",
+    sourceStatement: fillRow.statement,
+    accession: "",
+    sourceUrl: "",
+    filingForm: "",
+    filedDate: "",
+    startDate: "",
+    endDate: "",
+    cellWritable: true,
+    formulaPreserved: false,
+    formulaStatus: "unsupported reported-period value explicitly zeroed",
+    writeBlockedReason: existing !== null && Math.abs(existing) > 0.0001 ? `Prior model value ${roundModelValue(existing)} had no current SEC source support.` : "",
+    signConvention: "explicit zero",
+    confidence: "high",
+    validationStatus: "OK!",
+    notes: note,
+    finalSourceLineItems: "No current SEC source disclosed",
+    classificationReasons: note,
+    mappingPassedValidation: true
+  };
+}
+
+function targetedDerivedFormulaAuditRow(
+  options: WorkbookValidationRetryOptions,
+  cell: ExcelJS.Cell,
+  fillRow: FillRow,
+  period: string,
+  evaluator: FormulaEvaluator
+) {
+  const formula = formulaForCell(cell);
+  if (!formula) return null;
+  const value = evaluator.evaluateCell(cell) ?? numericCellValue(cell);
+  if (value === null || !Number.isFinite(value) || Math.abs(value) <= 0.0001) return null;
+  const sourceRows = sourceBackedFormulaReferenceAuditRows(options, cell, period);
+  if (!sourceRows.length) return null;
+  const note = `Derived from SEC-backed formula precedents: ${summarizeList(sourceRows.map((row) => row.modelRowLabel), 6)}.`;
+  const auditRow: MappingAuditRow = {
+    sheetName: options.sheet.name,
+    cell: cell.address,
+    modelRowLabel: fillRow.label,
+    section: fillRow.modelContext?.sectionHeader ?? "Balance Sheet",
+    period,
+    valueWritten: value,
+    mappingType: "derived",
+    conceptsUsed: unique(["TargetedBalanceSheetFormulaDerived", ...sourceRows.flatMap((row) => sourceConceptTagsForLedger(row.conceptsUsed).split("; ").filter(Boolean))]).join("; "),
+    secLabels: unique(sourceRows.flatMap((row) => (row.secLabels || row.finalSourceLineItems || "").split("; ").filter(Boolean))).join("; "),
+    sourceStatement: "balance",
+    accession: unique(sourceRows.flatMap((row) => normalizeAccessionList(row.accession))).join("; "),
+    sourceUrl: unique(sourceRows.map((row) => row.sourceUrl).filter(Boolean)).join("; "),
+    filingForm: unique(sourceRows.map((row) => row.filingForm ?? "").filter(Boolean)).join("; "),
+    filedDate: unique(sourceRows.map((row) => row.filedDate ?? "").filter(Boolean)).join("; "),
+    startDate: unique(sourceRows.map((row) => row.startDate ?? "").filter(Boolean)).join("; "),
+    endDate: unique(sourceRows.map((row) => row.endDate ?? "").filter(Boolean)).join("; "),
+    cellWritable: true,
+    formulaPreserved: false,
+    formulaStatus: "formula-derived value refreshed from SEC-backed precedent rows",
+    writeBlockedReason: "",
+    signConvention: "derived formula",
+    confidence: "medium",
+    validationStatus: "OK!",
+    notes: note,
+    finalSourceLineItems: unique(sourceRows.flatMap((row) => (row.finalSourceLineItems || row.secLabels || "").split("; ").filter(Boolean))).join("; "),
+    classificationReasons: note,
+    mappingPassedValidation: true
+  };
+  return auditRow;
+}
+
+function sourceBackedFormulaReferenceAuditRows(options: WorkbookValidationRetryOptions, cell: ExcelJS.Cell, period: string) {
+  const references = formulaReferenceCells(cell);
+  if (!references.length) return [];
+  const latestAuditRows = latestAuditRowsByCellPeriod(options.auditRows);
+  const sourceRows: MappingAuditRow[] = [];
+  for (const reference of references) {
+    const auditRow = latestAuditRows.get(sourceLedgerKey(reference.worksheet.name, reference.address, period));
+    if (!auditRow) return [];
+    const status = sourceLedgerStatusForAuditRow(auditRow);
+    if (!["explicit_current_sec_source", "validated_current_company_derived_value", "explicit_zero_no_source_disclosed"].includes(status)) return [];
+    sourceRows.push(auditRow);
+  }
+  return sourceRows;
+}
+
+function formulaReferenceCells(cell: ExcelJS.Cell) {
+  const formula = formulaForCell(cell);
+  if (!formula) return [];
+  const refs = new Set<string>();
+  formula.replace(/\$?([A-Z]{1,3})\$?(\d+):\$?([A-Z]{1,3})\$?(\d+)/g, (_match, startCol: string, startRow: string, endCol: string, endRow: string) => {
+    const start = { col: columnIndex(startCol), row: Number(startRow) };
+    const end = { col: columnIndex(endCol), row: Number(endRow) };
+    const rowCount = Math.abs(end.row - start.row) + 1;
+    const colCount = Math.abs(end.col - start.col) + 1;
+    if (rowCount * colCount > 200) return "";
+    for (let row = Math.min(start.row, end.row); row <= Math.max(start.row, end.row); row += 1) {
+      for (let col = Math.min(start.col, end.col); col <= Math.max(start.col, end.col); col += 1) refs.add(`${columnLetter(col)}${row}`);
+    }
+    return "";
+  });
+  formula.replace(/\$?([A-Z]{1,3})\$?(\d+)/g, (_match, col: string, row: string) => {
+    refs.add(`${col.toUpperCase()}${row}`);
+    return "";
+  });
+  refs.delete(cell.address);
+  return Array.from(refs)
+    .map((address) => cell.worksheet.getCell(address))
+    .filter((reference) => reference.address !== cell.address);
 }
 
 function strictPrimaryBalanceSheetRebuild(options: WorkbookValidationRetryOptions, config: { targetRowKeys?: Set<string> } = {}) {
@@ -15855,7 +16378,7 @@ function validationFailureResponseMessage(errors: string[], attempts: Validation
         .map((attempt) => {
           const diagnoses = attempt.diagnoses.length ? `; diagnoses: ${summarizeList(attempt.diagnoses, 3)}` : "";
           const rebuiltRows = attempt.rebuiltRows.length ? `; rebuilt rows: ${summarizeList(attempt.rebuiltRows, 5)}` : "";
-          return `attempt ${attempt.attempt} (${attempt.errorsBefore} -> ${attempt.errorsAfter} errors${diagnoses}${rebuiltRows})`;
+          return `attempt ${attempt.attempt} (${attempt.strategy} repair; ${attempt.errorsBefore} -> ${attempt.errorsAfter} errors${diagnoses}${rebuiltRows})`;
         })
         .join("; ")}.`
     : "";
@@ -15874,7 +16397,8 @@ function validateWorkbookBeforeReturn(
   balanceSheetColumns = columns,
   incomeStatementPeriods = periods,
   incomeStatementColumns = columns,
-  fillRows: FillRow[] = []
+  fillRows: FillRow[] = [],
+  auditRows: MappingAuditRow[] = []
 ) {
   const errors: string[] = [];
   const segmentSheet = workbook.getWorksheet(SEGMENT_SHEET);
@@ -15914,7 +16438,7 @@ function validateWorkbookBeforeReturn(
     const isFinancialCompanyStatementContext = profile.kind === "financial_company" || hasAnyConcept(ctx, "duration", C.netRevenue);
     errors.push(...validateIncomeStatementKeyMetrics(modelSheet, incomeStatementPeriods, incomeStatementColumns, ctx, evaluator, warnings, profile));
     if (!isFinancialCompanyStatementContext) {
-      errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings, fillRows));
+      errors.push(...validateBalanceSheetStatementTotals(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings, fillRows, auditRows));
     }
     errors.push(...validateBalanceSheetCheck(modelSheet, balanceSheetPeriods, balanceSheetColumns, ctx, evaluator, warnings));
     if (fillRows.length) {
@@ -18898,7 +19422,8 @@ function validateBalanceSheetStatementTotals(
   ctx: ResolveContext,
   evaluator: FormulaEvaluator,
   warnings: string[],
-  fillRows: FillRow[]
+  fillRows: FillRow[],
+  auditRows: MappingAuditRow[] = []
 ) {
   const errors: string[] = [];
   const primaryAssignmentLedgerRows = fillRows.length ? buildPrimaryBalanceSheetAssignmentLedgerRows(periods, ctx, fillRows) : [];
@@ -19000,7 +19525,7 @@ function validateBalanceSheetStatementTotals(
     )
   );
   errors.push(...validateBalanceSheetOtherBucketMetrics(sheet, periods, columns, ctx, evaluator, warnings, primaryAssignmentLedgerRows));
-  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator, warnings, primaryAssignmentLedgerRows));
+  errors.push(...validateBalanceSheetClassificationCompleteness(sheet, periods, columns, ctx, evaluator, warnings, primaryAssignmentLedgerRows, auditRows));
   errors.push(...validateBalanceSheetFourthQuarterAnnualTies(sheet, periods, columns, ctx, evaluator));
   errors.push(
     ...validateBalanceSheetSubtotalEqualsComponents(
@@ -19155,7 +19680,8 @@ function validateBalanceSheetClassificationCompleteness(
   ctx: ResolveContext,
   evaluator: FormulaEvaluator,
   warnings: string[],
-  primaryAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[]
+  primaryAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[],
+  auditRows: MappingAuditRow[] = []
 ) {
   const errors: string[] = [];
   const investmentRow = findBalanceSheetRow(sheet, CURRENT_INVESTMENT_ROW_LABELS);
@@ -19213,6 +19739,13 @@ function validateBalanceSheetClassificationCompleteness(
       const protectedFormula = isProtectedFormulaOrCheckCell(cell);
       const modelValue = evaluatedCellNumber(cell, evaluator);
       if (resolved.value === null) {
+        const sourceSupport = currentSourceLedgerSupportForCell(auditRows, sheet, rowNumber, col, period, modelValue);
+        if (sourceSupport) {
+          warnings.unshift(
+            `Balance Sheet ${period}: ${check.metricName} was accepted from targeted ${sourceSupport} source-ledger support because no direct resolver source exists.`
+          );
+          return;
+        }
         const primaryLedgerTie = primaryBalanceSheetAssignmentLedgerTie(sheet, period, col, primaryAssignmentLedgerRows, rowNumber, rowLabel(sheet, rowNumber), evaluator);
         if (primaryLedgerTie) {
           warnings.unshift(primaryAssignmentLedgerResolverWarning(period, check.metricName, primaryLedgerTie));
@@ -19249,6 +19782,25 @@ function validateBalanceSheetClassificationCompleteness(
   }
 
   return unique(errors);
+}
+
+function currentSourceLedgerSupportForCell(
+  auditRows: MappingAuditRow[],
+  sheet: ExcelJS.Worksheet,
+  rowNumber: number,
+  col: number,
+  period: string,
+  modelValue: number | null
+) {
+  if (!auditRows.length || modelValue === null) return null;
+  const auditRow = latestAuditRowsByCellPeriod(auditRows).get(sourceLedgerKey(sheet.name, `${columnLetter(col)}${rowNumber}`, period));
+  if (!auditRow) return null;
+  if (!statementMetricTies(auditRow.valueWritten, modelValue)) return null;
+  const status = sourceLedgerStatusForAuditRow(auditRow);
+  if (status === "explicit_current_sec_source") return "SEC";
+  if (status === "validated_current_company_derived_value") return "derived";
+  if (status === "explicit_zero_no_source_disclosed" && Math.abs(modelValue) <= 0.0001) return "explicit-zero";
+  return null;
 }
 
 function validateBalanceSheetFourthQuarterAnnualTies(
@@ -20814,7 +21366,8 @@ function buildHistoricalSourceLedgerRows(
       const auditStatus = auditRow ? sourceLedgerStatusForAuditRow(auditRow) : "stale_or_unsupported";
 
       if (formula) {
-        rows.push(sourceLedgerRowFromCell(company, filing, sheet, cell, fillRow, period, value, auditRow, "formula_preserved"));
+        const formulaStatus = auditRow && auditStatus !== "stale_or_unsupported" ? auditStatus : "formula_preserved";
+        rows.push(sourceLedgerRowFromCell(company, filing, sheet, cell, fillRow, period, value, auditRow, formulaStatus));
         continue;
       }
 
