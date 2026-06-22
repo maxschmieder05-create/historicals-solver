@@ -1,3 +1,5 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import path from "node:path";
 import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import {
@@ -77,6 +79,8 @@ export type FillModelWorkbookSummary = Record<string, unknown> & {
   filledCells: number;
   commentsAdded: number;
   warnings: string[];
+  debugLogPath?: string;
+  debugLogLineCount?: number;
 };
 
 export type FillModelWorkbookResult = {
@@ -85,22 +89,140 @@ export type FillModelWorkbookResult = {
   summary: FillModelWorkbookSummary;
 };
 
+type FillModelDebugDetails = Record<string, unknown>;
+
+class FillModelDebugLogger {
+  readonly filePath: string;
+  private readonly startedAt = Date.now();
+  private readonly lines: string[] = [];
+
+  constructor(query: string) {
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const safeQuery = safeDebugFilePart(query || "unknown");
+    const suffix = `${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    this.filePath = path.join(process.cwd(), "tmp", "fill-model-debug", `${timestamp}-${safeQuery}-${suffix}.txt`);
+    this.log("debug-log.created", {
+      query,
+      processId: process.pid,
+      nodeEnv: process.env.NODE_ENV ?? "",
+      filePath: this.filePath
+    });
+  }
+
+  get lineCount() {
+    return this.lines.length;
+  }
+
+  step(stage: string, details: FillModelDebugDetails = {}) {
+    this.log(`step.${stage}`, details);
+  }
+
+  warn(stage: string, details: FillModelDebugDetails = {}) {
+    this.log(`warn.${stage}`, details);
+  }
+
+  error(stage: string, details: FillModelDebugDetails = {}) {
+    this.log(`error.${stage}`, details);
+  }
+
+  log(stage: string, details: FillModelDebugDetails = {}) {
+    const elapsedMs = Date.now() - this.startedAt;
+    const suffix = Object.keys(details).length ? ` ${safeDebugJson(details)}` : "";
+    this.lines.push(`[${new Date().toISOString()} +${elapsedMs}ms] ${stage}${suffix}`);
+  }
+
+  async flush() {
+    await mkdir(path.dirname(this.filePath), { recursive: true });
+    await writeFile(this.filePath, `${this.lines.join("\n")}\n`, "utf8");
+  }
+}
+
 export class FillModelServiceError extends Error {
   readonly status: number;
+  readonly debugLogPath?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, debugLogPath?: string) {
     super(message);
     this.name = "FillModelServiceError";
     this.status = status;
+    this.debugLogPath = debugLogPath;
   }
 }
 
 export function fillModelErrorDetails(error: unknown) {
-  if (error instanceof FillModelServiceError) return { message: error.message, status: error.status };
-  if (error instanceof SecArchiveRateLimitError) return { message: error.message, status: 503 };
+  const debugLogPath = debugLogPathForError(error);
+  if (error instanceof FillModelServiceError) return { message: error.message, status: error.status, debugLogPath: error.debugLogPath ?? debugLogPath };
+  if (error instanceof SecArchiveRateLimitError) return { message: error.message, status: 503, debugLogPath };
   return {
     message: error instanceof Error ? error.message : "Unexpected fill error.",
-    status: 500
+    status: 500,
+    debugLogPath
+  };
+}
+
+function safeDebugFilePart(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48) || "unknown";
+}
+
+function safeDebugJson(value: unknown) {
+  return JSON.stringify(value, (_key, item) => {
+    if (typeof item === "bigint") return item.toString();
+    if (item instanceof Map) return { type: "Map", size: item.size, entries: Array.from(item.entries()).slice(0, 40) };
+    if (item instanceof Set) return Array.from(item.values()).slice(0, 80);
+    if (Array.isArray(item) && item.length > 80) return [...item.slice(0, 80), `... ${item.length - 80} more item(s)`];
+    if (typeof item === "string" && item.length > 1_000) return `${item.slice(0, 1_000)}... [truncated ${item.length - 1_000} chars]`;
+    return item;
+  });
+}
+
+function debugLogPathForError(error: unknown) {
+  if (!error || typeof error !== "object") return undefined;
+  const value = (error as { debugLogPath?: unknown }).debugLogPath;
+  return typeof value === "string" ? value : undefined;
+}
+
+function attachDebugLogPath(error: unknown, debugLogPath: string) {
+  if (!error || typeof error !== "object") return;
+  try {
+    (error as { debugLogPath?: string }).debugLogPath = debugLogPath;
+  } catch {
+    // Best-effort only; preserving the original error matters more than debug metadata.
+  }
+}
+
+function debugErrorDetails(error: unknown) {
+  return {
+    name: error instanceof Error ? error.name : typeof error,
+    message: error instanceof Error ? error.message : String(error),
+    stack: error instanceof Error ? error.stack : undefined
+  };
+}
+
+function debugSourceSummary(source: FactSource) {
+  return {
+    concept: source.concept,
+    label: sourceDisplayLabel(source),
+    value: source.value,
+    valueMillions: roundModelValue(source.value / 1_000_000),
+    sourceLayer: source.sourceLayer,
+    statement: source.lineItemClassification?.recommended_model_row,
+    accession: source.accn,
+    periodType: source.periodType
+  };
+}
+
+function debugResolvedSummary(resolved: ResolvedValue) {
+  return {
+    value: resolved.value,
+    valueMillions: resolved.value === null ? null : roundModelValue(resolved.value / 1_000_000),
+    classification: resolved.classification,
+    note: resolved.note,
+    sourceCount: resolved.sources.length,
+    sources: resolved.sources.slice(0, 12).map(debugSourceSummary)
   };
 }
 
@@ -2405,7 +2527,8 @@ async function buildLineItemClassificationStore(
   periods: string[],
   ctx: ResolveContext,
   fillRows: FillRow[],
-  state: LlmMappingState
+  state: LlmMappingState,
+  debug: FillModelDebugLogger
 ) {
   const store: FinancialLineItemClassificationStore = new Map();
   const warnings: string[] = [];
@@ -2420,6 +2543,16 @@ async function buildLineItemClassificationStore(
   const wantedPeriods = new Set(periods.flatMap((period) => [period, balanceSheetInstantLookupPeriod(period)]));
   const seen = new Set<string>();
   const statements = (ctx.filingPackageStatements ?? []).filter((statement) => statement.sourceTableType === "primary_statement");
+  debug.step("LLM line-item classification setup", {
+    company,
+    periodCount: periods.length,
+    statementCount: statements.length,
+    availableModelRowCount: availableModelRows.length,
+    alreadyMappedRowCount: alreadyMappedRows.length,
+    llmCanUse: llmCanUse(state, 1_500),
+    maxLineItemLlmCalls: LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS,
+    lineItemTimeoutMs: LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS
+  });
   let lineItemLlmCalls = 0;
   const maxLineItemLlmCalls =
     Number.isFinite(LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS) && LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS >= 0
@@ -2432,7 +2565,14 @@ async function buildLineItemClassificationStore(
 
   for (const statement of statements) {
     const statementName = financialStatementNameForSecStatement(statement);
-    if (!statementName) continue;
+    if (!statementName) {
+      debug.warn("LLM line-item classification skipped statement", {
+        statementName: statement.statementName,
+        accession: statement.accession,
+        reason: "statement type not recognized"
+      });
+      continue;
+    }
     const rows = statement.rows
       .filter((rowItem) => rowItem.consolidated && !rowItem.dimensions.length)
       .filter((rowItem) => typeof rowItem.value === "number" && Number.isFinite(rowItem.value))
@@ -2488,15 +2628,52 @@ async function buildLineItemClassificationStore(
       const right = b[0]?.fiscalPeriod ?? "";
       return comparePeriods(right, left);
     });
+    debug.step("LLM line-item classification statement prepared", {
+      statementName: statement.statementName,
+      statementType: statementName,
+      accession: statement.accession,
+      rowCount: rows.length,
+      requestGroupCount: requestGroups.length,
+      requestCount: requestGroups.reduce((total, group) => total + group.length, 0)
+    });
     for (const requests of requestGroups) {
-      if (!requests.some((request) => lineItemNeedsClassification(request))) continue;
+      const needsClassificationCount = requests.filter((request) => lineItemNeedsClassification(request)).length;
+      if (!needsClassificationCount) {
+        debug.step("LLM line-item classification group skipped", {
+          fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
+          statementName: statement.statementName,
+          reason: "no rows needed classification",
+          requestCount: requests.length
+        });
+        continue;
+      }
       const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmCalls < maxLineItemLlmCalls;
+      const model = chooseStatementLineItemClassificationModel(requests);
+      debug.step("LLM line-item classification group start", {
+        fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
+        statementName: statement.statementName,
+        statementType: statementName,
+        requestCount: requests.length,
+        needsClassificationCount,
+        willUseLlm,
+        model,
+        remainingLineItemLlmCalls: Math.max(0, maxLineItemLlmCalls - lineItemLlmCalls),
+        remainingGlobalLlmCalls: Math.max(0, state.maxCalls - state.calls),
+        labels: requests.map((request) => ({
+          label: request.cleanLabel || request.reportedLineItemLabel,
+          xbrlTag: request.xbrlTag,
+          section: request.section,
+          amount: request.amount,
+          deterministicCandidate: request.deterministicCandidate,
+          uncertaintyReason: request.uncertaintyReason
+        }))
+      });
       const classificationResult = await classifyFinancialStatementLineItems(requests, {
         llm: {
           enabled: willUseLlm,
           apiKey: llmApiKey(),
           endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
-          model: chooseStatementLineItemClassificationModel(requests),
+          model,
           siteUrl: OPENROUTER_SITE_URL,
           appTitle: OPENROUTER_APP_TITLE,
           timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
@@ -2505,13 +2682,51 @@ async function buildLineItemClassificationStore(
       state.calls += classificationResult.llmCalls;
       lineItemLlmCalls += classificationResult.llmCalls;
       warnings.push(...classificationResult.warnings);
+      debug.step("LLM line-item classification group complete", {
+        fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
+        statementName: statement.statementName,
+        model,
+        llmCalls: classificationResult.llmCalls,
+        warnings: classificationResult.warnings,
+        classificationCount: classificationResult.classifications.length
+      });
       for (const { request, classification } of classificationResult.classifications) {
         if (classification.warning) warnings.push(`${request.cleanLabel || request.reportedLineItemLabel}: ${classification.warning}`);
+        const failed =
+          !classification.mapping_passed_validation ||
+          classification.confidence === "low" ||
+          Boolean(classification.warning) ||
+          classification.should_exclude_from_other_bucket;
+        const classificationDetails = {
+          fiscalPeriod: request.fiscalPeriod,
+          sourceLineItem: request.cleanLabel || request.reportedLineItemLabel,
+          xbrlTag: request.xbrlTag,
+          amount: request.amount,
+          statement: request.statement,
+          section: request.section,
+          sourceTableType: request.sourceTableType,
+          deterministicCandidate: request.deterministicCandidate,
+          llmUsed: classification.llm_used,
+          recommendedModelRow: classification.recommended_model_row,
+          confidence: classification.confidence,
+          mappingPassedValidation: classification.mapping_passed_validation,
+          shouldExcludeFromOtherBucket: classification.should_exclude_from_other_bucket,
+          reason: classification.reason,
+          warning: classification.warning
+        };
+        if (failed) debug.warn("LLM line-item classification decision", classificationDetails);
+        else debug.step("LLM line-item classification decision", classificationDetails);
         registerLineItemClassification(store, request, classification);
       }
     }
   }
 
+  debug.step("LLM line-item classification store complete", {
+    storeEntries: store.size,
+    warnings,
+    lineItemLlmCalls,
+    globalLlmCalls: state.calls
+  });
   return { store, warnings };
 }
 
@@ -6799,13 +7014,16 @@ function normalizedMetricKeyForFillRow(fillRow: FillRow, profile: TemplateProfil
   return null;
 }
 
-function createFillTiming(query: string) {
-  if (process.env.FILL_MODEL_TIMING !== "1") return () => {};
+function createFillTiming(query: string, debug: FillModelDebugLogger) {
   const startedAt = Date.now();
   let lastAt = startedAt;
-  return (stage: string) => {
+  return (stage: string, details: FillModelDebugDetails = {}) => {
     const now = Date.now();
-    console.error(`[fill-model timing] ${query || "unknown"} ${stage}: +${now - lastAt}ms total=${now - startedAt}ms`);
+    const timing = { deltaMs: now - lastAt, totalMs: now - startedAt };
+    debug.step(stage, { ...timing, ...details });
+    if (process.env.FILL_MODEL_TIMING === "1") {
+      console.error(`[fill-model timing] ${query || "unknown"} ${stage}: +${timing.deltaMs}ms total=${timing.totalMs}ms`);
+    }
     lastAt = now;
   };
 }
@@ -6818,9 +7036,19 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
   const query = input.query.trim();
   if (!query) throw new FillModelServiceError("Enter a ticker or company name.", 400);
 
-  const timing = createFillTiming(query);
-    timing("request parsed");
+  const debug = new FillModelDebugLogger(query);
+  try {
+    const inputBuffer = workbookInputBuffer(input.workbookBuffer);
+    const timing = createFillTiming(query, debug);
+    timing("request parsed", {
+      query,
+      workbookBytes: inputBuffer.byteLength,
+      llmMappingEnabled: llmMappingEnabledByEnv(),
+      llmReviewEnabled: llmMappingReviewEnabledByEnv(),
+      hasOpenRouterApiKey: Boolean(llmApiKey())
+    });
     const company = await findCompany(query);
+    debug.step("company matched", company);
     const bulkSupport = await loadSecBulkSupport(company.cik, SEC_HEADERS);
     const filingMetadata = await fetchFilingMetadata(company, bulkSupport);
     const liveFacts = await fetchCompanyFacts(company.cik).catch(() => null);
@@ -6842,11 +7070,18 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
         })
       );
     }
-    timing("SEC facts/context loaded");
+    timing("SEC facts/context loaded", {
+      sourceLayer: bulkSupport.companyFacts ? "sec_bulk_companyfacts" : "sec_live_companyfacts",
+      bulkWarningCount: bulkSupport.warnings.length,
+      filingMetadataCount: filingMetadata.size,
+      durationPeriodCount: ctx.duration.size,
+      instantPeriodCount: ctx.instant.size,
+      fiscalPeriodCount: fiscalPeriods.entries.length
+    });
 
     const workbook = new ExcelJS.Workbook();
     workbook.creator = "Historicals Solver";
-    await workbook.xlsx.load(workbookInputBuffer(input.workbookBuffer) as unknown as ExcelJS.Buffer);
+    await workbook.xlsx.load(inputBuffer as unknown as ExcelJS.Buffer);
     requestAutomaticWorkbookCalculation(workbook);
     normalizeSharedFormulas(workbook);
     removeInvalidConditionalFormattingRules(workbook);
@@ -6861,7 +7096,12 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     const isStandardModelSheet = sheet.name === MODEL_SHEET;
     let columns = blueColumns(sheet);
     if (!columns.length) throw new FillModelServiceError(`Could not find blue historical input cells in the "${sheet.name}" worksheet.`, 400);
-    timing("workbook loaded and primary worksheet detected");
+    timing("workbook loaded and primary worksheet detected", {
+      worksheets: workbook.worksheets.map((worksheet) => worksheet.name),
+      primaryWorksheet: sheet.name,
+      isStandardModelSheet,
+      blueHistoricalColumns: columns
+    });
 
     let periodInfos = templatePeriodInfos(sheet, columns);
     let periods: string[];
@@ -6890,6 +7130,13 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       balanceSheetPairs = periods.map((period, index) => ({ period, col: columns[index] }));
     }
     if (!periods.length) throw new FillModelServiceError("SEC company facts did not include usable quarterly periods for this company.", 422);
+    debug.step("historical periods selected", {
+      periods,
+      columns,
+      periodInfos,
+      detectedPairCount: detectedPairs.length,
+      balanceSheetPairCount: balanceSheetPairs.length
+    });
     const balanceSheetHeaderPairs = (bestPeriodHeaderRow(sheet)?.infos ?? [])
       .filter(({ period, isEstimate }) => isHistoricalReportedPeriod(period, isEstimate, ctx))
       .map(({ period, col }) => ({ period, col }));
@@ -6917,9 +7164,14 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     balanceSheetColumns = balanceSheetPairs.map((pair) => pair.col);
     const modelPeriodMap = buildModelPeriodMap(reportedPeriodPairs, ctx);
     if (modelPeriodMap.missing.length) {
+      debug.error("model period map missing SEC filings", {
+        missing: modelPeriodMap.missing,
+        reportedPeriodPairs
+      });
       throw new FillModelServiceError(
         `Could not map SEC filings to model period column(s): ${modelPeriodMap.missing.join(", ")}. No financial data was written into unmapped periods.`,
-        422
+        422,
+        debug.filePath
       );
     }
     const filingPackageSupport = await fetchSecFilingPackageSupport(
@@ -6927,7 +7179,11 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       SEC_HEADERS
     );
     ctx.filingPackageStatements = filingPackageSupport.statements;
-    timing("periods and filing package loaded");
+    timing("periods and filing package loaded", {
+      modelPeriodMapEntries: modelPeriodMap.entries.length,
+      filingPackageStatements: filingPackageSupport.statements.length,
+      filingPackageWarnings: filingPackageSupport.warnings
+    });
     markReportedPeriodColumns(sheet, reportedPeriodPairs);
     normalizeReportedPeriodHeaderLabels(sheet, reportedPeriodPairs);
     if (segmentSheet) {
@@ -6947,27 +7203,54 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     const segmentRevenue = segmentSheet ? await fetchSegmentRevenueByPeriod(company, segmentPeriods, bulkSupport, fiscalPeriods) : [];
     timing("segment revenue loaded");
     const profile = detectTemplateProfile(workbook, sheet, ctx);
-    timing("template profile detected");
+    timing("template profile detected", profile);
     const goldLibrary = await scanConfiguredGoldModelLibrary().catch((error) => {
       preflightWarnings.push(`Gold-model library scan was skipped: ${error instanceof Error ? error.message : String(error)}.`);
       return null;
     });
-    timing("gold-model library scanned");
     if (goldLibrary) preflightWarnings.push(...goldLibrary.warnings);
     const goldReference = goldLibrary ? findVerifiedGoldModelForCompany(goldLibrary, company) : null;
+    timing("gold-model library scanned", {
+      warnings: goldLibrary?.warnings ?? [],
+      goldReference: goldReference
+        ? {
+            fileName: goldReference.fileName,
+            modelType: goldReference.modelType
+          }
+        : null
+    });
     const companyModelType = goldReference
       ? classifyModelTypeFromGoldReference(goldReference)
       : classifyCompanyModelTypeFromSecSignals(companyModelTypeSignals(company, ctx, bulkSupport));
     const templateModelType = classifyWorkbookModelType(workbook, profile.kind);
     const compatibility = checkModelTemplateCompatibility(companyModelType, templateModelType);
+    debug.step("model compatibility checked", {
+      companyModelType,
+      templateModelType,
+      compatibility
+    });
     if (!compatibility.compatible) {
-      throw new FillModelServiceError(compatibility.message || "The uploaded workbook template is not compatible with this company model type.", 422);
+      throw new FillModelServiceError(compatibility.message || "The uploaded workbook template is not compatible with this company model type.", 422, debug.filePath);
     }
     const normalizedPackage = buildNormalizedHistoricalsPackage(company, profile, periods, ctx, segmentRevenue);
     const fillRows = discoverFillRows(sheet, columns, periodInfos);
-    if (!fillRows.length) throw new FillModelServiceError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422);
+    if (!fillRows.length) {
+      debug.error("fill rows not discovered", {
+        worksheet: sheet.name,
+        columns,
+        periodInfos
+      });
+      throw new FillModelServiceError("Could not match the Model tab's blue input rows to supported financial statement labels.", 422, debug.filePath);
+    }
     ctx.template = buildLiabilityTemplateMappingContext(templateMappingRows(sheet, fillRows));
-    timing("template classified and fill rows discovered");
+    timing("template classified and fill rows discovered", {
+      fillRowCount: fillRows.length,
+      fillRowsByClassification: fillRows.reduce<Record<string, number>>((counts, rowItem) => {
+        counts[rowItem.classification] = (counts[rowItem.classification] ?? 0) + 1;
+        return counts;
+      }, {}),
+      templateContext: ctx.template
+    });
 
     const warnings: string[] = [];
     const auditRows: MappingAuditRow[] = [];
@@ -6981,6 +7264,10 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     warnings.push(...missingReportedFilingPeriodWarnings(sheet, ctx));
     if (bulkSupport.latestRefreshAt) warnings.push(`SEC bulk support latest archive timestamp: ${bulkSupport.latestRefreshAt}.`);
     warnings.push(...normalizedPackage.diagnostics.filter((item) => item.severity !== "info").map((item) => `${item.layer}: ${item.message}`));
+    debug.step("initial warnings collected", {
+      warningCount: warnings.length,
+      warnings
+    });
 
     const preRunCleanupPairs = reportedPeriodPairs.length ? reportedPeriodPairs : periods.map((period, index) => ({ period, col: columns[index] }));
     const preRunCleanup = clearHistoricalHardcodedInputCellsForSourceBackedRun(
@@ -6993,36 +7280,60 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     filledCells += preRunCleanup.clearedCells;
     commentsAdded += preRunCleanup.commentsAdded;
     warnings.push(...preRunCleanup.warnings);
+    debug.step("pre-run cleanup complete", preRunCleanup);
 
     const lineItemClassificationResult = await buildLineItemClassificationStore(
       company,
       unique([...periods, ...balanceSheetPeriods, ...incomeStatementPeriods]),
       ctx,
       fillRows,
-      llmState
+      llmState,
+      debug
     );
     ctx.lineItemClassifications = lineItemClassificationResult.store;
     warnings.push(...lineItemClassificationResult.warnings);
-    timing("line item classifications built");
+    timing("line item classifications built", {
+      classificationStoreEntries: lineItemClassificationResult.store.size,
+      warnings: lineItemClassificationResult.warnings
+    });
 
     const cleanupResult = cleanStaleProtectedHistoricalRows(sheet, fillRows, periods, columns, ctx, auditRows);
     filledCells += cleanupResult.clearedCells;
     commentsAdded += cleanupResult.commentsAdded;
     warnings.push(...cleanupResult.warnings);
+    debug.step("stale protected row cleanup complete", cleanupResult);
 
     for (const fillRow of fillRows) {
       let effectiveFillRow = fillRow;
       const rowNotes = new Set<string>();
       let unresolved = 0;
+      let rowFilledCells = 0;
+      let rowSkippedCells = 0;
+      let rowBlockedCells = 0;
+      let rowUnsupportedCells = 0;
+      let rowLlmMapped = false;
+
+      debug.step("fill-row.start", {
+        row: fillRow.row,
+        label: fillRow.label,
+        classification: fillRow.classification,
+        statement: fillRow.statement,
+        kind: fillRow.kind,
+        concepts: fillRow.concepts ?? [],
+        hasResolver: Boolean(fillRow.resolver),
+        modelContext: fillRow.modelContext
+      });
 
       if (fillRow.classification === "formula") {
+        debug.step("fill-row.skip-formula", { row: fillRow.row, label: fillRow.label });
         continue;
       }
 
       if (fillRow.classification === "unused" || (!fillRow.concepts?.length && !fillRow.resolver)) {
-        const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState);
+        const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState, debug);
         if (llmFillRow) {
           effectiveFillRow = llmFillRow;
+          rowLlmMapped = true;
           rowNotes.add(llmFillRow.comment || "LLM-assisted EDGAR concept mapping was applied after deterministic row matching did not find a confident mapping.");
         } else {
           const sourceCell = labelCell(sheet, fillRow.row);
@@ -7031,6 +7342,23 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
             if (addComment(sourceCell, fillRow.noFillComment)) commentsAdded += 1;
           }
           warnings.push(`${fillRow.label}: left blank after pre-run cleanup because no confident EDGAR match was found.`);
+          debug.warn("fill-row.left-blank-no-match", {
+            row: fillRow.row,
+            label: fillRow.label,
+            noFillComment: fillRow.noFillComment
+          });
+          debug.step("fill-row.complete", {
+            row: fillRow.row,
+            originalLabel: fillRow.label,
+            effectiveLabel: effectiveFillRow.label,
+            rowLlmMapped,
+            rowFilledCells,
+            rowSkippedCells,
+            rowBlockedCells,
+            rowUnsupportedCells,
+            unresolved,
+            leftBlankNoMatch: true
+          });
           continue;
         }
       }
@@ -7043,6 +7371,14 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
         const formulaBeforeWrite = hasFormula(cell);
         const writeDecision = historicalWriteDecision(effectiveFillRow, cell, period, ctx);
         if (!writeDecision.writable) {
+          rowSkippedCells += 1;
+          debug.step("cell.skip-not-writable", {
+            row: effectiveFillRow.row,
+            label: effectiveFillRow.label,
+            period,
+            cell: cell.address,
+            writeDecision
+          });
           if (shouldAuditSkippedWrite(writeDecision)) {
             auditRows.push(skippedMappingAuditRow(sheet, cell, effectiveFillRow, period, writeDecision));
           }
@@ -7051,9 +7387,10 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
 
         let resolved = resolveFillRowForModelPeriod(effectiveFillRow, period, ctx, normalizedPackage);
         if (resolved.value === null && effectiveFillRow === fillRow && fillRow.classification === "unused") {
-          const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState);
+          const llmFillRow = await llmAssistedFillRow(fillRow, company, periods, ctx, llmState, debug);
           if (llmFillRow) {
             effectiveFillRow = llmFillRow;
+            rowLlmMapped = true;
             rowNotes.add(llmFillRow.comment || "LLM-assisted EDGAR concept mapping was applied after deterministic row matching did not find a value.");
             resolved = resolveFillRowForModelPeriod(effectiveFillRow, period, ctx, normalizedPackage);
           }
@@ -7062,8 +7399,25 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
         if (resolved.value === null || Number.isNaN(resolved.value)) {
           const unsupportedInput = handleUnsupportedHistoricalBalanceSheetInput(sheet, cell, effectiveFillRow, period, auditRows);
           if (unsupportedInput.changed) filledCells += 1;
-          if (unsupportedInput.handled) continue;
+          if (unsupportedInput.handled) {
+            rowUnsupportedCells += 1;
+            debug.warn("cell.unsupported-input-handled", {
+              row: effectiveFillRow.row,
+              label: effectiveFillRow.label,
+              period,
+              cell: cell.address,
+              unsupportedInput
+            });
+            continue;
+          }
           unresolved += 1;
+          debug.warn("cell.unresolved", {
+            row: effectiveFillRow.row,
+            label: effectiveFillRow.label,
+            period,
+            cell: cell.address,
+            resolved: debugResolvedSummary(resolved)
+          });
           continue;
         }
 
@@ -7082,11 +7436,22 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
           : validation;
         if (validation.status === "blocked" && !actualizedForecastOverride) {
           unresolved += 1;
+          rowBlockedCells += 1;
           const value = resolved.value / (effectiveFillRow.scale ?? 1);
           const note = lineItemMappingSentence(effectiveFillRow.label, resolved);
           if (addComment(cell, note)) commentsAdded += 1;
           auditRows.push(blockedMappingAuditRow(sheet, cell, effectiveFillRow, period, value, resolved, validation, writeDecision));
           rowNotes.add(note);
+          debug.warn("cell.write-blocked-by-validation", {
+            row: effectiveFillRow.row,
+            label: effectiveFillRow.label,
+            period,
+            cell: cell.address,
+            value,
+            validation,
+            writeDecision,
+            resolved: debugResolvedSummary(resolved)
+          });
           continue;
         }
 
@@ -7100,6 +7465,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
           cell.value = valueToWrite;
         }
         filledCells += 1;
+        rowFilledCells += 1;
 
         const auditNote = auditNoteForResolvedValue(effectiveFillRow, resolved, period, ctx);
         if (auditNote) rowNotes.add(auditNote);
@@ -7118,6 +7484,18 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
         }
         auditRow.validationStatus = validationStatusText(effectiveValidation);
         auditRows.push(auditRow);
+        debug.step("cell.write", {
+          row: effectiveFillRow.row,
+          label: effectiveFillRow.label,
+          period,
+          cell: cell.address,
+          valueWritten: valueToWrite,
+          validationStatus: auditRow.validationStatus,
+          confidence,
+          preserveReportedBalanceFormula,
+          formulaBeforeWrite,
+          resolved: debugResolvedSummary(resolved)
+        });
       }
 
       if (unresolved && fillRow.classification === "partial") {
@@ -7136,9 +7514,27 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       if (unresolved) {
         warnings.push(`${effectiveFillRow.label}: ${unresolved} period(s) left blank because no matching SEC fact was found.`);
       }
+      debug.step("fill-row.complete", {
+        row: effectiveFillRow.row,
+        originalLabel: fillRow.label,
+        effectiveLabel: effectiveFillRow.label,
+        rowLlmMapped,
+        rowFilledCells,
+        rowSkippedCells,
+        rowBlockedCells,
+        rowUnsupportedCells,
+        unresolved,
+        notes: Array.from(rowNotes)
+      });
     }
     warnings.push(...llmState.warnings);
-    timing("base fill rows mapped");
+    timing("base fill rows mapped", {
+      filledCells,
+      commentsAdded,
+      auditRowCount: auditRows.length,
+      llmWarnings: llmState.warnings,
+      llmCalls: llmState.calls
+    });
 
     const actualizedBalanceResult = writeActualizedForecastBalanceSheetValues(
       company,
@@ -7153,6 +7549,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     filledCells += actualizedBalanceResult.filledCells;
     commentsAdded += actualizedBalanceResult.commentsAdded;
     warnings.push(...actualizedBalanceResult.warnings);
+    debug.step("actualized forecast balance sheet values written", actualizedBalanceResult);
 
     if (isStandardModelSheet) refreshDividendCachedResults(sheet, periods, columns);
 
@@ -7163,8 +7560,15 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       filledCells += segmentResult.filledCells;
       commentsAdded += segmentResult.commentsAdded;
       warnings.push(...segmentResult.warnings);
+      debug.step("segment analysis filled", {
+        segmentCount: segmentRevenue.length,
+        segmentPeriods,
+        segmentColumns,
+        result: segmentResult
+      });
     } else {
       warnings.push(`Could not find a "${SEGMENT_SHEET}" worksheet; segment revenue formulas were left untouched.`);
+      debug.warn("segment analysis worksheet missing", { expectedSheet: SEGMENT_SHEET });
     }
 
     for (const fillRow of fillRows) {
@@ -7178,11 +7582,13 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       const cashFlowClearResult = clearCashFlowStatementHistoricalInputs(sheet, periods, columns, auditRows);
       filledCells += cashFlowClearResult.clearedCells;
       warnings.push(...cashFlowClearResult.warnings);
+      debug.step("cash flow statement historical inputs cleared", cashFlowClearResult);
 
       const shareRepurchaseClearResult = clearStaleShareRepurchaseAssumptionAmounts(sheet, periods, columns, auditRows);
       filledCells += shareRepurchaseClearResult.clearedCells;
       commentsAdded += shareRepurchaseClearResult.commentsAdded;
       warnings.push(...shareRepurchaseClearResult.warnings);
+      debug.step("share repurchase stale assumptions cleared", shareRepurchaseClearResult);
 
       const revenueFormulaResult = reconcileIncomeStatementFormulaMetricToEdgar(
         sheet,
@@ -7197,36 +7603,43 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       filledCells += revenueFormulaResult.filledCells;
       commentsAdded += revenueFormulaResult.commentsAdded;
       warnings.push(...revenueFormulaResult.warnings);
+      debug.step("income statement revenue formulas reconciled", revenueFormulaResult);
 
       const incomeFormulaResult = reconcileIncomeStatementFormulaRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx);
       filledCells += incomeFormulaResult.filledCells;
       commentsAdded += incomeFormulaResult.commentsAdded;
       warnings.push(...incomeFormulaResult.warnings);
+      debug.step("income statement formula rows reconciled", incomeFormulaResult);
 
       const incomeClassificationResult = reconcileIncomeStatementClassificationRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
       filledCells += incomeClassificationResult.filledCells;
       commentsAdded += incomeClassificationResult.commentsAdded;
       warnings.push(...incomeClassificationResult.warnings);
+      debug.step("income statement classification rows reconciled", incomeClassificationResult);
 
       const pretaxFormulaResult = reconcilePreTaxIncomeFormulaRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx);
       filledCells += pretaxFormulaResult.filledCells;
       commentsAdded += pretaxFormulaResult.commentsAdded;
       warnings.push(...pretaxFormulaResult.warnings);
+      debug.step("pre-tax income formula rows reconciled", pretaxFormulaResult);
 
       const netIncomeFormulaResult = reconcileNetIncomeFormulaRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx);
       filledCells += netIncomeFormulaResult.filledCells;
       commentsAdded += netIncomeFormulaResult.commentsAdded;
       warnings.push(...netIncomeFormulaResult.warnings);
+      debug.step("net income formula rows reconciled", netIncomeFormulaResult);
 
       const balanceSheetTotalResult = reconcileBalanceSheetStatementTotalsToEdgar(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
       filledCells += balanceSheetTotalResult.filledCells;
       commentsAdded += balanceSheetTotalResult.commentsAdded;
       warnings.push(...balanceSheetTotalResult.warnings);
+      debug.step("balance sheet statement totals reconciled", balanceSheetTotalResult);
 
       const balanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns);
       filledCells += balanceSheetCheckResult.filledCells;
       commentsAdded += balanceSheetCheckResult.commentsAdded;
       warnings.push(...balanceSheetCheckResult.warnings);
+      debug.step("balance sheet check reconciled", balanceSheetCheckResult);
     }
 
     const formulaCacheColumns = uniqueNumbers([...columns, ...balanceSheetColumns, ...incomeStatementColumns]);
@@ -7242,6 +7655,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     filledCells += partialBalanceSheetCheckResult.filledCells;
     commentsAdded += partialBalanceSheetCheckResult.commentsAdded;
     warnings.push(...partialBalanceSheetCheckResult.warnings);
+    debug.step("partial balance sheet check reconciled", partialBalanceSheetCheckResult);
     ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
     requestAutomaticWorkbookCalculation(workbook);
     restoreProtectedCells(workbook, workbookSnapshot);
@@ -7253,18 +7667,21 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       filledCells += finalIncomeConsistencyResult.filledCells;
       commentsAdded += finalIncomeConsistencyResult.commentsAdded;
       warnings.push(...finalIncomeConsistencyResult.warnings);
+      debug.step("final income statement consistency reconciled", finalIncomeConsistencyResult);
       refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
 
       const finalBalanceSheetTotalResult = reconcileBalanceSheetStatementTotalsToEdgar(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
       filledCells += finalBalanceSheetTotalResult.filledCells;
       commentsAdded += finalBalanceSheetTotalResult.commentsAdded;
       warnings.push(...finalBalanceSheetTotalResult.warnings);
+      debug.step("final balance sheet totals reconciled", finalBalanceSheetTotalResult);
       refreshHistoricalFormulaCachedResults(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
       refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
       const finalPartialBalanceSheetCheckResult = reconcilePartialBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns);
       filledCells += finalPartialBalanceSheetCheckResult.filledCells;
       commentsAdded += finalPartialBalanceSheetCheckResult.commentsAdded;
       warnings.push(...finalPartialBalanceSheetCheckResult.warnings);
+      debug.step("final partial balance sheet check reconciled", finalPartialBalanceSheetCheckResult);
       const unsupportedTotalBalanceSheetCheckResult = reconcileBalanceSheetCheck(sheet, balanceSheetPeriods, balanceSheetColumns, (period) => {
         const lookupPeriod = balanceSheetInstantLookupPeriod(period);
         return !first(lookupPeriod, ctx.instant, C.assets);
@@ -7272,6 +7689,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       filledCells += unsupportedTotalBalanceSheetCheckResult.filledCells;
       commentsAdded += unsupportedTotalBalanceSheetCheckResult.commentsAdded;
       warnings.push(...unsupportedTotalBalanceSheetCheckResult.warnings);
+      debug.step("unsupported total balance sheet check reconciled", unsupportedTotalBalanceSheetCheckResult);
       ensureFormulaDisplayCaches(workbook, formulaCacheColumns, unique([sheet.name, MODEL_SHEET, SEGMENT_SHEET]));
       refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     }
@@ -7279,14 +7697,17 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     refreshFinalBalanceSheetKeyMetrics(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
     const balanceSheetAnnualCopyResult = copyBalanceSheetFourthQuarterToAnnualColumns(sheet, balanceSheetPeriods, balanceSheetColumns, ctx, auditRows);
     filledCells += balanceSheetAnnualCopyResult.filledCells;
+    debug.step("balance sheet fourth-quarter annual columns copied", balanceSheetAnnualCopyResult);
 
     const finalIncomeClassificationResult = reconcileIncomeStatementClassificationRowsToEdgar(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     filledCells += finalIncomeClassificationResult.filledCells;
     commentsAdded += finalIncomeClassificationResult.commentsAdded;
     warnings.push(...finalIncomeClassificationResult.warnings);
+    debug.step("final income classification rows reconciled", finalIncomeClassificationResult);
     const postTaxEquityBridgeResult = reconcilePostTaxEquityMethodNetIncomeBridge(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     filledCells += postTaxEquityBridgeResult.filledCells;
     warnings.push(...postTaxEquityBridgeResult.warnings);
+    debug.step("post-tax equity method net income bridge reconciled", postTaxEquityBridgeResult);
     refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
     timing("reconciliations complete");
 
@@ -7320,16 +7741,32 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     filledCells += validationResult.filledCells;
     commentsAdded += validationResult.commentsAdded;
     if (validationResult.errors.length) {
-      throw new FillModelServiceError(validationFailureResponseMessage(validationResult.errors, validationResult.attempts), 422);
+      debug.error("workbook validation failed", {
+        errors: validationResult.errors,
+        attempts: validationResult.attempts,
+        filledCells: validationResult.filledCells,
+        commentsAdded: validationResult.commentsAdded
+      });
+      throw new FillModelServiceError(validationFailureResponseMessage(validationResult.errors, validationResult.attempts), 422, debug.filePath);
     }
-    timing("workbook validation complete");
+    timing("workbook validation complete", {
+      attempts: validationResult.attempts,
+      filledCells: validationResult.filledCells,
+      commentsAdded: validationResult.commentsAdded
+    });
 
     const sourceLedgerRows = buildHistoricalSourceLedgerRows(company, modelPeriodMap.entries, sheet, fillRows, reportedPeriodPairs, auditRows);
     const sourceLedgerErrors = await validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries, company, filingMetadata);
     if (sourceLedgerErrors.length) {
-      throw new FillModelServiceError(`Source-backed historical validation failed: ${sourceLedgerErrors.slice(0, 6).join(" | ")}`, 422);
+      debug.error("source ledger validation failed", {
+        errors: sourceLedgerErrors,
+        sourceLedgerRowCount: sourceLedgerRows.length
+      });
+      throw new FillModelServiceError(`Source-backed historical validation failed: ${sourceLedgerErrors.slice(0, 6).join(" | ")}`, 422, debug.filePath);
     }
-    timing("source ledger validation complete");
+    timing("source ledger validation complete", {
+      sourceLedgerRowCount: sourceLedgerRows.length
+    });
 
     const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
     const incomeStatementAssignmentLedgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(incomeStatementPeriods, ctx, fillRows);
@@ -7338,6 +7775,11 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
           preserveExistingLabels: profile.kind === "financial_company"
         })
       : [];
+    debugAssignmentLedgerIssues(debug, {
+      balanceSheetAssignmentLedgerRows,
+      incomeStatementAssignmentLedgerRows,
+      segmentAnalysisAssignmentLedgerRows
+    });
     const llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
       company,
       periods: unique([...periods, ...balanceSheetPeriods, ...incomeStatementPeriods]),
@@ -7362,13 +7804,23 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       incomeStatementAssignmentLedgerRows,
       segmentAnalysisAssignmentLedgerRows,
       auditRows,
-      llmWorkbookToolbox
+      llmWorkbookToolbox,
+      debug
     );
     warnings.push(...llmMappingReview.warnings);
     if (llmMappingReview.blockingErrors.length) {
-      throw new FillModelServiceError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422);
+      debug.error("LLM mapping review blocking errors", {
+        blockingErrors: llmMappingReview.blockingErrors,
+        warnings: llmMappingReview.warnings,
+        rowCount: llmMappingReview.rows.length
+      });
+      throw new FillModelServiceError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422, debug.filePath);
     }
-    timing("LLM mapping review complete");
+    timing("LLM mapping review complete", {
+      warnings: llmMappingReview.warnings,
+      rowCount: llmMappingReview.rows.length,
+      blockingErrorCount: llmMappingReview.blockingErrors.length
+    });
 
     addFilingPeriodMapSheet(workbook, modelPeriodMap.entries);
     addMappingAuditSheet(workbook, auditRows);
@@ -7395,10 +7847,24 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     timing("workbook buffer written");
     const returnedWorkbookErrors = await validateReturnedWorkbookBuffer(output, validationOptions);
     if (returnedWorkbookErrors.length) {
-      throw new FillModelServiceError(`Returned workbook validation failed: ${returnedWorkbookErrors.slice(0, 6).join(" | ")}`, 422);
+      debug.error("returned workbook validation failed", {
+        errors: returnedWorkbookErrors
+      });
+      throw new FillModelServiceError(`Returned workbook validation failed: ${returnedWorkbookErrors.slice(0, 6).join(" | ")}`, 422, debug.filePath);
     }
-    timing("returned workbook validated");
+    timing("returned workbook validated", {
+      outputBytes: output.byteLength
+    });
     const outputName = `${company.ticker}_historicals_filled.xlsx`;
+    debug.step("fill complete", {
+      outputName,
+      outputBytes: output.byteLength,
+      periods,
+      filledCells,
+      commentsAdded,
+      warningCount: warnings.length,
+      debugLogPath: debug.filePath
+    });
     const summary: FillModelWorkbookSummary = {
       companyName: company.title,
       ticker: company.ticker,
@@ -7418,10 +7884,97 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       periods,
       filledCells,
       commentsAdded,
-      warnings: unique(warnings).slice(0, 8)
+      warnings: unique(warnings).slice(0, 8),
+      debugLogPath: debug.filePath,
+      debugLogLineCount: debug.lineCount
     };
 
     return { output, outputName, summary };
+  } catch (error) {
+    debug.error("fill failed", debugErrorDetails(error));
+    attachDebugLogPath(error, debug.filePath);
+    throw error;
+  } finally {
+    await debug.flush().catch((error) => {
+      console.error("Could not write fill-model debug log.", error);
+    });
+  }
+}
+
+function debugAssignmentLedgerIssues(
+  debug: FillModelDebugLogger,
+  ledgers: {
+    balanceSheetAssignmentLedgerRows: PrimaryBalanceSheetAssignmentLedgerRow[];
+    incomeStatementAssignmentLedgerRows: PrimaryIncomeStatementAssignmentLedgerRow[];
+    segmentAnalysisAssignmentLedgerRows: SegmentAnalysisAssignmentLedgerRow[];
+  }
+) {
+  const balanceIssues = ledgers.balanceSheetAssignmentLedgerRows.filter(
+    (row) => row.assignmentStatus === "explicitly_excluded_with_reason" || row.validationStatus !== "OK!" || row.side === "unknown"
+  );
+  const incomeIssues = ledgers.incomeStatementAssignmentLedgerRows.filter(
+    (row) => row.assignmentStatus === "explicitly_excluded_with_reason" || row.validationStatus !== "OK!"
+  );
+  const segmentIssues = ledgers.segmentAnalysisAssignmentLedgerRows.filter(
+    (row) => row.assignmentStatus === "not_disclosed" || row.validationStatus !== "OK!"
+  );
+
+  debug.step("primary statement assignment ledgers built", {
+    balanceSheetRows: ledgers.balanceSheetAssignmentLedgerRows.length,
+    incomeStatementRows: ledgers.incomeStatementAssignmentLedgerRows.length,
+    segmentAnalysisRows: ledgers.segmentAnalysisAssignmentLedgerRows.length,
+    balanceIssueCount: balanceIssues.length,
+    incomeIssueCount: incomeIssues.length,
+    segmentIssueCount: segmentIssues.length
+  });
+
+  for (const row of balanceIssues.slice(0, 120)) {
+    debug.warn("balance sheet assignment ledger issue", {
+      period: row.fiscalPeriod,
+      sourceLineItemLabel: row.sourceLineItemLabel,
+      sourceXbrlTag: row.sourceXbrlTag,
+      amount: row.amount,
+      assignedModelRow: row.assignedModelRow,
+      assignmentStatus: row.assignmentStatus,
+      validationStatus: row.validationStatus,
+      side: row.side,
+      sourceSection: row.sourceSection,
+      classificationReason: row.classificationReason,
+      llmUsed: row.llmUsed
+    });
+  }
+
+  for (const row of incomeIssues.slice(0, 120)) {
+    debug.warn("income statement assignment ledger issue", {
+      period: row.fiscalPeriod,
+      sourceLineItemLabel: row.sourceLineItemLabel,
+      sourceXbrlTag: row.sourceXbrlTag,
+      sourceAmount: row.sourceAmount,
+      modelAmount: row.modelAmount,
+      assignedModelRow: row.assignedModelRow,
+      assignmentStatus: row.assignmentStatus,
+      validationStatus: row.validationStatus,
+      sourceSection: row.sourceSection,
+      classificationReason: row.classificationReason,
+      llmUsed: row.llmUsed
+    });
+  }
+
+  for (const row of segmentIssues.slice(0, 120)) {
+    debug.warn("segment analysis assignment ledger issue", {
+      period: row.fiscalPeriod,
+      sourceLineItemLabel: row.sourceLineItemLabel,
+      sourceMetric: row.sourceMetric,
+      sourceAmount: row.sourceAmount,
+      modelAmount: row.modelAmount,
+      sourceXbrlTag: row.sourceXbrlTag,
+      assignedModelRow: row.assignedModelRow,
+      assignedCell: row.assignedCell,
+      assignmentStatus: row.assignmentStatus,
+      validationStatus: row.validationStatus,
+      classificationReason: row.classificationReason
+    });
+  }
 }
 
 async function findCompany(query: string): Promise<CompanyMatch> {
@@ -12938,6 +13491,18 @@ function llmCanUse(state: LlmMappingState, minRemainingMs = 1_000) {
   return false;
 }
 
+function llmMappingStateSummary(state: LlmMappingState) {
+  return {
+    enabled: state.enabled,
+    calls: state.calls,
+    maxCalls: state.maxCalls,
+    remainingMs: llmTimeRemainingMs(state),
+    decisionCount: state.decisions.size,
+    warningCount: state.warnings.length,
+    budgetWarningAdded: state.budgetWarningAdded
+  };
+}
+
 function llmMappingEnabledByEnv() {
   const raw = process.env.LLM_MAPPING_ENABLED;
   if (raw === undefined || raw === "") return Boolean(llmApiKey());
@@ -12963,11 +13528,16 @@ async function runLlmMappingReview(
   incomeStatementAssignmentLedgerRows: PrimaryIncomeStatementAssignmentLedgerRow[],
   segmentAnalysisAssignmentLedgerRows: SegmentAnalysisAssignmentLedgerRow[],
   auditRows: MappingAuditRow[],
-  llmWorkbookToolbox: LlmWorkbookToolbox
+  llmWorkbookToolbox: LlmWorkbookToolbox,
+  debug: FillModelDebugLogger
 ): Promise<{ rows: LlmMappingReviewRow[]; warnings: string[]; blockingErrors: string[] }> {
-  if (!llmMappingReviewEnabledByEnv()) return { rows: [], warnings: [], blockingErrors: [] };
+  if (!llmMappingReviewEnabledByEnv()) {
+    debug.step("LLM mapping review skipped", { reason: "disabled by LLM_MAPPING_REVIEW_ENABLED" });
+    return { rows: [], warnings: [], blockingErrors: [] };
+  }
   if (!llmApiKey()) {
     const message = "LLM mapping review was enabled but OPENROUTER_API_KEY was not set; generated workbook relies on deterministic validation only.";
+    debug.warn("LLM mapping review skipped", { reason: "missing OpenRouter API key" });
     return {
       rows: [llmMappingReviewSkippedRow(company, message)],
       warnings: [message],
@@ -12987,7 +13557,17 @@ async function runLlmMappingReview(
       auditRows,
       llmWorkbookToolbox
     );
-    const result = await requestLlmMappingReview(payload);
+    debug.step("LLM mapping review request prepared", {
+      periods,
+      sourceLedgerRows: sourceLedgerRows.length,
+      balanceAssignments: balanceSheetAssignmentLedgerRows.length,
+      incomeAssignments: incomeStatementAssignmentLedgerRows.length,
+      segmentAssignments: segmentAnalysisAssignmentLedgerRows.length,
+      auditRows: auditRows.length,
+      omittedCounts: payload.omittedCounts,
+      reviewerModel: LLM_MAPPING_REVIEW_MODEL
+    });
+    const result = await requestLlmMappingReview(payload, debug);
     const rows = llmMappingReviewRowsFromResult(company, result);
     const issueWarnings = result.issues
       .filter((issue) => issue.severity !== "info")
@@ -13000,9 +13580,22 @@ async function runLlmMappingReview(
           .filter((issue) => issue.severity === "error" && isActionableLlmMappingBlockingIssue(issue))
           .map((issue) => `${issue.period || "all periods"} ${issue.sourceLineItemLabel || issue.currentModelRow}: ${issue.reason}`)
       : [];
+    debug.step("LLM mapping review response accepted", {
+      status: result.status,
+      coverageSummary: result.coverageSummary,
+      verifiedDecisionCount: result.verifiedDecisionCount,
+      issueCount: result.issues.length,
+      issueWarnings,
+      blockingErrors
+    });
     return { rows, warnings: issueWarnings, blockingErrors };
   } catch (error) {
     const message = `LLM mapping review skipped (${error instanceof Error ? error.message : "unknown OpenRouter API error"}).`;
+    debug.error("LLM mapping review failed", {
+      message,
+      error: debugErrorDetails(error),
+      blockingMode: LLM_MAPPING_REVIEW_BLOCKING
+    });
     return {
       rows: [llmMappingReviewSkippedRow(company, message)],
       warnings: [message],
@@ -13067,7 +13660,7 @@ function llmMappingReviewRowsFromResult(company: CompanyMatch, result: LlmMappin
   }));
 }
 
-async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingReviewPayload>): Promise<LlmMappingReviewResult> {
+async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingReviewPayload>, debug: FillModelDebugLogger): Promise<LlmMappingReviewResult> {
   const apiKey = llmApiKey();
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
 
@@ -13090,6 +13683,17 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
   const controller = new AbortController();
   const timeoutMs = Number.isFinite(LLM_MAPPING_REVIEW_TIMEOUT_MS) && LLM_MAPPING_REVIEW_TIMEOUT_MS > 0 ? LLM_MAPPING_REVIEW_TIMEOUT_MS : 20_000;
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  debug.step("OpenRouter mapping review request start", {
+    model: LLM_MAPPING_REVIEW_MODEL,
+    timeoutMs,
+    periods: payload.periods,
+    primaryBalanceSheetAssignments: payload.primaryBalanceSheetAssignments.length,
+    primaryIncomeStatementAssignments: payload.primaryIncomeStatementAssignments.length,
+    segmentAnalysisAssignments: payload.segmentAnalysisAssignments.length,
+    sourceLedgerRows: payload.sourceLedgerRows.length,
+    mappingAuditRows: payload.mappingAuditRows.length,
+    omittedCounts: payload.omittedCounts
+  });
   const response = await Promise.race([
     fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
       method: "POST",
@@ -13128,12 +13732,35 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message = body?.error?.message || `${response.status} ${response.statusText}`;
+    debug.error("OpenRouter mapping review request failed", {
+      status: response.status,
+      statusText: response.statusText,
+      message,
+      body
+    });
     throw new Error(message);
   }
 
   const text = responseOutputText(body);
-  if (!text) throw new Error("OpenRouter mapping review response did not include text output");
-  return JSON.parse(text) as LlmMappingReviewResult;
+  if (!text) {
+    debug.error("OpenRouter mapping review response missing text", { body });
+    throw new Error("OpenRouter mapping review response did not include text output");
+  }
+  try {
+    const result = JSON.parse(text) as LlmMappingReviewResult;
+    debug.step("OpenRouter mapping review response parsed", {
+      status: result.status,
+      issueCount: result.issues.length,
+      coverageSummary: result.coverageSummary
+    });
+    return result;
+  } catch (error) {
+    debug.error("OpenRouter mapping review JSON parse failed", {
+      text,
+      error: debugErrorDetails(error)
+    });
+    throw error;
+  }
 }
 
 function llmMappingReviewPayload(
@@ -13623,32 +14250,99 @@ async function llmAssistedFillRow(
   company: CompanyMatch,
   periods: string[],
   ctx: ResolveContext,
-  state: LlmMappingState
+  state: LlmMappingState,
+  debug: FillModelDebugLogger
 ) {
-  if (!llmCanUse(state, Math.max(1_000, Math.min(LLM_MAPPING_TIMEOUT_MS, 3_000))) || !isLlmMappableRow(fillRow)) return null;
-  if (state.decisions.has(fillRow.row)) return state.decisions.get(fillRow.row) ?? null;
+  const minRemainingMs = Math.max(1_000, Math.min(LLM_MAPPING_TIMEOUT_MS, 3_000));
+  if (!llmCanUse(state, minRemainingMs)) {
+    debug.warn("LLM-assisted row mapping skipped", {
+      row: fillRow.row,
+      label: fillRow.label,
+      reason: "LLM budget, API key, or deadline unavailable",
+      state: llmMappingStateSummary(state),
+      minRemainingMs
+    });
+    return null;
+  }
+  if (!isLlmMappableRow(fillRow)) {
+    debug.step("LLM-assisted row mapping not applicable", {
+      row: fillRow.row,
+      label: fillRow.label,
+      classification: fillRow.classification,
+      statement: fillRow.statement,
+      modelContext: fillRow.modelContext
+    });
+    return null;
+  }
+  if (state.decisions.has(fillRow.row)) {
+    const cached = state.decisions.get(fillRow.row) ?? null;
+    debug.step("LLM-assisted row mapping cache hit", {
+      row: fillRow.row,
+      label: fillRow.label,
+      mapped: Boolean(cached),
+      cachedConcepts: cached?.concepts ?? []
+    });
+    return cached;
+  }
   if (state.calls >= state.maxCalls) {
     state.decisions.set(fillRow.row, null);
+    debug.warn("LLM-assisted row mapping skipped", {
+      row: fillRow.row,
+      label: fillRow.label,
+      reason: "LLM max calls reached",
+      state: llmMappingStateSummary(state)
+    });
     return null;
   }
 
   const candidates = llmCandidateFacts(fillRow, periods, ctx);
   if (!candidates.length) {
     state.decisions.set(fillRow.row, null);
+    debug.warn("LLM-assisted row mapping skipped", {
+      row: fillRow.row,
+      label: fillRow.label,
+      reason: "no candidate SEC facts met the score threshold",
+      periods,
+      minCandidateScore: llmMinCandidateScore(),
+      candidateLimit: llmCandidateLimit()
+    });
     return null;
   }
 
   state.calls += 1;
   try {
     const modelChoice = chooseLlmMappingModel(fillRow, candidates);
-    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model, ctx);
+    debug.step("LLM-assisted row mapping request", {
+      row: fillRow.row,
+      label: fillRow.label,
+      modelChoice,
+      candidateCount: candidates.length,
+      candidates: candidates.slice(0, 20)
+    });
+    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model, ctx, debug);
     const mapped = llmDecisionToFillRow(fillRow, decision, candidates, modelChoice);
     state.decisions.set(fillRow.row, mapped);
+    const details = {
+      row: fillRow.row,
+      label: fillRow.label,
+      decision,
+      mapped: Boolean(mapped),
+      mappedConcepts: mapped?.concepts ?? [],
+      mappedClassification: mapped?.classification
+    };
+    if (mapped) debug.step("LLM-assisted row mapping decision accepted", details);
+    else debug.warn("LLM-assisted row mapping decision rejected", details);
     return mapped;
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown OpenRouter API error";
     state.warnings.push(`${fillRow.label}: LLM-assisted mapping skipped (${message}).`);
     state.decisions.set(fillRow.row, null);
+    debug.error("LLM-assisted row mapping failed", {
+      row: fillRow.row,
+      label: fillRow.label,
+      error: debugErrorDetails(error),
+      state: llmMappingStateSummary(state)
+    });
     return null;
   }
 }
@@ -13767,7 +14461,8 @@ async function requestLlmMappingDecision(
   periods: string[],
   candidates: LlmCandidateFact[],
   model: string,
-  ctx: ResolveContext
+  ctx: ResolveContext,
+  debug: FillModelDebugLogger
 ): Promise<LlmMappingDecision> {
   const apiKey = llmApiKey();
   if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
@@ -13788,6 +14483,17 @@ async function requestLlmMappingDecision(
   const controller = new AbortController();
   const timeoutMs = Number.isFinite(LLM_MAPPING_TIMEOUT_MS) && LLM_MAPPING_TIMEOUT_MS > 0 ? LLM_MAPPING_TIMEOUT_MS : 3_000;
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  const payload = llmMappingPayload(company, fillRow, periods, candidates, ctx);
+  const relevantRowsOutput = payload.llmTools.find((tool) => tool.name === "sec.get_relevant_statement_rows")?.output as { rows?: unknown[] } | undefined;
+  debug.step("OpenRouter row mapping request start", {
+    row: fillRow.row,
+    label: fillRow.label,
+    model,
+    timeoutMs,
+    candidateCount: candidates.length,
+    relevantStatementRowCount: Array.isArray(relevantRowsOutput?.rows) ? relevantRowsOutput.rows.length : 0,
+    filingCommentaryCount: payload.filingCommentary.length
+  });
   const response = await Promise.race([
     fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
       method: "POST",
@@ -13802,7 +14508,7 @@ async function requestLlmMappingDecision(
         model,
         messages: [
           { role: "system", content: system },
-          { role: "user", content: JSON.stringify(llmMappingPayload(company, fillRow, periods, candidates, ctx)) }
+          { role: "user", content: JSON.stringify(payload) }
         ],
         temperature: 0,
         max_tokens: 700,
@@ -13826,12 +14532,43 @@ async function requestLlmMappingDecision(
   const body = await response.json().catch(() => null);
   if (!response.ok) {
     const message = body?.error?.message || `${response.status} ${response.statusText}`;
+    debug.error("OpenRouter row mapping request failed", {
+      row: fillRow.row,
+      label: fillRow.label,
+      status: response.status,
+      statusText: response.statusText,
+      message,
+      body
+    });
     throw new Error(message);
   }
 
   const text = responseOutputText(body);
-  if (!text) throw new Error("OpenRouter response did not include text output");
-  return JSON.parse(text) as LlmMappingDecision;
+  if (!text) {
+    debug.error("OpenRouter row mapping response missing text", {
+      row: fillRow.row,
+      label: fillRow.label,
+      body
+    });
+    throw new Error("OpenRouter response did not include text output");
+  }
+  try {
+    const decision = JSON.parse(text) as LlmMappingDecision;
+    debug.step("OpenRouter row mapping response parsed", {
+      row: fillRow.row,
+      label: fillRow.label,
+      decision
+    });
+    return decision;
+  } catch (error) {
+    debug.error("OpenRouter row mapping JSON parse failed", {
+      row: fillRow.row,
+      label: fillRow.label,
+      text,
+      error: debugErrorDetails(error)
+    });
+    throw error;
+  }
 }
 
 function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: string[], candidates: LlmCandidateFact[], ctx: ResolveContext) {

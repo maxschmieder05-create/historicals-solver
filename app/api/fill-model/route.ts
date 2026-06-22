@@ -24,16 +24,23 @@ export async function POST(request: NextRequest) {
         "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "content-disposition": `attachment; filename="${result.outputName}"`,
         "x-output-filename": result.outputName,
-        "x-fill-summary": encodeURIComponent(JSON.stringify(result.summary))
+        "x-fill-summary": encodeURIComponent(JSON.stringify(result.summary)),
+        ...(result.summary.debugLogPath ? { "x-debug-log-path": result.summary.debugLogPath } : {})
       }
     });
   } catch (error) {
     console.error(error);
-    const { message, status } = fillModelErrorDetails(error);
-    return jsonError(message, status);
+    const { message, status, debugLogPath } = fillModelErrorDetails(error);
+    return jsonError(message, status, debugLogPath);
   }
 }
 
-function jsonError(error: string, status: number) {
-  return NextResponse.json({ error }, { status });
+function jsonError(error: string, status: number, debugLogPath?: string) {
+  return NextResponse.json(
+    debugLogPath ? { error, debugLogPath } : { error },
+    {
+      status,
+      headers: debugLogPath ? { "x-debug-log-path": debugLogPath } : undefined
+    }
+  );
 }
