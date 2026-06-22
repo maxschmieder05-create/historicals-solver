@@ -20,8 +20,14 @@ const checks = [
     message: "Native file input must live inside the dropzone so direct clicks open the picker."
   },
   {
-    ok: /<input[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChangeCapture=\{handleFileSelect\}[\s\S]*onInputCapture=\{handleFileInput\}[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
+    ok: /<input[\s\S]*key=\{fileInputVersion\}[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChangeCapture=\{handleFileSelect\}[\s\S]*onInputCapture=\{handleFileInput\}[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
     message: "Native file input must remain wired to capture and bubble change/input events."
+  },
+  {
+    ok: /const SUPPORTED_WORKBOOK_EXTENSIONS = \["\.xlsx", "\.xlsm"\]/.test(source)
+      && /accept=\{SUPPORTED_WORKBOOK_ACCEPT\}/.test(source)
+      && /macroEnabled\.12/.test(source),
+    message: "Workbook picker must accept both .xlsx and .xlsm Open XML workbook files."
   },
   {
     ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*dataTransfer\.types[\s\S]*includes\("Files"\)[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
@@ -53,12 +59,14 @@ const checks = [
   },
   {
     ok: /const selectedFileRef = useRef<File \| null>\(null\);/.test(source)
-      && /selectedFileRef\.current = nextFile;\s*setFile\(nextFile\);/.test(source),
+      && /selectedFileRef\.current = nextFile;\s*setFile\(nextFile\);\s*setFileInputVersion\(\(version\) => version \+ 1\);/.test(source),
     message: "A valid workbook selection must synchronously store the selected File before updating visible state."
   },
   {
-    ok: /fileInputResetTimerRef\.current = window\.setTimeout\(\(\) => \{\s*clearFileInput\(\);\s*fileInputResetTimerRef\.current = null;\s*\}, 0\);/.test(source),
-    message: "Valid workbook selection must defer the native input reset until after the selected File is stored."
+    ok: /const \[fileInputVersion, setFileInputVersion\] = useState\(0\);/.test(source)
+      && /key=\{fileInputVersion\}/.test(source)
+      && !/fileInputResetTimerRef/.test(source),
+    message: "Valid workbook selection must remount the native input after state is stored instead of clearing it with a timer."
   },
   {
     ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
@@ -81,7 +89,7 @@ const checks = [
     message: "Native picker resets must stay out of picker-opening handlers that can erase picker results."
   },
   {
-    ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not an \.xlsx workbook/.test(source),
+    ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not a supported \.xlsx or \.xlsm workbook/.test(source),
     message: "Invalid workbook selections must clear both selected-file state and the native input."
   },
   {

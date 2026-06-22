@@ -21,6 +21,19 @@ type FillSummary = {
   warnings: string[];
 };
 
+const SUPPORTED_WORKBOOK_EXTENSIONS = [".xlsx", ".xlsm"] as const;
+const SUPPORTED_WORKBOOK_ACCEPT = [
+  ".xlsx",
+  ".xlsm",
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel.sheet.macroEnabled.12"
+].join(",");
+
+function isSupportedWorkbookFile(file: File) {
+  const fileName = file.name.toLowerCase();
+  return SUPPORTED_WORKBOOK_EXTENSIONS.some((extension) => fileName.endsWith(extension));
+}
+
 function hasTransferredFiles(dataTransfer: DataTransfer | null) {
   if (!dataTransfer) return false;
   if (Array.from(dataTransfer.types ?? []).includes("Files")) return true;
@@ -46,23 +59,17 @@ export default function Home() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
+  const [fileInputVersion, setFileInputVersion] = useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedFileRef = useRef<File | null>(null);
   const inputSyncFrameRef = useRef<number | null>(null);
   const inputSyncTimersRef = useRef<number[]>([]);
-  const fileInputResetTimerRef = useRef<number | null>(null);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
   const clearFileInput = useCallback(() => {
     if (!fileInputRef.current) return;
     fileInputRef.current.value = "";
-  }, []);
-
-  const clearPendingFileInputReset = useCallback(() => {
-    if (fileInputResetTimerRef.current === null) return;
-    window.clearTimeout(fileInputResetTimerRef.current);
-    fileInputResetTimerRef.current = null;
   }, []);
 
   function formatFileSize(bytes: number) {
@@ -74,22 +81,17 @@ export default function Home() {
     if (!nextFile) return;
     setError("");
     setSummary(null);
-    if (!nextFile.name.toLowerCase().endsWith(".xlsx")) {
+    if (!isSupportedWorkbookFile(nextFile)) {
       selectedFileRef.current = null;
       setFile(null);
-      clearPendingFileInputReset();
       clearFileInput();
-      setError(`${nextFile.name} is not an .xlsx workbook.`);
+      setError(`${nextFile.name} is not a supported .xlsx or .xlsm workbook.`);
       return;
     }
     selectedFileRef.current = nextFile;
     setFile(nextFile);
-    clearPendingFileInputReset();
-    fileInputResetTimerRef.current = window.setTimeout(() => {
-      clearFileInput();
-      fileInputResetTimerRef.current = null;
-    }, 0);
-  }, [clearFileInput, clearPendingFileInputReset]);
+    setFileInputVersion((version) => version + 1);
+  }, [clearFileInput]);
 
   const clearPendingInputSync = useCallback(() => {
     if (inputSyncFrameRef.current !== null) {
@@ -160,8 +162,6 @@ export default function Home() {
     };
   }, [clearPendingInputSync, handleWorkbookSelected, syncInputSelectionSoon]);
 
-  useEffect(() => clearPendingFileInputReset, [clearPendingFileInputReset]);
-
   useEffect(() => {
     const input = fileInputRef.current;
     if (!input) return;
@@ -179,7 +179,7 @@ export default function Home() {
       input.removeEventListener("input", handleNativeFileSelection);
       input.removeEventListener("cancel", handleNativeFileSelection);
     };
-  }, [syncInputSelection]);
+  }, [fileInputVersion, syncInputSelection]);
 
   function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
@@ -229,11 +229,11 @@ export default function Home() {
       return;
     }
     if (!selectedFile) {
-      setError("Choose an .xlsx workbook before filling.");
+      setError("Choose an .xlsx or .xlsm workbook before filling.");
       return;
     }
-    if (!selectedFile.name.toLowerCase().endsWith(".xlsx")) {
-      setError(`${selectedFile.name} is not an .xlsx workbook.`);
+    if (!isSupportedWorkbookFile(selectedFile)) {
+      setError(`${selectedFile.name} is not a supported .xlsx or .xlsm workbook.`);
       return;
     }
 
@@ -342,11 +342,12 @@ export default function Home() {
           >
             <input
               id="model-template-file"
+              key={fileInputVersion}
               ref={fileInputRef}
               className="fileInput"
               type="file"
               name="file"
-              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              accept={SUPPORTED_WORKBOOK_ACCEPT}
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               disabled={isSubmitting}
               onChangeCapture={handleFileSelect}
@@ -365,7 +366,7 @@ export default function Home() {
                 <small>{formatFileSize(file.size)}</small>
               </span>
             ) : (
-              <small>Click to browse or drag in an .xlsx file</small>
+              <small>Click to browse or drag in an .xlsx or .xlsm file</small>
             )}
             <span className="browseCue">{file ? "Choose different workbook" : "Choose workbook"}</span>
           </div>
