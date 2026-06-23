@@ -1,4 +1,9 @@
 import { normalizeAccession } from "./sec-accession";
+import {
+  balanceSheetRowDefinitionForLabel,
+  balanceSheetRowsEquivalent,
+  balanceSheetSectionCompatible
+} from "./balance-sheet-row-resolver";
 
 export type FinancialStatementName = "income_statement" | "balance_sheet" | "cash_flow" | "segment_analysis";
 
@@ -437,6 +442,7 @@ export function modelRowsMatch(a: string, b: string) {
   const right = normalizeKey(b);
   if (!left || !right) return false;
   if (left === right) return true;
+  if (balanceSheetRowsEquivalent(a, b)) return true;
   return equivalentModelRows(a).some((candidate) => normalizeKey(candidate) === right) || equivalentModelRows(b).some((candidate) => normalizeKey(candidate) === left);
 }
 
@@ -469,6 +475,8 @@ export function classificationModelRowAssignmentForPrimaryStatement(
 }
 
 function isReusableOtherBucketModelRow(modelRow: string) {
+  const balanceSheetDefinition = balanceSheetRowDefinitionForLabel(modelRow);
+  if (balanceSheetDefinition?.kind === "catch_all") return true;
   return (
     modelRowsMatch(modelRow, "Prepaid & Other Current Assets") ||
     modelRowsMatch(modelRow, "Other Non-Current Assets") ||
@@ -486,7 +494,7 @@ function deterministicFinancialLineItemClassification(
   const current = section.includes("current") ? section.startsWith("current") : null;
   const base = baseClassification(request);
   const preferred = (...rows: string[]) => rows.find((row) => modelRowAvailable(row, request.availableModelRows)) ?? rows[0];
-  const hasCurrentInvestmentsRow = request.availableModelRows.some((row) => /short[-\s]?term investments?|current investments?|marketable securities/i.test(row));
+  const hasCurrentInvestmentsRow = request.availableModelRows.some((row) => /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(row));
   const isDeferredTaxLine = /\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text);
   const textLooksDeferredTaxAsset = /\bassets?\b/.test(text);
   const textLooksDeferredTaxLiability = /\bliabilit/.test(text);
@@ -603,6 +611,19 @@ function deterministicFinancialLineItemClassification(
       reason: hasCurrentInvestmentsRow
         ? "Current investments map to the dedicated current investments row when the template provides one."
         : "Marketable securities, available-for-sale securities, and short-term investments are included with Cash & Cash Equivalents when no dedicated current investments row exists."
+    };
+  }
+
+  if (/\binvestment securities\b|\bdebt and equity securities\b|\bavailable[-\s]?for[-\s]?sale securities\b|\bmarketable securities\b/.test(text) && section === "non-current assets") {
+    return {
+      ...base,
+      recommended_model_row: preferred("Other Non-Current Assets"),
+      classification_type: "investment securities asset",
+      is_current: false,
+      is_operating: false,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Investment securities are asset investments, not shareholder equity, even when the SEC concept contains the word equity."
     };
   }
 
@@ -865,11 +886,21 @@ function classificationPassesValidation(request: FinancialLineItemClassification
   if (modelRowsMatch(row, "Deferred Income Taxes") && !classification.is_deferred_tax) return false;
   if ((modelRowsMatch(row, "Accrued Liabilities") || modelRowsMatch(row, "Other Current Liabilities")) && classification.is_debt) return false;
   if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /inventor|spare parts?|aircraft fuel|supplies|short[-\s]?term investments?|marketable securities|available[-\s]?for[-\s]?sale securities/.test(text)) return false;
-  if (request.section === "current assets" && !modelRowsMatch(row, "Cash & Cash Equivalents") && !modelRowsMatch(row, "Accounts Receivable") && !modelRowsMatch(row, "Inventory") && !modelRowsMatch(row, "Prepaid & Other Current Assets")) return false;
+  if (modelRowsMatch(row, "Common Stock & APIC") && /\binvestment securities\b|\bdebt and equity securities\b|\bavailable[-\s]?for[-\s]?sale securities\b|\bmarketable securities\b/.test(text)) return false;
+  if (request.section === "current assets" && !modelRowsMatch(row, "Cash & Cash Equivalents") && !modelRowsMatch(row, "Short-Term Investments") && !modelRowsMatch(row, "Accounts Receivable") && !modelRowsMatch(row, "Inventory") && !modelRowsMatch(row, "Prepaid & Other Current Assets")) return false;
   if (request.section === "non-current assets" && !modelRowsMatch(row, "PP&E, Net") && !modelRowsMatch(row, "Intangible Assets, Net") && !modelRowsMatch(row, "Goodwill") && !modelRowsMatch(row, "Other Non-Current Assets")) return false;
   if (request.section === "current liabilities" && !modelRowsMatch(row, "Accounts Payable") && !modelRowsMatch(row, "Accrued Liabilities") && !modelRowsMatch(row, "Other Current Liabilities") && !modelRowsMatch(row, "Revolver") && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)")) return false;
   if (request.section === "non-current liabilities" && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)") && !modelRowsMatch(row, "Deferred Income Taxes") && !modelRowsMatch(row, "Other Non-Current Liabilities")) return false;
   if (request.section === "equity" && !modelRowsMatch(row, "Common Stock & APIC") && !modelRowsMatch(row, "Retained Earnings") && !modelRowsMatch(row, "Treasury Stock") && !modelRowsMatch(row, "AOCI") && !modelRowsMatch(row, "Noncontrolling Interests")) return false;
+  if (
+    request.statement === "balance_sheet" &&
+    !balanceSheetSectionCompatible(row, request.section, {
+      label: request.cleanLabel || request.reportedLineItemLabel,
+      tag: request.xbrlTag
+    })
+  ) {
+    return false;
+  }
   return true;
 }
 
