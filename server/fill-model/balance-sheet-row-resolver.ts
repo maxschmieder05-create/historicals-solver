@@ -546,7 +546,7 @@ export function classifyBalanceSheetResolution(input: BalanceSheetResolvedCellIn
     input.classification === "residual" ||
     /\bresidual\b|\bderived\b|\bcalculated\b|\bless\b|\bexcluding\b|\bminus\b/i.test(text) ||
     Boolean(definition?.residualEligible && sources.length > 1);
-  if (looksResidual && definition?.residualEligible !== false && nonModelSources.length) {
+  if (looksResidual && definition?.residualEligible === true && nonModelSources.length) {
     return {
       state: "residual_calculated",
       canonicalModelRow,

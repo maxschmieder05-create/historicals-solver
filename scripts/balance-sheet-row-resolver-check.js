@@ -99,4 +99,20 @@ const explicitZero = classifyBalanceSheetResolution({
 });
 assert.equal(explicitZero.state, "explicit_zero_not_applicable");
 
+const componentDebt = classifyBalanceSheetResolution({
+  modelRow: "Revolver",
+  value: 457100000,
+  classification: "grouped",
+  sources: [
+    {
+      concept: "LongTermDebtAndCapitalLeaseObligationsCurrent",
+      label: "Notes payable and current maturities of long-term debt",
+      value: 457100000,
+      sourceLayer: "sec_filing_package"
+    }
+  ],
+  note: "Current maturities/current portion of long-term debt are grouped into the current borrowing row."
+});
+assert.equal(componentDebt.state, "direct_sec_sourced");
+
 console.log("Balance-sheet row resolver regression passed.");
