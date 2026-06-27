@@ -119,6 +119,35 @@ async function classify(overrides) {
   assert.equal(deferredIncome.is_deferred_revenue_or_contract_liability, true);
   assert.equal(deferredIncome.is_deferred_tax, false);
 
+  const longTermUnearnedRevenue = await classify({
+    label: "Long-term unearned revenue",
+    xbrlTag: "ContractWithCustomerLiabilityNoncurrent",
+    section: "current liabilities",
+    deterministicCandidate: "Other Current Liabilities"
+  });
+  assert.equal(longTermUnearnedRevenue.recommended_model_row, "Other Non-Current Liabilities");
+  assert.equal(longTermUnearnedRevenue.is_current, false);
+
+  const longTermIncomeTaxes = await classify({
+    label: "Long-term income taxes",
+    xbrlTag: "AccruedIncomeTaxesNoncurrent",
+    section: "current liabilities",
+    deterministicCandidate: "Accrued Liabilities"
+  });
+  assert.equal(longTermIncomeTaxes.recommended_model_row, "Other Non-Current Liabilities");
+  assert.equal(longTermIncomeTaxes.is_current, false);
+  assert.equal(longTermIncomeTaxes.is_tax_related, true);
+
+  const shortTermIncomeTaxes = await classify({
+    label: "Short-term income taxes",
+    xbrlTag: "AccruedIncomeTaxesCurrent",
+    section: "current liabilities",
+    deterministicCandidate: "Other Current Liabilities"
+  });
+  assert.equal(shortTermIncomeTaxes.recommended_model_row, "Accrued Liabilities");
+  assert.equal(shortTermIncomeTaxes.is_current, true);
+  assert.equal(shortTermIncomeTaxes.is_tax_related, true);
+
   const deferredTax = await classify({
     label: "Deferred tax liabilities",
     section: "non-current liabilities",

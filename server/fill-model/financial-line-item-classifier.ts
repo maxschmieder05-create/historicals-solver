@@ -495,6 +495,8 @@ function deterministicFinancialLineItemClassification(
   const base = baseClassification(request);
   const preferred = (...rows: string[]) => rows.find((row) => modelRowAvailable(row, request.availableModelRows)) ?? rows[0];
   const hasCurrentInvestmentsRow = request.availableModelRows.some((row) => /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(row));
+  const explicitNonCurrent = /\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent/.test(text.replace(/[^a-z0-9]/g, ""));
+  const effectiveCurrent = current === null && explicitNonCurrent ? false : current;
   const isDeferredTaxLine = /\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text);
   const textLooksDeferredTaxAsset = /\bassets?\b/.test(text);
   const textLooksDeferredTaxLiability = /\bliabilit/.test(text);
@@ -528,16 +530,43 @@ function deterministicFinancialLineItemClassification(
   }
 
   if (/\bdeferred (?:income|revenue)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b/.test(text)) {
+    const row = section === "non-current liabilities" || explicitNonCurrent ? preferred("Other Non-Current Liabilities") : preferred("Other Current Liabilities");
     return {
       ...base,
-      recommended_model_row: section === "non-current liabilities" ? preferred("Other Non-Current Liabilities") : preferred("Other Current Liabilities"),
+      recommended_model_row: row,
       classification_type: "deferred revenue or contract liability",
-      is_current: current,
+      is_current: modelRowsMatch(row, "Other Non-Current Liabilities") ? false : effectiveCurrent,
       is_tax_related: false,
       is_deferred_revenue_or_contract_liability: true,
       should_exclude_from_other_bucket: false,
       confidence: "high",
       reason: "Deferred income/revenue is a contract liability, not deferred income taxes."
+    };
+  }
+
+  if (!explicitNonCurrent && /\bshort[-\s]?term\b.*\bincome taxes?\b|\bincome taxes?\b.*\bcurrent\b|\baccrued income taxes current\b|\bincome taxes payable\b|\btaxes payable\b/.test(text)) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Accrued Liabilities"),
+      classification_type: "current income tax payable",
+      is_current: true,
+      is_tax_related: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Short-term income taxes payable are current accrued tax liabilities."
+    };
+  }
+
+  if (explicitNonCurrent && /\bincome taxes?\b|\btaxes payable\b/.test(text) && !isDeferredTaxLine) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Other Non-Current Liabilities"),
+      classification_type: "non-current income tax payable",
+      is_current: false,
+      is_tax_related: true,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Long-term income taxes payable are non-current tax liabilities, not current accrued liabilities."
     };
   }
 

@@ -3007,15 +3007,15 @@ function statementSectionForRow(
       value: typeof row.value === "number" ? row.value : 0
     };
     const parent = `${row.parentSubtotal?.concept ?? ""} ${row.parentSubtotal?.label ?? ""}`.toLowerCase();
+    const category = reportedLineItemCategory(source);
+    if (category === "non_current_liabilities") return "non-current liabilities";
+    if (category === "current_liabilities") return "current liabilities";
     if (row.currentNonCurrentSection === "current" && /asset|assetscurrent/.test(parent)) return "current assets";
     if (row.currentNonCurrentSection === "non_current" && /asset/.test(parent)) return "non-current assets";
     if (row.currentNonCurrentSection === "current" && /liabilit|liabilitiescurrent/.test(parent)) return "current liabilities";
     if (row.currentNonCurrentSection === "non_current" && /liabilit/.test(parent)) return "non-current liabilities";
-    const category = reportedLineItemCategory(source);
     if (category === "current_assets") return "current assets";
     if (category === "non_current_assets") return "non-current assets";
-    if (category === "current_liabilities") return "current liabilities";
-    if (category === "non_current_liabilities") return "non-current liabilities";
     if (category === "equity") return "equity";
     return "unknown";
   }
@@ -3173,18 +3173,20 @@ function primaryRowInNonCurrentAssetSection(row: PrimaryBalanceSheetRow, source:
 
 function primaryRowInCurrentLiabilitySection(row: PrimaryBalanceSheetRow, source: FactSource) {
   const parent = primaryRowParentConcept(row);
+  const category = reportedLineItemCategory(source);
+  if (category === "non_current_liabilities" || category === "total_liabilities" || category === "equity") return false;
   if (parent === "LiabilitiesCurrent") return true;
-  if (row.currentNonCurrentSection === "current" && reportedLineItemCategory(source) === "current_liabilities") return true;
-  return reportedLineItemCategory(source) === "current_liabilities";
+  if (row.currentNonCurrentSection === "current" && category === "current_liabilities") return true;
+  return category === "current_liabilities";
 }
 
 function primaryRowInNonCurrentLiabilitySection(row: PrimaryBalanceSheetRow, source: FactSource) {
   const parent = primaryRowParentConcept(row);
   const category = reportedLineItemCategory(source);
-  if (category === "current_assets" || category === "non_current_assets" || category === "total_assets" || category === "equity") return false;
+  if (category === "non_current_liabilities") return true;
+  if (category === "current_assets" || category === "non_current_assets" || category === "total_assets" || category === "current_liabilities" || category === "equity") return false;
   if (parent === "Liabilities" && !primaryRowInCurrentLiabilitySection(row, source) && !isPrimaryBalanceSheetSubtotalSource(source)) return true;
-  if (row.currentNonCurrentSection === "non_current") return category === "non_current_liabilities";
-  return category === "non_current_liabilities";
+  return row.currentNonCurrentSection === "non_current";
 }
 
 function sourceTextMatches(source: FactSource, pattern: RegExp) {
@@ -3215,6 +3217,7 @@ function sourceLooksLikeOtherCurrentLiability(source: FactSource) {
 }
 
 function sourceLooksLikeAccruedOperatingLiability(source: FactSource) {
+  if (sourceLooksLikeOtherNonCurrentLiability(source) || sourceTextMatches(source, /\bnon[-\s]?current\b|\blong[-\s]?term\b/)) return false;
   if (balanceSheetRowMatchesSourceAlias("Accrued Liabilities", source.label) || balanceSheetRowMatchesSourceAlias("Accrued Liabilities", source.concept)) return true;
   if (C.accrued.includes(source.concept)) return true;
   return sourceTextMatches(
@@ -3255,7 +3258,7 @@ function sourceLooksLikeOtherNonCurrentLiability(source: FactSource) {
   if (BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
-    /\bother\b.*\bnon[-\s]?current liabilit|\bother\b.*\blong[-\s]?term liabilit|\bnon[-\s]?current\b.*\bother liabilit|\blong[-\s]?term operating lease liabilit|\boperating lease\b.*\bliabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\boperating lease\b.*\bliabilit|\bother insurance liabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\bother insurance liabilit|\bother long[-\s]?term insurance liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
+    /\bother\b.*\bnon[-\s]?current liabilit|\bother\b.*\blong[-\s]?term liabilit|\bnon[-\s]?current\b.*\bother liabilit|\blong[-\s]?term operating lease liabilit|\boperating lease\b.*\bliabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\boperating lease\b.*\bliabilit|\bother insurance liabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\bother insurance liabilit|\bother long[-\s]?term insurance liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\blong[-\s]?term\b.*\b(?:unearned revenue|deferred revenue|deferred income|contract liabilit|income taxes?)\b|\b(?:unearned revenue|deferred revenue|deferred income|contract liabilit|income taxes?)\b.*\blong[-\s]?term\b|\basset retirement obligations?\b/
   );
 }
 
@@ -3381,7 +3384,7 @@ function primaryAccruedLiabilitySources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
     if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
     return (
-      (primaryRowInCurrentLiabilitySection(row, source) || sourceLooksLikeAccruedOperatingLiability(source)) &&
+      primaryRowInCurrentLiabilitySection(row, source) &&
       sourceLooksLikeAccruedOperatingLiability(source) &&
       !sourceLooksLikeAccountsPayable(source) &&
       !sourceLooksLikeCurrentDebtLine(source) &&
@@ -3412,6 +3415,7 @@ function primaryOtherCurrentLiabilitySources(period: string, ctx: ResolveContext
     const inCurrentLiabilitySection = primaryRowInCurrentLiabilitySection(row, source);
     const hasNoDedicatedCurrentLiabilityRow =
       inCurrentLiabilitySection &&
+      !sourceLooksLikeOtherNonCurrentLiability(source) &&
       !sourceLooksLikeAccountsPayable(source) &&
       (currentLeaseLiability || !sourceLooksLikeCurrentDebtLine(source)) &&
       !sourceLooksLikeAccruedOperatingLiability(source);
@@ -12502,6 +12506,15 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
   if (isAllowanceOrRollForwardTranslationSource(source)) return "cash_flow_or_support";
 
+  if (
+    [...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS, ...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS].includes(concept) ||
+    /\bnoncurrent liabilit|\bnon-current liabilit|\blong[- ]term debt|\blong[-\s]?term operating lease liabilit|\bdeferred tax liabilit|\bdeferred income taxes\b|\blong[-\s]?term\b.*\b(?:income taxes?|unearned revenue|deferred revenue|deferred income|contract liabilit)\b|\b(?:income taxes?|unearned revenue|deferred revenue|deferred income|contract liabilit)\b.*\blong[-\s]?term\b/.test(text)
+  ) return "non_current_liabilities";
+  if (
+    [...C.accrued, ...BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS, ...OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS].includes(concept) ||
+    /\bshort[-\s]?term\b.*\b(?:income taxes?|unearned revenue|deferred revenue|deferred income|contract liabilit)\b|\b(?:income taxes?|unearned revenue|deferred revenue|deferred income|contract liabilit)\b.*\bcurrent\b|\baccrued income taxes current\b/.test(text)
+  ) return "current_liabilities";
+
   if (/OtherNonOperatingIncomeExpense(?:Residual|FromReportedLine|FromPreTaxBridge)/i.test(concept)) return "other_non_operating_income_expense";
   if (/OperatingIncomeDerivedFromPreTaxBridge/i.test(concept)) return "operating_income";
   if (/IncomeTaxExpenseBenefitDerived/i.test(concept)) return "income_tax";
@@ -12550,7 +12563,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (C.assets.includes(concept)) return "total_assets";
   if (
     [...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS, ...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS].includes(concept) ||
-    /\bnoncurrent liabilit|\bnon-current liabilit|\blong[- ]term debt|\blong[-\s]?term operating lease liabilit|\bdeferred tax liabilit|\bdeferred income taxes\b|\bpension liabilit|\bpostretirement\b|\bother insurance liabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\bother insurance liabilit|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\basset retirement obligations?\b/.test(text)
+    /\bnoncurrent liabilit|\bnon-current liabilit|\blong[- ]term debt|\blong[-\s]?term operating lease liabilit|\bdeferred tax liabilit|\bdeferred income taxes\b|\blong[-\s]?term\b.*\b(?:income taxes?|unearned revenue|deferred revenue|deferred income|contract liabilit)\b|\b(?:income taxes?|unearned revenue|deferred revenue|deferred income|contract liabilit)\b.*\blong[-\s]?term\b|\bpension liabilit|\bpostretirement\b|\bother insurance liabilit.*\bnon[-\s]?current\b|\bnon[-\s]?current\b.*\bother insurance liabilit|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\basset retirement obligations?\b/.test(text)
   ) return "non_current_liabilities";
   if (
     [...C.ap, ...C.accrued, ...C.customerDeposits, ...C.currentLiabilities, ...C.currentDebt, ...BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS, ...OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS].includes(concept) ||
@@ -20306,7 +20319,7 @@ function validateBalanceSheetSubtotalEqualsComponents(
     const componentCells = componentRows.map((rowNumber) => sheet.getCell(rowNumber, col));
     const protectedFormula = isProtectedFormulaOrCheckCell(totalCell) || componentCells.some((cell) => isProtectedFormulaOrCheckCell(cell));
     const total = evaluatedCellNumber(totalCell, evaluator);
-    const components = componentCells.map((cell) => evaluatedCellNumber(cell, evaluator));
+    const components = componentRows.map((rowNumber) => balanceSheetSubtotalComponentValue(sheet, rowNumber, col, evaluator));
     if (total === null || components.some((value) => value === null)) return;
     const baseExpected = (components as number[]).reduce((sumValue, value) => sumValue + value, 0);
     let expected = baseExpected;
@@ -20331,7 +20344,7 @@ function validateBalanceSheetSubtotalEqualsComponents(
         return;
       }
       if (metricName === "total current liabilities" && currentLiabilitiesSubtotalExcludesDebtLabel(totalLabel)) {
-        warnings.unshift(`${message} The SEC current-liabilities subtotal was preserved; component presentation differs because current debt is modeled outside this subtotal.`);
+        errors.push(`${message} The current-liabilities subtotal excludes debt, so the non-debt component rows must reconcile before output.`);
         return;
       }
       if (metricName === "total liabilities") {
@@ -20344,6 +20357,34 @@ function validateBalanceSheetSubtotalEqualsComponents(
   });
 
   return errors;
+}
+
+function balanceSheetSubtotalComponentValue(
+  sheet: ExcelJS.Worksheet,
+  rowNumber: number,
+  col: number,
+  evaluator: FormulaEvaluator
+) {
+  const cell = sheet.getCell(rowNumber, col);
+  if (hasFormula(cell) && !isBalanceSheetSubtotalRowLabel(rowLabel(sheet, rowNumber))) {
+    const cached = numericCellValue(cell);
+    if (cached !== null) return cached;
+  }
+  return evaluatedCellNumber(cell, evaluator);
+}
+
+function isBalanceSheetSubtotalRowLabel(label: string) {
+  return (
+    isTotalAssetsLabel(label) ||
+    isTotalCurrentAssetsLabel(label) ||
+    isTotalNonCurrentAssetsLabel(label) ||
+    isCurrentLiabilitiesSubtotalLabel(label) ||
+    isTotalNonCurrentLiabilitiesLabel(label) ||
+    isTotalLiabilitiesLabel(label) ||
+    isTotalLiabilitiesAndEquityLabel(label) ||
+    isTotalStockholdersEquityLabel(label) ||
+    isTotalEquityLabel(label)
+  );
 }
 
 function balanceSheetCurrentLiabilitiesSubtotalExcludesDebt(sheet: ExcelJS.Worksheet) {
@@ -22029,12 +22070,28 @@ export function sourceLedgerStatusForAuditRow(row: MappingAuditRow): SourceLedge
 function sourceLedgerRowIsExplicitZeroNoSource(row: MappingAuditRow, text: string) {
   if (Math.abs(row.valueWritten) > 0.0001) return false;
   if (row.mappingType === "cleared") return false;
+  const hasModelZeroResolverSupport = /zero\/derived model support value with no direct SEC fact/i.test(text) && conceptsUsedAreAllZero(row.conceptsUsed);
+  const hasGeneratedZeroConceptSupport = conceptsUsedAreAllZero(row.conceptsUsed) && !/cleared|stale|unsupported|prior hardcoded/i.test(text);
   const hasNoSourceZeroEvidence =
     /NoCurrentSecSource|NotReported|NoSource|no current SEC source|no source disclosed|not reported|not applicable|no separate\b.*\breported|explicit(?:ly)?\s+(?:set|sourced)?\s*(?:as\s+)?zero/i.test(
       text
     );
+  if (hasModelZeroResolverSupport || hasGeneratedZeroConceptSupport) return true;
   if (!hasNoSourceZeroEvidence) return false;
   return !row.accession || /NoCurrentSecSource|NotReported|NoSource/i.test(text);
+}
+
+function conceptsUsedAreAllZero(conceptsUsed: string) {
+  const entries = conceptsUsed
+    .split(";")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+  if (!entries.length) return false;
+  return entries.every((entry) => {
+    const match = entry.match(/=(-?\d+(?:\.\d+)?)mm\b/i);
+    if (!match) return false;
+    return Math.abs(Number(match[1])) <= 0.0001;
+  });
 }
 
 async function validateHistoricalSourceLedger(

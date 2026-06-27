@@ -72,6 +72,51 @@ assert.equal(
     auditRow({
       modelRowLabel: "Deferred Income Taxes",
       conceptsUsed: "DeferredIncomeTaxLiabilitiesNet=0mm",
+      accession: "0000059478-26-000013",
+      formulaStatus: "not a formula cell",
+      validationStatus: "warning: Value is a zero/derived model support value with no direct SEC fact.",
+      notes: ""
+    })
+  ),
+  "explicit_zero_no_source_disclosed",
+  "zero-valued balance-sheet resolver support should count as explicit zero even when the ledger inherits a filing accession"
+);
+
+assert.equal(
+  sourceLedgerStatusForAuditRow(
+    auditRow({
+      modelRowLabel: "Noncontrolling Interests",
+      conceptsUsed: "MinorityInterest=0mm",
+      accession: "0000059478-26-000013",
+      formulaStatus: "not a formula cell",
+      validationStatus: "warning: Value is a zero/derived model support value with no direct SEC fact.",
+      notes: ""
+    })
+  ),
+  "explicit_zero_no_source_disclosed",
+  "zero-valued noncontrolling-interest resolver support should not block workbook output"
+);
+
+assert.equal(
+  sourceLedgerStatusForAuditRow(
+    auditRow({
+      modelRowLabel: "Deferred Income Taxes",
+      conceptsUsed: "DeferredIncomeTaxLiabilitiesNet=0mm",
+      accession: "",
+      formulaStatus: "not a formula cell",
+      validationStatus: "",
+      notes: ""
+    })
+  ),
+  "explicit_zero_no_source_disclosed",
+  "annual copied zero-valued balance-sheet concept support should remain valid even after explanatory notes are dropped"
+);
+
+assert.equal(
+  sourceLedgerStatusForAuditRow(
+    auditRow({
+      modelRowLabel: "Deferred Income Taxes",
+      conceptsUsed: "DeferredIncomeTaxLiabilitiesNet=0mm",
       formulaStatus: "not a formula cell",
       validationStatus: "warning: Value is a zero/derived model support value with no direct SEC fact.",
       notes: "No separate deferred tax liability was reported in the SEC balance sheet for this period."

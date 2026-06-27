@@ -486,21 +486,30 @@ export function classifyBalanceSheetSourceSection(
   source: { label?: string; tag?: string; concept?: string } = {}
 ): BalanceSheetSourceSection {
   const section = String(sourceSection ?? "").toLowerCase();
+  const text = `${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  const compact = normalizeBalanceSheetKey(text);
+  const isCurrentDebtPortion =
+    /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|\blong[-\s]?term debt\b.*\bcurrent\b|\bdebt due within one year\b/.test(text) ||
+    /longtermdebtcurrent|currentmaturitiesoflongtermdebt|currentportionoflongtermdebt/.test(compact);
+  const isExplicitNonCurrent = (/\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent|longterm/.test(compact)) && !isCurrentDebtPortion;
+  const isExplicitCurrent = isCurrentDebtPortion || /\bcurrent\b/.test(text) || (/current/.test(compact) && !/noncurrent/.test(compact));
+  const isAsset = /\bassets?\b/.test(text) || /asset/.test(compact);
+  const isLiability = /\bliabilit(?:y|ies)\b|\bpayable\b|\bdebt\b|\bborrowings?\b|\bobligations?\b/.test(text) || /liabilit|payable|debt|borrowing|obligation/.test(compact);
   if (section === "current assets" || section === "non-current assets" || section === "current liabilities" || section === "non-current liabilities" || section === "equity") {
+    if (section === "current liabilities" && isExplicitNonCurrent && isLiability) return "non-current liabilities";
+    if (section === "non-current liabilities" && isExplicitCurrent && !isExplicitNonCurrent && isLiability) return "current liabilities";
+    if (section === "current assets" && isExplicitNonCurrent && isAsset && !isLiability) return "non-current assets";
+    if (section === "non-current assets" && isExplicitCurrent && !isExplicitNonCurrent && isAsset && !isLiability) return "current assets";
     return section as BalanceSheetSourceSection;
   }
 
-  const text = `${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
-  const compact = normalizeBalanceSheetKey(text);
   if (/cashandduefrombanks|duefrombanks|interestbearingdeposits?inbanks?/.test(compact)) return "current assets";
   if (/shortterminvestments?|marketablesecurities|availableforsalesecurities|debtandequitysecurities|investmentsecurities/.test(compact)) {
     return /current/.test(compact) ? "current assets" : "non-current assets";
   }
   if (/stockholders?equity|shareholders?equity|retainedearnings|treasurystock|aoci|noncontrollinginterest|commonstock|additionalpaidincapital/.test(compact)) return "equity";
-  const isCurrent = /\bcurrent\b/.test(text) || /current/.test(compact);
-  const isNonCurrent = /\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent|longterm/.test(compact);
-  const isAsset = /\bassets?\b/.test(text) || /asset/.test(compact);
-  const isLiability = /\bliabilit(?:y|ies)\b|\bpayable\b|\bdebt\b|\bborrowings?\b|\bobligations?\b/.test(text) || /liabilit|payable|debt|borrowing|obligation/.test(compact);
+  const isCurrent = isExplicitCurrent;
+  const isNonCurrent = isExplicitNonCurrent;
   if (isCurrent && isAsset && !isLiability) return "current assets";
   if (isNonCurrent && isAsset && !isLiability) return "non-current assets";
   if (isCurrent && isLiability) return "current liabilities";

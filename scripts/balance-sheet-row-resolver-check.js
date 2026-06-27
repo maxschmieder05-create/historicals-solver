@@ -45,6 +45,20 @@ assert.equal(
   }),
   false
 );
+assert.equal(
+  balanceSheetSectionCompatible("Other Current Liabilities", "current liabilities", {
+    label: "Long-term unearned revenue",
+    tag: "ContractWithCustomerLiabilityNoncurrent"
+  }),
+  false
+);
+assert.equal(
+  balanceSheetSectionCompatible("Other Non-Current Liabilities", "current liabilities", {
+    label: "Long-term unearned revenue",
+    tag: "ContractWithCustomerLiabilityNoncurrent"
+  }),
+  true
+);
 assert.equal(balanceSheetLineLooksSubtotalLike("Accrued expenses and other current liabilities", "AccruedLiabilitiesCurrent"), true);
 
 const disappearingPeriods = [
