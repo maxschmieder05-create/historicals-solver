@@ -5,6 +5,7 @@ export type LiabilityTemplateRow = {
 };
 
 export type TemplateMappingContext = {
+  hasCashAndCurrentInvestmentRow: boolean;
   hasCurrentInvestmentRow: boolean;
   hasCurrentDebtRow: boolean;
   hasCurrentDebtMaturitiesRow: boolean;
@@ -150,6 +151,17 @@ export function buildLiabilityTemplateMappingContext(rows: LiabilityTemplateRow[
     ]);
 
   return {
+    hasCashAndCurrentInvestmentRow: hasAnyLabel([
+      /^cashandshortterminvestments$/,
+      /^cashshortterminvestments$/,
+      /^cashandshortterminvestmentsecurities$/,
+      /^cashandcurrentinvestments$/,
+      /^cashcurrentinvestments$/,
+      /^cashandmarketablesecurities$/,
+      /^cashmarketablesecurities$/,
+      /^cashcashequivalentsandshortterminvestments$/,
+      /^cashandcashequivalentsandshortterminvestments$/
+    ]),
     hasCurrentInvestmentRow:
       hasAnyConcept(CURRENT_INVESTMENT_CONCEPTS) ||
       hasAnyLabel([
