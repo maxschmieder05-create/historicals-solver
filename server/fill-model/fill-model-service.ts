@@ -2381,6 +2381,10 @@ function sourceCompactText(source: FactSource) {
   return normalize(sourceSearchText(source));
 }
 
+function sourceIsDollarSource(source: FactSource) {
+  return !source.unit || /usd/i.test(source.unit);
+}
+
 function isPrimaryIncomeStatementStructure(statement: SecFilingStatementStructure) {
   if (statement.sourceTableType !== "primary_statement") return false;
   const text = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
@@ -2466,7 +2470,7 @@ function primaryIncomeStatementSourcesForPeriod(period: string, ctx: ResolveCont
     primaryIncomeStatementRowsForPeriod(period, ctx)
       .map((item) => {
         const source = factSourceFromStatementRow(item.row, period);
-        return source && primaryIncomeStatementRowIsAboveOperatingIncome(item.statement, item.row) ? source : null;
+        return source && sourceIsDollarSource(source) && primaryIncomeStatementRowIsAboveOperatingIncome(item.statement, item.row) ? source : null;
       })
       .filter((source): source is FactSource => Boolean(source))
   );
@@ -3247,7 +3251,7 @@ function sourceLooksLikeAccruedOperatingLiability(source: FactSource) {
   if (C.accrued.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
-    /\baccrued\b|\bpharmacy claims?\b|\bdiscounts payable\b|\bhealth care costs? payable\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\bincome taxes payable\b|\btaxes payable\b/
+    /\baccrued\b|\bpharmacy claims?\b|\bdiscounts payable\b|\bhealth care costs? payable\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\bincome taxes payable\b|\btaxes payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b|\bsales incentives?\b/
   );
 }
 
@@ -3511,10 +3515,16 @@ function sourceMatchesPrimaryStatementRow(source: FactSource, row: SecFilingStat
 }
 
 function primaryStatementOperatingIncomeOrder(statement: SecFilingStatementStructure) {
-  return firstPrimaryStatementRowOrder(statement, (row) =>
-    C.operatingIncome.includes(row.xbrlConcept ?? "") ||
-    /\boperating\b.*\b(income|profit|loss|earnings)\b|\b(income|profit|loss|earnings)\b.*\boperations?\b/.test(row.rowLabel.toLowerCase())
-  );
+  return firstPrimaryStatementRowOrder(statement, (row) => {
+    const label = row.rowLabel.toLowerCase();
+    const concept = row.xbrlConcept ?? "";
+    if (/\b(?:continuing|discontinued) operations?\b|\bper share\b|\bbasic\b|\bdiluted\b/.test(label)) return false;
+    const isOperatingIncomeConcept = /operatingincomeloss|operatingincome|income from operations/i.test(concept) && !/nonoperating|beforeincometax|continuingoperations/i.test(concept);
+    return (
+      isOperatingIncomeConcept ||
+      /\boperating\b.*\b(income|profit|loss|earnings)\b|\b(income|profit|loss|earnings)\s+from\s+operations?\b/.test(label)
+    );
+  });
 }
 
 function primaryStatementTotalRevenueOrder(statement: SecFilingStatementStructure) {
@@ -3536,6 +3546,25 @@ function primaryStatementPreTaxIncomeOrder(statement: SecFilingStatementStructur
   );
 }
 
+function primaryStatementFirstBelowOperatingSentinelOrder(statement: SecFilingStatementStructure) {
+  const pretaxOrder = primaryStatementPreTaxIncomeOrder(statement);
+  return firstPrimaryStatementRowOrder(statement, (row) => {
+    if (pretaxOrder !== null && row.rowOrder >= pretaxOrder) return false;
+    const source: FactSource = {
+      concept: row.xbrlConcept ?? "",
+      label: row.rowLabel,
+      value: typeof row.value === "number" ? row.value : 0
+    };
+    const category = reportedLineItemCategory(source);
+    return (
+      category === "interest_income" ||
+      category === "interest_expense" ||
+      category === "other_non_operating_income_expense" ||
+      isBelowOperatingLineLabel(row.rowLabel)
+    );
+  });
+}
+
 function firstPrimaryStatementRowOrder(statement: SecFilingStatementStructure, predicate: (row: SecFilingStatementStructure["rows"][number]) => boolean) {
   const orders = statement.rows.filter(predicate).map((row) => row.rowOrder);
   return orders.length ? Math.min(...orders) : null;
@@ -3545,6 +3574,8 @@ function primaryIncomeStatementRowIsAboveOperatingIncome(statement: SecFilingSta
   const operatingOrder = primaryStatementOperatingIncomeOrder(statement);
   if (operatingOrder !== null) return row.rowOrder < operatingOrder;
   const pretaxOrder = primaryStatementPreTaxIncomeOrder(statement);
+  const belowOperatingStart = primaryStatementFirstBelowOperatingSentinelOrder(statement);
+  if (belowOperatingStart !== null) return row.rowOrder < belowOperatingStart && (pretaxOrder === null || row.rowOrder < pretaxOrder);
   if (pretaxOrder !== null) return row.rowOrder < pretaxOrder && !isBelowOperatingLineLabel(row.rowLabel);
   return !isBelowOperatingLineLabel(row.rowLabel);
 }
@@ -3570,12 +3601,35 @@ function primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement: SecFil
   if (operatingOrder !== null && row.rowOrder <= operatingOrder) return false;
   if (pretaxOrder !== null && row.rowOrder >= pretaxOrder) return false;
   if (operatingOrder !== null && pretaxOrder !== null) return true;
-  return isBelowOperatingLineLabel(row.rowLabel);
+  if (isBelowOperatingLineLabel(row.rowLabel)) return true;
+  if (operatingOrder === null) {
+    const belowOperatingStart = primaryStatementFirstBelowOperatingSentinelOrder(statement);
+    if (belowOperatingStart !== null && row.rowOrder > belowOperatingStart) {
+      const source: FactSource = {
+        concept: row.xbrlConcept ?? "",
+        label: row.rowLabel,
+        value: typeof row.value === "number" ? row.value : 0
+      };
+      const category = reportedLineItemCategory(source);
+      return ![
+        "revenue",
+        "cost_of_revenue",
+        "research_and_development",
+        "selling_general_administrative",
+        "income_statement_depreciation_amortization",
+        "operating_income",
+        "pretax_income",
+        "income_tax",
+        "net_income"
+      ].includes(category);
+    }
+  }
+  return false;
 }
 
 function isBelowOperatingLineLabel(label: string) {
   const text = label.toLowerCase();
-  return /\b(non[-\s]?operating|interest|investment gains?|investment losses?|equity investments?|equity securities?|equity method|foreign exchange|foreign currency|other income|other expense|other-net|debt extinguishment)\b/.test(text);
+  return /\b(non[-\s]?operating|interest|investment gains?|investment losses?|equity investments?|equity securities?|equity method|foreign exchange|foreign currency|other\s*\(?income\)?\s*expense|other\s*\(?expense\)?\s*income|other income|other expense|other-net|debt extinguishment)\b/.test(text);
 }
 
 function isStandaloneIncomeStatementDaRow(row: SecFilingStatementStructure["rows"][number]) {
@@ -3600,6 +3654,7 @@ function sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period: string, c
   if (isComprehensiveIncomeSource(source)) return false;
   const rows = primaryIncomeStatementRowsForSource(period, ctx, source);
   if (!rows.length) return !ctx.filingPackageStatements?.length && explicitOperatingLineFallback(source);
+  if (rows.some(({ statement, row }) => primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row))) return false;
   return rows.some(({ statement, row }) => primaryIncomeStatementRowIsAboveOperatingIncome(statement, row));
 }
 
@@ -3885,6 +3940,12 @@ function broadOtherExpenseAndIncomeValue(source: FactSource) {
 function otherNonOperatingValue(source: FactSource) {
   if (BROAD_OTHER_EXPENSE_AND_INCOME_CONCEPTS.includes(source.concept)) return broadOtherExpenseAndIncomeValue(source);
   const text = sourceSearchText(source);
+  if (
+    /\b(restructuring|impairment|special charges?|special items?|integration costs?|business realignment|acquisition[-\s]?related charges?|litigation|settlement|debt extinguishment)\b/.test(text) &&
+    !/\b(gain|income|benefit)\b/.test(text)
+  ) {
+    return expenseAsModelReduction(source.value);
+  }
   if (/\bother\b.*\bexpense\b|\bexpense\b.*\bother\b/.test(text) && !/\bincome\b|\bgain\b|\bloss\b|\bnet\b/.test(text)) {
     return expenseAsModelReduction(source.value);
   }
@@ -3944,6 +4005,16 @@ function resolveOperatingIncome(period: string, ctx: ResolveContext): ResolvedVa
 }
 
 function resolveInterestIncome(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryStatementSources = primaryStatementInterestIncomeSources(period, ctx);
+  if (primaryStatementSources.length) {
+    return {
+      value: primaryStatementSources.reduce((total, source) => total + source.value, 0),
+      sources: primaryStatementSources,
+      note: "Summed standalone primary income-statement interest income components reported below operating income.",
+      classification: primaryStatementSources.length > 1 ? "grouped" : "direct"
+    };
+  }
+
   const direct = acceptedSourceForModelRow(period, ctx, firstSemanticDurationSource(period, ctx, C.interestIncome, interestIncomeScore), "Interest Income");
   if (!direct) {
     return {
@@ -3986,6 +4057,26 @@ function resolveInterestIncome(period: string, ctx: ResolveContext): ResolvedVal
     note: "Mapped to EDGAR interest income using concept semantics, filing labels, and the company's reported sign convention.",
     classification: C.interestIncome.includes(direct.concept) ? "direct" : "grouped"
   };
+}
+
+function primaryStatementInterestIncomeSources(period: string, ctx: ResolveContext) {
+  if (!ctx.filingPackageStatements?.length) return [];
+  return withAcceptedModelRowClassifications(
+    period,
+    ctx,
+    uniqueFactSources(
+      primaryIncomeStatementRowsForPeriod(period, ctx)
+        .map(({ statement, row }) => {
+          const source = factSourceFromStatementRow(row, period);
+          if (!source || !sourceIsDollarSource(source)) return null;
+          if (!isExplicitInterestIncomeSource(source) || interestIncomeAlreadyIncludedInOtherIncomeBridge(source)) return null;
+          if (!primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row)) return null;
+          return source;
+        })
+        .filter((source): source is FactSource => Boolean(source))
+    ),
+    "Interest Income"
+  );
 }
 
 function interestIncomeAlreadyIncludedInOtherIncomeBridge(source: FactSource) {
@@ -4059,20 +4150,21 @@ function primaryIncomeStatementStructuresAvailable(ctx: ResolveContext) {
 
 function primaryStatementInterestExpenseSources(period: string, ctx: ResolveContext) {
   if (!ctx.filingPackageStatements?.length) return [];
-  const facts = ctx.duration.get(period);
-  if (!facts) return [];
   return withAcceptedModelRowClassifications(
     period,
     ctx,
     uniquePrimaryIncomeStatementLineSources(
       period,
       ctx,
-      Array.from(facts.values()).filter(
-        (source) =>
-          isExplicitInterestExpenseSource(source) &&
-          !isCombinedInterestAndOtherIncomeSource(source) &&
-          sourceHasStandalonePrimaryIncomeStatementInterestExpenseComponentLine(period, ctx, source)
-      )
+      primaryIncomeStatementRowsForPeriod(period, ctx)
+        .map(({ statement, row }) => {
+          const source = factSourceFromStatementRow(row, period);
+          if (!source || !sourceIsDollarSource(source)) return null;
+          if (!isExplicitInterestExpenseSource(source) || isCombinedInterestAndOtherIncomeSource(source)) return null;
+          if (!primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row)) return null;
+          return source;
+        })
+        .filter((source): source is FactSource => Boolean(source))
     ),
     "Interest Expense"
   );
@@ -4287,6 +4379,7 @@ function isOtherNonOperatingPrimaryStatementSource(source: FactSource) {
   const concept = source.concept;
   const text = sourceSearchText(source);
   if (isAllowanceOrRollForwardTranslationSource(source)) return false;
+  if (isOperatingSpecialChargeSource(source)) return true;
   if (sourceIsSeparatelyModeledOperatingExpense(source)) return false;
   if (isEquityMethodIncomeSource(source)) return true;
   if (
@@ -12595,16 +12688,36 @@ function expectedReportedLineItemCategory(fillRow: FillRow): ReportedLineItemCat
   return null;
 }
 
+function reportedLineItemCategoryFromAcceptedClassification(source: FactSource): ReportedLineItemCategory | null {
+  const classification = source.lineItemClassification;
+  if (!classification?.mapping_passed_validation) return null;
+  const row = classification.recommended_model_row;
+  if (modelRowsMatch(row, "Revenue")) return "revenue";
+  if (modelRowsMatch(row, "COGS / Cost of Goods Sold")) return "cost_of_revenue";
+  if (modelRowsMatch(row, "R&D")) return "research_and_development";
+  if (modelRowsMatch(row, "SG&A")) return "selling_general_administrative";
+  if (modelRowsMatch(row, "D&A")) return "income_statement_depreciation_amortization";
+  if (modelRowsMatch(row, "Other Operating Income / Expense")) return "other_operating_income_expense";
+  if (modelRowsMatch(row, "Interest Income")) return "interest_income";
+  if (modelRowsMatch(row, "Interest Expense")) return "interest_expense";
+  if (modelRowsMatch(row, "Other Non-Operating Income / Expense")) return "other_non_operating_income_expense";
+  if (modelRowsMatch(row, "Income Tax Benefit / Expense")) return "income_tax";
+  if (modelRowsMatch(row, "Net Income")) return "net_income";
+  return null;
+}
+
 function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory {
   const concept = source.concept;
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
   const labelAndNote = `${source.label || ""} ${source.note || ""}`.toLowerCase();
+  const acceptedClassificationCategory = reportedLineItemCategoryFromAcceptedClassification(source);
 
   if (/^segment:/i.test(concept) || /\bsegment\b|external customer|external revenue|reportable segment|\bmember\b/.test(labelAndNote)) return "segment_only";
   if (source.sourceLayer === "model") return "cash_flow_or_support";
   if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
   if (isAllowanceOrRollForwardTranslationSource(source)) return "cash_flow_or_support";
+  if (acceptedClassificationCategory) return acceptedClassificationCategory;
 
   if (
     [...C.deferredTaxLiability, ...PENSION_LIABILITY_CONCEPTS, ...NONCURRENT_DEBT_CONCEPTS, ...NONCURRENT_LEASE_LIABILITY_CONCEPTS, ...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS].includes(concept) ||

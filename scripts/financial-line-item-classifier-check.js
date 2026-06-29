@@ -206,10 +206,10 @@ async function classify(overrides) {
     deterministicCandidate: "Prepaid & Other Current Assets",
     availableModelRows: availableModelRows.filter((row) => !/short[-\s]?term investments?|current investments?|marketable securities/i.test(row))
   });
-  assert.equal(shortTermInvestments.recommended_model_row, "Cash & Cash Equivalents");
+  assert.equal(shortTermInvestments.recommended_model_row, "Prepaid & Other Current Assets");
   assert.equal(
     classificationModelRowAssignmentForPrimaryStatement(shortTermInvestments, availableModelRows).modelRow,
-    "Cash & Cash Equivalents"
+    "Prepaid & Other Current Assets"
   );
 
   const marketableSecurities = await classify({
@@ -218,7 +218,7 @@ async function classify(overrides) {
     deterministicCandidate: "Prepaid & Other Current Assets",
     availableModelRows: availableModelRows.filter((row) => !/short[-\s]?term investments?|current investments?|marketable securities/i.test(row))
   });
-  assert.equal(marketableSecurities.recommended_model_row, "Cash & Cash Equivalents");
+  assert.equal(marketableSecurities.recommended_model_row, "Prepaid & Other Current Assets");
 
   const iprd = await classify({
     label: "Acquired in-process research and development",
@@ -228,6 +228,43 @@ async function classify(overrides) {
     deterministicCandidate: "D&A"
   });
   assert.notEqual(iprd.recommended_model_row, "D&A");
+
+  const iprdImpairment = await classify({
+    label: "In-process research and development impairments",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    deterministicCandidate: "R&D"
+  });
+  assert.equal(iprdImpairment.recommended_model_row, "Other Operating Income / Expense");
+
+  const rdExcludingAcquiredInProcessCost = await classify({
+    label: "Research and Development Expense (Excluding Acquired in Process Cost)",
+    xbrlTag: "ResearchAndDevelopmentExpenseExcludingAcquiredInProcessCost",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    deterministicCandidate: "R&D"
+  });
+  assert.equal(rdExcludingAcquiredInProcessCost.recommended_model_row, "R&D");
+
+  const belowOperatingRestructuring = await classify({
+    label: "Restructuring",
+    statement: "income_statement",
+    section: "below operating income",
+    periodType: "duration",
+    deterministicCandidate: "Other Operating Income / Expense"
+  });
+  assert.equal(belowOperatingRestructuring.recommended_model_row, "Other Non-Operating Income / Expense");
+
+  const accruedRebates = await classify({
+    label: "Accrued rebates, returns and promotions",
+    statement: "balance_sheet",
+    section: "current liabilities",
+    periodType: "instant",
+    deterministicCandidate: "Other Current Liabilities"
+  });
+  assert.equal(accruedRebates.recommended_model_row, "Accrued Liabilities");
 
   const cashFlowDa = await classify({
     label: "Depreciation and amortization",

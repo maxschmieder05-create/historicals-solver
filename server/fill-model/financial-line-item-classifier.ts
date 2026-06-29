@@ -551,6 +551,25 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
+  if (
+    request.statement === "balance_sheet" &&
+    effectiveCurrent !== false &&
+    !explicitNonCurrent &&
+    /\baccrued\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b|\bdiscounts payable\b/.test(text) &&
+    !/\baccounts? payable\b|\btrade payables?\b|\bdeferred (?:income|revenue)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\bdebt\b|\bborrowings?\b|\bnotes?\b/.test(text)
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Accrued Liabilities"),
+      classification_type: "accrued operating current liability",
+      is_current: true,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Accrued compensation, payroll, taxes, rebates, returns, promotions, and similar operating accruals belong in accrued liabilities, not the other-current-liabilities bucket."
+    };
+  }
+
   if (!explicitNonCurrent && /\bshort[-\s]?term\b.*\bincome taxes?\b|\bincome taxes?\b.*\bcurrent\b|\baccrued income taxes current\b|\bincome taxes payable\b|\btaxes payable\b/.test(text)) {
     return {
       ...base,
@@ -694,36 +713,22 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
-  if (/\bacquired\b.*\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bipr&d\b|\biprd\b/.test(text)) {
+  const excludesAcquiredInProcessCost =
+    /\bexclud(?:e|es|ing)\b.*\bacquired\b.*\bin[-\s]?process\b.*\bcost\b/.test(text) ||
+    /researchanddevelopmentexpenseexcludingacquiredinprocesscost/i.test(request.xbrlTag ?? "");
+  if (!excludesAcquiredInProcessCost && /\bacquired\b.*\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bipr&d\b|\biprd\b/.test(text)) {
     const row = modelRowAvailable("Other Operating Income / Expense", request.availableModelRows)
       ? "Other Operating Income / Expense"
       : preferred("R&D");
     return {
       ...base,
       recommended_model_row: row,
-      classification_type: "acquired in-process R&D",
+      classification_type: "in-process R&D charge",
       is_current: null,
       is_operating: true,
       should_exclude_from_other_bucket: row !== "Other Operating Income / Expense",
       confidence: "high",
-      reason: "Acquired in-process R&D is not depreciation or amortization; classify it as R&D or another operating item based on template convention."
-    };
-  }
-
-  if (
-    request.statement === "income_statement" &&
-    request.section === "operating expenses" &&
-    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(text)
-  ) {
-    return {
-      ...base,
-      recommended_model_row: preferred("COGS / Cost of Goods Sold"),
-      classification_type: "direct operating cost or cost of revenue",
-      is_current: null,
-      is_operating: true,
-      should_exclude_from_other_bucket: true,
-      confidence: "high",
-      reason: "Primary income-statement cost of revenue/sales/goods/services lines belong in COGS / Cost of Goods Sold."
+      reason: "In-process R&D charges and impairments are not depreciation or amortization; classify them as R&D or another operating item based on template convention."
     };
   }
 
@@ -741,6 +746,23 @@ function deterministicFinancialLineItemClassification(
       should_exclude_from_other_bucket: true,
       confidence: "high",
       reason: "Research, product development, engineering, and technology development expenses belong in R&D when reported as operating expenses."
+    };
+  }
+
+  if (
+    request.statement === "income_statement" &&
+    request.section === "operating expenses" &&
+    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(text)
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("COGS / Cost of Goods Sold"),
+      classification_type: "direct operating cost or cost of revenue",
+      is_current: null,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "Primary income-statement cost of revenue/sales/goods/services lines belong in COGS / Cost of Goods Sold."
     };
   }
 
@@ -943,6 +965,7 @@ function classificationPassesValidation(request: FinancialLineItemClassification
   if (request.section === "current liabilities" && !modelRowsMatch(row, "Accounts Payable") && !modelRowsMatch(row, "Accrued Liabilities") && !modelRowsMatch(row, "Other Current Liabilities") && !modelRowsMatch(row, "Revolver") && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)")) return false;
   if (request.section === "non-current liabilities" && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)") && !modelRowsMatch(row, "Deferred Income Taxes") && !modelRowsMatch(row, "Other Non-Current Liabilities")) return false;
   if (request.section === "equity" && !modelRowsMatch(row, "Common Stock & APIC") && !modelRowsMatch(row, "Retained Earnings") && !modelRowsMatch(row, "Treasury Stock") && !modelRowsMatch(row, "AOCI") && !modelRowsMatch(row, "Noncontrolling Interests")) return false;
+  if (modelRowsMatch(row, "Other Current Liabilities") && /\baccrued\b.*\b(rebates?|returns?|promotions?|compensation|payroll|tax(?:es)?)\b/.test(text)) return false;
   if (
     request.statement === "balance_sheet" &&
     !balanceSheetSectionCompatible(row, request.section, {

@@ -911,11 +911,11 @@ function statementNameFromHtmlContext(html: string, tableHtml: string, tableInde
   return cleanStatementLabel(tableText.slice(0, 120)) || "SEC Filing Table";
 }
 
-function classifySourceTableType(text: string, roleUri = ""): SecFilingStatementSourceTableType {
+export function classifySourceTableType(text: string, roleUri = ""): SecFilingStatementSourceTableType {
   const haystack = `${text} ${roleUri}`.toLowerCase();
   if (/\b(segment|reportable segment|geographic|disaggregation of revenue|external customers)\b/.test(haystack)) return "segment_table";
   if (/\b(rollforward|roll forward|changes in|schedule of)\b/.test(haystack)) return "roll_forward";
-  if (/\b(balance sheets?|statements? of operations|statements? of income|income statements?|statements? of cash flows|cash flow statements?|statements? of stockholders|statements? of financial position|comprehensive income)\b/.test(haystack)) return "primary_statement";
+  if (/\b(balance sheets?|statements? of operations|statements? of income|statements? of earnings|income statements?|earnings statements?|statements? of cash flows|cash flow statements?|statements? of stockholders|statements? of financial position|comprehensive income)\b/.test(haystack)) return "primary_statement";
   if (/\b(note|notes to|supplemental|schedule)\b/.test(haystack)) return "footnote";
   if (/\b(parenthetical|detail|document and entity information)\b/.test(haystack)) return "support_table";
   return "unknown";

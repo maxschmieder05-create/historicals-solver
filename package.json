@@ -12,6 +12,7 @@
     "test:financial-company-regression": "node scripts/financial-company-regression-check.js",
     "test:liability-rules": "node scripts/liability-classification-rules-check.js",
     "test:line-item-classifier": "node scripts/financial-line-item-classifier-check.js",
+    "test:sec-filing-package-classification": "node scripts/sec-filing-package-classification-check.js",
     "test:amzn-liability-regression": "node scripts/amzn-liability-regression-check.js",
     "test:syk-random-validation": "node scripts/syk-random-validation-check.js",
     "test:mck-random-validation": "node scripts/mck-random-validation-check.js",
