@@ -1316,6 +1316,10 @@ const NONCONTROLLING_INCOME_CONCEPTS = [
 ];
 
 const EQUITY_METHOD_INCOME_CONCEPTS = ["IncomeLossFromEquityMethodInvestments"];
+const DISCONTINUED_OPERATIONS_INCOME_CONCEPTS = [
+  "IncomeLossFromDiscontinuedOperationsNetOfTax",
+  "IncomeLossFromDiscontinuedOperationsNetOfTaxAttributableToReportingEntity"
+];
 
 const POST_TAX_ADJUSTMENT_CONCEPTS = [
   "PreferredStockDividendsIncomeStatementImpact",
@@ -2083,6 +2087,9 @@ const PRIMARY_COST_OF_REVENUE_CONCEPTS = [
 ];
 
 function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryStatementCost = resolvePrimaryStatementCostOfRevenue(period, ctx);
+  if (primaryStatementCost.value !== null && primaryStatementHasCostOfRevenueSplitWithSeparateDa(period, ctx)) return primaryStatementCost;
+
   const direct = first(period, ctx.duration, PRIMARY_COST_OF_REVENUE_CONCEPTS);
   if (direct) {
     return {
@@ -2093,7 +2100,6 @@ function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValu
     };
   }
 
-  const primaryStatementCost = resolvePrimaryStatementCostOfRevenue(period, ctx);
   if (primaryStatementCost.value !== null) return primaryStatementCost;
 
   const directOperatingCosts = resolveDirectOperatingCostLines(period, ctx);
@@ -2261,6 +2267,13 @@ function sourceIsSeparatelyModeledOperatingExpense(source: FactSource) {
   if (isAcquiredInProcessResearchDevelopmentSource(source)) return true;
   if (isOperatingSpecialChargeSource(source)) return true;
   const text = sourceSearchText(source);
+  const isCostOfRevenueLine =
+    [...C.cogs, ...DIRECT_OPERATING_COST_CONCEPTS, ...PRIMARY_COST_OF_REVENUE_CONCEPTS].includes(source.concept) ||
+    /\bcost\b.*\b(?:sales|revenue|goods|services|products|operations?)\b|\b(?:sales|revenue|goods|services|products|operations?)\b.*\bcost\b/.test(text);
+  const isDaText = /\b(depreciation|amortization|depletion)\b/.test(text);
+  if (isCostOfRevenueLine && (!isDaText || /\b(excluding|exclusive of|excluding depreciation)\b.*\b(depreciation|amortization|depletion)\b/.test(text))) {
+    return false;
+  }
   if ([...C.sga, ...SALES_MARKETING_EXPENSE_CONCEPTS, ...GENERAL_ADMINISTRATIVE_EXPENSE_CONCEPTS].includes(source.concept)) return true;
   if (TECHNOLOGY_CONTENT_RD_CONCEPTS.includes(source.concept)) return true;
   if (INCOME_STATEMENT_DA_CONCEPTS.includes(source.concept)) return true;
@@ -3640,6 +3653,8 @@ function isStandaloneIncomeStatementDaRow(row: SecFilingStatementStructure["rows
     /\bdepreciation\b.*\bamortization\b|\bamortization\b.*\bdepreciation\b/.test(text) ||
     /\bdepreciation (?:expense|depletion|and amortization)\b/.test(text) ||
     /\bamortization expense\b/.test(text) ||
+    /\bamortization\b.*\bacquisition[-\s]?related intangibles?\b|\bacquisition[-\s]?related intangibles?\b.*\bamortization\b/.test(text) ||
+    /\bamortization\b.*\b(?:intangible|intangibles)\b|\b(?:intangible|intangibles)\b.*\bamortization\b/.test(text) ||
     /\bdepreciation, depletion and amortization\b/.test(text)
   );
 }
@@ -3921,6 +3936,8 @@ function incomeTaxScore(source: FactSource) {
 function netIncomeScore(source: FactSource) {
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
+  if (/other(non)?operatingincomeexpense|otherincome|otherexpense|nonoperatingincomeexpense|equitymethod|incomelossfromequitymethod|discontinuedoperations/i.test(compact)) return 0;
+  if (/\bother\b.*\b(?:income|expense|gain|loss)\b|\b(?:income|expense|gain|loss)\b.*\bother\b|\bdiscontinued operations?\b|\bequity method\b|\binvestee\b/.test(text)) return 0;
   if (/comprehensiveincome|earningspershare|noncontrollinginterest|minorityinterest|commonstockholders|commonshareholders/.test(compact)) return 0;
   let score = conceptScore(source, CONTINUING_NET_INCOME_CONCEPTS);
   if (/\bnet\b.*\b(?:income|loss|earnings)\b|\b(?:income|loss|earnings)\b.*\bnet\b/.test(text)) score += 8;
@@ -4404,6 +4421,11 @@ function isEquityMethodIncomeSource(source: FactSource) {
   if (EQUITY_METHOD_INCOME_CONCEPTS.includes(source.concept)) return true;
   const text = sourceSearchText(source);
   return /\b(equity method|unconsolidated (?:affiliate|entity|entities|investee|joint venture)s?)\b/.test(text) && /\b(income|loss|earnings?)\b/.test(text);
+}
+
+function isDiscontinuedOperationsIncomeSource(source: FactSource) {
+  if (DISCONTINUED_OPERATIONS_INCOME_CONCEPTS.includes(source.concept)) return true;
+  return sourceTextMatches(source, /\bincome\b.*\bdiscontinued operations?\b|\bdiscontinued operations?\b.*\b(?:income|loss)\b/);
 }
 
 function isAllowanceOrRollForwardTranslationSource(source: FactSource) {
@@ -4980,6 +5002,29 @@ function resolveResearchDevelopmentExpense(period: string, ctx: ResolveContext):
 }
 
 function resolveIncomeStatementDepreciationAmortization(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryStatementSources = withAcceptedModelRowClassifications(
+    period,
+    ctx,
+    uniquePrimaryIncomeStatementLineSources(
+      period,
+      ctx,
+      primaryIncomeStatementRowsForPeriod(period, ctx)
+        .filter(({ statement, row }) => isStandaloneIncomeStatementDaRow(row) && primaryIncomeStatementRowIsAboveOperatingIncome(statement, row))
+        .map(({ row }) => factSourceFromStatementRow(row, period))
+        .filter((source): source is FactSource => Boolean(source && sourceIsDollarSource(source)))
+    ),
+    "D&A"
+  );
+  if (primaryStatementSources.length) {
+    return {
+      value: -primaryStatementSources.reduce((total, source) => total + Math.abs(source.value), 0),
+      sources: primaryStatementSources,
+      note:
+        "Mapped from standalone D&A/amortization rows parsed from the primary income statement, including extension-tagged acquisition-related intangible amortization rows.",
+      classification: primaryStatementSources.length > 1 ? "grouped" : "direct"
+    };
+  }
+
   const candidates = uniqueFactSources(
     INCOME_STATEMENT_DA_CONCEPTS.map((concept) => first(period, ctx.duration, [concept])).filter(
       (source): source is FactSource => Boolean(source)
@@ -5077,7 +5122,8 @@ function equityMethodIncomeBelongsInPostTaxBridge(period: string, ctx: ResolveCo
   const tax = directIncomeTaxExpenseSource(period, ctx);
   const netIncome = directNetIncomeSource(period, ctx);
   if (pretax.value !== null && tax && netIncome) {
-    const bridgeAmount = netIncome.value - (pretax.value - tax.value);
+    const discontinued = first(period, ctx.duration, DISCONTINUED_OPERATIONS_INCOME_CONCEPTS);
+    const bridgeAmount = netIncome.value - (pretax.value - tax.value) - (discontinued?.value ?? 0);
     return statementMetricTies(bridgeAmount / 1_000_000, source.value / 1_000_000);
   }
 
@@ -13294,41 +13340,102 @@ function reconcilePostTaxEquityMethodNetIncomeBridge(
   const taxRow = findIncomeStatementMetricRow(sheet, ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"]);
   const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
   const postTaxRow = findIncomeStatementMetricRow(sheet, ["Post-Tax Adjustments", "Preferred Stock Dividend"]);
+  const discontinuedOperationsRow = findIncomeStatementMetricRow(sheet, ["Discontinued Operations"]);
   const adjustedNetIncomeRow = findIncomeStatementMetricRow(sheet, ["Adj. Net Income (Loss)", "Adjusted Net Income", "Adj. Net Income"]);
-  if (!pretaxRow || !taxRow || !netIncomeRow || !postTaxRow || !adjustedNetIncomeRow) return { filledCells, warnings };
-  if (!(taxRow < netIncomeRow && netIncomeRow < postTaxRow && postTaxRow < adjustedNetIncomeRow)) return { filledCells, warnings };
+  if (!pretaxRow || !taxRow || !netIncomeRow || !adjustedNetIncomeRow) return { filledCells, warnings };
 
   periods.forEach((period, index) => {
+    const bridgeItems: Array<{
+      rowNumber: number;
+      value: number;
+      resolved: ResolvedValue;
+      auditLabel: string;
+      formulaStatusLabel: string;
+    }> = [];
+
     const equityMethod = first(period, ctx.duration, EQUITY_METHOD_INCOME_CONCEPTS);
-    if (!equityMethod || Math.abs(equityMethod.value) < 1) return;
-    if (!equityMethodIncomeBelongsInPostTaxBridge(period, ctx, equityMethod)) return;
+    if (
+      postTaxRow &&
+      netIncomeRow < postTaxRow &&
+      postTaxRow < adjustedNetIncomeRow &&
+      equityMethod &&
+      Math.abs(equityMethod.value) >= 1 &&
+      equityMethodIncomeBelongsInPostTaxBridge(period, ctx, equityMethod)
+    ) {
+      bridgeItems.push({
+        rowNumber: postTaxRow,
+        value: equityMethod.value / 1_000_000,
+        resolved: {
+          value: equityMethod.value,
+          sources: [equityMethod],
+          note: "Mapped separately reported equity-method income/loss as a post-tax adjustment.",
+          classification: "direct"
+        },
+        auditLabel: "post-tax equity-method income",
+        formulaStatusLabel: "SEC post-tax equity-method income"
+      });
+    }
+
+    const discontinued = first(period, ctx.duration, DISCONTINUED_OPERATIONS_INCOME_CONCEPTS);
+    if (
+      discontinuedOperationsRow &&
+      netIncomeRow < discontinuedOperationsRow &&
+      discontinuedOperationsRow < adjustedNetIncomeRow &&
+      discontinued &&
+      Math.abs(discontinued.value) >= 1
+    ) {
+      bridgeItems.push({
+        rowNumber: discontinuedOperationsRow,
+        value: discontinued.value / 1_000_000,
+        resolved: {
+          value: discontinued.value,
+          sources: [discontinued],
+          note: "Mapped reported income/loss from discontinued operations as a post-tax net-income bridge item.",
+          classification: "direct"
+        },
+        auditLabel: "discontinued operations",
+        formulaStatusLabel: "SEC discontinued operations"
+      });
+    }
+
+    if (!bridgeItems.length) return;
     const col = columns[index];
     const netIncome = resolveNetIncome(period, ctx);
     if (netIncome.value === null) return;
 
     const netIncomeCell = sheet.getCell(netIncomeRow, col);
     const netIncomeFormula = formulaForCell(netIncomeCell);
-    const postTaxCell = sheet.getCell(postTaxRow, col);
     const adjustedCell = sheet.getCell(adjustedNetIncomeRow, col);
     if (!netIncomeFormula || netIncomeFormula.includes("!") || !hasFormula(adjustedCell)) return;
 
-    const postTaxValue = equityMethod.value / 1_000_000;
-    if (numericCellValue(postTaxCell) === null || !exactModelValueTies(numericCellValue(postTaxCell)!, postTaxValue)) {
-      if (!isProtectedFormulaOrCheckCell(postTaxCell) && isHardcodedFinancialInput(postTaxCell)) {
-        postTaxCell.value = postTaxValue;
-        const postTaxResolved: ResolvedValue = {
-          value: equityMethod.value,
-          sources: [equityMethod],
-          note: "Mapped separately reported equity-method income/loss as a post-tax adjustment.",
-          classification: "direct"
-        };
-        auditRows.push(mappingAuditRow(sheet, postTaxCell, plug(postTaxRow, rowLabel(sheet, postTaxRow), "income", "duration", resolvePostTaxAdjustments, "direct"), period, postTaxValue, postTaxResolved, "high", lineItemMappingSentence(rowLabel(sheet, postTaxRow), postTaxResolved)));
+    for (const item of bridgeItems) {
+      const bridgeCell = sheet.getCell(item.rowNumber, col);
+      if (numericCellValue(bridgeCell) !== null && exactModelValueTies(numericCellValue(bridgeCell)!, item.value)) continue;
+      if (!isProtectedFormulaOrCheckCell(bridgeCell) && isHardcodedFinancialInput(bridgeCell)) {
+        bridgeCell.value = item.value;
+        const bridgeRowLabel = rowLabel(sheet, item.rowNumber);
+        const resolver = /discontinued operations/i.test(bridgeRowLabel)
+          ? resolveDiscontinuedOperationsBridge
+          : resolvePostTaxAdjustments;
+        auditRows.push(
+          mappingAuditRow(
+            sheet,
+            bridgeCell,
+            plug(item.rowNumber, bridgeRowLabel, "income", "duration", resolver, "direct"),
+            period,
+            item.value,
+            item.resolved,
+            "high",
+            lineItemMappingSentence(bridgeRowLabel, item.resolved)
+          )
+        );
         filledCells += 1;
       }
     }
 
     const netIncomeValue = netIncome.value / 1_000_000;
-    const netIncomeBridgeFormula = `${columnLetter(col)}${pretaxRow}+${columnLetter(col)}${taxRow}+${columnLetter(col)}${postTaxRow}`;
+    const bridgeFormulaTerms = bridgeItems.map((item) => `${columnLetter(col)}${item.rowNumber}`);
+    const netIncomeBridgeFormula = [`${columnLetter(col)}${pretaxRow}`, `${columnLetter(col)}${taxRow}`, ...bridgeFormulaTerms].join("+");
     if (formulaForCell(netIncomeCell) !== netIncomeBridgeFormula || !exactModelValueTies(numericCellValue(netIncomeCell) ?? NaN, netIncomeValue)) {
       netIncomeCell.value = { formula: netIncomeBridgeFormula, result: netIncomeValue };
       const source = resolvedAuditSource(period, "net incomeResolved", "Resolved EDGAR net income", netIncome);
@@ -13340,26 +13447,33 @@ function reconcilePostTaxEquityMethodNetIncomeBridge(
         netIncomeValue,
         source,
         "income",
-        "Updated the preserved net-income formula to include separately reported post-tax equity-method income so the GAAP net-income anchor ties to EDGAR."
+        "Updated the preserved net-income formula to include separately reported post-tax primary-statement bridge items so the GAAP net-income anchor ties to EDGAR."
       );
       auditRow.formulaPreserved = true;
-      auditRow.formulaStatus = "formula bridge updated to include SEC post-tax equity-method income";
+      auditRow.formulaStatus = `formula bridge updated to include ${unique(bridgeItems.map((item) => item.formulaStatusLabel)).join(" and ")}`;
       auditRows.push(auditRow);
       filledCells += 1;
     }
 
-    const adjustedFormula = sumFormulaExcludingRow(col, netIncomeRow, adjustedNetIncomeRow - 1, postTaxRow);
+    const excludedRows = new Set(bridgeItems.map((item) => item.rowNumber));
+    const adjustedFormula = sumFormulaExcludingRows(col, netIncomeRow, adjustedNetIncomeRow - 1, excludedRows);
     const adjustedFormulaBefore = formulaForCell(adjustedCell);
     if (!adjustedFormulaBefore || adjustedFormulaBefore.includes("!")) return;
     const evaluator = new FormulaEvaluator(sheet, { skipCrossSheetFormulas: true });
     let adjustedResult = 0;
     for (let rowNumber = netIncomeRow; rowNumber < adjustedNetIncomeRow; rowNumber += 1) {
-      if (rowNumber === postTaxRow) continue;
+      if (excludedRows.has(rowNumber)) continue;
       adjustedResult += numericCellValue(sheet.getCell(rowNumber, col)) ?? evaluator.evaluateCell(sheet.getCell(rowNumber, col)) ?? 0;
     }
     if (adjustedFormulaBefore !== adjustedFormula || !exactModelValueTies(numericCellValue(adjustedCell) ?? NaN, adjustedResult)) {
       adjustedCell.value = { formula: adjustedFormula, result: adjustedResult };
-      const bridge = bridgeSource(period, "AdjustedNetIncomeFormulaExcludingEquityMethodDoubleCount", "Adjusted net income formula excluding post-tax equity-method double count", adjustedResult * 1_000_000, [netIncome, equityMethod]);
+      const bridge = bridgeSource(
+        period,
+        "AdjustedNetIncomeFormulaExcludingPostTaxBridgeDoubleCount",
+        "Adjusted net income formula excluding post-tax bridge rows already included in GAAP net income",
+        adjustedResult * 1_000_000,
+        [netIncome, ...bridgeItems.map((item) => item.resolved)]
+      );
       const auditRow = statementTotalAuditRow(
         sheet,
         adjustedCell,
@@ -13368,10 +13482,10 @@ function reconcilePostTaxEquityMethodNetIncomeBridge(
         adjustedResult,
         bridge,
         "income",
-        "Updated the adjusted-net-income formula to exclude the post-tax equity-method row already included in GAAP net income."
+        "Updated the adjusted-net-income formula to exclude post-tax bridge rows already included in GAAP net income."
       );
       auditRow.formulaPreserved = true;
-      auditRow.formulaStatus = "formula bridge updated to avoid double-counting SEC post-tax equity-method income";
+      auditRow.formulaStatus = "formula bridge updated to avoid double-counting SEC post-tax bridge rows";
       auditRows.push(auditRow);
       filledCells += 1;
     }
@@ -13379,18 +13493,22 @@ function reconcilePostTaxEquityMethodNetIncomeBridge(
 
   if (filledCells) {
     warnings.push(
-      `Income Statement: updated ${filledCells} formula/input cell(s) so separately reported equity-method income bridges below pre-tax income without being double counted.`
+      `Income Statement: updated ${filledCells} formula/input cell(s) so separately reported post-tax primary-statement items bridge to net income without being double counted.`
     );
   }
   return { filledCells, warnings };
 }
 
 function sumFormulaExcludingRow(col: number, startRow: number, endRow: number, excludedRow: number) {
+  return sumFormulaExcludingRows(col, startRow, endRow, new Set([excludedRow]));
+}
+
+function sumFormulaExcludingRows(col: number, startRow: number, endRow: number, excludedRows: Set<number>) {
   const colLetter = columnLetter(col);
   const ranges: string[] = [];
   let rangeStart: number | null = null;
   for (let row = startRow; row <= endRow; row += 1) {
-    if (row === excludedRow) {
+    if (excludedRows.has(row)) {
       if (rangeStart !== null) ranges.push(formatFormulaRange(colLetter, rangeStart, row - 1));
       rangeStart = null;
       continue;
@@ -19043,6 +19161,49 @@ function assignPrimaryBalanceSheetLineItem(
     return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E component rows such as land, buildings, improvements, machinery, and equipment map to PP&E even when SEC section context is weak.");
   }
 
+  if (section === "current liabilities" || primaryRowInCurrentLiabilitySection(row, source)) {
+    if (sourceLooksLikeAccountsPayable(source)) {
+      return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
+    }
+    if (sourceLooksLikeCurrentLeaseLiability(source)) {
+      return chooseOther(
+        "Other Current Liabilities",
+        ["Other Current Liabs"],
+        "Current lease liabilities are grouped into other current liabilities when the template has no dedicated current lease row."
+      );
+    }
+    if (sourceLooksLikeCurrentDebtMaturity(source)) {
+      return choose("LT Debt (Incl. Current Portion)", ["Long-Term Debt", "Long Term Debt", "Borrowings"], "Current maturities/current portion of long-term debt are grouped into LT Debt including current portion.");
+    }
+    if (genericDebtCurrentBelongsInDebtInclCurrentRow(source, ctx)) {
+      return choose(
+        "LT Debt (Incl. Current Portion)",
+        ["Long-Term Debt", "Long Term Debt", "Borrowings"],
+        "Generic DebtCurrent maps to LT Debt including current portion when the template has no separate current debt row."
+      );
+    }
+    if (genericCurrentDebtBelongsInCurrentMaturities(source, reportedStandaloneShortTermBorrowingSource(period, ctx), ctx)) {
+      return choose(
+        "LT Debt (Incl. Current Portion)",
+        ["Long-Term Debt", "Long Term Debt", "Borrowings"],
+        "Generic current debt maps to LT Debt including current portion when the template has no separate current debt row."
+      );
+    }
+    if (sourceLooksLikeShortTermBorrowing(source)) {
+      return choose("Revolver", ["Short-Term Borrowings", "Short Term Borrowings", "Current Borrowings"], "Short-term borrowings and notes payable map to Revolver/current borrowings.");
+    }
+    if (sourceLooksLikeOtherCurrentLiability(source)) {
+      return chooseOther(
+        "Other Current Liabilities",
+        ["Other Current Liabs"],
+        "Current liability line has no more dedicated model row, so it is grouped into other current liabilities."
+      );
+    }
+    if (sourceLooksLikeAccruedOperatingLiability(source)) {
+      return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
+    }
+  }
+
   const classifiedAssignment = classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows, section);
   if (classifiedAssignment) return classifiedAssignment;
 
@@ -19544,6 +19705,52 @@ function assignPrimaryIncomeStatementLineItem(
     };
   }
 
+  if (isEquityMethodIncomeSource(source) && equityMethodIncomeBelongsInPostTaxBridge(period, ctx, source)) {
+    const postTaxRow = availableIncomeStatementModelRow(fillRows, "Post-Tax Adjustments", [
+      "Preferred Stock Dividend",
+      "Equity Income",
+      "Equity Income in Investee",
+      "Equity Method Income"
+    ]);
+    if (postTaxRow) {
+      return {
+        modelRow: postTaxRow,
+        status: "grouped_into_model_row",
+        reason:
+          "Separately reported equity-method income below the income-tax line maps to the post-tax bridge so reported pre-tax income and GAAP net income both tie to EDGAR."
+      };
+    }
+    return chooseOther(
+      "Other Non-Operating Income / Expense",
+      ["Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)"],
+      "Equity-method income is a below-operating item and is grouped into other non-operating income/expense when no post-tax bridge row exists."
+    );
+  }
+
+  if (isDiscontinuedOperationsIncomeSource(source)) {
+    const discontinuedRow = availableIncomeStatementModelRow(fillRows, "Discontinued Operations", [
+      "Income from Discontinued Operations",
+      "Discontinued Operations, Net of Tax"
+    ]);
+    if (discontinuedRow) {
+      return {
+        modelRow: discontinuedRow,
+        status: "grouped_into_model_row",
+        reason:
+          "Income from discontinued operations is a reported post-tax primary-statement bridge item and maps to the template's Discontinued Operations row when present."
+      };
+    }
+    const postTaxRow = availableIncomeStatementModelRow(fillRows, "Post-Tax Adjustments", ["Preferred Stock Dividend"]);
+    if (postTaxRow) {
+      return {
+        modelRow: postTaxRow,
+        status: "grouped_into_model_row",
+        reason:
+          "Income from discontinued operations is a post-tax primary-statement bridge item and groups into Post-Tax Adjustments when the template has no dedicated discontinued-operations row."
+      };
+    }
+  }
+
   const exclusionReason = primaryIncomeStatementAssignmentExclusionReason(period, ctx, source, row, section);
   if (exclusionReason) {
     return {
@@ -19635,7 +19842,6 @@ function classifiedPrimaryIncomeStatementAssignment(
   fillRows: FillRow[]
 ): PrimaryIncomeStatementAssignment | null {
   const classification = lineItemClassificationForSource(period, ctx, source);
-  if (classification && !classification.llm_used) return null;
   const availableRows = fillRows.filter((row) => row.statement === "income" && row.kind === "duration").map((row) => row.label);
   const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
   if (!assignment) return null;
@@ -19659,6 +19865,8 @@ function incomeStatementAssignmentAmount(source: FactSource, modelRow: string | 
   if (modelRowsMatch(modelRow, "Income Tax Benefit / Expense")) return -source.value;
   if (modelRowsMatch(modelRow, "Other Operating Income / Expense")) return otherOperatingLineValue(source);
   if (modelRowsMatch(modelRow, "Other Non-Operating Income / Expense")) return otherNonOperatingValue(source);
+  if (modelRowsMatch(modelRow, "Post-Tax Adjustments")) return source.value;
+  if (modelRowsMatch(modelRow, "Discontinued Operations")) return source.value;
   return source.value;
 }
 
@@ -19697,7 +19905,9 @@ function incomeStatementAssignmentModelRowIsAssignable(modelRow: string | null) 
     "Interest Expense",
     "Goodwill Impairment",
     "Other Non-Operating Income / Expense",
-    "Income Tax Benefit / Expense"
+    "Income Tax Benefit / Expense",
+    "Post-Tax Adjustments",
+    "Discontinued Operations"
   ].some((candidate) => modelRowsMatch(modelRow, candidate));
 }
 
@@ -19759,12 +19969,50 @@ function primaryIncomeStatementRevenueComponentCoveredByTotal(
 function primaryIncomeStatementCostComponentCoveredByTotal(period: string, ctx: ResolveContext, source: FactSource, row: PrimaryIncomeStatementRow) {
   if (reportedLineItemCategory(source) !== "cost_of_revenue") return false;
   if (!row.dimensions.length && !row.parentSubtotal && (C.cogs.includes(source.concept) || sourceTextMatches(source, /\b(total )?cost of (revenue|sales|goods|services|products)\b/))) return false;
-  return primaryIncomeStatementRowsForPeriod(period, ctx).some(({ row: candidateRow }) => {
+  const coveredByTotal = primaryIncomeStatementRowsForPeriod(period, ctx).some(({ row: candidateRow }) => {
     if (candidateRow === row) return false;
     const candidate = factSourceFromStatementRow(candidateRow, period);
     if (!candidate || reportedLineItemCategory(candidate) !== "cost_of_revenue") return false;
     if (candidateRow.dimensions.length) return false;
     return C.cogs.includes(candidate.concept) || sourceTextMatches(candidate, /\b(total )?cost of (revenue|sales|goods|services|products)\b/);
+  });
+  if (!coveredByTotal) return false;
+  return !primaryStatementCostComponentBelongsWithSeparateDaSplit(period, ctx, row);
+}
+
+function primaryStatementHasCostOfRevenueSplitWithSeparateDa(period: string, ctx: ResolveContext) {
+  const rows = primaryIncomeStatementRowsForPeriod(period, ctx);
+  const hasDirectCostLine = rows.some(({ row }) => {
+    const source = factSourceFromStatementRow(row, period);
+    return Boolean(source && reportedLineItemCategory(source) === "cost_of_revenue" && !isOperatingExpenseSubtotalSource(source) && !isStandaloneIncomeStatementDaRow(row));
+  });
+  const hasCostSubtotal = rows.some(({ row }) => {
+    const source = factSourceFromStatementRow(row, period);
+    return Boolean(source && reportedLineItemCategory(source) === "cost_of_revenue" && isOperatingExpenseSubtotalSource(source));
+  });
+  const hasStandaloneDaLine = rows.some(
+    ({ statement, row }) => isStandaloneIncomeStatementDaRow(row) && primaryIncomeStatementRowIsAboveOperatingIncome(statement, row)
+  );
+  return hasDirectCostLine && hasCostSubtotal && hasStandaloneDaLine;
+}
+
+function primaryStatementCostComponentBelongsWithSeparateDaSplit(period: string, ctx: ResolveContext, row: PrimaryIncomeStatementRow) {
+  const rowSource = factSourceFromStatementRow(row, period);
+  if (!rowSource || reportedLineItemCategory(rowSource) !== "cost_of_revenue") return false;
+  if (isOperatingExpenseSubtotalSource(rowSource) || isStandaloneIncomeStatementDaRow(row)) return false;
+
+  const statementRows = primaryIncomeStatementRowsForPeriod(period, ctx).filter((item) => item.statement.accession === row.accession || !row.accession);
+  const laterCostSubtotal = statementRows.find(({ row: candidateRow }) => {
+    if (candidateRow.rowOrder <= row.rowOrder) return false;
+    const candidate = factSourceFromStatementRow(candidateRow, period);
+    if (!candidate) return false;
+    return isOperatingExpenseSubtotalSource(candidate) && reportedLineItemCategory(candidate) === "cost_of_revenue";
+  });
+  if (!laterCostSubtotal) return false;
+
+  return statementRows.some(({ statement, row: candidateRow }) => {
+    if (candidateRow.rowOrder <= row.rowOrder || candidateRow.rowOrder >= laterCostSubtotal.row.rowOrder) return false;
+    return isStandaloneIncomeStatementDaRow(candidateRow) && primaryIncomeStatementRowIsAboveOperatingIncome(statement, candidateRow);
   });
 }
 
@@ -20088,7 +20336,8 @@ function validatePrimaryIncomeStatementAssignmentCoverage(
       const rowNumber = findIncomeStatementLedgerModelRow(sheet, modelRow, fillRows);
       if (!rowNumber) {
         const message = `Income Statement ${period}: assignment ledger mapped ${assigned.length} source line(s) to missing model row "${modelRow}".`;
-        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
+        if (hardValidateAssignments) errors.push(message);
+        else warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
         return;
       }
       const expected = assigned.reduce((total, row) => total + row.modelAmount, 0) / 1_000_000;
@@ -20107,7 +20356,8 @@ function validatePrimaryIncomeStatementAssignmentCoverage(
       if (!statementMetricTies(actual, expected)) {
         const sourceLabels = assigned.map((row) => row.sourceLineItemLabel).filter(Boolean).join(", ");
         const message = `Income Statement ${cell.address} ${period}: model row "${modelRow}" is ${roundModelValue(actual)}, but primary assignment ledger expects ${roundModelValue(expected)} from ${sourceLabels}. Difference ${roundModelValue(actual - expected)}.`;
-        warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
+        if (hardValidateAssignments) recordIncomeStatementAssignmentValidationIssue(errors, warnings, message, protectedFormula);
+        else warnings.unshift(`${message} Assignment ledger row-level coverage was recorded for review but did not block workbook output.`);
       }
     });
   }
@@ -23162,6 +23412,18 @@ async function validateXlsxFormulaCellsReadyForDisplay(zip: JSZip, workbookXml: 
 function isPlainTextFormula(value: string) {
   return /^=\s*(?:[A-Z_@]|\d|[+\-.]|\()/i.test(value.trim());
 }
+
+export const __fillModelServiceTestHooks = {
+  buildPrimaryBalanceSheetAssignmentLedgerRows,
+  buildPrimaryIncomeStatementAssignmentLedgerRows,
+  primaryIncomeStatementSourcesForPeriod,
+  primaryStatementHasCostOfRevenueSplitWithSeparateDa,
+  reportedLineItemCategory,
+  resolveCostOfRevenue,
+  resolvePrimaryStatementCostOfRevenue,
+  resolveIncomeStatementDepreciationAmortization,
+  reconcilePostTaxEquityMethodNetIncomeBridge
+};
 
 function escapeXml(value: string) {
   return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

@@ -35,6 +35,8 @@
     "test:ko-balance-sheet-coverage": "node scripts/ko-balance-sheet-coverage-check.js",
     "test:ibm-income-statement-classification": "node scripts/ibm-income-statement-classification-check.js",
     "test:lly-income-statement-classification": "node scripts/lly-income-statement-classification-check.js",
+    "test:amd-income-statement-classification": "node scripts/amd-income-statement-classification-check.js",
+    "test:amd-balance-sheet-liability-classification": "node scripts/amd-balance-sheet-liability-classification-check.js",
     "test:lly-balance-sheet-classification": "node scripts/lly-balance-sheet-classification-check.js",
     "test:aal-classification-tightening": "node scripts/aal-classification-tightening-check.js",
     "test:audit-note-format": "node scripts/audit-note-format-check.js",

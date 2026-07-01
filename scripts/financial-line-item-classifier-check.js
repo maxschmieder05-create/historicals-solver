@@ -266,6 +266,18 @@ async function classify(overrides) {
   });
   assert.equal(accruedRebates.recommended_model_row, "Accrued Liabilities");
 
+  const exactAccruedLiabilities = await classify({
+    label: "Accrued Liabilities",
+    xbrlTag: "AccruedLiabilitiesCurrent",
+    statement: "balance_sheet",
+    section: "current liabilities",
+    periodType: "instant",
+    deterministicCandidate: "Other Current Liabilities",
+    uncertaintyReason: "Other buckets are allowed only when no better dedicated model row exists."
+  });
+  assert.equal(exactAccruedLiabilities.recommended_model_row, "Accrued Liabilities");
+  assert.equal(exactAccruedLiabilities.mapping_passed_validation, true);
+
   const cashFlowDa = await classify({
     label: "Depreciation and amortization",
     statement: "cash_flow",

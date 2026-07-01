@@ -241,6 +241,7 @@ const MODEL_ROW_ALIASES: Record<string, string[]> = {
     "administrative expense"
   ],
   "R&D": ["research and development", "r&d", "research & development"],
+  "COGS / Cost of Goods Sold": ["cost of goods sold", "cost of goods & services sold", "cost of revenue", "cost of sales", "cogs"],
   "D&A": ["depreciation and amortization", "depreciation & amortization", "d&a"],
   "Other Operating Income / Expense": ["other operating income expense", "other operating income", "other operating expense"],
   "Other Non-Operating Income / Expense": ["other non-operating income expense", "other income expense", "other expense income"]
