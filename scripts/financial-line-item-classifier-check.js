@@ -47,6 +47,64 @@ const {
 
 const availableModelRows = Object.keys(MODEL_ROW_DEFINITIONS);
 const modelRowDefinitions = modelRowDefinitionsForRows(availableModelRows);
+assert.equal(modelRowsMatch("Research & Development (R&D)", "R&D"), true);
+assert.equal(modelRowsMatch("Selling, General & Administration (SG&A)", "SG&A"), true);
+assert.equal(
+  classificationModelRowAssignmentForPrimaryStatement(
+    {
+      source_line_item: "Research and development",
+      recommended_action: "map",
+      recommended_model_row: "R&D",
+      recommended_model_row_mappings: [],
+      explicit_zero_rows: [],
+      classification_type: "research and development",
+      is_current: null,
+      is_debt: false,
+      is_operating: true,
+      is_tax_related: false,
+      is_deferred_revenue_or_contract_liability: false,
+      is_deferred_tax: false,
+      is_subtotal: false,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "R&D maps to the workbook R&D row.",
+      requires_validation: false,
+      requires_revalidation: false,
+      llm_used: false,
+      mapping_passed_validation: true
+    },
+    ["Research & Development (R&D)"]
+  ).modelRow,
+  "Research & Development (R&D)"
+);
+assert.equal(
+  classificationModelRowAssignmentForPrimaryStatement(
+    {
+      source_line_item: "Marketing, general and administrative",
+      recommended_action: "map",
+      recommended_model_row: "SG&A",
+      recommended_model_row_mappings: [],
+      explicit_zero_rows: [],
+      classification_type: "selling general and administrative",
+      is_current: null,
+      is_debt: false,
+      is_operating: true,
+      is_tax_related: false,
+      is_deferred_revenue_or_contract_liability: false,
+      is_deferred_tax: false,
+      is_subtotal: false,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "SG&A maps to the workbook SG&A row.",
+      requires_validation: false,
+      requires_revalidation: false,
+      llm_used: false,
+      mapping_passed_validation: true
+    },
+    ["Selling, General & Administration (SG&A)"]
+  ).modelRow,
+  "Selling, General & Administration (SG&A)"
+);
 
 function request(overrides) {
   return {

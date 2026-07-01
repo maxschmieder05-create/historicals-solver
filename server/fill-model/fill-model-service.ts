@@ -2088,7 +2088,6 @@ const PRIMARY_COST_OF_REVENUE_CONCEPTS = [
 
 function resolveCostOfRevenue(period: string, ctx: ResolveContext): ResolvedValue {
   const primaryStatementCost = resolvePrimaryStatementCostOfRevenue(period, ctx);
-  if (primaryStatementCost.value !== null && primaryStatementHasCostOfRevenueSplitWithSeparateDa(period, ctx)) return primaryStatementCost;
 
   const direct = first(period, ctx.duration, PRIMARY_COST_OF_REVENUE_CONCEPTS);
   if (direct) {
@@ -3552,6 +3551,10 @@ function primaryIncomeStatementRowLooksLikeTotalRevenue(row: SecFilingStatementS
   return false;
 }
 
+function primaryStatementGrossProfitOrder(statement: SecFilingStatementStructure) {
+  return firstPrimaryStatementRowOrder(statement, (row) => row.xbrlConcept === "GrossProfit" || /\bgross\b.*\b(profit|margin)\b/.test(row.rowLabel.toLowerCase()));
+}
+
 function primaryStatementPreTaxIncomeOrder(statement: SecFilingStatementStructure) {
   return firstPrimaryStatementRowOrder(statement, (row) =>
     PRETAX_INCOME_CONCEPTS.includes(row.xbrlConcept ?? "") ||
@@ -3591,6 +3594,12 @@ function primaryIncomeStatementRowIsAboveOperatingIncome(statement: SecFilingSta
   if (belowOperatingStart !== null) return row.rowOrder < belowOperatingStart && (pretaxOrder === null || row.rowOrder < pretaxOrder);
   if (pretaxOrder !== null) return row.rowOrder < pretaxOrder && !isBelowOperatingLineLabel(row.rowLabel);
   return !isBelowOperatingLineLabel(row.rowLabel);
+}
+
+function primaryIncomeStatementRowIsOperatingExpense(statement: SecFilingStatementStructure, row: SecFilingStatementStructure["rows"][number]) {
+  if (!primaryIncomeStatementRowIsAboveOperatingIncome(statement, row)) return false;
+  const grossProfitOrder = primaryStatementGrossProfitOrder(statement);
+  return grossProfitOrder === null || row.rowOrder > grossProfitOrder;
 }
 
 function primaryIncomeStatementRowIsInRevenueSection(statement: SecFilingStatementStructure, row: SecFilingStatementStructure["rows"][number]) {
@@ -5009,7 +5018,7 @@ function resolveIncomeStatementDepreciationAmortization(period: string, ctx: Res
       period,
       ctx,
       primaryIncomeStatementRowsForPeriod(period, ctx)
-        .filter(({ statement, row }) => isStandaloneIncomeStatementDaRow(row) && primaryIncomeStatementRowIsAboveOperatingIncome(statement, row))
+        .filter(({ statement, row }) => isStandaloneIncomeStatementDaRow(row) && primaryIncomeStatementRowIsOperatingExpense(statement, row))
         .map(({ row }) => factSourceFromStatementRow(row, period))
         .filter((source): source is FactSource => Boolean(source && sourceIsDollarSource(source)))
     ),
@@ -19652,7 +19661,7 @@ function buildPrimaryIncomeStatementAssignmentLedgerRows(
       const semanticKey = primaryAssignmentSemanticKey(period, statement, row, sourceWithStatementAccession, section);
       if (seenSemanticRows.has(semanticKey)) continue;
       seenSemanticRows.add(semanticKey);
-      const assignment = assignPrimaryIncomeStatementLineItem(period, ctx, sourceWithStatementAccession, row, section, fillRows);
+      const assignment = assignPrimaryIncomeStatementLineItem(period, ctx, sourceWithStatementAccession, statement, row, section, fillRows);
       const classification = lineItemClassificationForSource(period, ctx, sourceWithStatementAccession);
       rows.push({
         fiscalPeriod: period,
@@ -19684,6 +19693,7 @@ function assignPrimaryIncomeStatementLineItem(
   period: string,
   ctx: ResolveContext,
   source: FactSource,
+  statement: SecFilingStatementStructure,
   row: PrimaryIncomeStatementRow,
   section: FinancialStatementSection,
   fillRows: FillRow[]
@@ -19795,6 +19805,13 @@ function assignPrimaryIncomeStatementLineItem(
     );
   }
   if (category === "income_statement_depreciation_amortization") {
+    if (!primaryIncomeStatementRowIsOperatingExpense(statement, row)) {
+      return choose(
+        "COGS / Cost of Goods Sold",
+        ["Cost of Goods Sold", "Cost of Goods & Services Sold", "Cost of Revenue", "Cost of Sales"],
+        "Amortization presented inside the cost-of-sales block maps to COGS so gross profit ties to the reported SEC subtotal without double-counting below gross profit."
+      );
+    }
     return choose("D&A", ["Depreciation & Amortization", "Depreciation and Amortization"], "Standalone income-statement depreciation and amortization rows map to D&A.");
   }
   if (goodwillImpairmentScore(source) >= 9 && primaryIncomeStatementRowIsBelowOperatingBeforePreTaxForSourceRow(row)) {
@@ -21811,15 +21828,30 @@ function isPostTaxEquityMethodBridgeFormulaUpdate(cell: ExcelJS.Cell, formula: s
   const taxRow = findIncomeStatementMetricRow(sheet, ["Income Tax Benefit (Expense)", "Income Tax Expense", "Income Tax Provision (Expense)", "Income Tax"]);
   const netIncomeRow = findIncomeStatementMetricRow(sheet, ["Net Income (Loss)", "Net Income"]);
   const postTaxRow = findIncomeStatementMetricRow(sheet, ["Post-Tax Adjustments", "Preferred Stock Dividend"]);
+  const discontinuedOperationsRow = findIncomeStatementMetricRow(sheet, ["Discontinued Operations"]);
   const adjustedNetIncomeRow = findIncomeStatementMetricRow(sheet, ["Adj. Net Income (Loss)", "Adjusted Net Income", "Adj. Net Income"]);
-  if (!pretaxRow || !taxRow || !netIncomeRow || !postTaxRow || !adjustedNetIncomeRow) return false;
-  if (!(taxRow < netIncomeRow && netIncomeRow < postTaxRow && postTaxRow < adjustedNetIncomeRow)) return false;
+  if (!pretaxRow || !taxRow || !netIncomeRow || !adjustedNetIncomeRow) return false;
+  const bridgeRows = [postTaxRow, discontinuedOperationsRow]
+    .filter((candidate): candidate is number => Boolean(candidate && netIncomeRow < candidate && candidate < adjustedNetIncomeRow))
+    .sort((a, b) => a - b);
+  if (!bridgeRows.length) return false;
+  const bridgeRowSets: number[][] = [];
+  for (let mask = 1; mask < 1 << bridgeRows.length; mask += 1) {
+    bridgeRowSets.push(bridgeRows.filter((_bridgeRow, index) => Boolean(mask & (1 << index))));
+  }
   const colLetter = columnLetter(col);
   if (rowNumber === netIncomeRow) {
-    return normalizeFormula(formula) === normalizeFormula(`${colLetter}${pretaxRow}+${colLetter}${taxRow}+${colLetter}${postTaxRow}`);
+    return bridgeRowSets.some(
+      (bridgeRowSet) =>
+        normalizeFormula(formula) ===
+        normalizeFormula([`${colLetter}${pretaxRow}`, `${colLetter}${taxRow}`, ...bridgeRowSet.map((bridgeRow) => `${colLetter}${bridgeRow}`)].join("+"))
+    );
   }
   if (rowNumber === adjustedNetIncomeRow) {
-    return normalizeFormula(formula) === normalizeFormula(sumFormulaExcludingRow(col, netIncomeRow, adjustedNetIncomeRow - 1, postTaxRow));
+    return bridgeRowSets.some(
+      (bridgeRowSet) =>
+        normalizeFormula(formula) === normalizeFormula(sumFormulaExcludingRows(col, netIncomeRow, adjustedNetIncomeRow - 1, new Set(bridgeRowSet)))
+    );
   }
   return false;
 }
@@ -23422,6 +23454,8 @@ export const __fillModelServiceTestHooks = {
   resolveCostOfRevenue,
   resolvePrimaryStatementCostOfRevenue,
   resolveIncomeStatementDepreciationAmortization,
+  resolveOtherOperatingIncomeExpense,
+  isPostTaxEquityMethodBridgeFormulaUpdate,
   reconcilePostTaxEquityMethodNetIncomeBridge
 };
 

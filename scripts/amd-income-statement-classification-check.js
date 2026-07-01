@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const ExcelJS = require("exceljs");
 const fs = require("node:fs");
 const path = require("node:path");
 const Module = require("node:module");
@@ -183,8 +184,22 @@ assert.equal(byLabel.get("Total cost of sales").assignmentStatus, "subtotal_or_t
 
 const amortizationRows = byLabelRows("Amortization of acquisition-related intangibles");
 assert.equal(amortizationRows.length, 2);
-assert.equal(amortizationRows.every((row) => row.assignedModelRow === "Depreciation & Amortization"), true);
-assert.equal(amortizationRows.reduce((sum, row) => sum + row.modelAmount, 0), -551_000_000);
+assert.equal(
+  amortizationRows.find((row) => row.sourceXbrlTag === "AmortizationOfAcquisitionRelatedIntangiblesCOGS").assignedModelRow,
+  "Cost of Goods Sold"
+);
+assert.equal(
+  amortizationRows.find((row) => row.sourceXbrlTag === "AmortizationOfAcquisitionRelatedIntangiblesCOGS").modelAmount,
+  -261_000_000
+);
+assert.equal(
+  amortizationRows.find((row) => row.sourceXbrlTag === "AmortizationOfAcquisitionRelatedIntangiblesOpex").assignedModelRow,
+  "Depreciation & Amortization"
+);
+assert.equal(
+  amortizationRows.find((row) => row.sourceXbrlTag === "AmortizationOfAcquisitionRelatedIntangiblesOpex").modelAmount,
+  -290_000_000
+);
 
 assert.equal(byLabel.get("Other income (expense), net").assignedModelRow, "Other Non-Operating Income (Expense)");
 assert.equal(byLabel.get("Other income (expense), net").modelAmount, 165_000_000);
@@ -201,11 +216,29 @@ assert.equal(primaryCost.value, -4_576_000_000);
 assert.equal(hooks.primaryStatementHasCostOfRevenueSplitWithSeparateDa("1Q26", ctx), true);
 
 const cogs = hooks.resolveCostOfRevenue("1Q26", ctx);
-assert.equal(cogs.value, -4_576_000_000);
-assert.match(cogs.note, /primary income-statement cost of revenue/i);
+assert.equal(cogs.value, -4_837_000_000);
+assert.match(cogs.note, /consolidated SEC cost of revenue/i);
 
 const da = hooks.resolveIncomeStatementDepreciationAmortization("1Q26", ctx);
-assert.equal(da.value, -551_000_000);
+assert.equal(da.value, -290_000_000);
 assert.match(da.note, /primary income statement/i);
+
+const otherOperating = hooks.resolveOtherOperatingIncomeExpense("1Q26", ctx);
+assert.equal(otherOperating.value, 0);
+
+const workbook = new ExcelJS.Workbook();
+const sheet = workbook.addWorksheet("Model");
+sheet.getCell("A40").value = "x";
+sheet.getCell("C40").value = "Income Statement";
+sheet.getCell("C42").value = "Pre-Tax Income (Loss)";
+sheet.getCell("C44").value = "Income Tax Benefit (Expense)";
+sheet.getCell("C45").value = "Net Income (Loss)";
+sheet.getCell("C48").value = "Post-Tax Adjustments";
+sheet.getCell("C49").value = "Discontinued Operations";
+sheet.getCell("C50").value = "Adj. Net Income (Loss)";
+assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("Q45"), "Q42+Q44+Q48+Q49"), true);
+assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("T45"), "T42+T44+T49"), true);
+assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("Q50"), "SUM(Q45:Q47)"), true);
+assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("T50"), "SUM(T45:T48)"), true);
 
 console.log("AMD income statement classification regression passed.");
