@@ -336,6 +336,18 @@ async function classify(overrides) {
   assert.equal(exactAccruedLiabilities.recommended_model_row, "Accrued Liabilities");
   assert.equal(exactAccruedLiabilities.mapping_passed_validation, true);
 
+  const exactAccruedCurrentAndNoncurrentTag = await classify({
+    label: "Accrued Liabilities",
+    xbrlTag: "AccruedLiabilitiesCurrentAndNoncurrent",
+    statement: "balance_sheet",
+    section: "current liabilities",
+    periodType: "instant",
+    deterministicCandidate: "Other Current Liabilities",
+    uncertaintyReason: "XBRL concept says current and noncurrent, but the primary statement places the line in current liabilities."
+  });
+  assert.equal(exactAccruedCurrentAndNoncurrentTag.recommended_model_row, "Accrued Liabilities");
+  assert.equal(exactAccruedCurrentAndNoncurrentTag.mapping_passed_validation, true);
+
   const cashFlowDa = await classify({
     label: "Depreciation and amortization",
     statement: "cash_flow",

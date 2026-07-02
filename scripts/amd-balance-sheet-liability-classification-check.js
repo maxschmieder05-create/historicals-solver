@@ -75,9 +75,9 @@ function balanceRow(rowOrder, rowLabel, xbrlConcept, value, section = "current")
 
 const rows = [
   balanceRow(1, "Accounts payable", "AccountsPayableCurrent", 2_997_000_000),
-  balanceRow(2, "Accrued liabilities", "AccruedLiabilitiesCurrent", 5_785_000_000),
+  balanceRow(2, "Accrued liabilities", "AccruedLiabilitiesCurrentAndNoncurrent", 5_785_000_000),
   balanceRow(3, "Current portion of long-term debt, net", "LongTermDebtCurrent", 874_000_000),
-  balanceRow(4, "Other current liabilities", "OtherAccruedLiabilitiesCurrent", 850_000_000),
+  balanceRow(4, "Other current liabilities", "OtherLiabilitiesCurrent", 850_000_000),
   balanceRow(5, "Total current liabilities", "LiabilitiesCurrent", 10_506_000_000)
 ];
 
@@ -153,5 +153,13 @@ assert.equal(byLabel.get("Current portion of long-term debt, net").amount, 874_0
 assert.equal(byLabel.get("Other current liabilities").assignedModelRow, "Other Current Liabilities");
 assert.equal(byLabel.get("Other current liabilities").amount, 850_000_000);
 assert.equal(byLabel.has("Total current liabilities"), false);
+
+const accrued = hooks.resolveAccruedLiabilities("1Q26", ctx);
+assert.equal(accrued.value, 5_785_000_000);
+assert.equal(accrued.sources.some((source) => source.concept === "LongTermDebtCurrent"), false);
+
+const otherCurrent = hooks.resolveOtherCurrentLiabilities("1Q26", ctx);
+assert.equal(otherCurrent.value, 850_000_000);
+assert.equal(otherCurrent.sources.some((source) => source.concept === "AccruedLiabilitiesCurrentAndNoncurrent"), false);
 
 console.log("AMD balance sheet liability classification regression passed.");

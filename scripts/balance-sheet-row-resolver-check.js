@@ -32,6 +32,7 @@ const {
   balanceSheetRowsEquivalent,
   balanceSheetSectionCompatible,
   balanceSheetLineLooksSubtotalLike,
+  classifyBalanceSheetSourceSection,
   classifyBalanceSheetResolution
 } = loadTypeScriptModule(sourcePath);
 
@@ -60,6 +61,20 @@ assert.equal(
   true
 );
 assert.equal(balanceSheetLineLooksSubtotalLike("Accrued expenses and other current liabilities", "AccruedLiabilitiesCurrent"), true);
+assert.equal(
+  classifyBalanceSheetSourceSection("current liabilities", {
+    label: "Accrued liabilities",
+    concept: "AccruedLiabilitiesCurrentAndNoncurrent"
+  }),
+  "current liabilities"
+);
+assert.equal(
+  balanceSheetSectionCompatible("Accrued Liabilities", "current liabilities", {
+    label: "Accrued liabilities",
+    concept: "AccruedLiabilitiesCurrentAndNoncurrent"
+  }),
+  true
+);
 
 const disappearingPeriods = [
   ["1Q23", 5985],

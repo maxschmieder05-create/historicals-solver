@@ -491,7 +491,11 @@ export function classifyBalanceSheetSourceSection(
   const isCurrentDebtPortion =
     /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|\blong[-\s]?term debt\b.*\bcurrent\b|\bdebt due within one year\b/.test(text) ||
     /longtermdebtcurrent|currentmaturitiesoflongtermdebt|currentportionoflongtermdebt/.test(compact);
-  const isExplicitNonCurrent = (/\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent|longterm/.test(compact)) && !isCurrentDebtPortion;
+  const mentionsCurrentAndNonCurrent = /\bcurrent\s+and\s+non[-\s]?current\b/.test(text) || /currentandnoncurrent/.test(compact);
+  const isExplicitNonCurrent =
+    (/\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent|longterm/.test(compact)) &&
+    !isCurrentDebtPortion &&
+    !mentionsCurrentAndNonCurrent;
   const isExplicitCurrent = isCurrentDebtPortion || /\bcurrent\b/.test(text) || (/current/.test(compact) && !/noncurrent/.test(compact));
   const isAsset = /\bassets?\b/.test(text) || /asset/.test(compact);
   const isLiability = /\bliabilit(?:y|ies)\b|\bpayable\b|\bdebt\b|\bborrowings?\b|\bobligations?\b/.test(text) || /liabilit|payable|debt|borrowing|obligation/.test(compact);

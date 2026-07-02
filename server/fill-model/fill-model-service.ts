@@ -3258,6 +3258,7 @@ function sourceLooksLikeOtherCurrentLiability(source: FactSource) {
 }
 
 function sourceLooksLikeAccruedOperatingLiability(source: FactSource) {
+  if (sourceHasPlainAccruedLiabilityLabel(source)) return true;
   if (sourceLooksLikeOtherNonCurrentLiability(source) || sourceTextMatches(source, /\bnon[-\s]?current\b|\blong[-\s]?term\b/)) return false;
   if (balanceSheetRowMatchesSourceAlias("Accrued Liabilities", source.label) || balanceSheetRowMatchesSourceAlias("Accrued Liabilities", source.concept)) return true;
   if (C.accrued.includes(source.concept)) return true;
@@ -3265,6 +3266,11 @@ function sourceLooksLikeAccruedOperatingLiability(source: FactSource) {
     source,
     /\baccrued\b|\bpharmacy claims?\b|\bdiscounts payable\b|\bhealth care costs? payable\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\bincome taxes payable\b|\btaxes payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b|\bsales incentives?\b/
   );
+}
+
+function sourceHasPlainAccruedLiabilityLabel(source: FactSource) {
+  const label = normalize(source.label || "");
+  return /^(accruedliabilities|accruedliabilitiescurrent|accruedexpenses|accruedexpensescurrent)$/.test(label);
 }
 
 function sourceLooksLikeNonCurrentDebt(source: FactSource) {
@@ -6158,8 +6164,8 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
     "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
   );
   if (primaryAccrued.value !== null) {
-    const broadSource = primaryAccrued.sources.length === 1 && sourceLooksLikeBroadAccruedLiabilityBucket(primaryAccrued.sources[0]) ? primaryAccrued.sources[0] : null;
-    return broadSource ? adjustedBroadAccruedLiabilities(period, ctx, broadSource) : primaryAccrued;
+    const singleSource = primaryAccrued.sources.length === 1 ? primaryAccrued.sources[0] : null;
+    return singleSource ? adjustedBroadAccruedLiabilities(period, ctx, singleSource) : primaryAccrued;
   }
 
   const direct = first(period, ctx.instant, C.accrued);
@@ -6565,8 +6571,8 @@ function resolveDirectOrPrimaryAccruedLiabilities(period: string, ctx: ResolveCo
     "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
   );
   if (primaryAccrued.value !== null) {
-    const broadSource = primaryAccrued.sources.length === 1 && sourceLooksLikeBroadAccruedLiabilityBucket(primaryAccrued.sources[0]) ? primaryAccrued.sources[0] : null;
-    return broadSource ? adjustedBroadAccruedLiabilities(period, ctx, broadSource) : primaryAccrued;
+    const singleSource = primaryAccrued.sources.length === 1 ? primaryAccrued.sources[0] : null;
+    return singleSource ? adjustedBroadAccruedLiabilities(period, ctx, singleSource) : primaryAccrued;
   }
 
   const direct = first(period, ctx.instant, C.accrued);
@@ -6574,7 +6580,9 @@ function resolveDirectOrPrimaryAccruedLiabilities(period: string, ctx: ResolveCo
 }
 
 function adjustedBroadAccruedLiabilities(period: string, ctx: ResolveContext, direct: FactSource): ResolvedValue {
-  if (!sourceLooksLikeBroadAccruedLiabilityBucket(direct)) return { value: direct.value, sources: [direct] };
+  const broadAccruedBucket = sourceLooksLikeBroadAccruedLiabilityBucket(direct);
+  const needsReconciliation = broadAccruedBucket || plainAccruedLiabilitySourceNeedsComponentReconciliation(period, ctx, direct);
+  if (!needsReconciliation) return { value: direct.value, sources: [direct] };
 
   const exclusions: ResolvedValue[] = [];
   const currentDebtModeledSeparately = ctx.template ? !currentDebtBelongsInAccruedLiabilities(ctx.template) || debtRowUsesCombinedCurrentDebt(period, ctx) : true;
@@ -6603,8 +6611,38 @@ function adjustedBroadAccruedLiabilities(period: string, ctx: ResolveContext, di
   };
 }
 
+function plainAccruedLiabilitySourceNeedsComponentReconciliation(period: string, ctx: ResolveContext, direct: FactSource) {
+  if (!sourceHasPlainAccruedLiabilityLabel(direct)) return false;
+  const currentLiabilities = first(period, ctx.instant, C.currentLiabilities) ?? primaryBalanceSheetConceptSource(period, ctx, C.currentLiabilities);
+  const accountsPayable = resolveAccountsPayable(period, ctx);
+  const otherCurrentComponents = currentLiabilityComponentsReportedOutsideAccrued(period, ctx);
+  const currentDebt = reportedCurrentDebt(period, ctx);
+  if (!currentLiabilities || accountsPayable.value === null || otherCurrentComponents.value === null) return false;
+  const unadjustedComponentTotal = accountsPayable.value + direct.value + otherCurrentComponents.value + (currentDebt?.value ?? 0);
+  const overage = unadjustedComponentTotal - currentLiabilities.value;
+  return balanceSheetReconciliationVarianceIsMaterial(overage, currentLiabilities.value);
+}
+
+function currentLiabilityComponentsReportedOutsideAccrued(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = sum(period, ctx.instant, unique([...OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS, ...BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS]));
+  if (!direct) return { value: 0, sources: [zeroSource("OtherCurrentLiabilitiesNotSeparatelyReported")] };
+  const sources = direct.sources.filter((source) => !sourceLooksLikeAccruedOperatingLiability(source));
+  return {
+    value: sources.reduce((total, source) => total + source.value, 0),
+    sources
+  };
+}
+
+function balanceSheetReconciliationVarianceIsMaterial(variance: number, baseValue: number) {
+  return variance > Math.max(1_000_000, Math.abs(baseValue) * 0.001);
+}
+
 function sourceLooksLikeBroadAccruedLiabilityBucket(source: FactSource) {
-  return source.concept === "AccruedLiabilitiesCurrent" || sourceTextMatches(source, /\baccrued\b.*\b(other|current)\b|\baccrued liabilit(?:y|ies),?\s*current\b/);
+  if (sourceHasPlainAccruedLiabilityLabel(source)) return false;
+  return sourceTextMatches(
+    source,
+    /\baccrued\b.*\band other\b|\bother accrued\b|\baccrued expenses? and other current liabilities\b|\baccrued\b.*\bother\b.*\bcurrent liabilit/
+  );
 }
 
 function currentOperatingLeaseLiabilitiesForOtherCurrent(period: string, ctx: ResolveContext): ResolvedValue | null {
@@ -19201,15 +19239,17 @@ function assignPrimaryBalanceSheetLineItem(
     if (sourceLooksLikeShortTermBorrowing(source)) {
       return choose("Revolver", ["Short-Term Borrowings", "Short Term Borrowings", "Current Borrowings"], "Short-term borrowings and notes payable map to Revolver/current borrowings.");
     }
+    if (sourceLooksLikeAccruedOperatingLiability(source)) {
+      return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
+    }
+    const classifiedCurrentLiabilityAssignment = classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows, section);
+    if (classifiedCurrentLiabilityAssignment) return classifiedCurrentLiabilityAssignment;
     if (sourceLooksLikeOtherCurrentLiability(source)) {
       return chooseOther(
         "Other Current Liabilities",
         ["Other Current Liabs"],
         "Current liability line has no more dedicated model row, so it is grouped into other current liabilities."
       );
-    }
-    if (sourceLooksLikeAccruedOperatingLiability(source)) {
-      return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
     }
   }
 
@@ -19467,6 +19507,8 @@ function assignPrimaryBalanceSheetLineItem(
     if (sourceLooksLikeAccruedOperatingLiability(source)) {
       return choose("Accrued Liabilities", ["Accrued Expenses", "Accrued Expenses and Other"], "Accrued operating and tax liabilities map to accrued liabilities.");
     }
+    const classifiedCurrentLiabilityAssignment = classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows, section);
+    if (classifiedCurrentLiabilityAssignment) return classifiedCurrentLiabilityAssignment;
     return chooseOther(
       "Other Current Liabilities",
       ["Other Current Liabs"],
@@ -23451,6 +23493,8 @@ export const __fillModelServiceTestHooks = {
   primaryIncomeStatementSourcesForPeriod,
   primaryStatementHasCostOfRevenueSplitWithSeparateDa,
   reportedLineItemCategory,
+  resolveAccruedLiabilities,
+  resolveOtherCurrentLiabilities,
   resolveCostOfRevenue,
   resolvePrimaryStatementCostOfRevenue,
   resolveIncomeStatementDepreciationAmortization,

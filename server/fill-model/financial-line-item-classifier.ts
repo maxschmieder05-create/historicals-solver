@@ -507,7 +507,11 @@ function deterministicFinancialLineItemClassification(
   const currentInvestmentsRow = request.availableModelRows.find((row) =>
     !rowGroupsCashAndCurrentInvestments(row) && /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(row)
   );
-  const explicitNonCurrent = /\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent/.test(text.replace(/[^a-z0-9]/g, ""));
+  const compactText = text.replace(/[^a-z0-9]/g, "");
+  const mentionsCurrentAndNonCurrent = /\bcurrent\s+and\s+non[-\s]?current\b/.test(text) || /currentandnoncurrent/.test(compactText);
+  const explicitNonCurrent =
+    (/\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent/.test(compactText)) &&
+    !mentionsCurrentAndNonCurrent;
   const effectiveCurrent = current === null && explicitNonCurrent ? false : current;
   const isDeferredTaxLine = /\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text);
   const textLooksDeferredTaxAsset = /\bassets?\b/.test(text);
