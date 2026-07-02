@@ -59,7 +59,6 @@ export default function Home() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [summary, setSummary] = useState<FillSummary | null>(null);
   const [error, setError] = useState("");
-  const [fileInputVersion, setFileInputVersion] = useState(0);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedFileRef = useRef<File | null>(null);
   const inputSyncFrameRef = useRef<number | null>(null);
@@ -90,7 +89,6 @@ export default function Home() {
     }
     selectedFileRef.current = nextFile;
     setFile(nextFile);
-    setFileInputVersion((version) => version + 1);
   }, [clearFileInput]);
 
   const clearPendingInputSync = useCallback(() => {
@@ -179,7 +177,7 @@ export default function Home() {
       input.removeEventListener("input", handleNativeFileSelection);
       input.removeEventListener("cancel", handleNativeFileSelection);
     };
-  }, [fileInputVersion, syncInputSelection]);
+  }, [syncInputSelection]);
 
   function handleDrag(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
@@ -342,7 +340,6 @@ export default function Home() {
           >
             <input
               id="model-template-file"
-              key={fileInputVersion}
               ref={fileInputRef}
               className="fileInput"
               type="file"

@@ -20,7 +20,7 @@ const checks = [
     message: "Native file input must live inside the dropzone so direct clicks open the picker."
   },
   {
-    ok: /<input[\s\S]*key=\{fileInputVersion\}[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChangeCapture=\{handleFileSelect\}[\s\S]*onInputCapture=\{handleFileInput\}[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
+    ok: /<input[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChangeCapture=\{handleFileSelect\}[\s\S]*onInputCapture=\{handleFileInput\}[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
     message: "Native file input must remain wired to capture and bubble change/input events."
   },
   {
@@ -59,14 +59,14 @@ const checks = [
   },
   {
     ok: /const selectedFileRef = useRef<File \| null>\(null\);/.test(source)
-      && /selectedFileRef\.current = nextFile;\s*setFile\(nextFile\);\s*setFileInputVersion\(\(version\) => version \+ 1\);/.test(source),
-    message: "A valid workbook selection must synchronously store the selected File before updating visible state."
+      && /selectedFileRef\.current = nextFile;\s*setFile\(nextFile\);/.test(source),
+    message: "A valid workbook selection must synchronously store the selected File and update visible state."
   },
   {
-    ok: /const \[fileInputVersion, setFileInputVersion\] = useState\(0\);/.test(source)
-      && /key=\{fileInputVersion\}/.test(source)
+    ok: !/fileInputVersion/.test(source)
+      && !/setFileInputVersion/.test(source)
       && !/fileInputResetTimerRef/.test(source),
-    message: "Valid workbook selection must remount the native input after state is stored instead of clearing it with a timer."
+    message: "Valid workbook selection must not remount or reset the native input after the picker returns."
   },
   {
     ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
