@@ -395,11 +395,37 @@ input::placeholder {
   }
 }
 
-.error {
-  margin: 0;
+.errorPanel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid rgba(180, 35, 24, 0.22);
+  border-radius: 8px;
+  background: #fff5f4;
   color: var(--bad);
-  font-weight: 760;
+  padding: 12px 13px;
   line-height: 1.4;
+}
+
+.errorPanel strong {
+  font-weight: 780;
+}
+
+.errorPanel span,
+.debugPath {
+  color: #6c3c35;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.errorPanel code,
+.debugPath code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 11px;
+}
+
+.debugPath {
+  margin: 12px 0 0;
 }
 
 .summary {

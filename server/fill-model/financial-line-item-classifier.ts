@@ -589,7 +589,7 @@ function deterministicFinancialLineItemClassification(
     request.statement === "balance_sheet" &&
     effectiveCurrent !== false &&
     !explicitNonCurrent &&
-    /\baccrued\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b|\bdiscounts payable\b/.test(text) &&
+    /\baccrued\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\binterest payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b|\bdiscounts payable\b/.test(text) &&
     !/\baccounts? payable\b|\btrade payables?\b|\bdeferred (?:income|revenue)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b|\bdebt\b|\bborrowings?\b|\bnotes?\b/.test(text)
   ) {
     return {
@@ -600,7 +600,7 @@ function deterministicFinancialLineItemClassification(
       is_operating: true,
       should_exclude_from_other_bucket: true,
       confidence: "high",
-      reason: "Accrued compensation, payroll, taxes, rebates, returns, promotions, and similar operating accruals belong in accrued liabilities, not the other-current-liabilities bucket."
+      reason: "Accrued compensation, payroll, interest payable, taxes, rebates, returns, promotions, and similar current accruals belong in accrued liabilities, not the other-current-liabilities bucket."
     };
   }
 

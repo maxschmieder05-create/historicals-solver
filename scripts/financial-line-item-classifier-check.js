@@ -360,6 +360,18 @@ async function classify(overrides) {
   });
   assert.equal(accruedRebates.recommended_model_row, "Accrued Liabilities");
 
+  const interestPayable = await classify({
+    label: "Interest Payable, Current",
+    xbrlTag: "InterestPayableCurrent",
+    statement: "balance_sheet",
+    section: "current liabilities",
+    periodType: "instant",
+    deterministicCandidate: "Other Current Liabilities",
+    uncertaintyReason: "Current interest payable is a non-debt accrued liability line."
+  });
+  assert.equal(interestPayable.recommended_model_row, "Accrued Liabilities");
+  assert.equal(interestPayable.mapping_passed_validation, true);
+
   const exactAccruedLiabilities = await classify({
     label: "Accrued Liabilities",
     xbrlTag: "AccruedLiabilitiesCurrent",

@@ -19,6 +19,12 @@ type FillSummary = {
   filledCells: number;
   commentsAdded: number;
   warnings: string[];
+  debugLogPath?: string;
+};
+
+type FillError = {
+  message: string;
+  debugLogPath?: string;
 };
 
 const SUPPORTED_WORKBOOK_EXTENSIONS = [".xlsx", ".xlsm"] as const;
@@ -32,6 +38,11 @@ const SUPPORTED_WORKBOOK_ACCEPT = [
 function isSupportedWorkbookFile(file: File) {
   const fileName = file.name.toLowerCase();
   return SUPPORTED_WORKBOOK_EXTENSIONS.some((extension) => fileName.endsWith(extension));
+}
+
+function sameWorkbookFile(left: File | null, right: File | null) {
+  if (!left || !right) return false;
+  return left.name === right.name && left.size === right.size && left.lastModified === right.lastModified;
 }
 
 function hasTransferredFiles(dataTransfer: DataTransfer | null) {
@@ -58,7 +69,7 @@ export default function Home() {
   const [isDragging, setIsDragging] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [summary, setSummary] = useState<FillSummary | null>(null);
-  const [error, setError] = useState("");
+  const [error, setError] = useState<FillError | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedFileRef = useRef<File | null>(null);
   const inputSyncFrameRef = useRef<number | null>(null);
@@ -78,13 +89,16 @@ export default function Home() {
 
   const handleWorkbookSelected = useCallback((nextFile?: File | null) => {
     if (!nextFile) return;
-    setError("");
-    setSummary(null);
+    const fileChanged = !sameWorkbookFile(selectedFileRef.current, nextFile);
+    if (fileChanged) {
+      setError(null);
+      setSummary(null);
+    }
     if (!isSupportedWorkbookFile(nextFile)) {
       selectedFileRef.current = null;
       setFile(null);
       clearFileInput();
-      setError(`${nextFile.name} is not a supported .xlsx or .xlsm workbook.`);
+      setError({ message: `${nextFile.name} is not a supported .xlsx or .xlsm workbook.` });
       return;
     }
     selectedFileRef.current = nextFile;
@@ -223,20 +237,20 @@ export default function Home() {
         ?? fileInputRef.current?.files?.item(0)
         ?? null;
     if (!query) {
-      setError("Enter a ticker or company name before filling.");
+      setError({ message: "Enter a ticker or company name before filling." });
       return;
     }
     if (!selectedFile) {
-      setError("Choose an .xlsx or .xlsm workbook before filling.");
+      setError({ message: "Choose an .xlsx or .xlsm workbook before filling." });
       return;
     }
     if (!isSupportedWorkbookFile(selectedFile)) {
-      setError(`${selectedFile.name} is not a supported .xlsx or .xlsm workbook.`);
+      setError({ message: `${selectedFile.name} is not a supported .xlsx or .xlsm workbook.` });
       return;
     }
 
     setIsSubmitting(true);
-    setError("");
+    setError(null);
     setSummary(null);
 
     const formData = new FormData();
@@ -251,12 +265,18 @@ export default function Home() {
 
       if (!response.ok) {
         const payload = await response.json().catch(() => null);
-        throw new Error(payload?.error ?? "The workbook could not be filled.");
+        setError({
+          message: payload?.error ?? "The workbook could not be filled.",
+          debugLogPath: payload?.debugLogPath ?? response.headers.get("x-debug-log-path") ?? undefined
+        });
+        return;
       }
 
       const encoded = response.headers.get("x-fill-summary");
       if (encoded) {
-        setSummary(JSON.parse(decodeURIComponent(encoded)));
+        const parsedSummary = JSON.parse(decodeURIComponent(encoded)) as FillSummary;
+        const debugLogPath = response.headers.get("x-debug-log-path") ?? parsedSummary.debugLogPath;
+        setSummary(debugLogPath ? { ...parsedSummary, debugLogPath } : parsedSummary);
       }
 
       const blob = await response.blob();
@@ -269,7 +289,7 @@ export default function Home() {
       a.remove();
       URL.revokeObjectURL(downloadUrl);
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Something went wrong.");
+      setError({ message: caught instanceof Error ? caught.message : "Something went wrong." });
     } finally {
       setIsSubmitting(false);
     }
@@ -373,7 +393,16 @@ export default function Home() {
             {isSubmitting ? "Filling workbook" : "Fill and download"}
           </button>
 
-          {error ? <p className="error">{error}</p> : null}
+          {error ? (
+            <div className="errorPanel" role="alert">
+              <strong>{error.message}</strong>
+              {error.debugLogPath ? (
+                <span>
+                  Debug log: <code>{error.debugLogPath}</code>
+                </span>
+              ) : null}
+            </div>
+          ) : null}
         </form>
 
         {summary ? (
@@ -392,10 +421,15 @@ export default function Home() {
             </div>
             {summary.warnings.length ? (
               <ul>
-                {summary.warnings.slice(0, 4).map((warning) => (
+                {summary.warnings.slice(0, 6).map((warning) => (
                   <li key={warning}>{warning}</li>
                 ))}
               </ul>
+            ) : null}
+            {summary.debugLogPath ? (
+              <p className="debugPath">
+                Debug log: <code>{summary.debugLogPath}</code>
+              </p>
             ) : null}
           </section>
         ) : null}
