@@ -6,6 +6,7 @@ const ts = require("typescript");
 
 const repoRoot = path.resolve(__dirname, "..");
 const sourcePath = path.join(repoRoot, "server", "fill-model", "balance-sheet-row-resolver.ts");
+const currentNonCurrentSourcePath = path.join(repoRoot, "server", "fill-model", "current-non-current.ts");
 
 function compileTypeScript(source) {
   return ts.transpileModule(source, {
@@ -17,7 +18,15 @@ function compileTypeScript(source) {
   }).outputText;
 }
 
+function registerTypeScriptRequire() {
+  if (require.extensions[".ts"]) return;
+  require.extensions[".ts"] = (mod, file) => {
+    mod._compile(compileTypeScript(fs.readFileSync(file, "utf8")), file);
+  };
+}
+
 function loadTypeScriptModule(file) {
+  registerTypeScriptRequire();
   const source = fs.readFileSync(file, "utf8");
   const compiled = compileTypeScript(source);
   const mod = new Module(file, module);
@@ -35,10 +44,18 @@ const {
   classifyBalanceSheetSourceSection,
   classifyBalanceSheetResolution
 } = loadTypeScriptModule(sourcePath);
+const {
+  currentNonCurrentSignalFromText,
+  textLooksLikeCurrentDebtPortion
+} = loadTypeScriptModule(currentNonCurrentSourcePath);
 
 assert.equal(balanceSheetRowsEquivalent("Other liabilities, current", "Other Current Liabilities"), true);
 assert.equal(balanceSheetRowMatchesSourceAlias("Other Current Liabilities", "Accrued expenses and other current liabilities"), true);
 assert.equal(balanceSheetRowMatchesSourceAlias("Other Current Liabilities", "Other accrued expenses and liabilities"), true);
+assert.equal(currentNonCurrentSignalFromText("AccruedLiabilitiesCurrentAndNoncurrent"), "current-and-non-current");
+assert.equal(currentNonCurrentSignalFromText("Other liabilities noncurrent"), "non-current");
+assert.equal(currentNonCurrentSignalFromText("LongTermDebtCurrent"), "current");
+assert.equal(textLooksLikeCurrentDebtPortion("Debt due within one year"), true);
 assert.equal(
   balanceSheetSectionCompatible("Other Non-Current Liabilities", "current liabilities", {
     label: "Other current liabilities",

@@ -186,6 +186,11 @@ async function main() {
     errors.push(`Mapping Audit ${colLetter}${row("Other Operating Income (Expense)")} should not include OCI/AOCI reclassification rows. Entries: ${JSON.stringify(otherOperatingRows)}`);
   }
 
+  const sgaRows = auditRowsFor(audit, `${colLetter}${row("Selling, General & Administration (SG&A)")}`, period);
+  if (sgaRows.some((entry) => /OtherSellingGeneralAndAdministrativeExpense|Other operating charges/i.test(`${entry.concepts} ${entry.labels}`))) {
+    errors.push(`Mapping Audit ${colLetter}${row("Selling, General & Administration (SG&A)")} should not include KO's other operating charges. Entries: ${JSON.stringify(sgaRows)}`);
+  }
+
   const otherNonOperatingRows = auditRowsFor(audit, `${colLetter}${row("Other Non-Operating Income (Expense)")}`, period);
   const otherNonOperatingText = otherNonOperatingRows.map((entry) => `${entry.concepts} ${entry.labels}`).join(" | ");
   if (!/IncomeLossFromEquityMethodInvestments=384mm/.test(otherNonOperatingText)) {

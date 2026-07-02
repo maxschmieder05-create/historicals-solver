@@ -4,6 +4,7 @@ import {
   balanceSheetRowsEquivalent,
   balanceSheetSectionCompatible
 } from "./balance-sheet-row-resolver";
+import { currentNonCurrentSignalFromText } from "./current-non-current";
 
 export type FinancialStatementName = "income_statement" | "balance_sheet" | "cash_flow" | "segment_analysis";
 
@@ -139,12 +140,12 @@ export type FinancialStatementLineItemClassificationResult = {
 
 export const MODEL_ROW_DEFINITIONS: Record<string, string> = {
   "Cash & Cash Equivalents":
-    "Cash and cash equivalents. Include marketable securities or short-term investments only when the template row explicitly groups cash with current investments.",
+    "Cash and cash equivalents. Include current marketable securities or short-term investments when no dedicated current-investments row exists, because they are cash-like current investment balances.",
   "Accounts Receivable": "Trade accounts receivable, accounts receivable, receivables net of allowances.",
   Inventory:
     "Inventories and inventory-like operating assets, including supplies, parts, merchandise inventory, raw materials, WIP, finished goods, aircraft fuel/spare parts/supplies.",
   "Prepaid & Other Current Assets":
-    "Current assets not better mapped elsewhere, such as prepaid expenses, other current assets, tax receivables, contract assets, and current investments when the template has no dedicated current-investments row and no explicit cash-and-current-investments row.",
+    "Current assets not better mapped elsewhere, such as prepaid expenses, other current assets, tax receivables, and contract assets. Current marketable securities and short-term investments belong here only if the template has no cash row and no dedicated current-investments row.",
   "PP&E, Net": "Property, plant and equipment, operating property and equipment, net PP&E.",
   "Intangible Assets, Net": "Intangible assets, acquired intangibles, customer relationships, developed technology, intangible assets net.",
   Goodwill: "Goodwill.",
@@ -466,7 +467,8 @@ export function classificationModelRowAssignmentForPrimaryStatement(
 
   const normalizedRow = normalizeModelRow(classification.recommended_model_row) || classification.recommended_model_row;
   if (!normalizedRow || /unmapped|needs review/i.test(normalizedRow)) return null;
-  const modelRow = availableModelRows.find((available) => modelRowsMatch(available, normalizedRow)) ?? normalizedRow;
+  const modelRow = availableModelRows.find((available) => modelRowsMatch(available, normalizedRow));
+  if (!modelRow) return null;
   const grouped =
     classification.recommended_action === "merge_into_other" ||
     classification.recommended_action === "split_across_rows" ||
@@ -504,14 +506,12 @@ function deterministicFinancialLineItemClassification(
   const cashAndCurrentInvestmentsRow = request.availableModelRows.find((row) =>
     rowGroupsCashAndCurrentInvestments(row)
   );
+  const cashRow = request.availableModelRows.find((row) => modelRowsMatch(row, "Cash & Cash Equivalents"));
   const currentInvestmentsRow = request.availableModelRows.find((row) =>
     !rowGroupsCashAndCurrentInvestments(row) && /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(row)
   );
-  const compactText = text.replace(/[^a-z0-9]/g, "");
-  const mentionsCurrentAndNonCurrent = /\bcurrent\s+and\s+non[-\s]?current\b/.test(text) || /currentandnoncurrent/.test(compactText);
-  const explicitNonCurrent =
-    (/\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent/.test(compactText)) &&
-    !mentionsCurrentAndNonCurrent;
+  const currentNonCurrentSignal = currentNonCurrentSignalFromText(text);
+  const explicitNonCurrent = currentNonCurrentSignal === "non-current";
   const effectiveCurrent = current === null && explicitNonCurrent ? false : current;
   const isDeferredTaxLine = /\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text);
   const textLooksDeferredTaxAsset = /\bassets?\b/.test(text);
@@ -665,12 +665,13 @@ function deterministicFinancialLineItemClassification(
     const recommendedRow =
       currentInvestmentsRow ??
       cashAndCurrentInvestmentsRow ??
+      cashRow ??
       preferred("Prepaid & Other Current Assets");
-    const mapsToDedicatedRow = Boolean(currentInvestmentsRow || cashAndCurrentInvestmentsRow);
+    const mapsToDedicatedRow = Boolean(currentInvestmentsRow || cashAndCurrentInvestmentsRow || cashRow);
     return {
       ...base,
       recommended_model_row: recommendedRow,
-      classification_type: "current investment",
+      classification_type: currentInvestmentsRow ? "current investment" : "cash-like current investment",
       is_current: true,
       is_operating: false,
       should_exclude_from_other_bucket: mapsToDedicatedRow,
@@ -679,7 +680,9 @@ function deterministicFinancialLineItemClassification(
         ? "Current investments map to the dedicated current investments row when the template provides one."
         : cashAndCurrentInvestmentsRow
           ? "Current investments map to the template's explicit cash-and-current-investments row."
-          : "Current investments group into the current-assets residual row when the template has no dedicated current-investments row and no explicit cash-and-current-investments row."
+          : cashRow
+            ? "Current marketable securities and short-term investments group with cash when the template has no dedicated current-investments row."
+            : "Current investments group into the current-assets residual row when the template has no cash row and no dedicated current-investments row."
     };
   }
 
@@ -966,7 +969,15 @@ function classificationPassesValidation(request: FinancialLineItemClassification
     const hasCashAndCurrentInvestmentsRow = request.availableModelRows.some((availableRow) =>
       /cash.*(short[-\s]?term investments?|current investments?|marketable securities)|(short[-\s]?term investments?|current investments?|marketable securities).*cash/i.test(availableRow)
     );
-    if (hasCurrentInvestmentsRow || hasCashAndCurrentInvestmentsRow) return false;
+    const hasCashRow = request.availableModelRows.some((availableRow) => modelRowsMatch(availableRow, "Cash & Cash Equivalents"));
+    if (hasCurrentInvestmentsRow || hasCashAndCurrentInvestmentsRow || hasCashRow) return false;
+  }
+  if (modelRowsMatch(row, "Cash & Cash Equivalents") && /short[-\s]?term investments?|marketable securities|available[-\s]?for[-\s]?sale securities/.test(text)) {
+    const hasCurrentInvestmentsRow = request.availableModelRows.some((availableRow) =>
+      /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(availableRow) &&
+      !/cash.*(short[-\s]?term investments?|current investments?|marketable securities)|(short[-\s]?term investments?|current investments?|marketable securities).*cash/i.test(availableRow)
+    );
+    if (hasCurrentInvestmentsRow) return false;
   }
   if (modelRowsMatch(row, "Common Stock & APIC") && /\binvestment securities\b|\bdebt and equity securities\b|\bavailable[-\s]?for[-\s]?sale securities\b|\bmarketable securities\b/.test(text)) return false;
   if (request.section === "current assets" && !modelRowsMatch(row, "Cash & Cash Equivalents") && !modelRowsMatch(row, "Short-Term Investments") && !modelRowsMatch(row, "Accounts Receivable") && !modelRowsMatch(row, "Inventory") && !modelRowsMatch(row, "Prepaid & Other Current Assets")) return false;
@@ -998,7 +1009,7 @@ async function requestLlmClassification(
     ...GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
     "Do not use keyword matching alone. Reported statement location and accounting meaning take precedence over mathematical tie-outs.",
     "Use Other buckets only when no dedicated row exists. Do not use residual plugging.",
-    "Examples are non-exhaustive: current investments may belong in a dedicated investments row, an explicitly grouped cash/current-investments row, or the current-assets residual row; current maturities may belong with LT debt; advertising may belong with SG&A.",
+    "Examples are non-exhaustive: current investments may belong in a dedicated investments row, a cash/current-investments row, a plain cash row when no dedicated investments row exists, or the current-assets residual only when no cash/current-investment row exists; current maturities may belong with LT debt; advertising may belong with SG&A.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",
@@ -1067,8 +1078,8 @@ async function requestStatementLlmClassification(
     "Only return classifications for targetSourceRowKeys. Use each source_row_key exactly as provided.",
     "The model template order may differ from the filing statement order. Assign each source line to the model row that best fits the accounting meaning, even if that model row appears much earlier or later in the template.",
     "Use Other buckets only when no dedicated model row exists. Do not use residual plugging.",
-    "Examples are non-exhaustive: current investments may belong in a dedicated investments row, an explicitly grouped cash/current-investments row, or the current-assets residual row; current maturities may belong with LT debt; advertising may belong with SG&A.",
-    "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present, an explicit cash-and-current-investments row when the label groups them, and otherwise the current-assets residual row. Do not add them to a plain Cash & Cash Equivalents row.",
+    "Examples are non-exhaustive: current investments may belong in a dedicated investments row, a cash/current-investments row, a plain cash row when no dedicated investments row exists, or the current-assets residual only when no cash/current-investment row exists; current maturities may belong with LT debt; advertising may belong with SG&A.",
+    "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present. Otherwise group them with Cash & Cash Equivalents if the template has a cash row; use the current-assets residual only when there is no cash or current-investment row.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, notes payable current, and revolving facilities may belong in Revolver/current borrowings.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",

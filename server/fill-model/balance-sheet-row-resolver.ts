@@ -1,3 +1,5 @@
+import { compactFinancialText, currentNonCurrentSignalFromText, financialWordsText, textLooksLikeCurrentDebtPortion } from "./current-non-current";
+
 export type BalanceSheetResolverState =
   | "direct_sec_sourced"
   | "residual_calculated"
@@ -477,8 +479,8 @@ export function balanceSheetSectionCompatible(
 }
 
 function sourceLooksLikeCurrentLongTermDebtPortion(source: { label?: string; tag?: string; concept?: string }) {
-  const text = `${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
-  return /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|\blong[-\s]?term debt\b.*\bcurrent\b|\bconvertible\b.*\bnotes?\b|\bsenior notes?\b/.test(text);
+  const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
+  return textLooksLikeCurrentDebtPortion(text) || /\bconvertible\b.*\bnotes?\b|\bsenior notes?\b/.test(text);
 }
 
 export function classifyBalanceSheetSourceSection(
@@ -486,17 +488,11 @@ export function classifyBalanceSheetSourceSection(
   source: { label?: string; tag?: string; concept?: string } = {}
 ): BalanceSheetSourceSection {
   const section = String(sourceSection ?? "").toLowerCase();
-  const text = `${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
-  const compact = normalizeBalanceSheetKey(text);
-  const isCurrentDebtPortion =
-    /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|\blong[-\s]?term debt\b.*\bcurrent\b|\bdebt due within one year\b/.test(text) ||
-    /longtermdebtcurrent|currentmaturitiesoflongtermdebt|currentportionoflongtermdebt/.test(compact);
-  const mentionsCurrentAndNonCurrent = /\bcurrent\s+and\s+non[-\s]?current\b/.test(text) || /currentandnoncurrent/.test(compact);
-  const isExplicitNonCurrent =
-    (/\bnon[-\s]?current\b|\blong[-\s]?term\b/.test(text) || /noncurrent|longterm/.test(compact)) &&
-    !isCurrentDebtPortion &&
-    !mentionsCurrentAndNonCurrent;
-  const isExplicitCurrent = isCurrentDebtPortion || /\bcurrent\b/.test(text) || (/current/.test(compact) && !/noncurrent/.test(compact));
+  const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
+  const compact = compactFinancialText(text);
+  const currentNonCurrentSignal = currentNonCurrentSignalFromText(text);
+  const isExplicitNonCurrent = currentNonCurrentSignal === "non-current";
+  const isExplicitCurrent = currentNonCurrentSignal === "current";
   const isAsset = /\bassets?\b/.test(text) || /asset/.test(compact);
   const isLiability = /\bliabilit(?:y|ies)\b|\bpayable\b|\bdebt\b|\bborrowings?\b|\bobligations?\b/.test(text) || /liabilit|payable|debt|borrowing|obligation/.test(compact);
   if (section === "current assets" || section === "non-current assets" || section === "current liabilities" || section === "non-current liabilities" || section === "equity") {

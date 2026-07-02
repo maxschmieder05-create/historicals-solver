@@ -52,6 +52,34 @@ assert.equal(modelRowsMatch("Selling, General & Administration (SG&A)", "SG&A"),
 assert.equal(
   classificationModelRowAssignmentForPrimaryStatement(
     {
+      source_line_item: "Interest income",
+      recommended_action: "map",
+      recommended_model_row: "Interest Income",
+      recommended_model_row_mappings: [],
+      explicit_zero_rows: [],
+      classification_type: "interest income",
+      is_current: null,
+      is_debt: false,
+      is_operating: false,
+      is_tax_related: false,
+      is_deferred_revenue_or_contract_liability: false,
+      is_deferred_tax: false,
+      is_subtotal: false,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Standalone interest income.",
+      requires_validation: false,
+      requires_revalidation: false,
+      llm_used: false,
+      mapping_passed_validation: true
+    },
+    ["Revenue", "Interest Expense", "Net Revenue"]
+  ),
+  null
+);
+assert.equal(
+  classificationModelRowAssignmentForPrimaryStatement(
+    {
       source_line_item: "Research and development",
       recommended_action: "map",
       recommended_model_row: "R&D",
@@ -264,10 +292,10 @@ async function classify(overrides) {
     deterministicCandidate: "Prepaid & Other Current Assets",
     availableModelRows: availableModelRows.filter((row) => !/short[-\s]?term investments?|current investments?|marketable securities/i.test(row))
   });
-  assert.equal(shortTermInvestments.recommended_model_row, "Prepaid & Other Current Assets");
+  assert.equal(shortTermInvestments.recommended_model_row, "Cash & Cash Equivalents");
   assert.equal(
     classificationModelRowAssignmentForPrimaryStatement(shortTermInvestments, availableModelRows).modelRow,
-    "Prepaid & Other Current Assets"
+    "Cash & Cash Equivalents"
   );
 
   const marketableSecurities = await classify({
@@ -276,7 +304,15 @@ async function classify(overrides) {
     deterministicCandidate: "Prepaid & Other Current Assets",
     availableModelRows: availableModelRows.filter((row) => !/short[-\s]?term investments?|current investments?|marketable securities/i.test(row))
   });
-  assert.equal(marketableSecurities.recommended_model_row, "Prepaid & Other Current Assets");
+  assert.equal(marketableSecurities.recommended_model_row, "Cash & Cash Equivalents");
+
+  const dedicatedShortTermInvestments = await classify({
+    label: "Short-term investments",
+    section: "current assets",
+    deterministicCandidate: "Prepaid & Other Current Assets",
+    availableModelRows: [...availableModelRows, "Short-Term Investments"]
+  });
+  assert.equal(dedicatedShortTermInvestments.recommended_model_row, "Short-Term Investments");
 
   const iprd = await classify({
     label: "Acquired in-process research and development",
@@ -630,7 +666,15 @@ async function classify(overrides) {
   assert.deepEqual(statementPayload.targetSourceRowKeys, ["row-investments", "row-lease-financing", "row-notes-payable"]);
   assert.equal(statementPayload.statementRows.length, 5);
   assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-cash" && row.target === false), true);
-  assert.equal(statementPayload.statementRows.some((row) => row.sourceRowKey === "row-investments" && row.target === true && row.deterministicClassification), true);
+  assert.equal(
+    statementPayload.statementRows.some(
+      (row) =>
+        row.sourceRowKey === "row-investments" &&
+        row.target === true &&
+        row.deterministicClassification?.recommendedModelRow === "Cash & Cash Equivalents"
+    ),
+    true
+  );
   assert.equal(
     statementPayload.statementRows.some(
       (row) => row.sourceRowKey === "row-advertising" && row.target === false && row.deterministicClassification?.recommendedModelRow === "SG&A"

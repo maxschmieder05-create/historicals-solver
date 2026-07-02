@@ -1720,7 +1720,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
   if (balanceSheetDefinition) {
     switch (balanceSheetDefinition.canonical) {
       case "Cash & Cash Equivalents":
-        return plug(rowNumber, label, "balance", "instant", resolveCash, "direct");
+        return plug(rowNumber, label, "balance", "instant", resolveCashForTemplateRow, "direct");
       case "Short-Term Investments":
         return row(rowNumber, label, "balance", "instant", C.currentInvestments);
       case "Accounts Receivable":
@@ -1778,7 +1778,7 @@ function fillRowForContext(context: ModelRowContext): FillRow | null {
     return plug(rowNumber, label, "balance", "instant", resolveCashAndCurrentInvestments, "grouped");
   }
   if (has("Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash")) {
-    return plug(rowNumber, label, "balance", "instant", resolveCash, "direct");
+    return plug(rowNumber, label, "balance", "instant", resolveCashForTemplateRow, "direct");
   }
   if (has("Accounts Receivable", "Accounts Receivable, Net", "Trade Receivables", "Fees Receivable")) return plug(rowNumber, label, "balance", "instant", resolveAccountsReceivable);
   if (has("Card Member Receivables", "Card Member Recievables")) return row(rowNumber, label, "balance", "instant", C.cardReceivables);
@@ -2288,6 +2288,7 @@ function sourceIsSeparatelyModeledOperatingExpense(source: FactSource) {
 }
 
 function sourceLooksLikeSellingGeneralAdministrativeExpense(source: FactSource) {
+  if (isExplicitOtherOperatingLineSource(source)) return false;
   const text = sourceSearchText(source);
   return (
     /\bsg&a\b|\bselling\b.*\bgeneral\b.*\badministrative\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b/.test(text) ||
@@ -3384,11 +3385,11 @@ function primaryOtherCurrentAssetSources(period: string, ctx: ResolveContext) {
     const semanticOtherCurrentAsset =
       sourceTextMatches(source, /\bother current assets?\b|\bprepaid\b|\btax receivables?\b|\bother receivables?\b/) ||
       sourceLooksLikeAssetHeldForSale(source) ||
-      (!ctx.template?.hasCurrentInvestmentRow && !ctx.template?.hasCashAndCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source));
+      (!currentInvestmentsBelongInCashTemplate(ctx.template) && !ctx.template?.hasCurrentInvestmentRow && sourceLooksLikeCurrentInvestment(source));
     if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInCurrentAssetSection(row, source) && !semanticOtherCurrentAsset)) return false;
     if ([...C.cash, ...C.cardReceivables, ...C.inventory].includes(source.concept)) return false;
     if (C.receivables.includes(source.concept) && !sourceLooksLikeNonTradeReceivable(source)) return false;
-    if ((ctx.template?.hasCurrentInvestmentRow || ctx.template?.hasCashAndCurrentInvestmentRow) && sourceLooksLikeCurrentInvestment(source)) return false;
+    if ((ctx.template?.hasCurrentInvestmentRow || currentInvestmentsBelongInCashTemplate(ctx.template)) && sourceLooksLikeCurrentInvestment(source)) return false;
     if (inventoryLikeCurrentAssetScore(source) >= 5) return false;
     if (sourceTextMatches(source, /\bcash\b|\binventor(?:y|ies)\b/)) return false;
     if (sourceTextMatches(source, /\breceivables?\b/) && !sourceLooksLikeNonTradeReceivable(source)) return false;
@@ -5850,6 +5851,10 @@ function resolveCash(period: string, ctx: ResolveContext): ResolvedValue {
   return resolveReportedCashBalance(period, ctx);
 }
 
+function resolveCashForTemplateRow(period: string, ctx: ResolveContext): ResolvedValue {
+  return currentInvestmentsAreModeledInCash(period, ctx) ? resolveCashAndCurrentInvestments(period, ctx) : resolveCash(period, ctx);
+}
+
 function resolveCashAndCurrentInvestments(period: string, ctx: ResolveContext): ResolvedValue {
   const cash = resolveReportedCashBalance(period, ctx);
   if (cash.value === null) return { value: null, sources: [] };
@@ -5939,14 +5944,19 @@ function sourceLooksLikeReportedCashAggregate(source: FactSource) {
   );
 }
 
+function currentInvestmentsBelongInCashTemplate(template: TemplateMappingContext | undefined) {
+  if (!template || template.hasCurrentInvestmentRow) return false;
+  return template.hasCashAndCurrentInvestmentRow || template.hasCashRow;
+}
+
 function currentInvestmentsAreModeledInCash(period: string, ctx: ResolveContext) {
-  if (!ctx.template?.hasCashAndCurrentInvestmentRow) return false;
+  if (!currentInvestmentsBelongInCashTemplate(ctx.template)) return false;
   const currentInvestments = cashLikeCurrentInvestmentBalance(period, ctx);
   return Boolean(currentInvestments && currentInvestments.value !== null && currentInvestments.value !== 0);
 }
 
 function currentInvestmentsAreModeledInOtherCurrentAssets(period: string, ctx: ResolveContext) {
-  if (ctx.template?.hasCurrentInvestmentRow || ctx.template?.hasCashAndCurrentInvestmentRow) return false;
+  if (ctx.template?.hasCurrentInvestmentRow || currentInvestmentsBelongInCashTemplate(ctx.template)) return false;
   const otherCurrentAssets = resolvePrepaidAndOtherCurrentAssets(period, ctx);
   return otherCurrentAssets.value !== null && otherCurrentAssets.sources.some(sourceLooksLikeCurrentInvestment);
 }
@@ -12810,6 +12820,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (source.sourceLayer === "model") return "cash_flow_or_support";
   if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
   if (isAllowanceOrRollForwardTranslationSource(source)) return "cash_flow_or_support";
+  if (isExplicitOtherOperatingLineSource(source) || isOperatingSpecialChargeSource(source)) return "other_operating_income_expense";
   if (acceptedClassificationCategory) return acceptedClassificationCategory;
 
   if (
@@ -14327,7 +14338,7 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
     "Confirm that every material primary SEC line item and Segment Analysis line item is either assigned to the correct model row, grouped into the correct Other/reconciliation row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
     "This review is not centered on any one example. Treat examples such as short-term investments, current maturities of debt, deferred revenue, advertising, lease liabilities, pension liabilities, and equity method income as non-exhaustive patterns for accounting-substance routing.",
     "For any random SEC line item, ask which model row a careful human analyst would use after looking at the statement, subtotal context, XBRL concept, model row definitions, and reconciliation impact.",
-    "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present, in an explicit cash-and-current-investments row when the template label groups them, and otherwise in the current-assets residual row. Do not add them to a plain Cash & Cash Equivalents row.",
+    "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present. Otherwise group them with Cash & Cash Equivalents if the template has a cash row; use the current-assets residual only when there is no cash or current-investment row.",
     "Current maturities/current portion of long-term debt belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, and notes payable current may belong in Revolver/current borrowings.",
     "Deferred revenue or contract liabilities are operating liabilities, not deferred income taxes. Deferred tax assets/liabilities require tax-specific semantics.",
     "Cash-flow-only depreciation and amortization should not populate income-statement D&A unless it is an income-statement line.",
@@ -14465,7 +14476,7 @@ function llmMappingReviewPayload(
         "Act like a human analyst with the SEC filing, Model tab, and Segment Analysis tab open side by side: choose the destination row by accounting substance, statement or segment-table context, XBRL semantics, subtotal context, model row definitions, and reconciliation impact.",
       examplesAreNonExhaustive: true,
       templateRuleExamples: [
-        "Marketable securities / short-term investments map to a dedicated current-investments row when present, an explicit cash-and-current-investments row when labeled that way, or the current-assets residual row when neither dedicated row exists.",
+        "Marketable securities / short-term investments map to a dedicated current-investments row when present, otherwise to Cash & Cash Equivalents when the template has a cash row, and only to the current-assets residual row when neither cash nor dedicated current-investment rows exist.",
         "Current maturities of long-term debt combine with LT Debt including current portion.",
         "Advertising, promotional, selling, and marketing operating expenses group into SG&A when no more specific template row exists.",
         "Deferred revenue is an operating liability, not deferred income taxes.",
@@ -17569,7 +17580,7 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
     ctx,
     auditRows,
     ["Cash & Cash Equivalents", "Cash and Cash Equivalents", "Cash and Equivalents", "Cash"],
-    resolveCash
+    resolveCashForTemplateRow
   );
   refreshBalanceSheetInputFromResolver(
     sheet,
@@ -19147,6 +19158,7 @@ function assignPrimaryBalanceSheetLineItem(
 ): PrimaryBalanceSheetAssignment {
   const currentInvestmentRow = availableBalanceSheetModelRow(fillRows, "Short-Term Investments", CURRENT_INVESTMENT_ROW_LABELS);
   const cashAndCurrentInvestmentRow = availableBalanceSheetModelRow(fillRows, "Cash & Short-Term Investments", CASH_AND_CURRENT_INVESTMENT_ROW_LABELS);
+  const cashRow = availableBalanceSheetModelRow(fillRows, "Cash & Cash Equivalents", ["Cash and Cash Equivalents", "Cash and Equivalents", "Cash"]);
   const choose = (canonical: string, aliases: string[] = [], reason: string): PrimaryBalanceSheetAssignment => {
     const modelRow = availableBalanceSheetModelRow(fillRows, canonical, aliases) ?? canonical;
     return { modelRow, status: balanceSheetAssignmentStatusForModelRow(modelRow, source), reason };
@@ -19170,10 +19182,17 @@ function assignPrimaryBalanceSheetLineItem(
         reason: "Current marketable securities and short-term investments are grouped into the template's explicit cash-and-current-investments row."
       };
     }
+    if (cashRow) {
+      return {
+        modelRow: cashRow,
+        status: "grouped_into_model_row",
+        reason: "Current marketable securities and short-term investments are grouped into Cash & Cash Equivalents when the template has no dedicated current-investment row."
+      };
+    }
     return chooseOther(
       "Prepaid & Other Current Assets",
       OTHER_CURRENT_ASSET_ROW_LABELS,
-      "Current marketable securities and short-term investments are grouped into the current-assets residual row when the template has no dedicated current investment or explicit cash-and-current-investments row."
+      "Current marketable securities and short-term investments are grouped into the current-assets residual row when the template has no cash row, dedicated current investment row, or explicit cash-and-current-investments row."
     );
   };
 
@@ -19193,6 +19212,9 @@ function assignPrimaryBalanceSheetLineItem(
   }
   if (sourceTextMatches(source, /\bemployee benefits? trust\b/)) {
     return choose("Treasury Stock", ["Treasury & Preferred Stock"], "Employee benefit trust shares are contra-equity/treasury-style equity and map to treasury stock before generic APIC classification.");
+  }
+  if (primaryBalanceSheetRowLooksLikeNetPpeCarryingAmount(row, source)) {
+    return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "Net PP&E carrying amounts map to PP&E even when the label mentions accumulated depreciation.");
   }
   if (primaryBalanceSheetRowLooksLikeInventoryComponent(row, source)) {
     return choose("Inventory", ["Inventories"], "Inventory component rows such as raw materials, work-in-process, and finished goods map to inventory even when SEC section context is weak.");
@@ -19605,7 +19627,7 @@ function classifiedPrimaryBalanceSheetAssignment(
   const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
   if (!assignment) return null;
   if (primaryBalanceSheetAssignmentSideForModelRow(assignment.modelRow) === "unknown") return null;
-  if (sourceLooksLikeCurrentInvestment(source) && modelRowsMatch(assignment.modelRow, "Cash & Cash Equivalents")) {
+  if (sourceLooksLikeCurrentInvestment(source) && modelRowsMatch(assignment.modelRow, "Cash & Cash Equivalents") && !currentInvestmentCanMapToCashRow(fillRows)) {
     return null;
   }
   if (
@@ -19631,6 +19653,12 @@ function availableBalanceSheetModelRow(fillRows: FillRow[], canonical: string, a
       .filter((row) => row.statement === "balance" && row.kind === "instant")
       .find((row) => candidates.some((candidate) => modelRowsMatch(row.label, candidate) || balanceSheetRowsEquivalent(row.label, candidate) || normalize(row.label) === normalize(candidate)))?.label ?? null
   );
+}
+
+function currentInvestmentCanMapToCashRow(fillRows: FillRow[]) {
+  const currentInvestmentRow = availableBalanceSheetModelRow(fillRows, "Short-Term Investments", CURRENT_INVESTMENT_ROW_LABELS);
+  const cashRow = availableBalanceSheetModelRow(fillRows, "Cash & Cash Equivalents", ["Cash and Cash Equivalents", "Cash and Equivalents", "Cash"]);
+  return Boolean(!currentInvestmentRow && cashRow);
 }
 
 function balanceSheetAssignmentStatusForModelRow(modelRow: string, source: FactSource): BalanceSheetAssignmentStatus {
@@ -19741,11 +19769,13 @@ function assignPrimaryIncomeStatementLineItem(
   fillRows: FillRow[]
 ): PrimaryIncomeStatementAssignment {
   const choose = (canonical: string, aliases: string[] = [], reason: string): PrimaryIncomeStatementAssignment => {
-    const modelRow = availableIncomeStatementModelRow(fillRows, canonical, aliases) ?? canonical;
+    const modelRow = availableIncomeStatementModelRow(fillRows, canonical, aliases);
+    if (!modelRow) return missingIncomeStatementModelRowAssignment(canonical, reason);
     return { modelRow, status: incomeStatementAssignmentStatusForModelRow(modelRow, source), reason };
   };
   const chooseOther = (canonical: string, aliases: string[], reason: string): PrimaryIncomeStatementAssignment => {
-    const modelRow = availableIncomeStatementModelRow(fillRows, canonical, aliases) ?? canonical;
+    const modelRow = availableIncomeStatementModelRow(fillRows, canonical, aliases);
+    if (!modelRow) return missingIncomeStatementModelRowAssignment(canonical, reason);
     return { modelRow, status: "grouped_into_model_row", reason };
   };
 
@@ -19894,6 +19924,14 @@ function assignPrimaryIncomeStatementLineItem(
   };
 }
 
+function missingIncomeStatementModelRowAssignment(canonical: string, reason: string): PrimaryIncomeStatementAssignment {
+  return {
+    modelRow: null,
+    status: "explicitly_excluded_with_reason",
+    reason: `${reason} Template has no compatible income-statement model row for "${canonical}", so the source line is excluded from row-level assignment coverage instead of being mapped to a missing row.`
+  };
+}
+
 function classifiedPrimaryIncomeStatementAssignment(
   period: string,
   ctx: ResolveContext,
@@ -19905,6 +19943,7 @@ function classifiedPrimaryIncomeStatementAssignment(
   const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
   if (!assignment) return null;
   if (!incomeStatementAssignmentModelRowIsAssignable(assignment.modelRow)) return null;
+  if (modelRowsMatch(assignment.modelRow, "SG&A") && isExplicitOtherOperatingLineSource(source)) return null;
 
   return {
     modelRow: assignment.modelRow,
@@ -20156,7 +20195,7 @@ function duplicateIncomeStatementAssignmentKeys(rows: PrimaryIncomeStatementAssi
 }
 
 function allowedPrimaryIncomeStatementAssignmentExclusion(row: PrimaryIncomeStatementAssignmentLedgerRow) {
-  return /non-USD primary income statement|subtotal\/total row|double-counted|component\/detail row|tax component|tax provision|per-share|share-count|earnings-per-share|not a dollar income-statement amount/i.test(
+  return /non-USD primary income statement|subtotal\/total row|double-counted|component\/detail row|tax component|tax provision|per-share|share-count|earnings-per-share|not a dollar income-statement amount|template has no compatible income-statement model row/i.test(
     row.classificationReason
   );
 }
@@ -20764,7 +20803,7 @@ function validateBalanceSheetClassificationCompleteness(
       !currentInvestmentsModeledInOtherCurrentAssets
     ) {
       errors.push(
-        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no current investment row, cash/current-investment grouping row, or current-assets residual row to receive it.`
+        `Balance Sheet ${period}: EDGAR reports marketable securities / short-term investments of ${roundModelValue(currentInvestments.value / 1_000_000)} but the template has no cash row, current investment row, or current-assets residual row to receive it.`
       );
     }
   });
@@ -21152,7 +21191,7 @@ function balanceSheetDiagnosticResolverForLabel(label: string): ((period: string
   if (balanceSheetDefinition) {
     switch (balanceSheetDefinition.canonical) {
       case "Cash & Cash Equivalents":
-        return resolveCash;
+        return resolveCashForTemplateRow;
       case "Short-Term Investments":
         return (period, ctx) => sumWithNote(period, ctx.instant, C.currentInvestments, "Mapped to separately reported current marketable securities / short-term investments.");
       case "Accounts Receivable":
@@ -21223,7 +21262,9 @@ function balanceSheetDiagnosticResolverForLabel(label: string): ((period: string
   }
   const normalizedLabel = normalize(label);
   if (/^(cashshortterminvestments|cashandshortterminvestments|cashcurrentinvestments|cashandcurrentinvestments)$/.test(normalizedLabel)) return resolveCashAndCurrentInvestments;
-  if (/^(cashcashequivalents|cashandequivalents|cash)$/.test(normalizedLabel)) return resolveCash;
+  if (/^(cashcashequivalents|cashandequivalents|cash)$/.test(normalizedLabel)) {
+    return resolveCashForTemplateRow;
+  }
   if (/^(accountsreceivable|accountsreceivablenet|tradereceivables|feesreceivable)$/.test(normalizedLabel)) return resolveAccountsReceivable;
   if (/^inventory$/.test(normalizedLabel)) return resolveInventory;
   if (/^(shortterminvestments|marketablesecurities|currentmarketablesecurities|investmentsecurities|availableforsalesecurities|treasurysecurities)$/.test(normalizedLabel)) {

@@ -58,6 +58,7 @@ const baseRows = [
 ];
 
 const embeddedDebtContext = buildLiabilityTemplateMappingContext(baseRows);
+assert.equal(embeddedDebtContext.hasCashRow, false);
 assert.equal(embeddedDebtContext.hasCurrentDebtRow, false);
 assert.equal(embeddedDebtContext.hasCurrentLiabilitiesExcludingDebtRow, false);
 assert.equal(embeddedDebtContext.hasDebtInclCurrentPortionRow, true);
@@ -69,6 +70,11 @@ assert.equal(
   ),
   625
 );
+
+const cashContext = buildLiabilityTemplateMappingContext([{ statement: "balance", label: "Cash & Cash Equivalents" }]);
+assert.equal(cashContext.hasCashRow, true);
+assert.equal(cashContext.hasCurrentInvestmentRow, false);
+assert.equal(cashContext.hasCashAndCurrentInvestmentRow, false);
 
 const currentLiabilitiesExDebtContext = buildLiabilityTemplateMappingContext([
   ...baseRows,
