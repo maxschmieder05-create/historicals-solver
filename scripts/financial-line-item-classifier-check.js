@@ -384,6 +384,48 @@ async function classify(overrides) {
   assert.equal(exactAccruedCurrentAndNoncurrentTag.recommended_model_row, "Accrued Liabilities");
   assert.equal(exactAccruedCurrentAndNoncurrentTag.mapping_passed_validation, true);
 
+  const redeemableNciWithMezzanineRow = await classify({
+    label: "Redeemable noncontrolling interests in subsidiaries",
+    xbrlTag: "RedeemableNoncontrollingInterestEquityCarryingAmount",
+    statement: "balance_sheet",
+    section: "equity",
+    periodType: "instant",
+    deterministicCandidate: "Common Stock & APIC",
+    uncertaintyReason: "Redeemable noncontrolling interests are mezzanine equity."
+  });
+  assert.equal(redeemableNciWithMezzanineRow.recommended_model_row, "Mezzanine Equity");
+  assert.equal(redeemableNciWithMezzanineRow.mapping_passed_validation, true);
+
+  const availableRowsWithoutMezzanine = availableModelRows.filter((row) => row !== "Mezzanine Equity");
+  const redeemableNciWithoutMezzanineRow = await classify({
+    label: "Redeemable noncontrolling interests in subsidiaries",
+    xbrlTag: "RedeemableNoncontrollingInterestEquityCarryingAmount",
+    statement: "balance_sheet",
+    section: "equity",
+    periodType: "instant",
+    availableModelRows: availableRowsWithoutMezzanine,
+    deterministicCandidate: "Common Stock & APIC",
+    uncertaintyReason: "Redeemable noncontrolling interests are mezzanine equity, but the template has no mezzanine row."
+  });
+  assert.equal(redeemableNciWithoutMezzanineRow.recommended_model_row, "Other Non-Current Liabilities");
+  assert.equal(redeemableNciWithoutMezzanineRow.mapping_passed_validation, true);
+  assert.equal(
+    classificationModelRowAssignmentForPrimaryStatement(redeemableNciWithoutMezzanineRow, availableRowsWithoutMezzanine).modelRow,
+    "Other Non-Current Liabilities"
+  );
+  assert.equal(
+    lineItemNeedsClassification(
+      request({
+        label: "Redeemable noncontrolling interests in subsidiaries",
+        xbrlTag: "RedeemableNoncontrollingInterestEquityCarryingAmount",
+        statement: "balance_sheet",
+        section: "equity",
+        periodType: "instant"
+      })
+    ),
+    true
+  );
+
   const cashFlowDa = await classify({
     label: "Depreciation and amortization",
     statement: "cash_flow",

@@ -165,7 +165,9 @@ export const MODEL_ROW_DEFINITIONS: Record<string, string> = {
   "Deferred Income Taxes":
     "True deferred tax liabilities / deferred income taxes / deferred tax liabilities, non-current / deferred tax assets and liabilities net.",
   "Other Non-Current Liabilities":
-    "Non-current liabilities without better dedicated rows, including long-term deferred revenue, long-term contract liabilities, operating lease liabilities non-current, pension and postretirement obligations, asset retirement obligations, other long-term liabilities.",
+    "Non-current liabilities without better dedicated rows, including long-term deferred revenue, long-term contract liabilities, operating lease liabilities non-current, pension and postretirement obligations, asset retirement obligations, other long-term liabilities. If the template has no mezzanine-equity row, include redeemable noncontrolling interests here so total liabilities and equity reconcile.",
+  "Mezzanine Equity":
+    "Redeemable noncontrolling interests and other mezzanine equity presented outside permanent stockholders' equity.",
   "Common Stock & APIC": "Common stock, additional paid-in capital, capital in excess of par.",
   "Retained Earnings": "Retained earnings or retained deficit.",
   "Treasury Stock": "Treasury stock or contra-equity items such as employee benefit trust / ESOP trust if no better row exists.",
@@ -210,7 +212,10 @@ const AMBIGUOUS_LINE_ITEM_TERMS = [
   "promotional",
   "promotion",
   "selling",
-  "administrative"
+  "administrative",
+  "redeemable",
+  "mezzanine",
+  "noncontrolling"
 ];
 
 const MODEL_ROW_ALIASES: Record<string, string[]> = {
@@ -516,6 +521,26 @@ function deterministicFinancialLineItemClassification(
   const isDeferredTaxLine = /\bdeferred\b/.test(text) && /\btax(?:es)?\b/.test(text);
   const textLooksDeferredTaxAsset = /\bassets?\b/.test(text);
   const textLooksDeferredTaxLiability = /\bliabilit/.test(text);
+  const redeemableNoncontrollingInterest =
+    /\bredeemable\b.*\bnon[-\s]?controlling interests?\b|\bnon[-\s]?controlling interests?\b.*\bredeemable\b|\bredeemable nci\b/.test(text) ||
+    /RedeemableNoncontrollingInterest/i.test(request.xbrlTag ?? "");
+
+  if (request.statement === "balance_sheet" && redeemableNoncontrollingInterest) {
+    const row = preferred("Mezzanine Equity", "Other Non-Current Liabilities");
+    return {
+      ...base,
+      recommended_model_row: row,
+      classification_type: "redeemable noncontrolling interest mezzanine equity",
+      is_current: false,
+      is_debt: false,
+      is_operating: false,
+      should_exclude_from_other_bucket: !modelRowsMatch(row, "Other Non-Current Liabilities"),
+      confidence: "high",
+      reason: modelRowsMatch(row, "Mezzanine Equity")
+        ? "Redeemable noncontrolling interests are mezzanine equity and map to the dedicated mezzanine row when the template provides one."
+        : "Redeemable noncontrolling interests are mezzanine equity outside permanent equity; because the template has no mezzanine row, group them into Other Non-Current Liabilities so the liabilities-and-equity side reconciles."
+    };
+  }
 
   if (isDeferredTaxLine && (/assets?/.test(section) || (textLooksDeferredTaxAsset && !/liabilit/.test(section)))) {
     return {
@@ -960,6 +985,14 @@ function classificationPassesValidation(request: FinancialLineItemClassification
   if (modelRowsMatch(row, "Revolver") && /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|convertible|senior notes?/.test(text)) return false;
   if (modelRowsMatch(row, "Deferred Income Taxes") && !classification.is_deferred_tax) return false;
   if ((modelRowsMatch(row, "Accrued Liabilities") || modelRowsMatch(row, "Other Current Liabilities")) && classification.is_debt) return false;
+  if (
+    request.statement === "balance_sheet" &&
+    (/\bredeemable\b.*\bnon[-\s]?controlling interests?\b|\bnon[-\s]?controlling interests?\b.*\bredeemable\b|\bredeemable nci\b/.test(text) ||
+      /RedeemableNoncontrollingInterest/i.test(request.xbrlTag ?? "")) &&
+    (modelRowsMatch(row, "Mezzanine Equity") || modelRowsMatch(row, "Other Non-Current Liabilities"))
+  ) {
+    return true;
+  }
   if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /inventor|spare parts?|aircraft fuel|supplies/.test(text)) return false;
   if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /short[-\s]?term investments?|marketable securities|available[-\s]?for[-\s]?sale securities/.test(text)) {
     const hasCurrentInvestmentsRow = request.availableModelRows.some((availableRow) =>

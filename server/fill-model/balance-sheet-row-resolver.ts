@@ -471,6 +471,7 @@ export function balanceSheetSectionCompatible(
   if (evidence === "unknown") return true;
   if (definition.canonical === "LT Debt (Incl. Current Portion)" && evidence === "current liabilities" && sourceLooksLikeCurrentLongTermDebtPortion(source)) return true;
   if (definition.canonical === "Total Debt" && evidence === "current liabilities" && sourceLooksLikeCurrentLongTermDebtPortion(source)) return true;
+  if (definition.canonical === "Other Non-Current Liabilities" && evidence === "equity" && sourceLooksLikeRedeemableNoncontrollingInterest(source)) return true;
   if (definition.family === "current_assets") return evidence === "current assets";
   if (definition.family === "non_current_assets") return evidence === "non-current assets";
   if (definition.family === "current_liabilities") return evidence === "current liabilities";
@@ -481,6 +482,11 @@ export function balanceSheetSectionCompatible(
 function sourceLooksLikeCurrentLongTermDebtPortion(source: { label?: string; tag?: string; concept?: string }) {
   const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
   return textLooksLikeCurrentDebtPortion(text) || /\bconvertible\b.*\bnotes?\b|\bsenior notes?\b/.test(text);
+}
+
+function sourceLooksLikeRedeemableNoncontrollingInterest(source: { label?: string; tag?: string; concept?: string }) {
+  const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
+  return /\bredeemable\b.*\bnon[-\s]?controlling interests?\b|\bnon[-\s]?controlling interests?\b.*\bredeemable\b|\bredeemable nci\b|redeemablenoncontrollinginterest/.test(text);
 }
 
 export function classifyBalanceSheetSourceSection(

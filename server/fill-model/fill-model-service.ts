@@ -3157,6 +3157,9 @@ function lineItemClassificationUncertaintyReason(row: SecFilingStatementStructur
   const text = `${row.rowLabel} ${row.xbrlConcept ?? ""}`.toLowerCase();
   if (/\bdeferred\b/.test(text)) return "Deferred items can be deferred revenue/contract liabilities or deferred income taxes.";
   if (/\bdebt\b|\bnotes?\b|\bborrowings?\b/.test(text)) return "Debt labels require distinguishing true short-term borrowing facilities from current maturities or long-term debt instruments.";
+  if (/\bredeemable\b.*\bnon[-\s]?controlling|\bmezzanine\b|\bredeemable nci\b|redeemablenoncontrollinginterest/.test(text)) {
+    return "Redeemable noncontrolling interests are mezzanine equity and require routing to a dedicated mezzanine row, or to a broad liabilities/equity-side bucket when the template has no mezzanine row.";
+  }
   if (/\bother\b/.test(text) || /other/i.test(deterministicCandidate ?? "")) return "Other buckets are allowed only when no better dedicated model row exists.";
   if (/\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bselling\b|\badministrative\b/.test(text)) {
     return "Selling, marketing, advertising, and administrative expense labels require grouping into SG&A when no more dedicated model row exists.";
@@ -3369,6 +3372,33 @@ function sourceLooksLikeOperatingLeaseRightOfUseAsset(source: FactSource) {
   return sourceTextMatches(source, /\boperating lease\b.*\bright[-\s]?of[-\s]?use\b.*\bassets?\b|\bright[-\s]?of[-\s]?use\b.*\bassets?\b/) && !sourceTextMatches(source, /\bliabilit/);
 }
 
+function sourceLooksLikeDigitalOrCryptoAsset(source: FactSource) {
+  return sourceTextMatches(source, /\bcrypto assets?\b|\bdigital assets?\b|\bcrypto asset fair value\b/);
+}
+
+function sourceLooksLikeAssetBalanceForLiabilityBucket(source: FactSource) {
+  if (
+    sourceLooksLikeDedicatedAsset(source) ||
+    sourceLooksLikeCurrentInvestment(source) ||
+    sourceLooksLikeInvestmentAsset(source) ||
+    sourceLooksLikeDeferredTaxAsset(source) ||
+    sourceLooksLikeEquityMethodInvestmentAsset(source) ||
+    sourceLooksLikeIntangibleAsset(source) ||
+    sourceLooksLikeOperatingLeaseRightOfUseAsset(source) ||
+    sourceLooksLikeDigitalOrCryptoAsset(source) ||
+    sourceLooksLikeAssetHeldForSale(source)
+  ) {
+    return true;
+  }
+  const category = reportedLineItemCategory(source);
+  if (category === "current_assets" || category === "non_current_assets" || category === "total_assets") return true;
+  const text = sourceSearchText(source);
+  const hasAssetSignal =
+    /\bassets?\b|\basset\b|\boperating lease vehicles?\b|\benergy generation and storage systems?\b|\bsolar energy systems?\b/.test(text);
+  const hasLiabilitySignal = /\bliabilit|obligations?|payable|debt|borrowings?|asset retirement/.test(text);
+  return hasAssetSignal && !hasLiabilitySignal;
+}
+
 function sourceLooksLikeParentheticalBalanceSheetDetail(source: FactSource) {
   if (C.receivables.includes(source.concept) || C.ppe.includes(source.concept) || C.treasury.includes(source.concept) || source.concept === "CommonStockValue") return false;
   if (sourceTextMatches(source, /\b(?:par|stated) value\b.*\bper share\b|\bpar or stated value\b|\bper share\b.*\b(?:par|stated) value\b/)) return true;
@@ -3500,12 +3530,15 @@ function primaryCurrentDebtMaturitySources(period: string, ctx: ResolveContext) 
 
 function primaryOtherNonCurrentLiabilitySources(period: string, ctx: ResolveContext) {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    if (sourceLooksLikeRedeemableNoncontrollingInterest(source)) return !ctx.template?.hasMezzanineEquityRow;
+    if (sourceLooksLikeAssetBalanceForLiabilityBucket(source)) return false;
     const nonCurrentLeaseLiability = sourceLooksLikeNonCurrentLeaseLiability(source);
     const semanticOtherNonCurrentLiability = sourceTextMatches(
       source,
       /\blong[-\s]?term operating lease liabilit|\bother long[-\s]?term insurance liabilit|\bother long[-\s]?term liabilit|\bdeferred revenue\b.*\bnoncurrent\b|\basset retirement obligations?\b/
     ) || nonCurrentLeaseLiability || sourceLooksLikeMixedDeferredTaxAndOtherLiability(source);
-    if (isPrimaryBalanceSheetSubtotalSource(source) || (!primaryRowInNonCurrentLiabilitySection(row, source) && !semanticOtherNonCurrentLiability)) return false;
+    if (!primaryRowInNonCurrentLiabilitySection(row, source) && !semanticOtherNonCurrentLiability) return false;
     if (sourceLooksLikeNonCurrentDebt(source) && !nonCurrentLeaseLiability) return false;
     if (ctx.template?.hasDeferredTaxLiabilityRow && sourceLooksLikeDeferredTaxLiability(source) && !sourceLooksLikeMixedDeferredTaxAndOtherLiability(source)) return false;
     if (ctx.template?.hasNonCurrentLeaseLiabilityRow && sourceLooksLikeNonCurrentLeaseLiability(source)) return false;
@@ -6173,10 +6206,7 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
     primaryAccruedLiabilitySources(period, ctx),
     "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
   );
-  if (primaryAccrued.value !== null) {
-    const singleSource = primaryAccrued.sources.length === 1 ? primaryAccrued.sources[0] : null;
-    return singleSource ? adjustedBroadAccruedLiabilities(period, ctx, singleSource) : primaryAccrued;
-  }
+  if (primaryAccrued.value !== null) return primaryAccrued;
 
   const direct = first(period, ctx.instant, C.accrued);
   if (direct) return adjustedBroadAccruedLiabilities(period, ctx, direct);
@@ -6243,6 +6273,14 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.goodwill);
   if (direct) return { value: direct.value, sources: [direct] };
 
+  if (primaryBalanceSheetPeriodWasInspected(period, ctx)) {
+    return explicitZeroResolved(
+      "GoodwillNotSeparatelyDisclosed",
+      "No current-period goodwill disclosed",
+      "No goodwill line was disclosed on the current primary SEC balance sheet, so stale prior-period goodwill was cleared."
+    );
+  }
+
   const carried = firstWithPriorInstant(period, ctx.instant, C.goodwill);
   if (carried) {
     return {
@@ -6257,6 +6295,10 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
     sources: [],
     note: "No explicit SEC goodwill balance was reported for this period. The row was left unresolved instead of defaulting to zero."
   };
+}
+
+function primaryBalanceSheetPeriodWasInspected(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetRowsForPeriod(period, ctx).some((row) => Boolean(primaryBalanceSheetFactSource(row, period)));
 }
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
@@ -6580,10 +6622,7 @@ function resolveDirectOrPrimaryAccruedLiabilities(period: string, ctx: ResolveCo
     primaryAccruedLiabilitySources(period, ctx),
     "Mapped to reported accrued operating current liability lines from the primary consolidated balance sheet."
   );
-  if (primaryAccrued.value !== null) {
-    const singleSource = primaryAccrued.sources.length === 1 ? primaryAccrued.sources[0] : null;
-    return singleSource ? adjustedBroadAccruedLiabilities(period, ctx, singleSource) : primaryAccrued;
-  }
+  if (primaryAccrued.value !== null) return primaryAccrued;
 
   const direct = first(period, ctx.instant, C.accrued);
   return direct ? adjustedBroadAccruedLiabilities(period, ctx, direct) : { value: null, sources: [] };
@@ -6790,17 +6829,23 @@ function resolveDirectOtherNonCurrentLiabilities(period: string, ctx: ResolveCon
   if (primaryOtherNonCurrent.value !== null) return primaryOtherNonCurrent;
 
   const directConcepts = [...BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS];
+  if (!ctx.template?.hasMezzanineEquityRow) directConcepts.push(...REDEEMABLE_NCI_CONCEPTS);
   if (!ctx.template?.hasDeferredTaxLiabilityRow) directConcepts.push(...C.deferredTaxLiability);
   if (!ctx.template?.hasNonCurrentLeaseLiabilityRow) directConcepts.push(...NONCURRENT_LEASE_LIABILITY_CONCEPTS);
   if (!ctx.template?.hasPensionLiabilityRow) directConcepts.push(...PENSION_LIABILITY_CONCEPTS);
   const direct = sum(period, ctx.instant, directConcepts);
   if (!direct) return { value: null, sources: [] };
-  const sources = withAcceptedModelRowClassifications(period, ctx, direct.sources, "Other Non-Current Liabilities");
+  const sources = withAcceptedModelRowClassifications(period, ctx, direct.sources, "Other Non-Current Liabilities").filter(
+    (source) => sourceLooksLikeRedeemableNoncontrollingInterest(source) || !sourceLooksLikeAssetBalanceForLiabilityBucket(source)
+  );
   if (!sources.length) return { value: null, sources: [], note: "Non-current liability source lines were classified into dedicated rows outside Other Non-Current Liabilities." };
+  const includesRedeemableNci = sources.some(sourceLooksLikeRedeemableNoncontrollingInterest);
   return {
     value: sources.reduce((total, source) => total + source.value, 0),
     sources,
-    note: "Mapped to directly reported non-current liability concepts that do not have dedicated model rows.",
+    note: includesRedeemableNci
+      ? "Mapped to directly reported non-current liability concepts plus redeemable noncontrolling interests because the template has no mezzanine-equity row."
+      : "Mapped to directly reported non-current liability concepts that do not have dedicated model rows.",
     classification: sources.length > 1 ? "grouped" : "direct"
   };
 }
@@ -6841,6 +6886,18 @@ function resolveCurrentLiabilitiesForNonCurrentLiabilitySubtotal(period: string,
 function resolveModeledNonCurrentLiabilitiesSubtotal(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, ["LiabilitiesNoncurrent"]);
   if (direct) {
+    const redeemableNci = redeemableNciGroupedIntoOtherNonCurrentLiabilities(ctx)
+      ? resolveRedeemableNoncontrollingInterests(period, ctx)
+      : null;
+    if (redeemableNci?.value) {
+      return {
+        value: direct.value + redeemableNci.value,
+        sources: compactSources([direct, redeemableNci]),
+        note:
+          "Mapped to EDGAR non-current liabilities plus redeemable noncontrolling interests because the template has no mezzanine-equity row and groups redeemable NCI into Other Non-Current Liabilities.",
+        classification: "grouped"
+      };
+    }
     return {
       value: direct.value,
       sources: [direct],
@@ -6957,20 +7014,59 @@ function resolveTotalEquityIncludingNci(period: string, ctx: ResolveContext): Re
   };
 }
 
+function redeemableNciGroupedIntoOtherNonCurrentLiabilities(ctx: ResolveContext) {
+  return !ctx.template?.hasMezzanineEquityRow;
+}
+
+function resolveRedeemableNoncontrollingInterests(period: string, ctx: ResolveContext): ResolvedValue {
+  const direct = first(period, ctx.instant, REDEEMABLE_NCI_CONCEPTS) ?? primaryBalanceSheetConceptSource(period, ctx, REDEEMABLE_NCI_CONCEPTS);
+  if (!direct) {
+    return explicitZeroResolved(
+      REDEEMABLE_NCI_CONCEPTS[0],
+      "No redeemable noncontrolling interests disclosed",
+      "No redeemable noncontrolling interests were disclosed for this SEC balance sheet period."
+    );
+  }
+  return {
+    value: direct.value,
+    sources: [direct],
+    note: "Mapped to EDGAR redeemable noncontrolling interests in subsidiaries."
+  };
+}
+
 function resolveTotalLiabilities(period: string, ctx: ResolveContext): ResolvedValue {
   const direct = first(period, ctx.instant, C.liabilities);
-  if (direct) return { value: direct.value, sources: [direct] };
+  if (direct) {
+    const redeemableNci = redeemableNciGroupedIntoOtherNonCurrentLiabilities(ctx)
+      ? resolveRedeemableNoncontrollingInterests(period, ctx)
+      : null;
+    if (redeemableNci?.value) {
+      return {
+        value: direct.value + redeemableNci.value,
+        sources: compactSources([direct, redeemableNci]),
+        note:
+          "Included EDGAR total liabilities plus redeemable noncontrolling interests because the template has no mezzanine-equity row and groups redeemable NCI into Other Non-Current Liabilities.",
+        classification: "grouped"
+      };
+    }
+    return { value: direct.value, sources: [direct] };
+  }
 
   const assets = primaryBalanceSheetTotalAssets(period, ctx);
   const totalEquity = resolveTotalEquityIncludingNci(period, ctx);
-  if (!assets || totalEquity.value === null) {
+  const redeemableNci = redeemableNciGroupedIntoOtherNonCurrentLiabilities(ctx)
+    ? resolveRedeemableNoncontrollingInterests(period, ctx)
+    : zeroResolved(REDEEMABLE_NCI_CONCEPTS[0]);
+  if (!assets || totalEquity.value === null || redeemableNci.value === null) {
     return { value: null, sources: compactSources([assets, totalEquity]), note: "Could not derive total liabilities because EDGAR assets or total equity were unavailable." };
   }
 
   return {
-    value: assets.value - totalEquity.value,
-    sources: compactSources([assets, totalEquity]),
-    note: "Derived total liabilities from EDGAR total assets less total equity."
+    value: assets.value - totalEquity.value + redeemableNci.value,
+    sources: compactSources([assets, totalEquity, redeemableNci]),
+    note: redeemableNci.value
+      ? "Derived model total liabilities from EDGAR total assets less total equity plus redeemable noncontrolling interests grouped into liabilities because the template has no mezzanine-equity row."
+      : "Derived total liabilities from EDGAR total assets less total equity."
   };
 }
 
@@ -12875,6 +12971,7 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if (
     [...C.ppe, ...C.intangibles, ...C.goodwill, ...INVESTMENT_ASSET_CONCEPTS, "LongTermInvestments", "OperatingLeaseRightOfUseAsset", "OperatingLeaseRightOfUseAssetNet", "OtherAssetsNoncurrent", "RestrictedCashNoncurrent"].includes(concept) ||
     sourceLooksLikeDeferredTaxAsset(source) ||
+    sourceLooksLikeDigitalOrCryptoAsset(source) ||
     /\bnoncurrent assets?\b|\bnon-current assets?\b|\blong[-\s]?term investments?\b|\bequity investments?\b|\bright[-\s]?of[-\s]?use assets?\b|\boperating lease\b.*\bassets?\b|\bproperty\b.*\bplant\b|\bproperty and equipment\b|\bgoodwill\b|\bintangibles?\b|\bother assets?\b/.test(text)
   ) return "non_current_assets";
   if (C.assets.includes(concept)) return "total_assets";
@@ -17914,7 +18011,8 @@ function refreshFinalBalanceSheetKeyMetrics(sheet: ExcelJS.Worksheet, periods: s
       const cell = sheet.getCell(balanceSheetCheckRow, col);
       const formula = formulaForCell(cell);
       if (!formula) return;
-      setFormulaResult(cell, 0);
+      const evaluated = new FormulaEvaluator(sheet).evaluateCell(cell);
+      if (evaluated !== null) setFormulaResult(cell, evaluated);
     });
   }
 }
@@ -18828,6 +18926,10 @@ function validateIncomeStatementMetricAgainstEdgar(
 }
 
 function statementMetricCellValue(cell: ExcelJS.Cell, evaluator: FormulaEvaluator, expected: number) {
+  if (hasFormula(cell)) {
+    const evaluated = evaluator.evaluateCell(cell);
+    if (evaluated !== null) return evaluated;
+  }
   const cached = numericCellValue(cell);
   if (cached !== null && statementMetricTies(cached, expected)) return cached;
   return evaluator.evaluateCell(cell);
@@ -19313,11 +19415,11 @@ function assignPrimaryBalanceSheetLineItem(
     return choose("Mezzanine Equity", ["Redeemable Noncontrolling Interests", "Redeemable NCI"], "Redeemable noncontrolling interests map to mezzanine equity when the template exposes that row.");
   }
   if (sourceLooksLikeRedeemableNoncontrollingInterest(source)) {
-    return {
-      modelRow: null,
-      status: "explicitly_excluded_with_reason",
-      reason: "Redeemable noncontrolling interests are mezzanine equity outside stockholders' equity, and the template has no mezzanine-equity row."
-    };
+    return chooseOther(
+      "Other Non-Current Liabilities",
+      ["Other Long-Term Liabilities", "Other LT Liabilities"],
+      "Redeemable noncontrolling interests are mezzanine equity outside permanent equity; because the template has no mezzanine-equity row, they are grouped into Other Non-Current Liabilities so liabilities and equity reconcile."
+    );
   }
   if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
     return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
@@ -19596,11 +19698,11 @@ function assignPrimaryBalanceSheetLineItem(
       return choose("Mezzanine Equity", ["Redeemable Noncontrolling Interests", "Redeemable NCI"], "Redeemable noncontrolling interests map to mezzanine equity when the template exposes that row.");
     }
     if (sourceLooksLikeRedeemableNoncontrollingInterest(source)) {
-      return {
-        modelRow: null,
-        status: "explicitly_excluded_with_reason",
-        reason: "Redeemable noncontrolling interests are mezzanine equity outside stockholders' equity, and the template has no mezzanine-equity row."
-      };
+      return chooseOther(
+        "Other Non-Current Liabilities",
+        ["Other Long-Term Liabilities", "Other LT Liabilities"],
+        "Redeemable noncontrolling interests are mezzanine equity outside permanent equity; because the template has no mezzanine-equity row, they are grouped into Other Non-Current Liabilities so liabilities and equity reconcile."
+      );
     }
     if (C.nci.includes(source.concept) || sourceTextMatches(source, /\bnoncontrolling interest\b|\bminority interest\b/)) {
       return choose("Noncontrolling Interests", ["Non-Controlling Interests"], "Noncontrolling interests map to noncontrolling interests.");
@@ -20328,16 +20430,6 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
             return;
           }
         }
-        if (modelRowsMatch(modelRow, "Accrued Liabilities")) {
-          const resolvedAccrued = resolveAccruedLiabilities(lookupPeriod, ctx);
-          const resolvedAccruedValue = resolvedAccrued.value === null ? null : resolvedAccrued.value / 1_000_000;
-          if (resolvedAccruedValue !== null && statementMetricTies(actual, resolvedAccruedValue)) {
-            warnings.unshift(
-              `${message} The model row ties the EDGAR accrued-liability resolver, which may subtract current debt or lease components modeled in separate rows.`
-            );
-            return;
-          }
-        }
         errors.push(message);
       }
     });
@@ -20578,7 +20670,18 @@ function validateBalanceSheetStatementTotals(
     )
   );
   errors.push(
-    ...validateBalanceSheetMetricAgainstEdgar(sheet, periods, columns, ctx, evaluator, warnings, "total liabilities", ["Total Liabilities"], C.liabilities)
+    ...validateBalanceSheetMetricAgainstResolver(
+      sheet,
+      periods,
+      columns,
+      ctx,
+      evaluator,
+      warnings,
+      "total liabilities",
+      ["Total Liabilities"],
+      resolveTotalLiabilities,
+      primaryAssignmentLedgerRows
+    )
   );
   errors.push(
     ...validateBalanceSheetMetricAgainstResolver(
@@ -21634,7 +21737,7 @@ function validateBalanceSheetCheck(sheet: ExcelJS.Worksheet, periods: string[], 
       if (isProjectedBalanceSheetCell(sheet, checkRow, columns[index])) return;
       const protectedFormula = isProtectedFormulaOrCheckCell(cell);
       const cached = numericCellValue(cell);
-      const check = cached !== null && statementMetricTies(cached, 0) ? cached : evaluator.evaluateCell(cell);
+      const check = hasFormula(cell) ? evaluator.evaluateCell(cell) : cached !== null && statementMetricTies(cached, 0) ? cached : evaluator.evaluateCell(cell);
       if (check === null) {
         const message = `Balance Sheet ${cell.address} ${period}: could not evaluate the model's balance sheet check row.`;
         recordBalanceSheetValidationIssue(errors, warnings, message, protectedFormula, sheet, period, columns[index], ctx, message);
@@ -23535,7 +23638,12 @@ export const __fillModelServiceTestHooks = {
   primaryStatementHasCostOfRevenueSplitWithSeparateDa,
   reportedLineItemCategory,
   resolveAccruedLiabilities,
+  resolveGoodwill,
   resolveOtherCurrentLiabilities,
+  resolveOtherNonCurrentLiabilities,
+  resolveTotalLiabilities,
+  FormulaEvaluator,
+  statementMetricCellValue,
   resolveCostOfRevenue,
   resolvePrimaryStatementCostOfRevenue,
   resolveIncomeStatementDepreciationAmortization,

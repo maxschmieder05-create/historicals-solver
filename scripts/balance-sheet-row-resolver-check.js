@@ -92,6 +92,13 @@ assert.equal(
   }),
   true
 );
+assert.equal(
+  balanceSheetSectionCompatible("Other Non-Current Liabilities", "equity", {
+    label: "Redeemable noncontrolling interests in subsidiaries",
+    concept: "RedeemableNoncontrollingInterestEquityCarryingAmount"
+  }),
+  true
+);
 
 const disappearingPeriods = [
   ["1Q23", 5985],
