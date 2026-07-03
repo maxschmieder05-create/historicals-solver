@@ -40,6 +40,7 @@ const {
   classifyFinancialLineItem,
   classifyFinancialStatementLineItems,
   classificationModelRowAssignmentForPrimaryStatement,
+  materialStatementLineItemNeedsAnalystPass,
   modelRowDefinitionsForRows,
   modelRowsMatch,
   lineItemNeedsClassification
@@ -49,6 +50,30 @@ const availableModelRows = Object.keys(MODEL_ROW_DEFINITIONS);
 const modelRowDefinitions = modelRowDefinitionsForRows(availableModelRows);
 assert.equal(modelRowsMatch("Research & Development (R&D)", "R&D"), true);
 assert.equal(modelRowsMatch("Selling, General & Administration (SG&A)", "SG&A"), true);
+assert.equal(
+  materialStatementLineItemNeedsAnalystPass(
+    request({
+      label: "Cash and cash equivalents",
+      xbrlTag: "CashAndCashEquivalentsAtCarryingValue",
+      section: "current assets",
+      amount: 1_000_000,
+      uncertaintyReason: ""
+    })
+  ),
+  true
+);
+assert.equal(
+  materialStatementLineItemNeedsAnalystPass(
+    request({
+      label: "Cash and cash equivalents",
+      xbrlTag: "CashAndCashEquivalentsAtCarryingValue",
+      section: "current assets",
+      amount: 100,
+      uncertaintyReason: ""
+    })
+  ),
+  false
+);
 assert.equal(
   classificationModelRowAssignmentForPrimaryStatement(
     {
@@ -772,6 +797,224 @@ async function classify(overrides) {
   assert.equal(deterministicAssignment.modelRow, "LT Debt (Incl. Current Portion)");
   assert.equal(deterministicAssignment.llmUsed, false);
   assert.equal(deterministicAssignment.reason.startsWith("Validated line-item classification:"), true);
+
+  const fullAnalystPassPayloads = [];
+  const fullAnalystPassResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-cash",
+        rowOrder: 1,
+        label: "Cash and cash equivalents",
+        xbrlTag: "CashAndCashEquivalentsAtCarryingValue",
+        section: "current assets",
+        amount: 1_000_000,
+        uncertaintyReason: ""
+      }),
+      request({
+        sourceRowKey: "row-investments",
+        rowOrder: 2,
+        label: "Short-term investments",
+        xbrlTag: "ShortTermInvestments",
+        section: "current assets",
+        amount: 2_000_000,
+        deterministicCandidate: "Prepaid & Other Current Assets"
+      }),
+      request({
+        sourceRowKey: "row-advertising",
+        rowOrder: 7,
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration",
+        amount: 3_000_000,
+        uncertaintyReason: ""
+      }),
+      request({
+        sourceRowKey: "row-lease-financing",
+        rowOrder: 12,
+        label: "Other lease financing obligations",
+        xbrlTag: "OtherLeaseFinancingObligations",
+        section: "non-current liabilities",
+        amount: 4_000_000,
+        deterministicCandidate: "Other Non-Current Liabilities",
+        uncertaintyReason: "lease financing may represent debt or another long-term liability"
+      }),
+      request({
+        sourceRowKey: "row-notes-payable",
+        rowOrder: 13,
+        label: "Notes payable",
+        xbrlTag: "NotesPayableCurrent",
+        section: "current liabilities",
+        amount: 5_000_000,
+        deterministicCandidate: "Other Current Liabilities",
+        uncertaintyReason: "notes payable could be current borrowings even if reported below other liabilities"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.2",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init.body);
+          fullAnalystPassPayloads.push(body);
+          return {
+            ok: true,
+            json: async () => ({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-cash",
+                          source_line_item: "Cash and cash equivalents",
+                          recommended_action: "map",
+                          recommended_model_row: "Cash & Cash Equivalents",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "cash",
+                          is_current: true,
+                          is_debt: false,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Cash maps to the cash row after reviewing the full statement.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        },
+                        {
+                          source_row_key: "row-investments",
+                          source_line_item: "Short-term investments",
+                          recommended_action: "remap",
+                          recommended_model_row: "Cash & Cash Equivalents",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "cash-like current investment",
+                          is_current: true,
+                          is_debt: false,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "No dedicated current investments row is available, so investments group with cash.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        },
+                        {
+                          source_row_key: "row-advertising",
+                          source_line_item: "Advertising expense",
+                          recommended_action: "map",
+                          recommended_model_row: "SG&A",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "selling and marketing expense",
+                          is_current: null,
+                          is_debt: false,
+                          is_operating: true,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Advertising is a selling and marketing operating expense and groups into SG&A.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        },
+                        {
+                          source_row_key: "row-lease-financing",
+                          source_line_item: "Other lease financing obligations",
+                          recommended_action: "remap",
+                          recommended_model_row: "LT Debt (Incl. Current Portion)",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "debt-like financing obligation",
+                          is_current: false,
+                          is_debt: true,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Whole-statement context shows this is a financing obligation below operating liabilities.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        },
+                        {
+                          source_row_key: "row-notes-payable",
+                          source_line_item: "Notes payable",
+                          recommended_action: "remap",
+                          recommended_model_row: "Revolver",
+                          recommended_model_row_mappings: [],
+                          explicit_zero_rows: [],
+                          classification_type: "current borrowing facility",
+                          is_current: true,
+                          is_debt: true,
+                          is_operating: false,
+                          is_tax_related: false,
+                          is_deferred_revenue_or_contract_liability: false,
+                          is_deferred_tax: false,
+                          is_subtotal: false,
+                          should_exclude_from_other_bucket: true,
+                          confidence: "high",
+                          reason: "Notes payable current is a current borrowing source and belongs with Revolver/current borrowings.",
+                          requires_validation: true,
+                          requires_revalidation: true
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            })
+          };
+        }
+      },
+      statementAnalystPass: {
+        enabled: true,
+        materialityThreshold: 500_000
+      }
+    }
+  );
+  assert.equal(fullAnalystPassPayloads.length, 1);
+  const fullAnalystPayload = JSON.parse(fullAnalystPassPayloads[0].messages[1].content);
+  assert.deepEqual(fullAnalystPayload.targetSourceRowKeys, [
+    "row-cash",
+    "row-investments",
+    "row-advertising",
+    "row-lease-financing",
+    "row-notes-payable"
+  ]);
+  assert.equal(fullAnalystPayload.statementRows.every((row) => row.target === true), true);
+  assert.equal(
+    fullAnalystPayload.statementRows.every((row) => row.targetReason === "material_pre_fill_analyst_pass"),
+    true
+  );
+  assert.equal(
+    fullAnalystPayload.classificationGoal.includes("Deterministic candidates are evidence and validation guardrails"),
+    true
+  );
+  assert.equal(fullAnalystPassResult.classifications.length, 5);
+  assert.equal(fullAnalystPassResult.classifications.find((item) => item.request.sourceRowKey === "row-cash").classification.llm_used, true);
+  assert.equal(
+    fullAnalystPassResult.classifications.find((item) => item.request.sourceRowKey === "row-advertising").classification.recommended_model_row,
+    "SG&A"
+  );
 
   const failedPayloads = [];
   const failedResult = await classifyFinancialStatementLineItems(

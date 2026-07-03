@@ -116,6 +116,10 @@ type LlmClassificationOptions = {
 
 type ClassifierOptions = {
   llm?: LlmClassificationOptions;
+  statementAnalystPass?: {
+    enabled: boolean;
+    materialityThreshold?: number;
+  };
 };
 
 type PreparedLineItemClassification = {
@@ -125,6 +129,7 @@ type PreparedLineItemClassification = {
   fallback: FinancialLineItemClassification;
   initialClassification: FinancialLineItemClassification;
   deterministicIsValidated: boolean;
+  materialAnalystTarget: boolean;
   needsClassification: boolean;
   needsLlm: boolean;
 };
@@ -277,6 +282,8 @@ const GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS = [
   "Preserve EDGAR tie-outs: major model totals should reconcile to the SEC filing through assigned components, formulas, or explicit exclusion reasons."
 ];
 
+const DEFAULT_MATERIAL_STATEMENT_ROW_THRESHOLD = 500_000;
+
 export function modelRowDefinitionsForRows(availableRows: string[]) {
   const output: Record<string, string> = {};
   for (const [row, definition] of Object.entries(MODEL_ROW_DEFINITIONS)) {
@@ -321,6 +328,20 @@ export function lineItemNeedsClassification(request: FinancialLineItemClassifica
   ) return true;
   if (request.deterministicCandidate && /other|accrued|revolver|deferred|d&a|depreciation|amortization/i.test(request.deterministicCandidate)) return true;
   return Boolean(request.uncertaintyReason);
+}
+
+export function materialStatementLineItemNeedsAnalystPass(
+  request: FinancialLineItemClassificationRequest,
+  materialityThreshold = DEFAULT_MATERIAL_STATEMENT_ROW_THRESHOLD
+) {
+  if (request.sourceTableType !== "primary_statement") return false;
+  if (request.statement !== "income_statement" && request.statement !== "balance_sheet") return false;
+  if (request.unit && !/usd/i.test(request.unit)) return false;
+  if (typeof request.amount !== "number" || !Number.isFinite(request.amount)) return false;
+  const threshold = Number.isFinite(materialityThreshold) && materialityThreshold >= 0
+    ? materialityThreshold
+    : DEFAULT_MATERIAL_STATEMENT_ROW_THRESHOLD;
+  return Math.abs(request.amount) >= threshold;
 }
 
 function primaryBalanceSheetLineItemNeedsLlmReview(request: FinancialLineItemClassificationRequest) {
@@ -457,13 +478,17 @@ function prepareLineItemClassification(
       ...deterministic,
       recommended_model_row: normalizeModelRow(deterministic.recommended_model_row) || deterministic.recommended_model_row
     });
-  const needsClassification = lineItemNeedsClassification(request);
+  const materialAnalystTarget = Boolean(
+    options.statementAnalystPass?.enabled &&
+      materialStatementLineItemNeedsAnalystPass(request, options.statementAnalystPass.materialityThreshold)
+  );
+  const needsClassification = materialAnalystTarget || lineItemNeedsClassification(request);
   const needsLlm = Boolean(
     options.llm?.enabled &&
       options.llm.apiKey &&
       options.llm.model &&
       needsClassification &&
-      (!deterministicIsValidated || primaryBalanceSheetLineItemNeedsLlmReview(request))
+      (materialAnalystTarget || !deterministicIsValidated || primaryBalanceSheetLineItemNeedsLlmReview(request))
   );
 
   return {
@@ -473,6 +498,7 @@ function prepareLineItemClassification(
     fallback,
     initialClassification: finalizeClassification(request, fallback),
     deterministicIsValidated,
+    materialAnalystTarget,
     needsClassification,
     needsLlm
   };
@@ -1129,6 +1155,7 @@ async function requestStatementLlmClassification(
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Do not classify one row in isolation. Review the entire provided statement in row order, including sibling labels, parent subtotals, current/non-current sections, XBRL tag semantics, deterministic classifications, and model row definitions.",
     "Think like a human reviewer with the SEC statement and model open side by side: the filing labels and model labels will not always match, so assign by accounting substance and template definitions.",
+    "Use deterministic candidates and fallback rows as evidence, validation hints, and guardrails only. They are not the primary mapper for target rows.",
     ...GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
     "Only return classifications for targetSourceRowKeys. Use each source_row_key exactly as provided.",
     "The model template order may differ from the filing statement order. Assign each source line to the model row that best fits the accounting meaning, even if that model row appears much earlier or later in the template.",
@@ -1179,7 +1206,7 @@ function statementLlmClassificationPayload(prepared: PreparedLineItemClassificat
     modelRowDefinitions: first?.modelRowDefinitions ?? {},
     alreadyMappedRows: first?.alreadyMappedRows ?? [],
     classificationGoal:
-      "Classify only the target rows after reviewing the full SEC statement context as if the SEC statement and model template were open side by side. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match. The examples in the system prompt are non-exhaustive; apply the same accounting-substance reasoning to any random SEC line item.",
+      "Classify only the target rows after reviewing the full SEC statement context as if the SEC statement and model template were open side by side. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match. Deterministic candidates are evidence and validation guardrails, not the primary mapper. The examples in the system prompt are non-exhaustive; apply the same accounting-substance reasoning to any random SEC line item.",
     routingPrinciples: GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
     statementRows: prepared
       .slice()
@@ -1188,6 +1215,7 @@ function statementLlmClassificationPayload(prepared: PreparedLineItemClassificat
         sourceRowKey: item.rowKey,
         rowOrder: item.request.rowOrder ?? null,
         target: targets.some((target) => target.rowKey === item.rowKey),
+        targetReason: item.materialAnalystTarget ? "material_pre_fill_analyst_pass" : item.needsLlm ? "ambiguous_or_validation_required" : "",
         reportedLineItemLabel: item.request.reportedLineItemLabel,
         cleanLabel: item.request.cleanLabel,
         xbrlTag: item.request.xbrlTag ?? "",

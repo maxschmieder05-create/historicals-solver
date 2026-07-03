@@ -36,6 +36,7 @@ import {
   classificationModelRowAssignmentForPrimaryStatement,
   classificationSourceKeys,
   lineItemNeedsClassification,
+  materialStatementLineItemNeedsAnalystPass,
   modelRowDefinitionsForRows,
   modelRowsMatch,
   type FinancialLineItemClassification,
@@ -835,6 +836,7 @@ const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
   process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24, 8)
 );
 const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 15_000);
+const LLM_PREFILL_ANALYST_MATERIALITY_USD = Number(process.env.LLM_PREFILL_ANALYST_MATERIALITY_USD || 500_000);
 
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
@@ -2692,6 +2694,8 @@ async function buildLineItemClassificationStore(
     statementCount: statements.length,
     availableModelRowCount: availableModelRows.length,
     alreadyMappedRowCount: alreadyMappedRows.length,
+    preFillAnalystPass: true,
+    preFillAnalystMaterialityUsd: LLM_PREFILL_ANALYST_MATERIALITY_USD,
     llmCanUse: llmCanUse(state, 1_500),
     maxLineItemLlmCalls: LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS,
     lineItemTimeoutMs: LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS
@@ -2778,20 +2782,35 @@ async function buildLineItemClassificationStore(
       accession: statement.accession,
       rowCount: rows.length,
       requestGroupCount: requestGroups.length,
-      requestCount: requestGroups.reduce((total, group) => total + group.length, 0)
+      requestCount: requestGroups.reduce((total, group) => total + group.length, 0),
+      materialAnalystTargetCount: requestGroups.reduce(
+        (total, group) =>
+          total + group.filter((request) => materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)).length,
+        0
+      )
     });
     for (const requests of requestGroups) {
-      const needsClassificationCount = requests.filter((request) => lineItemNeedsClassification(request)).length;
+      const materialAnalystTargetCount = requests.filter((request) =>
+        materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
+      ).length;
+      const needsClassificationCount = requests.filter(
+        (request) => lineItemNeedsClassification(request) || materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
+      ).length;
       if (!needsClassificationCount) {
         debug.step("LLM line-item classification group skipped", {
           fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
           statementName: statement.statementName,
-          reason: "no rows needed classification",
+          reason: "no material or ambiguous rows needed classification",
           requestCount: requests.length
         });
         continue;
       }
       const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmAttempts < maxLineItemLlmCalls;
+      if (!willUseLlm && materialAnalystTargetCount > 0 && state.enabled) {
+        warnings.push(
+          `${requests[0]?.fiscalPeriod ?? ""} ${statement.statementName}: pre-fill LLM analyst pass could not review ${materialAnalystTargetCount} material SEC line item(s) within the configured LLM budget; deterministic evidence and validation were used as fallback.`
+        );
+      }
       const model = chooseStatementLineItemClassificationModel(requests);
       debug.step("LLM line-item classification group start", {
         fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
@@ -2799,6 +2818,7 @@ async function buildLineItemClassificationStore(
         statementType: statementName,
         requestCount: requests.length,
         needsClassificationCount,
+        materialAnalystTargetCount,
         willUseLlm,
         model,
         remainingLineItemLlmCalls: Math.max(0, maxLineItemLlmCalls - lineItemLlmAttempts),
@@ -2821,6 +2841,10 @@ async function buildLineItemClassificationStore(
           siteUrl: OPENROUTER_SITE_URL,
           appTitle: OPENROUTER_APP_TITLE,
           timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
+        },
+        statementAnalystPass: {
+          enabled: true,
+          materialityThreshold: LLM_PREFILL_ANALYST_MATERIALITY_USD
         }
       });
       classificationResult.llmTelemetry.forEach((telemetry) => recordLlmTelemetry(state, telemetry));
@@ -3013,7 +3037,9 @@ function statementLineItemDedupeKey(
 
 function chooseStatementLineItemClassificationModel(requests: FinancialLineItemClassificationRequest[]) {
   const text = requests.map((request) => `${request.cleanLabel} ${request.xbrlTag ?? ""} ${request.section}`).join(" ").toLowerCase();
-  const targetCount = requests.filter((request) => lineItemNeedsClassification(request)).length;
+  const targetCount = requests.filter(
+    (request) => lineItemNeedsClassification(request) || materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
+  ).length;
   if (targetCount > 1 || /\bdeferred\b|\bdebt\b|\bnotes?\b|\bother\b|\bspecial\b|\bimpairment\b|\brestructuring\b|\binvestments?\b/.test(text)) {
     return LLM_MAPPING_COMPLEX_MODEL;
   }
@@ -19681,6 +19707,9 @@ function assignPrimaryBalanceSheetLineItem(
     return choose("PP&E, Net", ["Property Plant and Equipment Net", "Property, Plant and Equipment, Net", "Property and Equipment, Net"], "PP&E component rows such as land, buildings, improvements, machinery, and equipment map to PP&E even when SEC section context is weak.");
   }
 
+  const analystAssignment = analystPrimaryBalanceSheetAssignment(period, ctx, source, fillRows, section);
+  if (analystAssignment) return analystAssignment;
+
   if (section === "current liabilities" || primaryRowInCurrentLiabilitySection(row, source)) {
     if (sourceLooksLikeAccountsPayable(source)) {
       return choose("Accounts Payable", ["Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities"], "Accounts payable maps to accounts payable.");
@@ -20095,6 +20124,18 @@ function classifiedPrimaryBalanceSheetAssignment(
     status: assignment.grouped ? "grouped_into_model_row" : balanceSheetAssignmentStatusForModelRow(assignment.modelRow, source),
     reason: assignment.reason
   };
+}
+
+function analystPrimaryBalanceSheetAssignment(
+  period: string,
+  ctx: ResolveContext,
+  source: FactSource,
+  fillRows: FillRow[],
+  section: FinancialStatementSection
+): PrimaryBalanceSheetAssignment | null {
+  const classification = lineItemClassificationForSource(period, ctx, source);
+  if (!classification?.llm_used) return null;
+  return classifiedPrimaryBalanceSheetAssignment(period, ctx, source, fillRows, section);
 }
 
 function availableBalanceSheetModelRow(fillRows: FillRow[], canonical: string, aliases: string[] = []) {
