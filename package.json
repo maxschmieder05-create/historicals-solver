@@ -41,6 +41,7 @@
     "test:aal-classification-tightening": "node scripts/aal-classification-tightening-check.js",
     "test:audit-note-format": "node scripts/audit-note-format-check.js",
     "test:llm-workbench": "node scripts/llm-workbench-check.js",
+    "test:llm-accounting-controller": "node scripts/llm-accounting-controller-check.js",
     "test:gold-model-library": "node scripts/gold-model-library-check.js",
     "test:balance-sheet-row-resolver": "node scripts/balance-sheet-row-resolver-check.js",
     "test:source-ledger-status": "node scripts/source-ledger-status-check.js",

@@ -69,6 +69,15 @@ import {
   type LlmWorkbookToolbox
 } from "./llm-workbench";
 import {
+  aggregateAccountingTelemetry,
+  type AccountingLlmResult,
+  type AccountingLlmStatus,
+  type AccountingLlmTelemetry,
+  type AccountingLlmValidationResult,
+  requestAccountingJson,
+  sanitizeAccountingTelemetry
+} from "./llm-accounting-controller";
+import {
   balanceSheetLineLooksSubtotalLike,
   balanceSheetRowAliases,
   balanceSheetRowDefinitionForCanonical,
@@ -361,6 +370,13 @@ type LlmMappingState = {
   decisions: Map<number, FillRow | null>;
   warnings: string[];
   calls: number;
+  attempts: number;
+  successfulCompletions: number;
+  validatedCompletions: number;
+  failedAttempts: number;
+  affectedOutputDecisions: number;
+  telemetry: AccountingLlmTelemetry[];
+  statusCounts: Record<AccountingLlmStatus, number>;
   maxCalls: number;
   startedAt: number;
   deadlineAt: number;
@@ -411,6 +427,13 @@ type LlmMappingReviewRow = LlmMappingReviewIssue & {
   company: string;
   ticker: string;
   reviewerModel: string;
+  llmStatus: AccountingLlmStatus;
+  llmAttempts: number;
+  llmSuccessfulCompletions: number;
+  llmValidatedCompletions: number;
+  llmAffectedOutputDecisions: number;
+  llmGenerationId: string;
+  llmUsageSummary: string;
   reviewStatus: LlmMappingReviewResult["status"] | "skipped";
   coverageSummary: string;
   verifiedDecisionCount: number;
@@ -778,8 +801,8 @@ const SEC_HEADERS = {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "openrouter/owl-alpha";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-4o";
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "openai/gpt-5";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-5.2";
 const LLM_MAPPING_FAST_MODEL = process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL;
 const LLM_MAPPING_COMPLEX_MODEL =
   process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || DEFAULT_LLM_MAPPING_COMPLEX_MODEL;
@@ -2674,6 +2697,7 @@ async function buildLineItemClassificationStore(
     lineItemTimeoutMs: LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS
   });
   let lineItemLlmCalls = 0;
+  let lineItemLlmAttempts = 0;
   const maxLineItemLlmCalls =
     Number.isFinite(LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS) && LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS >= 0
       ? LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS
@@ -2767,7 +2791,7 @@ async function buildLineItemClassificationStore(
         });
         continue;
       }
-      const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmCalls < maxLineItemLlmCalls;
+      const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmAttempts < maxLineItemLlmCalls;
       const model = chooseStatementLineItemClassificationModel(requests);
       debug.step("LLM line-item classification group start", {
         fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
@@ -2777,8 +2801,8 @@ async function buildLineItemClassificationStore(
         needsClassificationCount,
         willUseLlm,
         model,
-        remainingLineItemLlmCalls: Math.max(0, maxLineItemLlmCalls - lineItemLlmCalls),
-        remainingGlobalLlmCalls: Math.max(0, state.maxCalls - state.calls),
+        remainingLineItemLlmCalls: Math.max(0, maxLineItemLlmCalls - lineItemLlmAttempts),
+        remainingGlobalLlmCalls: Math.max(0, state.maxCalls - state.attempts),
         labels: requests.map((request) => ({
           label: request.cleanLabel || request.reportedLineItemLabel,
           xbrlTag: request.xbrlTag,
@@ -2799,14 +2823,18 @@ async function buildLineItemClassificationStore(
           timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
         }
       });
-      state.calls += classificationResult.llmCalls;
+      classificationResult.llmTelemetry.forEach((telemetry) => recordLlmTelemetry(state, telemetry));
       lineItemLlmCalls += classificationResult.llmCalls;
+      lineItemLlmAttempts += classificationResult.llmAttempts;
       warnings.push(...classificationResult.warnings);
       debug.step("LLM line-item classification group complete", {
         fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
         statementName: statement.statementName,
         model,
         llmCalls: classificationResult.llmCalls,
+        llmAttempts: classificationResult.llmAttempts,
+        llmSuccessfulCompletions: classificationResult.llmSuccessfulCompletions,
+        llmTelemetry: classificationResult.llmTelemetry.map(sanitizeAccountingTelemetry),
         warnings: classificationResult.warnings,
         classificationCount: classificationResult.classifications.length
       });
@@ -2827,6 +2855,7 @@ async function buildLineItemClassificationStore(
           sourceTableType: request.sourceTableType,
           deterministicCandidate: request.deterministicCandidate,
           llmUsed: classification.llm_used,
+          llmStatus: classification.llm_status,
           recommendedModelRow: classification.recommended_model_row,
           confidence: classification.confidence,
           mappingPassedValidation: classification.mapping_passed_validation,
@@ -2845,7 +2874,9 @@ async function buildLineItemClassificationStore(
     storeEntries: store.size,
     warnings,
     lineItemLlmCalls,
-    globalLlmCalls: state.calls
+    lineItemLlmAttempts,
+    globalLlmCalls: state.calls,
+    globalLlmAttempts: state.attempts
   });
   return { store, warnings };
 }
@@ -8129,7 +8160,10 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       commentsAdded,
       auditRowCount: auditRows.length,
       llmWarnings: llmState.warnings,
-      llmCalls: llmState.calls
+      llmCalls: llmState.calls,
+      llmAttempts: llmState.attempts,
+      llmSuccessfulCompletions: llmState.successfulCompletions,
+      llmFailedAttempts: llmState.failedAttempts
     });
 
     const actualizedBalanceResult = writeActualizedForecastBalanceSheetValues(
@@ -8402,6 +8436,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       segmentAnalysisAssignmentLedgerRows,
       auditRows,
       llmWorkbookToolbox,
+      llmState,
       debug
     );
     warnings.push(...llmMappingReview.warnings);
@@ -8416,7 +8451,8 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     timing("LLM mapping review complete", {
       warnings: llmMappingReview.warnings,
       rowCount: llmMappingReview.rows.length,
-      blockingErrorCount: llmMappingReview.blockingErrors.length
+      blockingErrorCount: llmMappingReview.blockingErrors.length,
+      llm: llmMappingStateSummary(llmState)
     });
 
     addFilingPeriodMapSheet(workbook, modelPeriodMap.entries);
@@ -8460,8 +8496,10 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       filledCells,
       commentsAdded,
       warningCount: warnings.length,
+      llm: llmMappingStateSummary(llmState),
       debugLogPath: debug.filePath
     });
+    const llmSummary = llmMappingStateSummary(llmState);
     const summary: FillModelWorkbookSummary = {
       companyName: company.title,
       ticker: company.ticker,
@@ -8481,6 +8519,16 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       periods,
       filledCells,
       commentsAdded,
+      llm: {
+        ...llmSummary,
+        telemetry: llmState.telemetry.slice(-20).map(sanitizeAccountingTelemetry)
+      },
+      llmCalls: llmState.calls,
+      llmAttempts: llmState.attempts,
+      llmSuccessfulCompletions: llmState.successfulCompletions,
+      llmValidatedCompletions: llmState.validatedCompletions,
+      llmFailedAttempts: llmState.failedAttempts,
+      llmAffectedOutputDecisions: llmState.affectedOutputDecisions,
       warnings: unique(warnings).slice(0, 8),
       debugLogPath: debug.filePath,
       debugLogLineCount: debug.lineCount
@@ -14332,11 +14380,41 @@ function createLlmMappingState(): LlmMappingState {
     decisions: new Map(),
     warnings: enabledByEnv && !hasApiKey ? ["LLM mapping was enabled but OPENROUTER_API_KEY was not set; deterministic EDGAR mapping was used."] : [],
     calls: 0,
+    attempts: 0,
+    successfulCompletions: 0,
+    validatedCompletions: 0,
+    failedAttempts: 0,
+    affectedOutputDecisions: 0,
+    telemetry: [],
+    statusCounts: emptyLlmStatusCounts(),
     maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS >= 0 ? LLM_MAPPING_MAX_CALLS : 24,
     startedAt,
     deadlineAt: startedAt + maxDurationMs,
     budgetWarningAdded: false
   };
+}
+
+function emptyLlmStatusCounts(): Record<AccountingLlmStatus, number> {
+  return {
+    disabled: 0,
+    unavailable: 0,
+    attempted_failed: 0,
+    completed_unvalidated: 0,
+    completed_validated: 0,
+    repaired: 0,
+    needs_human_review: 0
+  };
+}
+
+function recordLlmTelemetry(state: LlmMappingState, telemetry: AccountingLlmTelemetry) {
+  state.telemetry.push(telemetry);
+  state.statusCounts[telemetry.status] += 1;
+  if (telemetry.attempted) state.attempts += 1;
+  if (telemetry.completed) state.successfulCompletions += 1;
+  if (telemetry.validated) state.validatedCompletions += 1;
+  if (telemetry.attempted && !telemetry.completed) state.failedAttempts += 1;
+  if (telemetry.affectedOutput) state.affectedOutputDecisions += 1;
+  if (telemetry.completed) state.calls += 1;
 }
 
 function llmTimeRemainingMs(state: LlmMappingState) {
@@ -14345,7 +14423,7 @@ function llmTimeRemainingMs(state: LlmMappingState) {
 
 function llmCanUse(state: LlmMappingState, minRemainingMs = 1_000) {
   if (!state.enabled) return false;
-  if (state.calls >= state.maxCalls) return false;
+  if (state.attempts >= state.maxCalls) return false;
   if (llmTimeRemainingMs(state) >= minRemainingMs) return true;
   if (!state.budgetWarningAdded) {
     state.budgetWarningAdded = true;
@@ -14355,12 +14433,21 @@ function llmCanUse(state: LlmMappingState, minRemainingMs = 1_000) {
 }
 
 function llmMappingStateSummary(state: LlmMappingState) {
+  const aggregate = aggregateAccountingTelemetry(state.telemetry);
   return {
     enabled: state.enabled,
     calls: state.calls,
+    attempts: state.attempts,
+    successfulCompletions: state.successfulCompletions,
+    validatedCompletions: state.validatedCompletions,
+    failedAttempts: state.failedAttempts,
+    affectedOutputDecisions: state.affectedOutputDecisions,
+    statusCounts: state.statusCounts,
     maxCalls: state.maxCalls,
     remainingMs: llmTimeRemainingMs(state),
     decisionCount: state.decisions.size,
+    models: aggregate.models,
+    usage: aggregate.usage,
     warningCount: state.warnings.length,
     budgetWarningAdded: state.budgetWarningAdded
   };
@@ -14392,17 +14479,18 @@ async function runLlmMappingReview(
   segmentAnalysisAssignmentLedgerRows: SegmentAnalysisAssignmentLedgerRow[],
   auditRows: MappingAuditRow[],
   llmWorkbookToolbox: LlmWorkbookToolbox,
+  state: LlmMappingState,
   debug: FillModelDebugLogger
 ): Promise<{ rows: LlmMappingReviewRow[]; warnings: string[]; blockingErrors: string[] }> {
   if (!llmMappingReviewEnabledByEnv()) {
     debug.step("LLM mapping review skipped", { reason: "disabled by LLM_MAPPING_REVIEW_ENABLED" });
-    return { rows: [], warnings: [], blockingErrors: [] };
+    return { rows: [llmMappingReviewSkippedRow(company, "LLM mapping review disabled by LLM_MAPPING_REVIEW_ENABLED.", state, "disabled")], warnings: [], blockingErrors: [] };
   }
   if (!llmApiKey()) {
     const message = "LLM mapping review was enabled but OPENROUTER_API_KEY was not set; generated workbook relies on deterministic validation only.";
     debug.warn("LLM mapping review skipped", { reason: "missing OpenRouter API key" });
     return {
-      rows: [llmMappingReviewSkippedRow(company, message)],
+      rows: [llmMappingReviewSkippedRow(company, message, state, "unavailable")],
       warnings: [message],
       blockingErrors: []
     };
@@ -14430,24 +14518,41 @@ async function runLlmMappingReview(
       omittedCounts: payload.omittedCounts,
       reviewerModel: LLM_MAPPING_REVIEW_MODEL
     });
-    const result = await requestLlmMappingReview(payload, debug);
-    const rows = llmMappingReviewRowsFromResult(company, result);
-    const issueWarnings = result.issues
+    const result = await requestLlmMappingReview(payload, company, debug);
+    recordLlmTelemetry(state, result.telemetry);
+    if (!result.value) {
+      const message = `LLM mapping review ${result.status} (${result.error || result.telemetry.errorMessage || "unknown OpenRouter API error"}).`;
+      debug.error("LLM mapping review failed", {
+        message,
+        telemetry: sanitizeAccountingTelemetry(result.telemetry),
+        blockingMode: LLM_MAPPING_REVIEW_BLOCKING
+      });
+      return {
+        rows: [llmMappingReviewSkippedRow(company, message, state, result.status)],
+        warnings: [message],
+        blockingErrors: []
+      };
+    }
+    const review = result.value;
+    const rows = llmMappingReviewRowsFromResult(company, review, state, result.status);
+    const issueWarnings = review.issues
       .filter((issue) => issue.severity !== "info")
       .map((issue) => {
         const recommended = issue.recommendedModelRow && issue.recommendedModelRow !== issue.currentModelRow ? ` Recommended row: ${issue.recommendedModelRow}.` : "";
         return `LLM mapping review ${issue.severity}: ${issue.period || "all periods"} ${issue.sourceLineItemLabel || issue.currentModelRow}: ${issue.reason}${recommended}`;
       });
     const blockingErrors = LLM_MAPPING_REVIEW_BLOCKING
-      ? result.issues
+      ? review.issues
           .filter((issue) => issue.severity === "error" && isActionableLlmMappingBlockingIssue(issue))
           .map((issue) => `${issue.period || "all periods"} ${issue.sourceLineItemLabel || issue.currentModelRow}: ${issue.reason}`)
       : [];
     debug.step("LLM mapping review response accepted", {
       status: result.status,
-      coverageSummary: result.coverageSummary,
-      verifiedDecisionCount: result.verifiedDecisionCount,
-      issueCount: result.issues.length,
+      llmStatus: result.status,
+      telemetry: sanitizeAccountingTelemetry(result.telemetry),
+      coverageSummary: review.coverageSummary,
+      verifiedDecisionCount: review.verifiedDecisionCount,
+      issueCount: review.issues.length,
       issueWarnings,
       blockingErrors
     });
@@ -14460,7 +14565,7 @@ async function runLlmMappingReview(
       blockingMode: LLM_MAPPING_REVIEW_BLOCKING
     });
     return {
-      rows: [llmMappingReviewSkippedRow(company, message)],
+      rows: [llmMappingReviewSkippedRow(company, message, state, "attempted_failed")],
       warnings: [message],
       blockingErrors: []
     };
@@ -14474,11 +14579,17 @@ function isActionableLlmMappingBlockingIssue(issue: LlmMappingReviewIssue) {
   return Boolean(issue.sourceLineItemLabel && issue.currentModelRow && issue.recommendedModelRow && issue.recommendedModelRow !== issue.currentModelRow);
 }
 
-function llmMappingReviewSkippedRow(company: CompanyMatch, reason: string): LlmMappingReviewRow {
+function llmMappingReviewSkippedRow(
+  company: CompanyMatch,
+  reason: string,
+  state: LlmMappingState,
+  status: AccountingLlmStatus
+): LlmMappingReviewRow {
   return {
     company: company.title,
     ticker: company.ticker,
     reviewerModel: LLM_MAPPING_REVIEW_MODEL,
+    ...llmReviewTelemetryFields(state, status),
     reviewStatus: "skipped",
     coverageSummary: reason,
     verifiedDecisionCount: 0,
@@ -14495,7 +14606,12 @@ function llmMappingReviewSkippedRow(company: CompanyMatch, reason: string): LlmM
   };
 }
 
-function llmMappingReviewRowsFromResult(company: CompanyMatch, result: LlmMappingReviewResult): LlmMappingReviewRow[] {
+function llmMappingReviewRowsFromResult(
+  company: CompanyMatch,
+  result: LlmMappingReviewResult,
+  state: LlmMappingState,
+  status: AccountingLlmStatus
+): LlmMappingReviewRow[] {
   const issues = result.issues.length
     ? result.issues
     : [
@@ -14516,6 +14632,7 @@ function llmMappingReviewRowsFromResult(company: CompanyMatch, result: LlmMappin
     company: company.title,
     ticker: company.ticker,
     reviewerModel: LLM_MAPPING_REVIEW_MODEL,
+    ...llmReviewTelemetryFields(state, status),
     reviewStatus: result.status,
     coverageSummary: result.coverageSummary,
     verifiedDecisionCount: result.verifiedDecisionCount,
@@ -14523,9 +14640,41 @@ function llmMappingReviewRowsFromResult(company: CompanyMatch, result: LlmMappin
   }));
 }
 
-async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingReviewPayload>, debug: FillModelDebugLogger): Promise<LlmMappingReviewResult> {
+function llmReviewTelemetryFields(state: LlmMappingState, status: AccountingLlmStatus) {
+  const aggregate = aggregateAccountingTelemetry(state.telemetry);
+  const latestGenerationId = state.telemetry
+    .slice()
+    .reverse()
+    .find((item) => item.generationId)?.generationId;
+  return {
+    llmStatus: status,
+    llmAttempts: aggregate.attempts,
+    llmSuccessfulCompletions: aggregate.successfulCompletions,
+    llmValidatedCompletions: aggregate.validatedCompletions,
+    llmAffectedOutputDecisions: aggregate.affectedOutputDecisions,
+    llmGenerationId: latestGenerationId ?? "",
+    llmUsageSummary: llmUsageSummary(aggregate.usage)
+  };
+}
+
+function llmUsageSummary(usage: ReturnType<typeof aggregateAccountingTelemetry>["usage"]) {
+  const parts = [
+    usage.promptTokens === undefined ? "" : `prompt=${usage.promptTokens}`,
+    usage.completionTokens === undefined ? "" : `completion=${usage.completionTokens}`,
+    usage.totalTokens === undefined ? "" : `total=${usage.totalTokens}`,
+    usage.reasoningTokens === undefined ? "" : `reasoning=${usage.reasoningTokens}`,
+    usage.cachedTokens === undefined ? "" : `cached=${usage.cachedTokens}`,
+    usage.cost === undefined ? "" : `cost=${usage.cost}`
+  ].filter(Boolean);
+  return parts.join("; ");
+}
+
+async function requestLlmMappingReview(
+  payload: ReturnType<typeof llmMappingReviewPayload>,
+  company: CompanyMatch,
+  debug: FillModelDebugLogger
+): Promise<AccountingLlmResult<LlmMappingReviewResult>> {
   const apiKey = llmApiKey();
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
 
   const system = [
     "You are an accounting review controller for an EDGAR-sourced financial model historicals system.",
@@ -14543,9 +14692,7 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
     "If the evidence is insufficient, return needs_human_review rather than guessing. Return strict JSON only."
   ].join(" ");
 
-  const controller = new AbortController();
   const timeoutMs = Number.isFinite(LLM_MAPPING_REVIEW_TIMEOUT_MS) && LLM_MAPPING_REVIEW_TIMEOUT_MS > 0 ? LLM_MAPPING_REVIEW_TIMEOUT_MS : 20_000;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
   debug.step("OpenRouter mapping review request start", {
     model: LLM_MAPPING_REVIEW_MODEL,
     timeoutMs,
@@ -14557,73 +14704,44 @@ async function requestLlmMappingReview(payload: ReturnType<typeof llmMappingRevi
     mappingAuditRows: payload.mappingAuditRows.length,
     omittedCounts: payload.omittedCounts
   });
-  const response = await Promise.race([
-    fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": OPENROUTER_APP_TITLE
-      },
-      body: JSON.stringify({
-        model: LLM_MAPPING_REVIEW_MODEL,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: JSON.stringify(payload) }
-        ],
-        temperature: 0,
-        max_tokens: 2200,
-        provider: { require_parameters: true },
-        response_format: {
-          type: "json_schema",
-          json_schema: llmMappingReviewJsonSchema()
-        }
-      })
-    }),
-    new Promise<Response>((_, reject) => {
-      timeout = setTimeout(() => {
-        controller.abort();
-        reject(new Error(`OpenRouter mapping review timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    })
-  ]).finally(() => {
-    if (timeout) clearTimeout(timeout);
+  const result = await requestAccountingJson<LlmMappingReviewResult>({
+    purpose: "workbook_mapping_review",
+    apiKey,
+    endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
+    model: LLM_MAPPING_REVIEW_MODEL,
+    siteUrl: OPENROUTER_SITE_URL,
+    appTitle: OPENROUTER_APP_TITLE,
+    timeoutMs,
+    maxTokens: 2200,
+    sessionId: llmSessionId(company, "workbook-review"),
+    jsonSchema: llmMappingReviewJsonSchema(),
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(payload) }
+    ],
+    validate: validateLlmMappingReviewResult,
+    repair: {
+      enabled: true,
+      instruction:
+        "Repair the workbook mapping review. It must match the schema, use only EDGAR evidence from the payload, and return needs_review if any issue lacks enough evidence."
+    }
   });
-
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = body?.error?.message || `${response.status} ${response.statusText}`;
-    debug.error("OpenRouter mapping review request failed", {
-      status: response.status,
-      statusText: response.statusText,
-      message,
-      body
-    });
-    throw new Error(message);
-  }
-
-  const text = responseOutputText(body);
-  if (!text) {
-    debug.error("OpenRouter mapping review response missing text", { body });
-    throw new Error("OpenRouter mapping review response did not include text output");
-  }
-  try {
-    const result = JSON.parse(text) as LlmMappingReviewResult;
+  if (result.value) {
     debug.step("OpenRouter mapping review response parsed", {
+      status: result.value.status,
+      llmStatus: result.status,
+      telemetry: sanitizeAccountingTelemetry(result.telemetry),
+      issueCount: result.value.issues.length,
+      coverageSummary: result.value.coverageSummary
+    });
+  } else {
+    debug.error("OpenRouter mapping review request failed", {
       status: result.status,
-      issueCount: result.issues.length,
-      coverageSummary: result.coverageSummary
+      error: result.error,
+      telemetry: sanitizeAccountingTelemetry(result.telemetry)
     });
-    return result;
-  } catch (error) {
-    debug.error("OpenRouter mapping review JSON parse failed", {
-      text,
-      error: debugErrorDetails(error)
-    });
-    throw error;
   }
+  return result;
 }
 
 function llmMappingReviewPayload(
@@ -15108,6 +15226,64 @@ function llmMappingReviewJsonSchema() {
   };
 }
 
+function validateLlmMappingReviewResult(value: unknown): AccountingLlmValidationResult<LlmMappingReviewResult> {
+  if (!isJsonRecord(value)) return { ok: false, needsHumanReview: true, error: "LLM mapping review must be a JSON object." };
+  const status = enumValue(value.status, ["passed", "needs_review"]);
+  if (!status) return { ok: false, needsHumanReview: true, error: "LLM mapping review status is invalid." };
+  if (typeof value.coverageSummary !== "string") {
+    return { ok: false, needsHumanReview: true, error: "LLM mapping review coverageSummary must be a string." };
+  }
+  if (typeof value.verifiedDecisionCount !== "number" || !Number.isInteger(value.verifiedDecisionCount)) {
+    return { ok: false, needsHumanReview: true, error: "LLM mapping review verifiedDecisionCount must be an integer." };
+  }
+  if (!Array.isArray(value.issues)) return { ok: false, needsHumanReview: true, error: "LLM mapping review issues must be an array." };
+  const issues: LlmMappingReviewIssue[] = [];
+  for (const issue of value.issues) {
+    if (!isJsonRecord(issue)) return { ok: false, needsHumanReview: true, error: "Every LLM mapping review issue must be an object." };
+    const severity = enumValue(issue.severity, ["info", "warning", "error"]);
+    const issueType = enumValue(issue.issueType, [
+      "verified",
+      "missing_source_line",
+      "wrong_model_row",
+      "duplicate_or_double_count",
+      "sign_or_amount_issue",
+      "unsupported_exclusion",
+      "needs_human_review"
+    ]);
+    if (!severity) return { ok: false, needsHumanReview: true, error: "LLM mapping review issue severity is invalid." };
+    if (!issueType) return { ok: false, needsHumanReview: true, error: "LLM mapping review issueType is invalid." };
+    const requiredStrings = ["period", "sourceLineItemLabel", "sourceXbrlTag", "currentModelRow", "recommendedModelRow", "reason", "reusableRule"];
+    const badString = requiredStrings.find((key) => typeof issue[key] !== "string");
+    if (badString) return { ok: false, needsHumanReview: true, error: `LLM mapping review issue ${badString} must be a string.` };
+    if (!Array.isArray(issue.evidence) || !issue.evidence.every((item) => typeof item === "string")) {
+      return { ok: false, needsHumanReview: true, error: "LLM mapping review issue evidence must be an array of strings." };
+    }
+    issues.push({
+      severity,
+      issueType,
+      period: issue.period,
+      sourceLineItemLabel: issue.sourceLineItemLabel,
+      sourceXbrlTag: issue.sourceXbrlTag,
+      currentModelRow: issue.currentModelRow,
+      recommendedModelRow: issue.recommendedModelRow,
+      reason: issue.reason,
+      reusableRule: issue.reusableRule,
+      evidence: issue.evidence
+    });
+  }
+  return {
+    ok: true,
+    validated: true,
+    affectedOutput: status === "needs_review" || issues.some((issue) => issue.severity !== "info"),
+    value: {
+      status,
+      coverageSummary: value.coverageSummary,
+      verifiedDecisionCount: value.verifiedDecisionCount,
+      issues
+    }
+  };
+}
+
 async function llmAssistedFillRow(
   fillRow: FillRow,
   company: CompanyMatch,
@@ -15147,7 +15323,7 @@ async function llmAssistedFillRow(
     });
     return cached;
   }
-  if (state.calls >= state.maxCalls) {
+  if (state.attempts >= state.maxCalls) {
     state.decisions.set(fillRow.row, null);
     debug.warn("LLM-assisted row mapping skipped", {
       row: fillRow.row,
@@ -15172,7 +15348,6 @@ async function llmAssistedFillRow(
     return null;
   }
 
-  state.calls += 1;
   try {
     const modelChoice = chooseLlmMappingModel(fillRow, candidates);
     debug.step("LLM-assisted row mapping request", {
@@ -15182,12 +15357,29 @@ async function llmAssistedFillRow(
       candidateCount: candidates.length,
       candidates: candidates.slice(0, 20)
     });
-    const decision = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model, ctx, debug);
+    const result = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model, ctx, debug);
+    recordLlmTelemetry(state, result.telemetry);
+    if (!result.value) {
+      const message = result.error || result.telemetry.errorMessage || "unknown OpenRouter API error";
+      state.warnings.push(`${fillRow.label}: LLM-assisted mapping ${result.status} (${message}).`);
+      state.decisions.set(fillRow.row, null);
+      debug.error("LLM-assisted row mapping failed", {
+        row: fillRow.row,
+        label: fillRow.label,
+        status: result.status,
+        telemetry: sanitizeAccountingTelemetry(result.telemetry),
+        state: llmMappingStateSummary(state)
+      });
+      return null;
+    }
+    const decision = result.value;
     const mapped = llmDecisionToFillRow(fillRow, decision, candidates, modelChoice);
     state.decisions.set(fillRow.row, mapped);
     const details = {
       row: fillRow.row,
       label: fillRow.label,
+      status: result.status,
+      telemetry: sanitizeAccountingTelemetry(result.telemetry),
       decision,
       mapped: Boolean(mapped),
       mappedConcepts: mapped?.concepts ?? [],
@@ -15326,9 +15518,8 @@ async function requestLlmMappingDecision(
   model: string,
   ctx: ResolveContext,
   debug: FillModelDebugLogger
-): Promise<LlmMappingDecision> {
+): Promise<AccountingLlmResult<LlmMappingDecision>> {
   const apiKey = llmApiKey();
-  if (!apiKey) throw new Error("OPENROUTER_API_KEY is not set");
 
   const system = [
     "You map financial model rows to SEC EDGAR XBRL facts.",
@@ -15343,9 +15534,7 @@ async function requestLlmMappingDecision(
     "Return strict JSON only."
   ].join(" ");
 
-  const controller = new AbortController();
   const timeoutMs = Number.isFinite(LLM_MAPPING_TIMEOUT_MS) && LLM_MAPPING_TIMEOUT_MS > 0 ? LLM_MAPPING_TIMEOUT_MS : 3_000;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
   const payload = llmMappingPayload(company, fillRow, periods, candidates, ctx);
   const relevantRowsOutput = payload.llmTools.find((tool) => tool.name === "sec.get_relevant_statement_rows")?.output as { rows?: unknown[] } | undefined;
   debug.step("OpenRouter row mapping request start", {
@@ -15357,81 +15546,46 @@ async function requestLlmMappingDecision(
     relevantStatementRowCount: Array.isArray(relevantRowsOutput?.rows) ? relevantRowsOutput.rows.length : 0,
     filingCommentaryCount: payload.filingCommentary.length
   });
-  const response = await Promise.race([
-    fetch(OPENROUTER_CHAT_COMPLETIONS_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-        "HTTP-Referer": OPENROUTER_SITE_URL,
-        "X-Title": OPENROUTER_APP_TITLE
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: JSON.stringify(payload) }
-        ],
-        temperature: 0,
-        max_tokens: 700,
-        provider: { require_parameters: true },
-        response_format: {
-          type: "json_schema",
-          json_schema: llmMappingJsonSchema()
-        }
-      })
-    }),
-    new Promise<Response>((_, reject) => {
-      timeout = setTimeout(() => {
-        controller.abort();
-        reject(new Error(`OpenRouter mapping timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    })
-  ]).finally(() => {
-    if (timeout) clearTimeout(timeout);
+  const result = await requestAccountingJson<LlmMappingDecision>({
+    purpose: "row_mapping",
+    apiKey,
+    endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
+    model,
+    siteUrl: OPENROUTER_SITE_URL,
+    appTitle: OPENROUTER_APP_TITLE,
+    timeoutMs,
+    maxTokens: 700,
+    sessionId: llmSessionId(company, "row-mapping"),
+    jsonSchema: llmMappingJsonSchema(),
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(payload) }
+    ],
+    validate: (value) => validateLlmMappingDecision(value, candidates, fillRow),
+    repair: {
+      enabled: true,
+      instruction:
+        "Repair the EDGAR mapping decision. Use only selectedConcepts present in the candidate facts, choose needs_review if uncertain, and return only JSON matching the schema."
+    }
   });
-
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = body?.error?.message || `${response.status} ${response.statusText}`;
-    debug.error("OpenRouter row mapping request failed", {
-      row: fillRow.row,
-      label: fillRow.label,
-      status: response.status,
-      statusText: response.statusText,
-      message,
-      body
-    });
-    throw new Error(message);
-  }
-
-  const text = responseOutputText(body);
-  if (!text) {
-    debug.error("OpenRouter row mapping response missing text", {
-      row: fillRow.row,
-      label: fillRow.label,
-      body
-    });
-    throw new Error("OpenRouter response did not include text output");
-  }
-  try {
-    const decision = JSON.parse(text) as LlmMappingDecision;
+  if (result.value) {
     debug.step("OpenRouter row mapping response parsed", {
       row: fillRow.row,
       label: fillRow.label,
-      decision
+      status: result.status,
+      telemetry: sanitizeAccountingTelemetry(result.telemetry),
+      decision: result.value
     });
-    return decision;
-  } catch (error) {
-    debug.error("OpenRouter row mapping JSON parse failed", {
+  } else {
+    debug.error("OpenRouter row mapping request failed", {
       row: fillRow.row,
       label: fillRow.label,
-      text,
-      error: debugErrorDetails(error)
+      status: result.status,
+      error: result.error,
+      telemetry: sanitizeAccountingTelemetry(result.telemetry)
     });
-    throw error;
   }
+  return result;
 }
 
 function llmMappingPayload(company: CompanyMatch, fillRow: FillRow, periods: string[], candidates: LlmCandidateFact[], ctx: ResolveContext) {
@@ -15580,6 +15734,79 @@ function llmMappingJsonSchema() {
       }
     }
   };
+}
+
+function validateLlmMappingDecision(
+  value: unknown,
+  candidates: LlmCandidateFact[],
+  fillRow: FillRow
+): AccountingLlmValidationResult<LlmMappingDecision> {
+  if (!isJsonRecord(value)) return { ok: false, needsHumanReview: true, error: "LLM mapping decision must be a JSON object." };
+  const operation = enumValue(value.operation, ["direct", "sum", "difference", "needs_review"]);
+  const confidence = enumValue(value.confidence, ["high", "medium", "low"]);
+  const sourceStatement = enumValue(value.sourceStatement, ["income", "balance", "cash_flow", "segment", "support", "unknown"]);
+  if (!operation) return { ok: false, needsHumanReview: true, error: "LLM mapping decision operation is invalid." };
+  if (!confidence) return { ok: false, needsHumanReview: true, error: "LLM mapping decision confidence is invalid." };
+  if (!sourceStatement) return { ok: false, needsHumanReview: true, error: "LLM mapping decision sourceStatement is invalid." };
+  if (!Array.isArray(value.selectedConcepts) || !value.selectedConcepts.every((item) => typeof item === "string")) {
+    return { ok: false, needsHumanReview: true, error: "LLM mapping decision selectedConcepts must be an array of concept strings." };
+  }
+  const sign = value.sign === -1 ? -1 : value.sign === 1 ? 1 : null;
+  if (!sign) return { ok: false, needsHumanReview: true, error: "LLM mapping decision sign must be 1 or -1." };
+  const booleanKeys = ["requiresReview", "isSubtotalOrComponent", "excludeFromOtherBecauseDedicatedRowExists"];
+  const badBoolean = booleanKeys.find((key) => typeof value[key] !== "boolean");
+  if (badBoolean) return { ok: false, needsHumanReview: true, error: `LLM mapping decision ${badBoolean} must be boolean.` };
+  const stringKeys = ["reason", "sourceLineItemLabel", "sourceSection", "recommendedModelRow"];
+  const badString = stringKeys.find((key) => typeof value[key] !== "string");
+  if (badString) return { ok: false, needsHumanReview: true, error: `LLM mapping decision ${badString} must be a string.` };
+
+  const allowed = new Set(candidates.map((candidate) => candidate.concept));
+  const selectedConcepts = unique(value.selectedConcepts);
+  const unknownConcepts = selectedConcepts.filter((concept) => !allowed.has(concept));
+  if (unknownConcepts.length) {
+    return {
+      ok: false,
+      needsHumanReview: true,
+      error: `${fillRow.label}: LLM selected concept(s) outside the EDGAR candidate pack: ${unknownConcepts.join(", ")}.`
+    };
+  }
+  if (operation !== "needs_review" && !selectedConcepts.length) {
+    return { ok: false, needsHumanReview: true, error: `${fillRow.label}: LLM selected no EDGAR concepts for a mapping operation.` };
+  }
+  const decision: LlmMappingDecision = {
+    operation,
+    selectedConcepts,
+    sign,
+    confidence,
+    reason: value.reason,
+    requiresReview: value.requiresReview,
+    sourceLineItemLabel: value.sourceLineItemLabel,
+    sourceStatement,
+    sourceSection: value.sourceSection,
+    recommendedModelRow: value.recommendedModelRow,
+    isSubtotalOrComponent: value.isSubtotalOrComponent,
+    excludeFromOtherBecauseDedicatedRowExists: value.excludeFromOtherBecauseDedicatedRowExists
+  };
+  const affectsOutput =
+    operation !== "needs_review" &&
+    !decision.requiresReview &&
+    confidence !== "low" &&
+    selectedConcepts.length > 0 &&
+    !decision.isSubtotalOrComponent &&
+    !decision.excludeFromOtherBecauseDedicatedRowExists;
+  return { ok: true, value: decision, validated: true, affectedOutput: affectsOutput };
+}
+
+function isJsonRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function enumValue<T extends string>(value: unknown, allowed: T[]): T | null {
+  return typeof value === "string" && (allowed as string[]).includes(value) ? (value as T) : null;
+}
+
+function llmSessionId(company: CompanyMatch, purpose: string) {
+  return `historicals-${company.ticker || company.cik}-${purpose}`.toLowerCase().replace(/[^a-z0-9-]+/g, "-").slice(0, 120);
 }
 
 function responseOutputText(body: any) {
@@ -23334,7 +23561,7 @@ function addSegmentAnalysisAssignmentLedgerSheet(workbook: ExcelJS.Workbook, led
   sheet.views = [{ state: "frozen", ySplit: 1 }];
 }
 
-function addLlmMappingReviewSheet(workbook: ExcelJS.Workbook, reviewRows: LlmMappingReviewRow[]) {
+export function addLlmMappingReviewSheet(workbook: ExcelJS.Workbook, reviewRows: LlmMappingReviewRow[]) {
   const existing = workbook.getWorksheet(LLM_MAPPING_REVIEW_SHEET);
   if (existing) workbook.removeWorksheet(existing.id);
   if (!reviewRows.length) return;
@@ -23343,6 +23570,13 @@ function addLlmMappingReviewSheet(workbook: ExcelJS.Workbook, reviewRows: LlmMap
     { header: "company", key: "company", width: 32 },
     { header: "ticker", key: "ticker", width: 10 },
     { header: "reviewer model", key: "reviewerModel", width: 28 },
+    { header: "LLM status", key: "llmStatus", width: 24 },
+    { header: "LLM attempts", key: "llmAttempts", width: 14 },
+    { header: "LLM completions", key: "llmSuccessfulCompletions", width: 16 },
+    { header: "LLM validated", key: "llmValidatedCompletions", width: 14 },
+    { header: "LLM output decisions", key: "llmAffectedOutputDecisions", width: 20 },
+    { header: "LLM generation id", key: "llmGenerationId", width: 32 },
+    { header: "LLM usage", key: "llmUsageSummary", width: 46 },
     { header: "review status", key: "reviewStatus", width: 16 },
     { header: "coverage summary", key: "coverageSummary", width: 70 },
     { header: "verified decision count", key: "verifiedDecisionCount", width: 22 },

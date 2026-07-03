@@ -5,6 +5,13 @@ import {
   balanceSheetSectionCompatible
 } from "./balance-sheet-row-resolver";
 import { currentNonCurrentSignalFromText } from "./current-non-current";
+import {
+  AccountingLlmResult,
+  AccountingLlmStatus,
+  AccountingLlmTelemetry,
+  AccountingLlmValidationResult,
+  requestAccountingJson
+} from "./llm-accounting-controller";
 
 export type FinancialStatementName = "income_statement" | "balance_sheet" | "cash_flow" | "segment_analysis";
 
@@ -89,6 +96,7 @@ export type FinancialLineItemClassification = {
   requires_validation: boolean;
   requires_revalidation: boolean;
   llm_used: boolean;
+  llm_status?: AccountingLlmStatus;
   mapping_passed_validation: boolean;
   warning?: string;
 };
@@ -136,6 +144,9 @@ export type FinancialStatementLineItemClassificationResult = {
   }>;
   warnings: string[];
   llmCalls: number;
+  llmAttempts: number;
+  llmSuccessfulCompletions: number;
+  llmTelemetry: AccountingLlmTelemetry[];
 };
 
 export const MODEL_ROW_DEFINITIONS: Record<string, string> = {
@@ -338,9 +349,10 @@ export async function classifyFinancialLineItem(
 
   if (!shouldCallLlm) return finalizeClassification(request, fallback);
 
-  try {
-    const llm = options.llm!;
-    const llmClassification = await requestLlmClassification(request, llm);
+  const llm = options.llm!;
+  const result = await requestLlmClassification(request, llm);
+  if (result.value) {
+    const llmClassification = result.value;
     return finalizeClassification(request, {
       ...llmClassification,
       source_line_item: llmClassification.source_line_item || request.cleanLabel || request.reportedLineItemLabel,
@@ -350,17 +362,11 @@ export async function classifyFinancialLineItem(
         fallback.recommended_model_row,
       confidence: llmClassification.confidence ?? "low",
       requires_validation: true,
-      llm_used: true
-    });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown classifier LLM error";
-    return finalizeClassification(request, {
-      ...fallback,
-      confidence: lowerClassificationConfidence(fallback.confidence, "medium"),
-      llm_used: false,
-      warning: `LLM classification skipped (${message}).`
+      llm_used: result.telemetry.affectedOutput,
+      llm_status: result.status
     });
   }
+  return failedLlmClassification(request, fallback, result.status, result.error || result.telemetry.errorMessage || "unknown classifier LLM error");
 }
 
 export async function classifyFinancialStatementLineItems(
@@ -373,11 +379,13 @@ export async function classifyFinancialStatementLineItems(
     .map((item) => ({ request: item.request, classification: item.initialClassification }));
   const targets = prepared.filter((item) => item.needsLlm);
 
-  if (!targets.length) return { classifications, warnings: [], llmCalls: 0 };
+  if (!targets.length) return { classifications, warnings: [], llmCalls: 0, llmAttempts: 0, llmSuccessfulCompletions: 0, llmTelemetry: [] };
 
-  try {
-    const llm = options.llm!;
-    const response = await requestStatementLlmClassification(prepared, targets, llm);
+  const llm = options.llm!;
+  const result = await requestStatementLlmClassification(prepared, targets, llm);
+  const telemetry = [result.telemetry];
+  if (result.value) {
+    const response = result.value;
     const byRowKey = new Map(response.classifications.map((item) => [item.source_row_key, item]));
     const merged = prepared
       .filter((item) => item.needsClassification)
@@ -395,7 +403,8 @@ export async function classifyFinancialStatementLineItems(
               item.fallback.recommended_model_row,
             confidence: llmClassification.confidence ?? "low",
             requires_validation: true,
-            llm_used: true
+            llm_used: result.telemetry.affectedOutput,
+            llm_status: result.status
           })
         };
       });
@@ -404,14 +413,35 @@ export async function classifyFinancialStatementLineItems(
       (item) =>
         `${item.request.cleanLabel || item.request.reportedLineItemLabel}: statement-level LLM did not return a classification; deterministic fallback was used.`
     );
-    return { classifications: merged, warnings, llmCalls: 1 };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "unknown classifier LLM error";
-    const warnings = targets.map(
-      (item) => `${item.request.cleanLabel || item.request.reportedLineItemLabel}: statement-level LLM classification skipped (${message}).`
-    );
-    return { classifications, warnings, llmCalls: 1 };
+    return {
+      classifications: merged,
+      warnings,
+      llmCalls: result.telemetry.completed ? 1 : 0,
+      llmAttempts: result.telemetry.attempted ? 1 : 0,
+      llmSuccessfulCompletions: result.telemetry.completed ? 1 : 0,
+      llmTelemetry: telemetry
+    };
   }
+  const message = result.error || result.telemetry.errorMessage || "unknown classifier LLM error";
+  const failed = prepared
+    .filter((item) => item.needsClassification)
+    .map((item) => ({
+      request: item.request,
+      classification: item.needsLlm
+        ? failedLlmClassification(item.request, item.fallback, result.status, message)
+        : item.initialClassification
+    }));
+  const warnings = targets.map(
+    (item) => `${item.request.cleanLabel || item.request.reportedLineItemLabel}: statement-level LLM classification ${result.status} (${message}).`
+  );
+  return {
+    classifications: failed,
+    warnings,
+    llmCalls: 0,
+    llmAttempts: result.telemetry.attempted ? 1 : 0,
+    llmSuccessfulCompletions: 0,
+    llmTelemetry: telemetry
+  };
 }
 
 function prepareLineItemClassification(
@@ -976,6 +1006,22 @@ function finalizeClassification(
   };
 }
 
+function failedLlmClassification(
+  request: FinancialLineItemClassificationRequest,
+  fallback: FinancialLineItemClassification,
+  status: AccountingLlmStatus,
+  message: string
+): FinancialLineItemClassification {
+  return finalizeClassification(request, {
+    ...fallback,
+    confidence: "low",
+    llm_used: false,
+    llm_status: status,
+    mapping_passed_validation: false,
+    warning: `LLM classification ${status} (${message}); human review is required before this ambiguous SEC line item can be treated as LLM-reviewed.`
+  });
+}
+
 function classificationPassesValidation(request: FinancialLineItemClassificationRequest, classification: FinancialLineItemClassification) {
   const text = requestSearchText(request);
   const row = classification.recommended_model_row;
@@ -1034,7 +1080,7 @@ function classificationPassesValidation(request: FinancialLineItemClassification
 async function requestLlmClassification(
   request: FinancialLineItemClassificationRequest,
   options: LlmClassificationOptions
-): Promise<FinancialLineItemClassification> {
+): Promise<AccountingLlmResult<FinancialLineItemClassification>> {
   const system = [
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Classify the reported source line item into the best model template row using accounting meaning, statement section, XBRL tag semantics, parent subtotal, and template row definitions.",
@@ -1050,59 +1096,35 @@ async function requestLlmClassification(
     "Use recommended_action remap for validation failures caused by a source line belonging in a different row; use exclude for subtotal/component double-counting.",
     "Return strict JSON only."
   ].join(" ");
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timeoutMs = options.timeoutMs ?? 15_000;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const response = await Promise.race([
-    fetchImpl(options.endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${options.apiKey}`,
-        "HTTP-Referer": options.siteUrl,
-        "X-Title": options.appTitle
-      },
-      body: JSON.stringify({
-        model: options.model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: JSON.stringify(request) }
-        ],
-        temperature: 0,
-        max_tokens: 700,
-        provider: { require_parameters: true },
-        response_format: {
-          type: "json_schema",
-          json_schema: financialLineItemClassificationJsonSchema()
-        }
-      })
-    }),
-    new Promise<Response>((_, reject) => {
-      timeout = setTimeout(() => {
-        controller.abort();
-        reject(new Error(`classifier LLM timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    })
-  ]).finally(() => {
-    if (timeout) clearTimeout(timeout);
+  return requestAccountingJson<FinancialLineItemClassification>({
+    purpose: "line_item_classification",
+    apiKey: options.apiKey,
+    endpoint: options.endpoint,
+    model: options.model,
+    siteUrl: options.siteUrl,
+    appTitle: options.appTitle,
+    timeoutMs: options.timeoutMs ?? 15_000,
+    maxTokens: 700,
+    fetchImpl: options.fetchImpl,
+    jsonSchema: financialLineItemClassificationJsonSchema(),
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(request) }
+    ],
+    validate: (value) => validateFinancialLineItemClassification(value, request),
+    repair: {
+      enabled: true,
+      instruction:
+        "Repair the classification. It must choose an available model row, pass current/non-current and statement-section validation, and return only JSON matching the schema."
+    }
   });
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = body?.error?.message || `${response.status} ${response.statusText}`;
-    throw new Error(message);
-  }
-  const text = responseOutputText(body);
-  if (!text) throw new Error("classifier response did not include text output");
-  return JSON.parse(text) as FinancialLineItemClassification;
 }
 
 async function requestStatementLlmClassification(
   prepared: PreparedLineItemClassification[],
   targets: PreparedLineItemClassification[],
   options: LlmClassificationOptions
-): Promise<StatementLlmClassificationResponse> {
+): Promise<AccountingLlmResult<StatementLlmClassificationResponse>> {
   const system = [
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
     "Do not classify one row in isolation. Review the entire provided statement in row order, including sibling labels, parent subtotals, current/non-current sections, XBRL tag semantics, deterministic classifications, and model row definitions.",
@@ -1120,52 +1142,28 @@ async function requestStatementLlmClassification(
     "Use recommended_action remap for validation failures caused by a source line belonging in a different row; use exclude for subtotal/component double-counting.",
     "Return strict JSON only."
   ].join(" ");
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timeoutMs = options.timeoutMs ?? 15_000;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const response = await Promise.race([
-    fetchImpl(options.endpoint, {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${options.apiKey}`,
-        "HTTP-Referer": options.siteUrl,
-        "X-Title": options.appTitle
-      },
-      body: JSON.stringify({
-        model: options.model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: JSON.stringify(statementLlmClassificationPayload(prepared, targets)) }
-        ],
-        temperature: 0,
-        max_tokens: Math.max(900, Math.min(2600, 420 + targets.length * 260)),
-        provider: { require_parameters: true },
-        response_format: {
-          type: "json_schema",
-          json_schema: financialStatementLineItemClassificationJsonSchema()
-        }
-      })
-    }),
-    new Promise<Response>((_, reject) => {
-      timeout = setTimeout(() => {
-        controller.abort();
-        reject(new Error(`statement classifier LLM timed out after ${timeoutMs}ms`));
-      }, timeoutMs);
-    })
-  ]).finally(() => {
-    if (timeout) clearTimeout(timeout);
+  return requestAccountingJson<StatementLlmClassificationResponse>({
+    purpose: "statement_line_item_classification",
+    apiKey: options.apiKey,
+    endpoint: options.endpoint,
+    model: options.model,
+    siteUrl: options.siteUrl,
+    appTitle: options.appTitle,
+    timeoutMs: options.timeoutMs ?? 15_000,
+    maxTokens: Math.max(900, Math.min(2600, 420 + targets.length * 260)),
+    fetchImpl: options.fetchImpl,
+    jsonSchema: financialStatementLineItemClassificationJsonSchema(),
+    messages: [
+      { role: "system", content: system },
+      { role: "user", content: JSON.stringify(statementLlmClassificationPayload(prepared, targets)) }
+    ],
+    validate: (value) => validateStatementLineItemClassification(value, targets),
+    repair: {
+      enabled: true,
+      instruction:
+        "Repair the statement classification batch. Return one classification for every targetSourceRowKey, use source_row_key exactly, choose available model rows, and return only JSON matching the schema."
+    }
   });
-  const body = await response.json().catch(() => null);
-  if (!response.ok) {
-    const message = body?.error?.message || `${response.status} ${response.statusText}`;
-    throw new Error(message);
-  }
-  const text = responseOutputText(body);
-  if (!text) throw new Error("statement classifier response did not include text output");
-  return JSON.parse(text) as StatementLlmClassificationResponse;
 }
 
 function statementLlmClassificationPayload(prepared: PreparedLineItemClassification[], targets: PreparedLineItemClassification[]) {
@@ -1379,6 +1377,191 @@ function financialStatementLineItemClassificationJsonSchema() {
       }
     }
   };
+}
+
+function validateFinancialLineItemClassification(
+  value: unknown,
+  request: FinancialLineItemClassificationRequest
+): AccountingLlmValidationResult<FinancialLineItemClassification> {
+  const shape = validateFinancialLineItemClassificationShape(value);
+  if (!shape.ok) return shape;
+  const normalized = {
+    ...shape.value,
+    recommended_model_row: normalizeModelRow(shape.value.recommended_model_row) || shape.value.recommended_model_row
+  };
+  const actionIsValidNonMapping =
+    normalized.recommended_action === "exclude" ||
+    normalized.recommended_action === "set_zero" ||
+    normalized.recommended_action === "keep_existing";
+  const validated =
+    actionIsValidNonMapping ||
+    classificationPassesValidation(request, {
+      ...normalized,
+      mapping_passed_validation: false
+    });
+  if (!validated) {
+    return {
+      ok: false,
+      needsHumanReview: true,
+      error: `${request.cleanLabel || request.reportedLineItemLabel}: LLM decision failed deterministic accounting validation for ${normalized.recommended_model_row}.`
+    };
+  }
+  return {
+    ok: true,
+    value: normalized,
+    validated: true,
+    affectedOutput: true
+  };
+}
+
+function validateStatementLineItemClassification(
+  value: unknown,
+  targets: PreparedLineItemClassification[]
+): AccountingLlmValidationResult<StatementLlmClassificationResponse> {
+  if (!isRecord(value) || !Array.isArray(value.classifications)) {
+    return { ok: false, needsHumanReview: true, error: "Statement classifier response must contain a classifications array." };
+  }
+  const targetByKey = new Map(targets.map((target) => [target.rowKey, target]));
+  const seen = new Set<string>();
+  const classifications: StatementLlmClassification[] = [];
+  for (const item of value.classifications) {
+    if (!isRecord(item) || typeof item.source_row_key !== "string") {
+      return { ok: false, needsHumanReview: true, error: "Every statement classification must include source_row_key." };
+    }
+    const target = targetByKey.get(item.source_row_key);
+    if (!target) {
+      return { ok: false, needsHumanReview: true, error: `LLM returned unexpected source_row_key ${item.source_row_key}.` };
+    }
+    if (seen.has(item.source_row_key)) {
+      return { ok: false, needsHumanReview: true, error: `LLM returned duplicate source_row_key ${item.source_row_key}.` };
+    }
+    const shape = validateFinancialLineItemClassificationShape(item);
+    if (!shape.ok) return shape;
+    const normalized: StatementLlmClassification = {
+      ...shape.value,
+      source_row_key: item.source_row_key,
+      recommended_model_row: normalizeModelRow(shape.value.recommended_model_row) || shape.value.recommended_model_row
+    };
+    const actionIsValidNonMapping =
+      normalized.recommended_action === "exclude" ||
+      normalized.recommended_action === "set_zero" ||
+      normalized.recommended_action === "keep_existing";
+    const validated =
+      actionIsValidNonMapping ||
+      classificationPassesValidation(target.request, {
+        ...normalized,
+        mapping_passed_validation: false
+      });
+    if (!validated) {
+      return {
+        ok: false,
+        needsHumanReview: true,
+        error: `${target.request.cleanLabel || target.request.reportedLineItemLabel}: LLM decision failed deterministic accounting validation for ${normalized.recommended_model_row}.`
+      };
+    }
+    classifications.push(normalized);
+    seen.add(item.source_row_key);
+  }
+  const missing = targets.filter((target) => !seen.has(target.rowKey));
+  if (missing.length) {
+    return {
+      ok: false,
+      needsHumanReview: true,
+      error: `Statement classifier omitted target row(s): ${missing.map((target) => target.rowKey).join(", ")}.`
+    };
+  }
+  return {
+    ok: true,
+    value: { classifications },
+    validated: true,
+    affectedOutput: classifications.length > 0
+  };
+}
+
+function validateFinancialLineItemClassificationShape(value: unknown): AccountingLlmValidationResult<FinancialLineItemClassification> {
+  if (!isRecord(value)) return { ok: false, needsHumanReview: true, error: "Classification must be a JSON object." };
+  const recommendedAction = stringEnum(value.recommended_action, [
+    "map",
+    "remap",
+    "set_zero",
+    "merge_into_other",
+    "split_across_rows",
+    "keep_existing",
+    "exclude"
+  ]);
+  const confidence = stringEnum(value.confidence, ["high", "medium", "low"]);
+  const requiredStrings = ["source_line_item", "recommended_model_row", "classification_type", "reason"];
+  const missingString = requiredStrings.find((key) => typeof value[key] !== "string");
+  if (missingString) return { ok: false, needsHumanReview: true, error: `Classification field ${missingString} must be a string.` };
+  if (!recommendedAction) return { ok: false, needsHumanReview: true, error: "Classification recommended_action is invalid." };
+  if (!confidence) return { ok: false, needsHumanReview: true, error: "Classification confidence is invalid." };
+  if (!Array.isArray(value.recommended_model_row_mappings)) {
+    return { ok: false, needsHumanReview: true, error: "recommended_model_row_mappings must be an array." };
+  }
+  if (!Array.isArray(value.explicit_zero_rows)) {
+    return { ok: false, needsHumanReview: true, error: "explicit_zero_rows must be an array." };
+  }
+  const booleanKeys = [
+    "is_debt",
+    "is_tax_related",
+    "is_deferred_revenue_or_contract_liability",
+    "is_deferred_tax",
+    "is_subtotal",
+    "should_exclude_from_other_bucket",
+    "requires_validation",
+    "requires_revalidation"
+  ];
+  const badBoolean = booleanKeys.find((key) => typeof value[key] !== "boolean");
+  if (badBoolean) return { ok: false, needsHumanReview: true, error: `Classification field ${badBoolean} must be boolean.` };
+  if (!booleanOrNull(value.is_current)) return { ok: false, needsHumanReview: true, error: "is_current must be boolean or null." };
+  if (!booleanOrNull(value.is_operating)) return { ok: false, needsHumanReview: true, error: "is_operating must be boolean or null." };
+  return {
+    ok: true,
+    validated: false,
+    affectedOutput: false,
+    value: {
+      source_line_item: value.source_line_item,
+      recommended_action: recommendedAction,
+      recommended_model_row: value.recommended_model_row,
+      recommended_model_row_mappings: value.recommended_model_row_mappings.map((item) => ({
+        source_line_item: isRecord(item) && typeof item.source_line_item === "string" ? item.source_line_item : "",
+        model_row: isRecord(item) && typeof item.model_row === "string" ? item.model_row : "",
+        amount: isRecord(item) && typeof item.amount === "number" ? item.amount : null,
+        reason: isRecord(item) && typeof item.reason === "string" ? item.reason : ""
+      })),
+      explicit_zero_rows: value.explicit_zero_rows.map((item) => ({
+        model_row: isRecord(item) && typeof item.model_row === "string" ? item.model_row : "",
+        reason: isRecord(item) && typeof item.reason === "string" ? item.reason : ""
+      })),
+      classification_type: value.classification_type,
+      is_current: value.is_current,
+      is_debt: value.is_debt,
+      is_operating: value.is_operating,
+      is_tax_related: value.is_tax_related,
+      is_deferred_revenue_or_contract_liability: value.is_deferred_revenue_or_contract_liability,
+      is_deferred_tax: value.is_deferred_tax,
+      is_subtotal: value.is_subtotal,
+      should_exclude_from_other_bucket: value.should_exclude_from_other_bucket,
+      confidence,
+      reason: value.reason,
+      requires_validation: value.requires_validation,
+      requires_revalidation: value.requires_revalidation,
+      llm_used: false,
+      mapping_passed_validation: false
+    }
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function stringEnum<T extends string>(value: unknown, allowed: T[]): T | null {
+  return typeof value === "string" && (allowed as string[]).includes(value) ? (value as T) : null;
+}
+
+function booleanOrNull(value: unknown) {
+  return typeof value === "boolean" || value === null;
 }
 
 function responseOutputText(body: any) {

@@ -515,7 +515,7 @@ async function classify(overrides) {
         enabled: true,
         apiKey: "test-key",
         endpoint: "https://example.test/chat/completions",
-        model: "test-model",
+        model: "openai/gpt-5.2",
         siteUrl: "http://localhost:3000",
         appTitle: "Historicals Solver Test",
         timeoutMs: 100,
@@ -568,6 +568,7 @@ async function classify(overrides) {
   assert.equal(ambiguousLease.recommended_model_row, "LT Debt (Incl. Current Portion)");
   assert.equal(llmRequestedPayloads.length, 1);
   assert.equal(llmRequestedPayloads[0].response_format.type, "json_schema");
+  assert.equal("temperature" in llmRequestedPayloads[0], false);
   const llmUserPayload = JSON.parse(llmRequestedPayloads[0].messages[1].content);
   assert.equal(llmUserPayload.reportedLineItemLabel, "Other lease financing obligations");
   assert.equal(llmUserPayload.modelRowDefinitions["LT Debt (Incl. Current Portion)"].includes("Long-term debt instruments"), true);
@@ -626,7 +627,7 @@ async function classify(overrides) {
         enabled: true,
         apiKey: "test-key",
         endpoint: "https://example.test/chat/completions",
-        model: "test-model",
+        model: "openai/gpt-5.2",
         siteUrl: "http://localhost:3000",
         appTitle: "Historicals Solver Test",
         timeoutMs: 100,
@@ -737,7 +738,11 @@ async function classify(overrides) {
   );
   assert.equal(statementPayload.modelRowDefinitions["SG&A"].includes("advertising"), true);
   assert.equal(statementBatchPayloads[0].response_format.json_schema.schema.properties.classifications.items.properties.source_row_key.type, "string");
+  assert.equal("temperature" in statementBatchPayloads[0], false);
   assert.equal(batchResult.llmCalls, 1);
+  assert.equal(batchResult.llmAttempts, 1);
+  assert.equal(batchResult.llmSuccessfulCompletions, 1);
+  assert.equal(batchResult.llmTelemetry[0].status, "completed_validated");
   const investmentsClassification = batchResult.classifications.find((item) => item.request.sourceRowKey === "row-investments").classification;
   assert.equal(investmentsClassification.recommended_model_row, "Cash & Cash Equivalents");
   assert.equal(investmentsClassification.llm_used, true);
@@ -767,6 +772,182 @@ async function classify(overrides) {
   assert.equal(deterministicAssignment.modelRow, "LT Debt (Incl. Current Portion)");
   assert.equal(deterministicAssignment.llmUsed, false);
   assert.equal(deterministicAssignment.reason.startsWith("Validated line-item classification:"), true);
+
+  const failedPayloads = [];
+  const failedResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-other-debt",
+        rowOrder: 3,
+        label: "Other debt obligations",
+        xbrlTag: "OtherDebtObligations",
+        section: "non-current liabilities",
+        deterministicCandidate: "Other Non-Current Liabilities",
+        uncertaintyReason: "debt-like obligations require LLM accounting review"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.2",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async (_url, init) => {
+          failedPayloads.push(JSON.parse(init.body));
+          return {
+            ok: false,
+            status: 404,
+            statusText: "Not Found",
+            headers: { get: () => null },
+            json: async () => ({ error: { message: "No endpoints found that can handle the requested parameters" } })
+          };
+        }
+      }
+    }
+  );
+  assert.equal(failedPayloads.length, 1);
+  assert.equal(failedResult.llmCalls, 0);
+  assert.equal(failedResult.llmAttempts, 1);
+  assert.equal(failedResult.llmSuccessfulCompletions, 0);
+  assert.equal(failedResult.llmTelemetry[0].status, "attempted_failed");
+  assert.equal(failedResult.llmTelemetry[0].routingError, true);
+  const failedClassification = failedResult.classifications[0].classification;
+  assert.equal(failedClassification.llm_used, false);
+  assert.equal(failedClassification.confidence, "low");
+  assert.equal(failedClassification.llm_status, "attempted_failed");
+
+  const usageResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-other-current",
+        rowOrder: 4,
+        label: "Other current notes payable",
+        xbrlTag: "NotesPayableCurrent",
+        section: "current liabilities",
+        deterministicCandidate: "Other Current Liabilities",
+        uncertaintyReason: "notes payable could be current borrowings"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.2",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () => ({
+          ok: true,
+          status: 200,
+          statusText: "OK",
+          headers: { get: (name) => (name === "X-Generation-Id" ? "gen-test-123" : null) },
+          json: async () => ({
+            id: "gen-test-123",
+            model: "openai/gpt-5.2",
+            usage: {
+              prompt_tokens: 111,
+              completion_tokens: 22,
+              total_tokens: 133,
+              cost: 0.001,
+              completion_tokens_details: { reasoning_tokens: 7 },
+              prompt_tokens_details: { cached_tokens: 5 }
+            },
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    classifications: [
+                      {
+                        source_row_key: "row-other-current",
+                        source_line_item: "Other current notes payable",
+                        recommended_action: "remap",
+                        recommended_model_row: "Revolver",
+                        recommended_model_row_mappings: [],
+                        explicit_zero_rows: [],
+                        classification_type: "current borrowing facility",
+                        is_current: true,
+                        is_debt: true,
+                        is_operating: false,
+                        is_tax_related: false,
+                        is_deferred_revenue_or_contract_liability: false,
+                        is_deferred_tax: false,
+                        is_subtotal: false,
+                        should_exclude_from_other_bucket: true,
+                        confidence: "high",
+                        reason: "Notes payable current is a current borrowing source.",
+                        requires_validation: true,
+                        requires_revalidation: true
+                      }
+                    ]
+                  })
+                }
+              }
+            ]
+          })
+        })
+      }
+    }
+  );
+  assert.equal(usageResult.llmCalls, 1);
+  assert.equal(usageResult.llmTelemetry[0].generationId, "gen-test-123");
+  assert.equal(usageResult.llmTelemetry[0].usage.promptTokens, 111);
+  assert.equal(usageResult.llmTelemetry[0].usage.completionTokens, 22);
+  assert.equal(usageResult.llmTelemetry[0].usage.cost, 0.001);
+
+  let malformedAttempts = 0;
+  const malformedResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-bad",
+        rowOrder: 5,
+        label: "Other deferred balance",
+        xbrlTag: "OtherDeferredBalance",
+        section: "current liabilities",
+        deterministicCandidate: "Other Current Liabilities",
+        uncertaintyReason: "deferred balance requires review"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.2",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () => {
+          malformedAttempts += 1;
+          return {
+            ok: true,
+            status: 200,
+            statusText: "OK",
+            headers: { get: () => null },
+            json: async () => ({
+              choices: [
+                {
+                  message: {
+                    content: malformedAttempts === 1 ? "{not-json" : JSON.stringify({ classifications: [] })
+                  }
+                }
+              ]
+            })
+          };
+        }
+      }
+    }
+  );
+  assert.equal(malformedAttempts, 2);
+  assert.equal(malformedResult.llmCalls, 0);
+  assert.equal(malformedResult.llmAttempts, 1);
+  assert.equal(malformedResult.llmTelemetry[0].repairAttempted, true);
+  assert.equal(malformedResult.llmTelemetry[0].status, "needs_human_review");
+  assert.equal(malformedResult.classifications[0].classification.confidence, "low");
+  assert.equal(malformedResult.classifications[0].classification.llm_status, "needs_human_review");
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {
