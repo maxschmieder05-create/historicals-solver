@@ -47,20 +47,30 @@ function sameWorkbookFile(left: File | null, right: File | null) {
 
 function hasTransferredFiles(dataTransfer: DataTransfer | null) {
   if (!dataTransfer) return false;
-  if (Array.from(dataTransfer.types ?? []).includes("Files")) return true;
+  const types = Array.from(dataTransfer.types ?? []).map((type) => type.toLowerCase());
+  if (types.includes("files") || types.includes("application/x-moz-file") || types.includes("public.file-url")) return true;
   return Array.from(dataTransfer.items ?? []).some((item) => item.kind === "file");
 }
 
 function workbookFileFromTransfer(dataTransfer: DataTransfer | null) {
   if (!dataTransfer) return null;
-  const listedFile = Array.from(dataTransfer.files ?? [])[0];
-  if (listedFile) return listedFile;
+  const listedFiles = Array.from(dataTransfer.files ?? []);
+  const listedWorkbook = listedFiles.find(isSupportedWorkbookFile);
+  if (listedWorkbook) return listedWorkbook;
+  if (listedFiles[0]) return listedFiles[0];
+  const itemFiles: File[] = [];
   for (const item of Array.from(dataTransfer.items ?? [])) {
     if (item.kind !== "file") continue;
     const itemFile = item.getAsFile();
-    if (itemFile) return itemFile;
+    if (itemFile) itemFiles.push(itemFile);
   }
-  return null;
+  return itemFiles.find(isSupportedWorkbookFile) ?? itemFiles[0] ?? null;
+}
+
+function markWorkbookDropEffect(dataTransfer: DataTransfer | null) {
+  if (!hasTransferredFiles(dataTransfer)) return false;
+  if (dataTransfer) dataTransfer.dropEffect = "copy";
+  return true;
 }
 
 export default function Home() {
@@ -72,6 +82,7 @@ export default function Home() {
   const [error, setError] = useState<FillError | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedFileRef = useRef<File | null>(null);
+  const dragDepthRef = useRef(0);
   const inputSyncFrameRef = useRef<number | null>(null);
   const inputSyncTimersRef = useRef<number[]>([]);
 
@@ -105,6 +116,15 @@ export default function Home() {
     setFile(nextFile);
   }, [clearFileInput]);
 
+  const handleDroppedWorkbook = useCallback((dataTransfer: DataTransfer | null) => {
+    const droppedFile = workbookFileFromTransfer(dataTransfer);
+    if (!droppedFile) {
+      setError({ message: "Drop an .xlsx or .xlsm workbook file." });
+      return;
+    }
+    handleWorkbookSelected(droppedFile);
+  }, [handleWorkbookSelected]);
+
   const clearPendingInputSync = useCallback(() => {
     if (inputSyncFrameRef.current !== null) {
       window.cancelAnimationFrame(inputSyncFrameRef.current);
@@ -132,17 +152,25 @@ export default function Home() {
 
   useEffect(() => {
     function handleWindowDragOver(event: globalThis.DragEvent) {
-      if (!hasTransferredFiles(event.dataTransfer)) return;
+      if (!markWorkbookDropEffect(event.dataTransfer)) return;
       event.preventDefault();
+      dragDepthRef.current = Math.max(1, dragDepthRef.current);
       setIsDragging(true);
+    }
+
+    function handleWindowDragLeave(event: globalThis.DragEvent) {
+      if (event.clientX > 0 && event.clientY > 0 && event.clientX < window.innerWidth && event.clientY < window.innerHeight) return;
+      dragDepthRef.current = 0;
+      setIsDragging(false);
     }
 
     function handleWindowDrop(event: globalThis.DragEvent) {
       const transfer = event.dataTransfer;
       if (!hasTransferredFiles(transfer)) return;
       event.preventDefault();
+      dragDepthRef.current = 0;
       setIsDragging(false);
-      handleWorkbookSelected(workbookFileFromTransfer(transfer));
+      handleDroppedWorkbook(transfer);
     }
 
     function handleWindowFocus() {
@@ -160,19 +188,21 @@ export default function Home() {
     syncInputSelectionSoon();
 
     window.addEventListener("dragover", handleWindowDragOver);
+    window.addEventListener("dragleave", handleWindowDragLeave);
     window.addEventListener("drop", handleWindowDrop);
     window.addEventListener("focus", handleWindowFocus);
     window.addEventListener("pageshow", handlePageShow);
     document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       window.removeEventListener("dragover", handleWindowDragOver);
+      window.removeEventListener("dragleave", handleWindowDragLeave);
       window.removeEventListener("drop", handleWindowDrop);
       window.removeEventListener("focus", handleWindowFocus);
       window.removeEventListener("pageshow", handlePageShow);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       clearPendingInputSync();
     };
-  }, [clearPendingInputSync, handleWorkbookSelected, syncInputSelectionSoon]);
+  }, [clearPendingInputSync, handleDroppedWorkbook, syncInputSelectionSoon]);
 
   useEffect(() => {
     const input = fileInputRef.current;
@@ -193,23 +223,34 @@ export default function Home() {
     };
   }, [syncInputSelection]);
 
-  function handleDrag(event: DragEvent<HTMLDivElement>) {
+  function handleDrag(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     event.stopPropagation();
-    if (event.type === "dragenter" || event.type === "dragover") setIsDragging(true);
+    markWorkbookDropEffect(event.dataTransfer);
+    if (event.type === "dragenter") {
+      dragDepthRef.current += 1;
+      setIsDragging(true);
+      return;
+    }
+    if (event.type === "dragover") {
+      setIsDragging(true);
+      return;
+    }
     if (event.type === "dragleave") {
       const nextTarget = event.relatedTarget;
       if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
-      setIsDragging(false);
+      dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+      if (dragDepthRef.current === 0) setIsDragging(false);
     }
-    if (event.type === "drop") setIsDragging(false);
   }
 
-  function handleDrop(event: DragEvent<HTMLDivElement>) {
+  function handleDrop(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     event.stopPropagation();
+    markWorkbookDropEffect(event.dataTransfer);
+    dragDepthRef.current = 0;
     setIsDragging(false);
-    handleWorkbookSelected(workbookFileFromTransfer(event.dataTransfer));
+    handleDroppedWorkbook(event.dataTransfer);
   }
 
   function pickInputFile(input: HTMLInputElement) {
@@ -353,10 +394,10 @@ export default function Home() {
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
             aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
             aria-disabled={isSubmitting}
-            onDragEnter={handleDrag}
-            onDragOver={handleDrag}
-            onDragLeave={handleDrag}
-            onDrop={handleDrop}
+            onDragEnterCapture={handleDrag}
+            onDragOverCapture={handleDrag}
+            onDragLeaveCapture={handleDrag}
+            onDropCapture={handleDrop}
           >
             <input
               id="model-template-file"

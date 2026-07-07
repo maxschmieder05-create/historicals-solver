@@ -30,12 +30,16 @@ const checks = [
     message: "Workbook picker must accept both .xlsx and .xlsm Open XML workbook files."
   },
   {
-    ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*dataTransfer\.types[\s\S]*includes\("Files"\)[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
-    message: "File drag detection must accept both DataTransfer.types and DataTransfer.items file payloads."
+    ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*type\.toLowerCase\(\)[\s\S]*types\.includes\("files"\)[\s\S]*application\/x-moz-file[\s\S]*public\.file-url[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
+    message: "File drag detection must accept case-normalized DataTransfer.types, browser-specific file types, and DataTransfer.items file payloads."
   },
   {
-    ok: /function workbookFileFromTransfer\(dataTransfer: DataTransfer \| null\)[\s\S]*Array\.from\(dataTransfer\.files \?\? \[\]\)\[0\][\s\S]*item\.getAsFile\(\)/.test(source),
-    message: "Dropped workbook extraction must fall back to DataTransferItem.getAsFile when files is empty."
+    ok: /function markWorkbookDropEffect\(dataTransfer: DataTransfer \| null\)[\s\S]*dataTransfer\.dropEffect = "copy"/.test(source),
+    message: "Workbook drag/drop handlers must mark supported file drags as copy operations so browsers allow the drop."
+  },
+  {
+    ok: /function workbookFileFromTransfer\(dataTransfer: DataTransfer \| null\)[\s\S]*listedFiles\.find\(isSupportedWorkbookFile\)[\s\S]*item\.getAsFile\(\)[\s\S]*itemFiles\.find\(isSupportedWorkbookFile\)/.test(source),
+    message: "Dropped workbook extraction must prefer supported workbook files and fall back to DataTransferItem.getAsFile when files is empty."
   },
   {
     ok: /input\.addEventListener\("change", handleNativeFileSelection\)/.test(source)
@@ -45,12 +49,13 @@ const checks = [
   },
   {
     ok: /const handleWorkbookSelected = useCallback/.test(source)
-      && /handleWorkbookSelected\(workbookFileFromTransfer\(event\.dataTransfer\)\)/.test(source)
+      && /const handleDroppedWorkbook = useCallback/.test(source)
+      && /handleDroppedWorkbook\(event\.dataTransfer\)/.test(source)
       && /handleWorkbookSelected\(input\.files\?\.item\(0\) \?\? undefined\)/.test(source),
     message: "File picker and drag/drop paths must share the same workbook-selection handler."
   },
   {
-    ok: /handleWorkbookSelected\(workbookFileFromTransfer\(transfer\)\)/.test(source),
+    ok: /handleDroppedWorkbook\(transfer\)/.test(source),
     message: "Window-level file drops must use the normalized drag payload extractor."
   },
   {
@@ -87,6 +92,14 @@ const checks = [
     ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source)
       && !/(onClick|onPointerDown|onKeyDown)=\{handleFilePicker/.test(source),
     message: "Native picker resets must stay out of picker-opening handlers that can erase picker results."
+  },
+  {
+    ok: /const dragDepthRef = useRef\(0\);/.test(source)
+      && /onDragEnterCapture=\{handleDrag\}/.test(source)
+      && /onDragOverCapture=\{handleDrag\}/.test(source)
+      && /onDragLeaveCapture=\{handleDrag\}/.test(source)
+      && /onDropCapture=\{handleDrop\}/.test(source),
+    message: "Dropzone must capture drag/drop events before the transparent native input can swallow the drop."
   },
   {
     ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not a supported \.xlsx or \.xlsm workbook/.test(source),
