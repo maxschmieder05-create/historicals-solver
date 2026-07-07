@@ -802,15 +802,39 @@ const SEC_HEADERS = {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "openai/gpt-5";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-5.2";
-const LLM_MAPPING_FAST_MODEL = process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL;
-const LLM_MAPPING_COMPLEX_MODEL =
-  process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || DEFAULT_LLM_MAPPING_COMPLEX_MODEL;
-const LLM_MAPPING_REVIEW_MODEL = process.env.LLM_MAPPING_REVIEW_MODEL || LLM_MAPPING_COMPLEX_MODEL || LLM_MAPPING_FAST_MODEL;
-const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 24);
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "deepseek/deepseek-chat-v3.1";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "deepseek/deepseek-v3.1-terminus";
+const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "deepseek/deepseek-r1-0528";
+const LLM_MAPPING_FAST_MODEL = normalizeConfiguredLlmModel(
+  process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL,
+  DEFAULT_LLM_MAPPING_FAST_MODEL
+);
+const LLM_MAPPING_COMPLEX_MODEL = normalizeConfiguredLlmModel(
+  process.env.LLM_MAPPING_COMPLEX_MODEL || process.env.LLM_MAPPING_STRONG_MODEL || DEFAULT_LLM_MAPPING_COMPLEX_MODEL,
+  DEFAULT_LLM_MAPPING_COMPLEX_MODEL
+);
+const LLM_MAPPING_REVIEW_MODEL = normalizeConfiguredLlmModel(
+  process.env.LLM_MAPPING_REVIEW_MODEL || DEFAULT_LLM_MAPPING_REVIEW_MODEL,
+  DEFAULT_LLM_MAPPING_REVIEW_MODEL
+);
+const LLM_MAPPING_FAST_FALLBACK_MODELS = llmFallbackModels(
+  process.env.LLM_MAPPING_FAST_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
+  [DEFAULT_LLM_MAPPING_COMPLEX_MODEL, DEFAULT_LLM_MAPPING_REVIEW_MODEL],
+  LLM_MAPPING_FAST_MODEL
+);
+const LLM_MAPPING_COMPLEX_FALLBACK_MODELS = llmFallbackModels(
+  process.env.LLM_MAPPING_COMPLEX_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
+  [DEFAULT_LLM_MAPPING_FAST_MODEL, DEFAULT_LLM_MAPPING_REVIEW_MODEL],
+  LLM_MAPPING_COMPLEX_MODEL
+);
+const LLM_MAPPING_REVIEW_FALLBACK_MODELS = llmFallbackModels(
+  process.env.LLM_MAPPING_REVIEW_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
+  [DEFAULT_LLM_MAPPING_COMPLEX_MODEL, DEFAULT_LLM_MAPPING_FAST_MODEL],
+  LLM_MAPPING_REVIEW_MODEL
+);
+const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 80);
 const LLM_MAPPING_REVIEW_MAX_ITEMS = Number(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS || 2500);
-const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 20_000);
+const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 45_000);
 const LLM_MAPPING_REVIEW_BLOCKING =
   process.env.LLM_MAPPING_REVIEW_BLOCKING === undefined || process.env.LLM_MAPPING_REVIEW_BLOCKING === ""
     ? true
@@ -818,8 +842,8 @@ const LLM_MAPPING_REVIEW_BLOCKING =
 const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
-const LLM_MAPPING_TIMEOUT_MS = Number(process.env.LLM_MAPPING_TIMEOUT_MS || 3_000);
-const LLM_TOTAL_TIMEOUT_MS = Number(process.env.LLM_TOTAL_TIMEOUT_MS || 120_000);
+const LLM_MAPPING_TIMEOUT_MS = Number(process.env.LLM_MAPPING_TIMEOUT_MS || 10_000);
+const LLM_TOTAL_TIMEOUT_MS = Number(process.env.LLM_TOTAL_TIMEOUT_MS || 480_000);
 const LLM_WORKBENCH_MAX_FACTS = Number(process.env.LLM_WORKBENCH_MAX_FACTS || 500);
 const LLM_WORKBENCH_MAX_STATEMENT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_STATEMENT_ROWS || 650);
 const LLM_WORKBENCH_MAX_WORKBOOK_CELLS = Number(process.env.LLM_WORKBENCH_MAX_WORKBOOK_CELLS || 700);
@@ -833,10 +857,38 @@ const FAST_XLSX_ZIP_OPTIONS = {
   compression: "STORE" as const
 };
 const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
-  process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24, 8)
+  process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 80, 40)
 );
-const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 15_000);
+const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 30_000);
 const LLM_PREFILL_ANALYST_MATERIALITY_USD = Number(process.env.LLM_PREFILL_ANALYST_MATERIALITY_USD || 500_000);
+
+function normalizeConfiguredLlmModel(model: string, fallback: string) {
+  const trimmed = model.trim();
+  if (!trimmed) return fallback;
+  const normalized = trimmed.toLowerCase();
+  if (/^openrouter\/(?:owl-alpha|horizon-alpha|horizon-beta)$/.test(normalized)) return DEFAULT_LLM_MAPPING_FAST_MODEL;
+  return trimmed;
+}
+
+function llmFallbackModels(raw: string | undefined, defaults: string[], primary: string) {
+  const configured = raw
+    ? raw
+        .split(",")
+        .map((item) => normalizeConfiguredLlmModel(item, ""))
+        .filter(Boolean)
+    : defaults;
+  const primaryKey = primary.toLowerCase();
+  const seen = new Set<string>([primaryKey]);
+  return configured
+    .map((item) => normalizeConfiguredLlmModel(item, ""))
+    .filter(Boolean)
+    .filter((item) => {
+      const key = item.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
 
 const BLUE_FONT_COLORS = new Set(["FF0000FF", "FF0070C0", "FF0563C1", "FF0000EE"]);
 const MODEL_SHEET = "Model";
@@ -2430,11 +2482,12 @@ function isPrimaryIncomeStatementStructure(statement: SecFilingStatementStructur
   return /\b(operations?|income|earnings|profit|loss)\b/.test(text);
 }
 
-function isPrimaryBalanceSheetStructure(statement: SecFilingStatementStructure) {
+export function isPrimaryBalanceSheetStructure(statement: SecFilingStatementStructure) {
   if (statement.sourceTableType !== "primary_statement") return false;
   const text = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
   if (/\bparenthetical|parentheticals|details?|supplemental\b/.test(text)) return false;
-  if (/\b(cash flows?|operations?|income|earnings|comprehensive income|stockholders?|shareholders?|equity)\b/.test(text)) return false;
+  if (!/\b(balance sheets?|financial position)\b/.test(text)) return false;
+  if (/\b(cash flows?|operations?|income|earnings|comprehensive income)\b/.test(text)) return false;
   return /\b(balance sheets?|financial position)\b/.test(text);
 }
 
@@ -2614,10 +2667,29 @@ function primaryBalanceSheetStatementRowsForPeriod(
     }))
     .filter((candidate) => candidate.rows.length);
   if (!candidates.length) return [];
-  const best = candidates
+  const scored = candidates
     .map((candidate) => ({ ...candidate, score: primaryBalanceSheetStatementScore(candidate.statement, candidate.rows) }))
-    .sort((a, b) => b.score - a.score || b.rows.length - a.rows.length)[0];
-  return best.rows.map((row) => ({ statement: best.statement, row }));
+    .filter((candidate) => candidate.score > 0)
+    .sort((a, b) => b.score - a.score || b.rows.length - a.rows.length);
+  const selected = scored.length ? scored : candidates.map((candidate) => ({ ...candidate, score: 0 }));
+  const rows: Array<{ statement: SecFilingStatementStructure; row: PrimaryBalanceSheetRow }> = [];
+  const seen = new Set<string>();
+  for (const candidate of selected) {
+    for (const row of candidate.rows) {
+      const section = statementSectionForRow(candidate.statement, row, "balance_sheet");
+      const key = [
+        normalizeAccession(row.accession || candidate.statement.accession),
+        section,
+        row.xbrlConcept ?? cleanLineItemLabel(row.rowLabel),
+        cleanLineItemLabel(row.rowLabel),
+        typeof row.value === "number" ? Math.round(row.value) : ""
+      ].join("|");
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({ statement: candidate.statement, row });
+    }
+  }
+  return rows.sort((a, b) => a.row.rowOrder - b.row.rowOrder);
 }
 
 function primaryBalanceSheetStatementScore(statement: SecFilingStatementStructure, rows: PrimaryBalanceSheetRow[]) {
@@ -2838,6 +2910,7 @@ async function buildLineItemClassificationStore(
           apiKey: llmApiKey(),
           endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
           model,
+          fallbackModels: llmFallbackModelsForAccountingModel(model),
           siteUrl: OPENROUTER_SITE_URL,
           appTitle: OPENROUTER_APP_TITLE,
           timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
@@ -14443,6 +14516,12 @@ function recordLlmTelemetry(state: LlmMappingState, telemetry: AccountingLlmTele
   if (telemetry.completed) state.calls += 1;
 }
 
+function recordLlmTelemetryAttempts(state: LlmMappingState, result: { telemetry: AccountingLlmTelemetry; attemptTelemetry?: AccountingLlmTelemetry[] }) {
+  for (const telemetry of result.attemptTelemetry ?? [result.telemetry]) {
+    recordLlmTelemetry(state, telemetry);
+  }
+}
+
 function llmTimeRemainingMs(state: LlmMappingState) {
   return Math.max(0, state.deadlineAt - Date.now());
 }
@@ -14545,7 +14624,7 @@ async function runLlmMappingReview(
       reviewerModel: LLM_MAPPING_REVIEW_MODEL
     });
     const result = await requestLlmMappingReview(payload, company, debug);
-    recordLlmTelemetry(state, result.telemetry);
+    recordLlmTelemetryAttempts(state, result);
     if (!result.value) {
       const message = `LLM mapping review ${result.status} (${result.error || result.telemetry.errorMessage || "unknown OpenRouter API error"}).`;
       debug.error("LLM mapping review failed", {
@@ -14735,6 +14814,7 @@ async function requestLlmMappingReview(
     apiKey,
     endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
     model: LLM_MAPPING_REVIEW_MODEL,
+    fallbackModels: LLM_MAPPING_REVIEW_FALLBACK_MODELS,
     siteUrl: OPENROUTER_SITE_URL,
     appTitle: OPENROUTER_APP_TITLE,
     timeoutMs,
@@ -15384,7 +15464,7 @@ async function llmAssistedFillRow(
       candidates: candidates.slice(0, 20)
     });
     const result = await requestLlmMappingDecision(company, fillRow, periods, candidates, modelChoice.model, ctx, debug);
-    recordLlmTelemetry(state, result.telemetry);
+    recordLlmTelemetryAttempts(state, result);
     if (!result.value) {
       const message = result.error || result.telemetry.errorMessage || "unknown OpenRouter API error";
       state.warnings.push(`${fillRow.label}: LLM-assisted mapping ${result.status} (${message}).`);
@@ -15505,6 +15585,13 @@ function chooseLlmMappingModel(fillRow: FillRow, candidates: LlmCandidateFact[])
   };
 }
 
+function llmFallbackModelsForAccountingModel(model: string) {
+  if (model.toLowerCase() === LLM_MAPPING_FAST_MODEL.toLowerCase()) return LLM_MAPPING_FAST_FALLBACK_MODELS;
+  if (model.toLowerCase() === LLM_MAPPING_COMPLEX_MODEL.toLowerCase()) return LLM_MAPPING_COMPLEX_FALLBACK_MODELS;
+  if (model.toLowerCase() === LLM_MAPPING_REVIEW_MODEL.toLowerCase()) return LLM_MAPPING_REVIEW_FALLBACK_MODELS;
+  return llmFallbackModels(undefined, [LLM_MAPPING_COMPLEX_MODEL, LLM_MAPPING_FAST_MODEL, LLM_MAPPING_REVIEW_MODEL], model);
+}
+
 function llmMappingComplexityScore(fillRow: FillRow, candidates: LlmCandidateFact[]) {
   const label = [fillRow.label, fillRow.modelContext?.sectionHeader, fillRow.modelContext?.previousLabel, fillRow.modelContext?.nextLabel].join(" ");
   const scoredCandidates = candidates.map((candidate) => llmCandidateScore(fillRow, candidate)).sort((a, b) => b - a);
@@ -15577,6 +15664,7 @@ async function requestLlmMappingDecision(
     apiKey,
     endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
     model,
+    fallbackModels: llmFallbackModelsForAccountingModel(model),
     siteUrl: OPENROUTER_SITE_URL,
     appTitle: OPENROUTER_APP_TITLE,
     timeoutMs,

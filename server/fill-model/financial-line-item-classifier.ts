@@ -108,6 +108,7 @@ type LlmClassificationOptions = {
   apiKey: string;
   endpoint: string;
   model: string;
+  fallbackModels?: string[];
   siteUrl: string;
   appTitle: string;
   timeoutMs?: number;
@@ -404,7 +405,7 @@ export async function classifyFinancialStatementLineItems(
 
   const llm = options.llm!;
   const result = await requestStatementLlmClassification(prepared, targets, llm);
-  const telemetry = [result.telemetry];
+  const telemetry = result.attemptTelemetry ?? [result.telemetry];
   if (result.value) {
     const response = result.value;
     const byRowKey = new Map(response.classifications.map((item) => [item.source_row_key, item]));
@@ -437,9 +438,9 @@ export async function classifyFinancialStatementLineItems(
     return {
       classifications: merged,
       warnings,
-      llmCalls: result.telemetry.completed ? 1 : 0,
-      llmAttempts: result.telemetry.attempted ? 1 : 0,
-      llmSuccessfulCompletions: result.telemetry.completed ? 1 : 0,
+      llmCalls: telemetry.filter((item) => item.completed).length,
+      llmAttempts: telemetry.filter((item) => item.attempted).length,
+      llmSuccessfulCompletions: telemetry.filter((item) => item.completed).length,
       llmTelemetry: telemetry
     };
   }
@@ -459,7 +460,7 @@ export async function classifyFinancialStatementLineItems(
     classifications: failed,
     warnings,
     llmCalls: 0,
-    llmAttempts: result.telemetry.attempted ? 1 : 0,
+    llmAttempts: telemetry.filter((item) => item.attempted).length,
     llmSuccessfulCompletions: 0,
     llmTelemetry: telemetry
   };
@@ -1127,6 +1128,7 @@ async function requestLlmClassification(
     apiKey: options.apiKey,
     endpoint: options.endpoint,
     model: options.model,
+    fallbackModels: options.fallbackModels,
     siteUrl: options.siteUrl,
     appTitle: options.appTitle,
     timeoutMs: options.timeoutMs ?? 15_000,
@@ -1174,6 +1176,7 @@ async function requestStatementLlmClassification(
     apiKey: options.apiKey,
     endpoint: options.endpoint,
     model: options.model,
+    fallbackModels: options.fallbackModels,
     siteUrl: options.siteUrl,
     appTitle: options.appTitle,
     timeoutMs: options.timeoutMs ?? 15_000,

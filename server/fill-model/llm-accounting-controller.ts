@@ -71,6 +71,7 @@ export type AccountingLlmRequest<T> = {
   apiKey: string;
   endpoint: string;
   model: string;
+  fallbackModels?: string[];
   siteUrl: string;
   appTitle: string;
   messages: AccountingLlmMessage[];
@@ -93,6 +94,7 @@ export type AccountingLlmResult<T> = {
   rawText?: string;
   error?: string;
   telemetry: AccountingLlmTelemetry;
+  attemptTelemetry?: AccountingLlmTelemetry[];
 };
 
 type OpenRouterModelCapabilities = {
@@ -141,6 +143,23 @@ export function emptyAccountingLlmTelemetry(input: {
 }
 
 export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>): Promise<AccountingLlmResult<T>> {
+  const modelCandidates = uniqueModels([request.model, ...(request.fallbackModels ?? [])]);
+  const attemptTelemetry: AccountingLlmTelemetry[] = [];
+  let lastResult: AccountingLlmResult<T> | null = null;
+
+  for (const model of modelCandidates) {
+    const result = await requestAccountingJsonForModel({ ...request, model });
+    attemptTelemetry.push(...(result.attemptTelemetry ?? [result.telemetry]));
+    if (result.value) return { ...result, attemptTelemetry };
+    lastResult = result;
+    if (!llmResultEligibleForFallback(result)) break;
+  }
+
+  if (lastResult) return { ...lastResult, attemptTelemetry };
+  return requestAccountingJsonForModel(request);
+}
+
+async function requestAccountingJsonForModel<T>(request: AccountingLlmRequest<T>): Promise<AccountingLlmResult<T>> {
   const startedAt = Date.now();
   if (request.enabled === false) {
     const telemetry = emptyAccountingLlmTelemetry({
@@ -247,6 +266,30 @@ export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>)
       errorMessage: parsed.error
     }
   };
+}
+
+function uniqueModels(models: string[]) {
+  const seen = new Set<string>();
+  return models
+    .map((model) => model.trim())
+    .filter(Boolean)
+    .filter((model) => {
+      const key = model.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+function llmResultEligibleForFallback<T>(result: AccountingLlmResult<T>) {
+  if (result.status !== "attempted_failed" && result.status !== "needs_human_review") return false;
+  const error = result.error || result.telemetry.errorMessage || "";
+  return Boolean(
+    !error ||
+      /no endpoints|routing|provider|timed out|did not include text output|json|schema|parse|validation|omitted target|unexpected source_row_key|duplicate source_row_key/i.test(
+        error
+      )
+  );
 }
 
 export function aggregateAccountingTelemetry(items: AccountingLlmTelemetry[]) {
@@ -573,6 +616,16 @@ function staticCapabilitiesForModel(model: string): OpenRouterModelCapabilities 
       supportsStructuredOutputs: true,
       supportsTemperature: !/^openai\/o[34]/.test(normalized),
       supportsMaxCompletionTokens: /^openai\/o[34]/.test(normalized),
+      supportsMaxTokens: true,
+      source: "static"
+    };
+  }
+  if (/^(deepseek|qwen|moonshotai|z-ai)\//.test(normalized)) {
+    return {
+      supportsResponseFormat: true,
+      supportsStructuredOutputs: true,
+      supportsTemperature: true,
+      supportsMaxCompletionTokens: false,
       supportsMaxTokens: true,
       source: "static"
     };
