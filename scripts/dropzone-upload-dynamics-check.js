@@ -48,6 +48,13 @@ const checks = [
     message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing, including same-file cancel events."
   },
   {
+    ok: /function handleFilePickerActivation\(event: SyntheticEvent<HTMLInputElement>\)[\s\S]*syncInputSelectionSoon\(event\.currentTarget\);/.test(source)
+      && /onClickCapture=\{handleFilePickerActivation\}/.test(source)
+      && /onFocusCapture=\{handleFilePickerActivation\}/.test(source)
+      && /onBlurCapture=\{handleFilePickerActivation\}/.test(source),
+    message: "File input activation, focus, and blur must schedule a deferred native input resync so OS picker timing cannot strand a selected workbook."
+  },
+  {
     ok: /const handleWorkbookSelected = useCallback/.test(source)
       && /const handleDroppedWorkbook = useCallback/.test(source)
       && /handleDroppedWorkbook\(event\.dataTransfer\)/.test(source)

@@ -4,6 +4,7 @@ import {
   ChangeEvent,
   DragEvent,
   FormEvent,
+  SyntheticEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -265,6 +266,10 @@ export default function Home() {
     pickInputFile(event.currentTarget);
   }
 
+  function handleFilePickerActivation(event: SyntheticEvent<HTMLInputElement>) {
+    syncInputSelectionSoon(event.currentTarget);
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -408,6 +413,9 @@ export default function Home() {
               accept={SUPPORTED_WORKBOOK_ACCEPT}
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               disabled={isSubmitting}
+              onClickCapture={handleFilePickerActivation}
+              onFocusCapture={handleFilePickerActivation}
+              onBlurCapture={handleFilePickerActivation}
               onChangeCapture={handleFileSelect}
               onInputCapture={handleFileInput}
               onChange={handleFileSelect}
