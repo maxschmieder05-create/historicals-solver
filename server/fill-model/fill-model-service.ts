@@ -14712,7 +14712,7 @@ async function runLlmMappingReview(
       return {
         rows: [llmMappingReviewSkippedRow(company, message, state, result.status)],
         warnings: [message],
-        blockingErrors: []
+        blockingErrors: llmMappingReviewFailureBlockingErrors(message)
       };
     }
     const review = result.value;
@@ -14749,9 +14749,13 @@ async function runLlmMappingReview(
     return {
       rows: [llmMappingReviewSkippedRow(company, message, state, "attempted_failed")],
       warnings: [message],
-      blockingErrors: []
+      blockingErrors: llmMappingReviewFailureBlockingErrors(message)
     };
   }
+}
+
+function llmMappingReviewFailureBlockingErrors(message: string) {
+  return LLM_MAPPING_REVIEW_BLOCKING ? [message] : [];
 }
 
 function isActionableLlmMappingBlockingIssue(issue: LlmMappingReviewIssue) {
@@ -19531,14 +19535,16 @@ function validateIncomeStatementMetricAgainstEdgar(
     const modelValue = options.hard && displayedValue !== null ? displayedValue : statementMetricCellValue(cell, evaluator, expected);
     if (modelValue === null) {
       const message = `Income Statement ${cell.address} ${period}: could not evaluate model ${metricName}.`;
-      if (protectedFormula || hasFormula(cell)) warnings.unshift(message);
+      if (options.hard) errors.push(`${message} Reported-period income-statement value must be evaluated before output.`);
+      else if (protectedFormula || hasFormula(cell)) warnings.unshift(message);
       else errors.push(message);
       return;
     }
 
     if (!statementMetricTies(modelValue, expected)) {
       const message = `Income Statement ${cell.address} ${period}: ${metricName} ${roundModelValue(modelValue)} does not match EDGAR ${roundModelValue(expected)}.`;
-      if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+      if (options.hard) errors.push(`${message} Reported-period income-statement formula must be refreshed or remapped before output.`);
+      else if (protectedFormula) warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
       else if (hasFormula(cell) && !options.hard) warnings.unshift(message);
       else errors.push(message);
     }
@@ -20681,7 +20687,7 @@ function classifiedPrimaryIncomeStatementAssignment(
   fillRows: FillRow[]
 ): PrimaryIncomeStatementAssignment | null {
   const classification = lineItemClassificationForSource(period, ctx, source);
-  const availableRows = fillRows.filter((row) => row.statement === "income" && row.kind === "duration").map((row) => row.label);
+  const availableRows = incomeStatementAssignmentCandidateRows(fillRows).map((row) => row.label);
   const assignment = classificationModelRowAssignmentForPrimaryStatement(classification, availableRows);
   if (!assignment) return null;
   if (!incomeStatementAssignmentModelRowIsAssignable(assignment.modelRow)) return null;
@@ -20726,10 +20732,21 @@ function incomeStatementAssignmentStatusForModelRow(modelRow: string, source: Fa
 function availableIncomeStatementModelRow(fillRows: FillRow[], canonical: string, aliases: string[] = []) {
   const candidates = [canonical, ...aliases];
   return (
-    fillRows
-      .filter((row) => row.statement === "income" && row.kind === "duration")
+    incomeStatementAssignmentCandidateRows(fillRows)
       .find((row) => candidates.some((candidate) => modelRowsMatch(row.label, candidate) || normalize(row.label) === normalize(candidate)))?.label ?? null
   );
+}
+
+function incomeStatementAssignmentCandidateRows(fillRows: FillRow[]) {
+  return fillRows.filter((row) => {
+    if (row.kind !== "duration") return false;
+    if (row.statement === "income") return true;
+    const context = row.modelContext;
+    if (!context) return false;
+    if (inBalanceSheetContext(context)) return false;
+    const section = `${context.sectionHeader ?? ""} ${context.previousLabel ?? ""} ${context.nextLabel ?? ""} ${context.label}`.toLowerCase();
+    return /\bincome statement\b/.test(section) && !/\bcash flow|balance sheet|working capital|debt|shareholders?|equity|schedule|assumptions\b/.test(section);
+  });
 }
 
 function incomeStatementAssignmentModelRowIsAssignable(modelRow: string | null) {
@@ -21229,7 +21246,7 @@ function recordIncomeStatementAssignmentValidationIssue(
   protectedFormula: boolean
 ) {
   if (protectedFormula) {
-    warnings.unshift(`${message} Protected formula/check cell was preserved for review.`);
+    errors.push(`${message} Reported-period income-statement formula must be refreshed or remapped before output.`);
     return;
   }
   errors.push(message);
@@ -24309,6 +24326,10 @@ export const __fillModelServiceTestHooks = {
   buildPrimaryBalanceSheetAssignmentLedgerRows,
   buildPrimaryIncomeStatementAssignmentLedgerRows,
   validatePrimaryBalanceSheetAssignmentCoverage,
+  validatePrimaryIncomeStatementAssignmentCoverage,
+  validateIncomeStatementMetricAgainstEdgar,
+  llmMappingReviewFailureBlockingErrors,
+  incomeStatementAssignmentCandidateRows,
   primaryIncomeStatementSourcesForPeriod,
   primaryStatementHasCostOfRevenueSplitWithSeparateDa,
   reportedLineItemCategory,
