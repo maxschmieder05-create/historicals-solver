@@ -103,10 +103,10 @@ async function main() {
     validate: (value) => (value && value.ok === true ? { ok: true, value, validated: true, affectedOutput: true } : { ok: false, error: "bad" })
   });
 
-  assert.equal(quotaResult.status, "completed_validated");
-  assert.equal(quotaCalls, 2);
+  assert.equal(quotaResult.status, "attempted_failed");
+  assert.equal(quotaCalls, 1);
   assert.equal(quotaResult.attemptTelemetry[0].httpStatus, 403);
-  assert.equal(quotaResult.attemptTelemetry[1].status, "completed_validated");
+  assert.equal(quotaResult.attemptTelemetry.length, 1);
 
   const workbook = new ExcelJS.Workbook();
   addLlmMappingReviewSheet(workbook, [

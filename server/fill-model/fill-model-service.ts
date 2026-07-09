@@ -832,8 +832,9 @@ const LLM_MAPPING_REVIEW_FALLBACK_MODELS = llmFallbackModels(
   [DEFAULT_LLM_MAPPING_COMPLEX_MODEL, DEFAULT_LLM_MAPPING_FAST_MODEL],
   LLM_MAPPING_REVIEW_MODEL
 );
-const LLM_MAPPING_MAX_CALLS = Number(process.env.LLM_MAPPING_MAX_CALLS || 80);
-const LLM_MAPPING_REVIEW_MAX_ITEMS = Number(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS || 2500);
+const LLM_MAPPING_HARD_MAX_CALLS = positiveNumber(process.env.LLM_MAPPING_HARD_MAX_CALLS, 12);
+const LLM_MAPPING_MAX_CALLS = boundedPositiveNumber(process.env.LLM_MAPPING_MAX_CALLS, 12, LLM_MAPPING_HARD_MAX_CALLS);
+const LLM_MAPPING_REVIEW_MAX_ITEMS = boundedPositiveNumber(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS, 900, 1_200);
 const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 45_000);
 const LLM_MAPPING_REVIEW_BLOCKING =
   process.env.LLM_MAPPING_REVIEW_BLOCKING === undefined || process.env.LLM_MAPPING_REVIEW_BLOCKING === ""
@@ -857,10 +858,22 @@ const FAST_XLSX_ZIP_OPTIONS = {
   compression: "STORE" as const
 };
 const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
-  process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS || Math.min(Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 80, 40)
+  Math.min(
+    boundedPositiveNumber(process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS, Math.min(LLM_MAPPING_MAX_CALLS, 12), LLM_MAPPING_MAX_CALLS),
+    LLM_MAPPING_MAX_CALLS
+  )
 );
 const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 30_000);
 const LLM_PREFILL_ANALYST_MATERIALITY_USD = Number(process.env.LLM_PREFILL_ANALYST_MATERIALITY_USD || 500_000);
+
+function positiveNumber(value: string | number | undefined, fallback: number) {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function boundedPositiveNumber(value: string | number | undefined, fallback: number, max: number) {
+  return Math.min(positiveNumber(value, fallback), positiveNumber(max, fallback));
+}
 
 function normalizeConfiguredLlmModel(model: string, fallback: string) {
   const trimmed = model.trim();
@@ -14026,6 +14039,9 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
   if (noncontrollingIncomeRow) refreshFormulaRowCachedResults(sheet, noncontrollingIncomeRow, columns);
   if (adjustedNetIncomeRow) refreshFormulaRowCachedResults(sheet, adjustedNetIncomeRow, columns);
 
+  const nonAnnualColumns = columns.filter((_col, index) => !isAnnualPeriod(periods[index]));
+  refreshAnnualIncomeStatementFormulaCaches(sheet, nonAnnualColumns.length ? nonAnnualColumns : columns, [otherOperatingRow, otherNonOperatingRow, pretaxRow, netIncomeRow]);
+
   refreshFormulaMetricResultsFromResolver(
     sheet,
     periods,
@@ -14118,8 +14134,6 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     resolveNetIncome,
     "net income"
   );
-  const nonAnnualColumns = columns.filter((_col, index) => !isAnnualPeriod(periods[index]));
-  refreshAnnualIncomeStatementFormulaCaches(sheet, nonAnnualColumns.length ? nonAnnualColumns : columns, [otherOperatingRow, otherNonOperatingRow, pretaxRow, netIncomeRow]);
 }
 
 function refreshAnnualIncomeStatementFormulaCaches(sheet: ExcelJS.Worksheet, periodColumns: number[], rows: Array<number | null>) {
@@ -14591,6 +14605,14 @@ function recordLlmTelemetry(state: LlmMappingState, telemetry: AccountingLlmTele
   if (telemetry.attempted && !telemetry.completed) state.failedAttempts += 1;
   if (telemetry.affectedOutput) state.affectedOutputDecisions += 1;
   if (telemetry.completed) state.calls += 1;
+  if (llmTelemetryIndicatesAccountBudgetExhausted(telemetry)) {
+    state.enabled = false;
+    state.deadlineAt = Date.now();
+    if (!state.budgetWarningAdded) {
+      state.budgetWarningAdded = true;
+      state.warnings.push("LLM provider budget/key limit was exhausted; remaining rows used deterministic EDGAR mapping and fail-closed validation.");
+    }
+  }
 }
 
 function recordLlmTelemetryAttempts(state: LlmMappingState, result: { telemetry: AccountingLlmTelemetry; attemptTelemetry?: AccountingLlmTelemetry[] }) {
@@ -14633,6 +14655,11 @@ function llmMappingStateSummary(state: LlmMappingState) {
     warningCount: state.warnings.length,
     budgetWarningAdded: state.budgetWarningAdded
   };
+}
+
+function llmTelemetryIndicatesAccountBudgetExhausted(telemetry: AccountingLlmTelemetry) {
+  const message = telemetry.errorMessage || "";
+  return Boolean((!telemetry.httpStatus || [401, 403].includes(telemetry.httpStatus)) && /key limit|quota|billing|credits?|auth|api key|forbidden/i.test(message));
 }
 
 function llmMappingEnabledByEnv() {
@@ -14755,6 +14782,7 @@ async function runLlmMappingReview(
 }
 
 function llmMappingReviewFailureBlockingErrors(message: string) {
+  if (/key limit|quota|billing|credits?|auth|api key|forbidden/i.test(message)) return [];
   return LLM_MAPPING_REVIEW_BLOCKING ? [message] : [];
 }
 
@@ -20692,12 +20720,19 @@ function classifiedPrimaryIncomeStatementAssignment(
   if (!assignment) return null;
   if (!incomeStatementAssignmentModelRowIsAssignable(assignment.modelRow)) return null;
   if (modelRowsMatch(assignment.modelRow, "SG&A") && isExplicitOtherOperatingLineSource(source)) return null;
+  if (classificationAssignmentConflictsWithPrimaryIncomeStatementSemantics(source, assignment.modelRow)) return null;
 
   return {
     modelRow: assignment.modelRow,
     status: assignment.grouped ? "grouped_into_model_row" : incomeStatementAssignmentStatusForModelRow(assignment.modelRow, source),
     reason: assignment.reason
   };
+}
+
+function classificationAssignmentConflictsWithPrimaryIncomeStatementSemantics(source: FactSource, modelRow: string) {
+  if (isOperatingSpecialChargeSource(source) && !modelRowsMatch(modelRow, "Other Operating Income / Expense")) return true;
+  if (isExplicitOtherOperatingLineSource(source) && !modelRowsMatch(modelRow, "Other Operating Income / Expense")) return true;
+  return false;
 }
 
 function incomeStatementAssignmentAmount(source: FactSource, modelRow: string | null) {

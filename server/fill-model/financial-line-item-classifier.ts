@@ -559,6 +559,7 @@ function deterministicFinancialLineItemClassification(
   request: FinancialLineItemClassificationRequest
 ): FinancialLineItemClassification | null {
   const text = requestSearchText(request);
+  const ownText = requestOwnSearchText(request);
   const section = request.section;
   const current = section.includes("current") ? section.startsWith("current") : null;
   const base = baseClassification(request);
@@ -808,9 +809,9 @@ function deterministicFinancialLineItemClassification(
   }
 
   const excludesAcquiredInProcessCost =
-    /\bexclud(?:e|es|ing)\b.*\bacquired\b.*\bin[-\s]?process\b.*\bcost\b/.test(text) ||
+    /\bexclud(?:e|es|ing)\b.*\bacquired\b.*\bin[-\s]?process\b.*\bcost\b/.test(ownText) ||
     /researchanddevelopmentexpenseexcludingacquiredinprocesscost/i.test(request.xbrlTag ?? "");
-  if (!excludesAcquiredInProcessCost && /\bacquired\b.*\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bipr&d\b|\biprd\b/.test(text)) {
+  if (!excludesAcquiredInProcessCost && /\bacquired\b.*\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bipr&d\b|\biprd\b/.test(ownText)) {
     const row = modelRowAvailable("Other Operating Income / Expense", request.availableModelRows)
       ? "Other Operating Income / Expense"
       : preferred("R&D");
@@ -829,7 +830,7 @@ function deterministicFinancialLineItemClassification(
   if (
     request.statement === "income_statement" &&
     request.section === "operating expenses" &&
-    /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b|\btechnology and content\b/.test(text)
+    /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b|\btechnology and content\b/.test(ownText)
   ) {
     return {
       ...base,
@@ -846,7 +847,24 @@ function deterministicFinancialLineItemClassification(
   if (
     request.statement === "income_statement" &&
     request.section === "operating expenses" &&
-    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(text)
+    /\bspecial items?\b|\brestructuring\b|\bimpairment\b|\bspecial charges?\b|\bintegration costs?\b|\blitigation\b|\bsettlement\b|\baccretion\b/.test(ownText)
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Other Operating Income / Expense"),
+      classification_type: "special operating charge",
+      is_current: null,
+      is_operating: true,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason: "The item is presented above operating income and belongs in other operating income/expense."
+    };
+  }
+
+  if (
+    request.statement === "income_statement" &&
+    request.section === "operating expenses" &&
+    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(ownText)
   ) {
     return {
       ...base,
@@ -863,7 +881,7 @@ function deterministicFinancialLineItemClassification(
   if (
     request.statement === "income_statement" &&
     request.section === "operating expenses" &&
-    /\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bsales and marketing\b|\bselling and marketing\b|\bsales expense\b|\bselling expense\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b|\bsg&a\b|\bselling\b.*\bgeneral\b.*\badministrative\b/.test(text)
+    /\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bsales and marketing\b|\bselling and marketing\b|\bsales expense\b|\bselling expense\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b|\bsg&a\b|\bselling\b.*\bgeneral\b.*\badministrative\b/.test(ownText)
   ) {
     return {
       ...base,
@@ -877,7 +895,7 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
-  if (/\bdepreciation\b|\bamortization\b|\bdepletion\b|\bd&a\b/.test(text)) {
+  if (/\bdepreciation\b|\bamortization\b|\bdepletion\b|\bd&a\b/.test(ownText)) {
     const standaloneIncomeStatementDa = request.statement === "income_statement" && request.section === "operating expenses" && !/\bcash flows?|operating activities|reconciliation|supplemental/.test(text);
     return {
       ...base,
@@ -893,7 +911,7 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
-  if (/\bspecial items?\b|\brestructuring\b|\bimpairment\b|\bspecial charges?\b|\bintegration costs?\b|\blitigation\b|\bsettlement\b|\baccretion\b/.test(text)) {
+  if (/\bspecial items?\b|\brestructuring\b|\bimpairment\b|\bspecial charges?\b|\bintegration costs?\b|\blitigation\b|\bsettlement\b|\baccretion\b/.test(ownText)) {
     const operating = request.section === "operating expenses";
     return {
       ...base,
@@ -1666,6 +1684,18 @@ function requestSearchText(request: FinancialLineItemClassificationRequest) {
     request.xbrlTag ?? "",
     request.parentSubtotal?.label ?? "",
     request.parentSubtotal?.concept ?? "",
+    request.section
+  ]
+    .join(" ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+}
+
+function requestOwnSearchText(request: FinancialLineItemClassificationRequest) {
+  return [
+    request.reportedLineItemLabel,
+    request.cleanLabel,
+    request.xbrlTag ?? "",
     request.section
   ]
     .join(" ")

@@ -9,6 +9,14 @@ const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model
 const ticker = process.env.LLY_TICKER || "LLY";
 
 const expected = {
+  FY23: {
+    "Pre-Tax Income (Loss)": 6554.6,
+    "Net Income (Loss)": 5240.4
+  },
+  FY24: {
+    "Pre-Tax Income (Loss)": 12680.4,
+    "Net Income (Loss)": 10590
+  },
   "1Q24": {
     "Depreciation & Amortization": 0,
     "Other Operating Income (Expense)": -110.5,
@@ -22,13 +30,14 @@ const expected = {
   FY25: {
     "Depreciation & Amortization": 0,
     "Other Operating Income (Expense)": -3394,
-    EBIT: 26302
+    EBIT: 26302,
+    "Pre-Tax Income (Loss)": 25731,
+    "Net Income (Loss)": 20640
   },
   "1Q26": {
     "Depreciation & Amortization": 0,
     "Other Operating Income (Expense)": -863,
     EBIT: 8915,
-    "Interest (Expense)": -211,
     "Other Non-Operating Income (Expense)": -65
   }
 };
@@ -170,6 +179,19 @@ async function main() {
   const q126OtherNonOperatingRows = auditRowsFor(audit, "U41", "1Q26");
   if (q126OtherNonOperatingRows.some((row) => /ResearchAndDevelopmentAssetAcquired|RestructuringSettlementAndImpairment/.test(row.concepts))) {
     errors.push("Mapping Audit U41 should not absorb LLY operating IPR&D or restructuring charges into other non-operating income/expense.");
+  }
+
+  const q126InterestCol = findPeriodColumn(model, "1Q26");
+  const interestRow = findRow(model, "Interest (Expense)");
+  if (q126InterestCol && interestRow) {
+    const interestValue = cellValue(model.getCell(interestRow, q126InterestCol));
+    if (interestValue !== null && interestValue !== "") {
+      errors.push(`1Q26 Interest (Expense): expected blank because EDGAR reports only net non-operating income/expense on the primary statement, got ${interestValue}.`);
+    }
+  }
+  const q126InterestAuditRows = auditRowsFor(audit, "U39", "1Q26");
+  if (!q126InterestAuditRows.some((row) => /cleared/i.test(row.validationStatus))) {
+    errors.push("Mapping Audit U39 should document clearing the stale 1Q26 interest expense input when no standalone primary-statement EDGAR interest expense exists.");
   }
 
   if (errors.length) {

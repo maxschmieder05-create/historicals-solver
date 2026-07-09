@@ -194,6 +194,50 @@ async function classify(overrides) {
 }
 
 (async () => {
+  const incomeStatementCostSubtotal = {
+    label: "Cost of sales, operating expenses, and other-net",
+    concept: "CostOfSalesOperatingExpensesAndOtherNet"
+  };
+  const incomeRows = [
+    "COGS / Cost of Goods Sold",
+    "Selling, General & Administration (SG&A)",
+    "Other Operating Income (Expense)"
+  ];
+  const subtotalChildCostOfSales = await classify({
+    statement: "income_statement",
+    periodType: "duration",
+    label: "Cost of sales",
+    xbrlTag: "CostOfGoodsAndServicesSold",
+    section: "operating expenses",
+    parentSubtotal: incomeStatementCostSubtotal,
+    availableModelRows: incomeRows
+  });
+  assert.equal(subtotalChildCostOfSales.recommended_model_row, "COGS / Cost of Goods Sold");
+
+  const marketingAdmin = await classify({
+    statement: "income_statement",
+    periodType: "duration",
+    label: "Marketing, selling, and administrative",
+    xbrlTag: "SellingGeneralAndAdministrativeExpense",
+    section: "operating expenses",
+    parentSubtotal: incomeStatementCostSubtotal,
+    deterministicCandidate: "SG&A",
+    availableModelRows: incomeRows
+  });
+  assert.equal(modelRowsMatch(marketingAdmin.recommended_model_row, "Selling, General & Administration (SG&A)"), true);
+
+  const restructuringCharges = await classify({
+    statement: "income_statement",
+    periodType: "duration",
+    label: "Asset impairment, restructuring, and other special charges",
+    xbrlTag: "RestructuringSettlementAndImpairmentProvisions",
+    section: "operating expenses",
+    parentSubtotal: incomeStatementCostSubtotal,
+    deterministicCandidate: "Other Operating Income / Expense",
+    availableModelRows: incomeRows
+  });
+  assert.equal(modelRowsMatch(restructuringCharges.recommended_model_row, "Other Operating Income (Expense)"), true);
+
   const convertibleNotes = await classify({
     label: "Short-term convertible senior notes",
     section: "current liabilities",
