@@ -284,9 +284,12 @@ function uniqueModels(models: string[]) {
 function llmResultEligibleForFallback<T>(result: AccountingLlmResult<T>) {
   if (result.status !== "attempted_failed" && result.status !== "needs_human_review") return false;
   const error = result.error || result.telemetry.errorMessage || "";
+  const httpStatus = result.telemetry.httpStatus;
+  if (httpStatus && [408, 409, 425, 429, 500, 502, 503, 504].includes(httpStatus)) return true;
+  if (httpStatus === 403 && /key limit|quota|rate limit|billing|credits?|capacity|provider/i.test(error)) return true;
   return Boolean(
     !error ||
-      /no endpoints|routing|provider|timed out|did not include text output|json|schema|parse|validation|omitted target|unexpected source_row_key|duplicate source_row_key/i.test(
+      /no endpoints|routing|provider|timed out|key limit|quota|rate limit|billing|credits?|capacity|temporarily unavailable|overloaded|did not include text output|json|schema|parse|validation|omitted target|unexpected source_row_key|duplicate source_row_key/i.test(
         error
       )
   );

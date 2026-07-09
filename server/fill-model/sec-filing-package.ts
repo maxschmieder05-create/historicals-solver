@@ -914,7 +914,15 @@ function statementNameFromHtmlContext(html: string, tableHtml: string, tableInde
 export function classifySourceTableType(text: string, roleUri = ""): SecFilingStatementSourceTableType {
   const haystack = `${text} ${roleUri}`.toLowerCase();
   if (/\b(segment|reportable segment|geographic|disaggregation of revenue|external customers)\b/.test(haystack)) return "segment_table";
+  if (/\b(?:was|were|is|are)?\s*not material\b/.test(haystack)) return "support_table";
+  if (
+    /\b(?:finite[-\s]?lived\s+)?intangible assets?\b/.test(haystack) &&
+    /\b(?:expected|future|estimated)?\s*amortization\b|\bamortization expense\b|\bremainder of \d{4}\b|\bthereafter\b/.test(haystack)
+  ) {
+    return "support_table";
+  }
   if (/\b(rollforward|roll forward|changes in|schedule of)\b/.test(haystack)) return "roll_forward";
+  if (/\b(?:current[-\s]?period accruals?|accrual adjustments?|charges incurred|balance at (?:january|february|march|april|may|june|july|august|september|october|november|december))\b/.test(haystack) && /\b(?:accrual|warrant)/.test(haystack)) return "roll_forward";
   if (/\b(balance sheets?|statements? of operations|statements? of income|statements? of earnings|income statements?|earnings statements?|statements? of cash flows|cash flow statements?|statements? of stockholders|statements? of financial position|comprehensive income)\b/.test(haystack)) return "primary_statement";
   if (/\b(note|notes to|supplemental|schedule)\b/.test(haystack)) return "footnote";
   if (/\b(parenthetical|detail|document and entity information)\b/.test(haystack)) return "support_table";

@@ -75,6 +75,26 @@ function balanceRow(rowOrder, rowLabel, xbrlConcept, value, section = "current")
 }
 
 const rows = [
+  {
+    statementName: "Condensed Consolidated Balance Sheets",
+    sourceTableType: "primary_statement",
+    rowLabel: "Accounts receivable (net of allowance of $12)",
+    xbrlConcept: "AllowanceForDoubtfulAccountsReceivableCurrent",
+    taxonomy: "us-gaap",
+    value: 12_000_000,
+    unit: "USD",
+    period: {
+      instant: reportDate,
+      periodType: "instant"
+    },
+    consolidated: true,
+    dimensions: [],
+    rowOrder: 0,
+    accession,
+    reportingPeriod: reportDate,
+    currentNonCurrentSection: "current",
+    parentSubtotal: { label: "Current assets", concept: "AssetsCurrent" }
+  },
   balanceRow(1, "Accounts payable", "AccountsPayableCurrent", 2_997_000_000),
   balanceRow(2, "Accrued liabilities", "AccruedLiabilitiesCurrentAndNoncurrent", 5_785_000_000),
   balanceRow(3, "Current portion of long-term debt, net", "LongTermDebtCurrent", 874_000_000),
@@ -154,6 +174,7 @@ assert.equal(byLabel.get("Current portion of long-term debt, net").amount, 874_0
 assert.equal(byLabel.get("Other current liabilities").assignedModelRow, "Other Current Liabilities");
 assert.equal(byLabel.get("Other current liabilities").amount, 850_000_000);
 assert.equal(byLabel.has("Total current liabilities"), false);
+assert.equal(byLabel.has("Accounts receivable (net of allowance of $12)"), false);
 
 const accrued = hooks.resolveAccruedLiabilities("1Q26", ctx);
 assert.equal(accrued.value, 5_785_000_000);
@@ -162,6 +183,151 @@ assert.equal(accrued.sources.some((source) => source.concept === "LongTermDebtCu
 const otherCurrent = hooks.resolveOtherCurrentLiabilities("1Q26", ctx);
 assert.equal(otherCurrent.value, 850_000_000);
 assert.equal(otherCurrent.sources.some((source) => source.concept === "AccruedLiabilitiesCurrentAndNoncurrent"), false);
+
+function ibmLikeRow(rowOrder, rowLabel, xbrlConcept, value, section = "current", statementName = "Consolidated Balance Sheet") {
+  return {
+    statementName,
+    sourceTableType: "primary_statement",
+    rowLabel,
+    xbrlConcept,
+    taxonomy: "us-gaap",
+    value,
+    unit: "USD",
+    period: {
+      instant: reportDate,
+      periodType: "instant"
+    },
+    consolidated: true,
+    dimensions: [],
+    rowOrder,
+    accession,
+    reportingPeriod: reportDate,
+    currentNonCurrentSection: section,
+    parentSubtotal: { label: section === "current" ? "Current assets" : "Assets", concept: section === "current" ? "AssetsCurrent" : "Assets" }
+  };
+}
+
+const ibmLikeRows = [
+  ibmLikeRow(1, "Finished goods", "InventoryFinishedGoodsNetOfReserves", 268_000_000),
+  ibmLikeRow(2, "Work in process and raw materials", "InventoryWorkInProcessAndRawMaterialsNetOfReserves", 1_208_000_000),
+  ibmLikeRow(3, "Total inventory", "InventoryNet", 1_476_000_000),
+  ibmLikeRow(4, "Intangible assets — net", "FiniteLivedIntangibleAssetsNet", 14_624_000_000, "non_current"),
+  ibmLikeRow(
+    5,
+    "Remainder of 2026",
+    "FiniteLivedIntangibleAssetsAmortizationExpenseRemainderOfFiscalYear",
+    1_500_000_000,
+    "non_current",
+    "Consolidated Balance Sheet is estimated to be the following"
+  ),
+  ibmLikeRow(
+    6,
+    "Thereafter",
+    "FiniteLivedIntangibleAssetsAmortizationExpenseYearFiveAndAfterYearFive",
+    13_124_000_000,
+    "non_current",
+    "Consolidated Balance Sheet is estimated to be the following"
+  )
+];
+const ibmLikeCtx = {
+  ...ctx,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map(
+        ibmLikeRows.map((row) => [
+          row.xbrlConcept,
+          {
+            concept: row.xbrlConcept,
+            label: row.rowLabel,
+            value: row.value,
+            unit: "USD",
+            taxonomy: row.taxonomy,
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant",
+            reportDate
+          }
+        ])
+      )
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Consolidated Balance Sheet",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      filingDate: "2026-05-06",
+      rows: ibmLikeRows
+    }
+  ]
+};
+const ibmLikeFillRows = ["Inventory", "Intangible Assets, Net"].map((label, index) => ({
+  row: index + 10,
+  label,
+  classification: "direct",
+  statement: "balance",
+  kind: "instant",
+  scale: 1_000_000
+}));
+const inventory = hooks.resolveInventory("1Q26", ibmLikeCtx);
+assert.equal(inventory.value, 1_476_000_000);
+assert.equal(inventory.sources[0].concept, "InventoryNet");
+const ibmLikeLedger = hooks.buildPrimaryBalanceSheetAssignmentLedgerRows(["1Q26"], ibmLikeCtx, ibmLikeFillRows);
+assert.equal(
+  ibmLikeLedger.filter((row) => row.assignedModelRow === "Inventory").reduce((total, row) => total + row.amount, 0),
+  1_476_000_000
+);
+assert.equal(
+  ibmLikeLedger.filter((row) => row.assignedModelRow === "Intangible Assets, Net").reduce((total, row) => total + row.amount, 0),
+  14_624_000_000
+);
+assert.equal(ibmLikeLedger.some((row) => /Remainder|Thereafter/.test(row.sourceLineItemLabel)), false);
+
+assert.equal(
+  hooks.reportedLineItemCategory({
+    concept: "AccountsReceivableNetCurrent",
+    label: "Accounts Receivable, after Allowance for Credit Loss, Current",
+    value: 6_493_000_000,
+    sourceLayer: "sec_live_companyfacts",
+    periodType: "instant"
+  }),
+  "current_assets"
+);
+assert.equal(
+  hooks.reportedLineItemCategory({
+    concept: "PropertyPlantAndEquipmentAndFinanceLeaseRightOfUseAssetAfterAccumulatedDepreciationAndAmortization",
+    label: "Property, Plant, and Equipment and Finance Lease Right-of-Use Asset, after Accumulated Depreciation and Amortization",
+    value: 5_781_000_000,
+    sourceLayer: "sec_live_companyfacts",
+    periodType: "instant"
+  }),
+  "non_current_assets"
+);
+assert.equal(
+  hooks.reportedLineItemCategory({
+    concept: "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent",
+    label: "Marketable securities",
+    value: 964_000_000,
+    sourceLayer: "sec_filing_package",
+    periodType: "instant"
+  }),
+  "current_assets"
+);
+assert.equal(
+  hooks.reportedLineItemCategory({
+    concept: "AllowanceForDoubtfulAccountsReceivableCurrent",
+    label: "Allowance for doubtful accounts receivable, current",
+    value: 12_000_000,
+    sourceLayer: "sec_filing_package",
+    periodType: "instant"
+  }),
+  "cash_flow_or_support"
+);
 
 const tslaAccession = "000162828026000001";
 const tslaReportDate = "2026-03-31";
@@ -309,6 +475,59 @@ assert.equal(hooks.resolveTotalLiabilities("1Q26", tslaCtx).value, 58_979_000_00
 assert.equal(tslaByLabel.get("Digital assets").assignedModelRow, "Other Non-Current Assets");
 assert.equal(tslaByLabel.get("Redeemable noncontrolling interests in subsidiaries").assignedModelRow, "Other Non-Current Liabilities");
 assert.notEqual(tslaByLabel.get("Redeemable noncontrolling interests in subsidiaries").assignmentStatus, "explicitly_excluded_with_reason");
+
+const priorAnnualAccession = "000000248825000010";
+const priorAnnualEntry = {
+  accessionNumber: priorAnnualAccession,
+  accessionKey: priorAnnualAccession,
+  form: "10-K",
+  filingDate: "2026-02-01",
+  reportDate: "2025-12-31",
+  fiscalYear: 2025,
+  fiscalQuarter: 4,
+  quarterPeriod: "4Q25",
+  annualPeriod: "FY25"
+};
+const coverageCtx = {
+  ...ctx,
+  fiscalPeriods: {
+    entries: [priorAnnualEntry, filingEntry],
+    byAccession: new Map([
+      [priorAnnualAccession, priorAnnualEntry],
+      [accession, filingEntry]
+    ]),
+    byReportDate: new Map([
+      [priorAnnualEntry.reportDate, priorAnnualEntry],
+      [reportDate, filingEntry]
+    ]),
+    reportedPeriods: new Set(["4Q25", "FY25", "1Q26"]),
+    fiscalYearEndMonth: 12,
+    fiscalYearEndDay: 31
+  }
+};
+const validationWorkbook = new ExcelJS.Workbook();
+const validationSheet = validationWorkbook.addWorksheet("Model");
+validationSheet.getCell("A1").value = "Balance Sheet";
+fillRows.forEach((row) => {
+  validationSheet.getCell(row.row + 1, 1).value = row.label;
+});
+validationSheet.getCell(2, 3).value = 2_997;
+validationSheet.getCell(3, 3).value = 5_785;
+validationSheet.getCell(4, 3).value = 874;
+validationSheet.getCell(5, 3).value = 850;
+validationSheet.getCell("A6").value = "Cash Flow Statement";
+const coverageWarnings = [];
+const coverageErrors = hooks.validatePrimaryBalanceSheetAssignmentCoverage(
+  validationSheet,
+  ["4Q25", "1Q26"],
+  [2, 3],
+  coverageCtx,
+  new hooks.FormulaEvaluator(validationSheet),
+  coverageWarnings,
+  fillRows.map((row) => ({ ...row, row: row.row + 1 }))
+);
+assert.equal(coverageErrors.length, 0);
+assert.ok(coverageWarnings.some((warning) => /Balance Sheet 4Q25: no primary balance sheet assignment ledger rows/.test(warning)));
 
 const workbook = new ExcelJS.Workbook();
 const formulaSheet = workbook.addWorksheet("Model");

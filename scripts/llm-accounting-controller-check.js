@@ -74,6 +74,40 @@ async function main() {
   assert.equal(result.attemptTelemetry[1].model, "deepseek/deepseek-v3.1-terminus");
   assert.equal(result.attemptTelemetry[1].status, "completed_validated");
 
+  let quotaCalls = 0;
+  const quotaResult = await requestAccountingJson({
+    purpose: "statement_line_item_classification",
+    apiKey: "test-key",
+    endpoint: "https://openrouter.ai/api/v1/chat/completions",
+    model: "deepseek/deepseek-v3.1-terminus",
+    fallbackModels: ["deepseek/deepseek-r1-0528"],
+    siteUrl: "http://localhost:3000",
+    appTitle: "Historicals Solver",
+    messages: [{ role: "user", content: "{}" }],
+    jsonSchema: { name: "test", schema: { type: "object" } },
+    maxTokens: 50,
+    timeoutMs: 1000,
+    fetchImpl: async (_url, init) => {
+      quotaCalls += 1;
+      const body = JSON.parse(init.body);
+      if (quotaCalls === 1) {
+        assert.equal(body.model, "deepseek/deepseek-v3.1-terminus");
+        return new Response(
+          JSON.stringify({ error: { message: "Key limit exceeded (total limit)." } }),
+          { status: 403, statusText: "Forbidden" }
+        );
+      }
+      assert.equal(body.model, "deepseek/deepseek-r1-0528");
+      return new Response(JSON.stringify({ id: "gen-quota-ok", choices: [{ message: { content: "{\"ok\":true}" } }] }), { status: 200 });
+    },
+    validate: (value) => (value && value.ok === true ? { ok: true, value, validated: true, affectedOutput: true } : { ok: false, error: "bad" })
+  });
+
+  assert.equal(quotaResult.status, "completed_validated");
+  assert.equal(quotaCalls, 2);
+  assert.equal(quotaResult.attemptTelemetry[0].httpStatus, 403);
+  assert.equal(quotaResult.attemptTelemetry[1].status, "completed_validated");
+
   const workbook = new ExcelJS.Workbook();
   addLlmMappingReviewSheet(workbook, [
     {

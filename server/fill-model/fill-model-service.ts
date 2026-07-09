@@ -1136,6 +1136,7 @@ const C = {
     "ShortTermInvestments",
     "OtherShortTermInvestments",
     "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+    "DebtSecuritiesAvailableForSaleExcludingAccruedInterestCurrent",
     "DebtSecuritiesAvailableForSaleCurrent"
   ],
   receivables: ["AccountsReceivableNetCurrent", "AccountsReceivableNet", "TradeAccountsReceivableNetCurrent", "ReceivablesNetCurrent"],
@@ -2486,6 +2487,7 @@ export function isPrimaryBalanceSheetStructure(statement: SecFilingStatementStru
   if (statement.sourceTableType !== "primary_statement") return false;
   const text = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
   if (/\bparenthetical|parentheticals|details?|supplemental\b/.test(text)) return false;
+  if (/\b(?:was|were|is|are)?\s*not material\b|\broll\s?forward\b|\bchanges in\b|\bschedule of\b/.test(text)) return false;
   if (!/\b(balance sheets?|financial position)\b/.test(text)) return false;
   if (/\b(cash flows?|operations?|income|earnings|comprehensive income)\b/.test(text)) return false;
   return /\b(balance sheets?|financial position)\b/.test(text);
@@ -2626,6 +2628,9 @@ function primaryBalanceSheetComponentSources(
     primaryBalanceSheetRowsForPeriod(period, ctx)
       .map((row) => primaryBalanceSheetFactSource(row, period))
       .filter((source): source is FactSource & { primaryRow: PrimaryBalanceSheetRow } => Boolean(source))
+      .filter(({ primaryRow, ...source }) => !primaryBalanceSheetSupportRollForwardRow(primaryRow, source))
+      .filter(({ primaryRow, ...source }) => !primaryBalanceSheetSupportScheduleRow(primaryRow, source))
+      .filter(({ primaryRow: _primaryRow, ...source }) => !sourceLooksLikeParentheticalBalanceSheetDetail(source))
       .filter(({ primaryRow, ...source }) => predicate(source, primaryRow))
       .map(({ primaryRow: _primaryRow, ...source }) => source)
   );
@@ -2638,6 +2643,7 @@ function primaryBalanceSheetConceptSource(period: string, ctx: ResolveContext, c
     if (!candidate || !wanted.has(candidate.concept)) continue;
     const { primaryRow: _primaryRow, ...source } = candidate;
     if (source.unit && !/usd/i.test(source.unit)) continue;
+    if (primaryBalanceSheetSupportScheduleRow(row, source)) continue;
     if (sourceLooksLikeParentheticalBalanceSheetDetail(source)) continue;
     return source;
   }
@@ -2804,6 +2810,11 @@ async function buildLineItemClassificationStore(
       const source = factSourceFromStatementRow(rowItem, period || rowItem.reportingPeriod || statement.reportingPeriod || "");
       if (!source) continue;
       const section = statementSectionForRow(statement, rowItem, statementName);
+      if (statementName === "balance_sheet") {
+        if (primaryBalanceSheetSupportRollForwardRow(rowItem, source)) continue;
+        if (primaryBalanceSheetSupportScheduleRow(rowItem, source)) continue;
+        if (sourceLooksLikeParentheticalBalanceSheetDetail(source)) continue;
+      }
       const deterministicCandidate = deterministicModelRowCandidateForSource(source, statementName, section);
       const fiscalPeriod = period || rowItem.reportingPeriod || statement.reportingPeriod || "";
       const request: FinancialLineItemClassificationRequest = {
@@ -3478,7 +3489,8 @@ function sourceLooksLikeCashLikeShortTermInvestment(source: FactSource) {
   return (
     source.concept === "ShortTermInvestments" ||
     source.concept === "OtherShortTermInvestments" ||
-    /\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/.test(text)
+    C.currentInvestments.includes(source.concept) ||
+    /\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b|\bsecurities\b.*\bavailable[-\s]?for[-\s]?sale\b/.test(text)
   );
 }
 
@@ -3531,9 +3543,32 @@ function sourceLooksLikeAssetBalanceForLiabilityBucket(source: FactSource) {
 
 function sourceLooksLikeParentheticalBalanceSheetDetail(source: FactSource) {
   if (C.receivables.includes(source.concept) || C.ppe.includes(source.concept) || C.treasury.includes(source.concept) || source.concept === "CommonStockValue") return false;
+  if (/^AllowanceFor/i.test(source.concept) || /(?:allowance|reserve)s?\s+for/i.test(sourceSearchText(source))) return true;
   if (sourceTextMatches(source, /\b(?:par|stated) value\b.*\bper share\b|\bpar or stated value\b|\bper share\b.*\b(?:par|stated) value\b/)) return true;
   if (Math.abs(source.value) < 1_000_000 && sourceTextMatches(source, /\bpar value\b|\bauthorized\b.*\bshares\b|\bissued\b.*\bshares\b/)) return true;
   return sourceTextMatches(source, /\ballowances?\b|\baccumulated depreciation\b|\baccumulated amortization\b/);
+}
+
+function primaryBalanceSheetSupportRollForwardRow(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const label = cleanLineItemLabel(row.rowLabel).toLowerCase();
+  const text = `${label} ${sourceSearchText(source)} ${row.statementName ?? ""}`.toLowerCase();
+  const accrualOrWarranty = /\b(accrual|warrant)/.test(text);
+  if (accrualOrWarranty && /^(?:balance at|balance,|beginning balance|ending balance)\b/.test(label)) return true;
+  if (accrualOrWarranty && /^(?:current[-\s]?period accruals?|accrual adjustments?|charges incurred|payments?)\b/.test(label)) return true;
+  return false;
+}
+
+function primaryBalanceSheetSupportScheduleRow(row: PrimaryBalanceSheetRow, source: FactSource) {
+  const label = cleanLineItemLabel(row.rowLabel).toLowerCase();
+  const text = `${label} ${sourceSearchText(source)} ${row.statementName ?? ""}`.toLowerCase();
+  if (/^FiniteLivedIntangibleAssetsAmortizationExpense/i.test(source.concept)) return true;
+  if (
+    /\b(?:finite[-\s]?lived\s+)?intangible assets?\b/.test(text) &&
+    /\b(?:expected|future|estimated)?\s*amortization\b|\bamortization expense\b|\bremainder of \d{4}\b|\bthereafter\b|\bnext twelve months\b|\byear (?:one|two|three|four|five)\b/.test(text)
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function sourceLooksLikePrepaidOtherCurrentAsset(source: FactSource) {
@@ -4608,8 +4643,10 @@ function isDiscontinuedOperationsIncomeSource(source: FactSource) {
 }
 
 function isAllowanceOrRollForwardTranslationSource(source: FactSource) {
+  if (directBalanceSheetCarryingAmountCategory(source)) return false;
   const text = sourceSearchText(source);
   const compact = sourceCompactText(source);
+  if (/^AllowanceFor/i.test(source.concept) || /(?:allowance|reserve)s?\s+for/.test(text)) return true;
   if (/allowanceforcreditloss|allowanceforloanloss|valuationallowance|loanlossreserve|lossreserve/.test(compact)) return true;
   if (/\ballowance\b|\breserve\b/.test(text) && /\bcredit loss(?:es)?\b|\bloan loss(?:es)?\b/.test(text)) return true;
   if (/foreigncurrencytranslation|currencytranslation/.test(compact) && !/foreigncurrencytransaction|currencytransaction|foreignexchange/.test(compact)) return true;
@@ -6166,6 +6203,16 @@ function resolveAccountsReceivable(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolveInventory(period: string, ctx: ResolveContext): ResolvedValue {
+  const primaryTotal = primaryBalanceSheetConceptSource(period, ctx, ["InventoryNet", "AirlineRelatedInventoryNet", "AirlineRelatedInventory"]);
+  if (primaryTotal && primaryTotal.value !== 0) {
+    return {
+      value: primaryTotal.value,
+      sources: [primaryTotal],
+      note: "Mapped to the reported SEC primary balance-sheet inventory total.",
+      classification: "direct"
+    };
+  }
+
   const direct = acceptedSourceForModelRow(period, ctx, first(period, ctx.instant, C.inventory), "Inventory");
   if (direct && direct.value !== 0) {
     return {
@@ -13150,10 +13197,12 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   const compact = sourceCompactText(source);
   const labelAndNote = `${source.label || ""} ${source.note || ""}`.toLowerCase();
   const acceptedClassificationCategory = reportedLineItemCategoryFromAcceptedClassification(source);
+  const directBalanceSheetCategory = directBalanceSheetCarryingAmountCategory(source);
 
   if (/^segment:/i.test(concept) || /\bsegment\b|external customer|external revenue|reportable segment|\bmember\b/.test(labelAndNote)) return "segment_only";
   if (source.sourceLayer === "model") return "cash_flow_or_support";
   if (/cashflow|cashflowstatement|operatingactivities|investingactivities|financingactivities|noncash|cashpaid|cashprovided|supplemental/.test(compact)) return "cash_flow_or_support";
+  if (directBalanceSheetCategory) return directBalanceSheetCategory;
   if (isAllowanceOrRollForwardTranslationSource(source)) return "cash_flow_or_support";
   if (isExplicitOtherOperatingLineSource(source) || isOperatingSpecialChargeSource(source)) return "other_operating_income_expense";
   if (acceptedClassificationCategory) return acceptedClassificationCategory;
@@ -13226,6 +13275,34 @@ function reportedLineItemCategory(source: FactSource): ReportedLineItemCategory 
   if ([...C.equity, ...C.commonApic, ...C.retained, ...C.treasury, ...C.aoci, ...C.nci].includes(concept) || /\bequity\b|\bstockholders?\b|\bshareholders?\b|\bretained earnings\b|\btreasury stock\b|\bnoncontrolling interest\b/.test(text)) return "equity";
 
   return "unknown";
+}
+
+function directBalanceSheetCarryingAmountCategory(source: FactSource): ReportedLineItemCategory | null {
+  const concept = source.concept;
+  if (
+    [...C.cash, ...C.currentInvestments, ...C.receivables, ...C.cardReceivables, ...C.inventory, ...C.currentAssets, ...OTHER_CURRENT_ASSET_CONCEPTS].includes(concept)
+  ) {
+    return "current_assets";
+  }
+  if (
+    [
+      ...C.ppe,
+      ...C.intangibles,
+      ...C.goodwill,
+      ...INVESTMENT_ASSET_CONCEPTS,
+      "LongTermInvestments",
+      "OperatingLeaseRightOfUseAsset",
+      "OperatingLeaseRightOfUseAssetNet",
+      "OtherAssetsNoncurrent",
+      "RestrictedCashNoncurrent"
+    ].includes(concept) ||
+    sourceLooksLikeDeferredTaxAsset(source) ||
+    sourceLooksLikeDigitalOrCryptoAsset(source)
+  ) {
+    return "non_current_assets";
+  }
+  if (C.assets.includes(concept)) return "total_assets";
+  return null;
 }
 
 function reportedLineItemCategoryCompatible(expected: ReportedLineItemCategory, actual: ReportedLineItemCategory, fillRow: FillRow, source: FactSource) {
@@ -17416,9 +17493,91 @@ function rebuildPrimaryBalanceSheetRowsFromAssignmentLedger(
       const cell = options.sheet.getCell(rowNumber, col);
       const formulaBefore = formulaForCell(cell);
       const actual = formulaBefore ? evaluator.evaluateCell(cell) ?? numericCellValue(cell) : numericCellValue(cell);
-      if (actual !== null && statementMetricTies(actual, expected)) continue;
+      const label = rowLabel(options.sheet, rowNumber) || modelRow;
+      const fillRow = fillRowForTargetedBalanceSheetRepair(options, rowNumber, label);
+      const resolver = fillRow.resolver ?? balanceSheetDiagnosticResolverForLabel(modelRow);
+      const resolved = resolver ? resolver(lookupPeriod, options.ctx) : null;
+      const resolvedValue = resolved?.value === null || resolved?.value === undefined ? null : resolved.value / (fillRow.scale ?? 1);
+      const resolverOverridesAssignment =
+        resolved &&
+        resolvedValue !== null &&
+        !statementMetricTies(resolvedValue, expected) &&
+        (resolvedHasCurrentSourceSupport(resolved) || resolvedCanOverridePrimaryBalanceSheetAssignment(modelRow, resolved, assigned));
+      if (resolverOverridesAssignment) {
+        if (actual !== null && statementMetricTies(actual, resolvedValue)) {
+          warnings.push(
+            `Automatic balance-sheet repair preserved ${cell.address} ${period} because "${modelRow}" ties the EDGAR resolver value, which is preferred over the narrower primary assignment ledger.`
+          );
+          continue;
+        }
+        if (!forceTargetedRepair && !canRewritePrimaryBalanceSheetAssignmentCell(options.sheet, rowNumber, col, cell)) {
+          warnings.push(
+            `Automatic balance-sheet repair left ${cell.address} ${period} unchanged because "${modelRow}" has an EDGAR resolver value that is preferred over the narrower primary assignment ledger, but the cell is not a writable reported-period input.`
+          );
+          continue;
+        }
+        clearEdgarMapperComment(cell);
+        cell.value = resolvedValue;
+        evaluator.clear();
+        filledCells += 1;
+        rebuiltRows.add(label);
+        const note = lineItemMappingSentence(label, resolved);
+        if (addComment(cell, note)) commentsAdded += 1;
+        const sourceDerived = resolved.sources.some((source) => source.sourceLayer === "derived");
+        const auditRow = mappingAuditRow(options.sheet, cell, fillRow, period, resolvedValue, resolved, sourceDerived ? "medium" : "high", note);
+        auditRow.mappingType = sourceDerived ? "derived" : auditRow.mappingType;
+        auditRow.formulaPreserved = false;
+        auditRow.formulaStatus = formulaBefore
+          ? "reported-period formula replaced with SEC resolver value because the primary assignment ledger was narrower"
+          : "historical input refreshed from SEC resolver value because the primary assignment ledger was narrower";
+        auditRow.validationStatus = "OK!";
+        options.auditRows.push(auditRow);
+        warnings.push(
+          `Automatic balance-sheet repair wrote ${cell.address} ${period} from the EDGAR resolver value because "${modelRow}" differed from the narrower primary assignment ledger.`
+        );
+        continue;
+      }
+
       const existingAuditRow = latestAuditRows.get(sourceLedgerKey(options.sheet.name, cell.address, period));
       const existingAuditStatus = existingAuditRow ? sourceLedgerStatusForAuditRow(existingAuditRow) : "stale_or_unsupported";
+      if (
+        !forceTargetedRepair &&
+        existingAuditRow &&
+        auditRowCanOverridePrimaryBalanceSheetAssignment(existingAuditRow) &&
+        !statementMetricTies(existingAuditRow.valueWritten, expected)
+      ) {
+        if (actual !== null && statementMetricTies(actual, existingAuditRow.valueWritten)) {
+          warnings.push(
+            `Automatic balance-sheet repair preserved ${cell.address} ${period} because the row already had ${existingAuditStatus} source-ledger support that differed from the narrower primary assignment ledger.`
+          );
+          continue;
+        }
+        if (!canRewritePrimaryBalanceSheetAssignmentCell(options.sheet, rowNumber, col, cell)) {
+          warnings.push(
+            `Automatic balance-sheet repair left ${cell.address} ${period} unchanged because the row had current source-ledger support that differed from the narrower primary assignment ledger, but the cell is not a writable reported-period input.`
+          );
+          continue;
+        }
+        clearEdgarMapperComment(cell);
+        cell.value = existingAuditRow.valueWritten;
+        evaluator.clear();
+        filledCells += 1;
+        rebuiltRows.add(label);
+        if (existingAuditRow.notes && addComment(cell, existingAuditRow.notes)) commentsAdded += 1;
+        options.auditRows.push({
+          ...existingAuditRow,
+          formulaPreserved: false,
+          formulaStatus: formulaBefore
+            ? "reported-period formula replaced with current source-ledger value because the primary assignment ledger was narrower"
+            : "historical input refreshed from current source-ledger value because the primary assignment ledger was narrower",
+          validationStatus: "OK!"
+        });
+        warnings.push(
+          `Automatic balance-sheet repair wrote ${cell.address} ${period} from current source-ledger support because "${modelRow}" differed from the narrower primary assignment ledger.`
+        );
+        continue;
+      }
+      if (actual !== null && statementMetricTies(actual, expected)) continue;
       if (
         !forceTargetedRepair &&
         existingAuditRow &&
@@ -19564,6 +19723,9 @@ function buildPrimaryBalanceSheetAssignmentLedgerRows(
     for (const { statement, row } of primaryBalanceSheetStatementRowsForPeriod(period, ctx)) {
       const source = primaryBalanceSheetFactSource(row, period);
       if (!source) continue;
+      if (primaryBalanceSheetSupportRollForwardRow(row, source)) continue;
+      if (primaryBalanceSheetSupportScheduleRow(row, source)) continue;
+      if (sourceLooksLikeParentheticalBalanceSheetDetail(source)) continue;
       if (statementRowIsSubtotal(row) || isPrimaryBalanceSheetSubtotalSource(source) || isPrimaryBalanceSheetComponentSubtotalRow(source)) continue;
       if (primaryBalanceSheetCombinedLineCoveredByComponentDetail(period, ctx, statement, row, source)) continue;
 
@@ -20809,7 +20971,9 @@ function validatePrimaryBalanceSheetAssignmentCoverage(
     const rows = ledgerRows.filter((row) => row.fiscalPeriod === lookupPeriod);
     if (!rows.length) {
       if (hasReportedFilingPeriod(lookupPeriod, ctx) || hasReportedFinancialStatementPeriod(lookupPeriod, ctx)) {
-        errors.push(`Balance Sheet ${period}: no primary balance sheet assignment ledger rows were generated for a reported SEC balance sheet period.`);
+        const message = `Balance Sheet ${period}: no primary balance sheet assignment ledger rows were generated for a reported SEC balance sheet period.`;
+        if (hardValidateAssignments) errors.push(message);
+        else warnings.unshift(`${message} Historical assignment coverage was recorded for audit; hard row-level coverage is enforced on the latest reported balance sheet period.`);
       }
       continue;
     }
@@ -20937,6 +21101,31 @@ function primaryBalanceSheetAssignmentResolverTieWarning(
       : null;
   }
   return null;
+}
+
+function resolvedCanOverridePrimaryBalanceSheetAssignment(
+  modelRow: string,
+  resolved: ResolvedValue | null,
+  assigned: PrimaryBalanceSheetAssignmentLedgerRow[]
+) {
+  if (!balanceSheetAssignmentRowMayPreferResolver(modelRow)) return false;
+  if (!resolved || resolved.value === null || !Number.isFinite(resolved.value)) return false;
+  const resolverText = [resolved.classification ?? "", resolved.note ?? "", ...resolved.sources.map((source) => `${source.concept} ${source.label} ${source.note ?? ""}`)].join(" ");
+  const assignedText = assigned.map((row) => `${row.sourceLineItemLabel} ${row.sourceXbrlTag} ${row.classificationReason}`).join(" ");
+  const resolverHasSupport = resolvedHasCurrentSourceSupport(resolved);
+  if (!(resolverHasSupport || /residual|derived|calculated|less|included|excluding|no separate|not reported|explicit(?:ly)? zero/i.test(resolverText))) return false;
+  return /component|detail|narrower|dedicated|other|residual|grouped/i.test(`${modelRow} ${resolverText} ${assignedText}`);
+}
+
+function auditRowCanOverridePrimaryBalanceSheetAssignment(row: MappingAuditRow) {
+  if (row.valueWritten === null || !Number.isFinite(row.valueWritten)) return false;
+  const status = sourceLedgerStatusForAuditRow(row);
+  if (status === "stale_or_unsupported") return false;
+  if (status !== "formula_preserved") return true;
+  if (!/balance/i.test(row.sourceStatement)) return false;
+  if (row.accession) return true;
+  if (sourceLedgerRowHasBalanceSheetResidualSupport(row)) return true;
+  return parsedConceptEntries(row.conceptsUsed).some((entry) => !/NoCurrentSecSource|NotReported|NoSource/i.test(entry.concept));
 }
 
 function balanceSheetAssignmentRowMayPreferResolver(modelRow: string) {
@@ -24119,9 +24308,11 @@ function isPlainTextFormula(value: string) {
 export const __fillModelServiceTestHooks = {
   buildPrimaryBalanceSheetAssignmentLedgerRows,
   buildPrimaryIncomeStatementAssignmentLedgerRows,
+  validatePrimaryBalanceSheetAssignmentCoverage,
   primaryIncomeStatementSourcesForPeriod,
   primaryStatementHasCostOfRevenueSplitWithSeparateDa,
   reportedLineItemCategory,
+  resolveInventory,
   resolveAccruedLiabilities,
   resolveGoodwill,
   resolveOtherCurrentLiabilities,
