@@ -802,9 +802,11 @@ const SEC_HEADERS = {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "deepseek/deepseek-chat-v3.1";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "deepseek/deepseek-v3.1-terminus";
-const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "deepseek/deepseek-r1-0528";
+// The free router selects a currently available zero-cost model that supports
+// the request parameters (notably strict structured JSON output).
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "openrouter/free";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openrouter/free";
+const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "openrouter/free";
 const LLM_MAPPING_FAST_MODEL = normalizeConfiguredLlmModel(
   process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL,
   DEFAULT_LLM_MAPPING_FAST_MODEL
