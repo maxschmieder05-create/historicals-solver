@@ -260,6 +260,56 @@ async function main() {
   assert.equal(rejectedCorrection.changed, false);
   assert.equal(rejectedCorrection.rejected.some((item) => /section\/side validation/.test(item)), true);
 
+  const unclassifiedDebtSource = {
+    period: "3Q26",
+    accession: "0000000000-26-000002",
+    xbrlTag: "DeferredFinanceCostsNet",
+    label: "Less unamortized debt discounts and issuance costs",
+    amount: 14000000
+  };
+  const unclassifiedDebtAssignment = {
+    fiscalPeriod: unclassifiedDebtSource.period,
+    sourceFilingAccession: unclassifiedDebtSource.accession,
+    sourceStatement: "Consolidated Balance Sheets",
+    sourceLineItemLabel: unclassifiedDebtSource.label,
+    amount: unclassifiedDebtSource.amount,
+    sourceXbrlTag: unclassifiedDebtSource.xbrlTag,
+    assignedModelRow: "",
+    assignmentStatus: "explicitly_excluded_with_reason",
+    classificationReason: "Could not determine asset, liability, or equity section for this primary balance sheet line.",
+    llmUsed: false,
+    validationStatus: "OK!",
+    side: "unknown",
+    sourceSection: "unknown",
+    sourceRowKey: "row-2"
+  };
+  const missingClassificationStore = new Map();
+  const missingClassificationCorrection = applyLlmMappingReviewCorrections({
+    issues: [
+      {
+        severity: "error",
+        issueType: "unsupported_exclusion",
+        period: unclassifiedDebtSource.period,
+        sourceLineItemLabel: unclassifiedDebtSource.label,
+        sourceXbrlTag: unclassifiedDebtSource.xbrlTag,
+        currentModelRow: "",
+        recommendedModelRow: "LT Debt (Incl. Current Portion)",
+        reason: "Debt issuance costs are a long-term debt carrying-value adjustment.",
+        reusableRule: "Classify debt carrying-value adjustments with long-term debt using statement context.",
+        evidence: ["Primary balance sheet debt context"]
+      }
+    ],
+    classifications: missingClassificationStore,
+    balanceAssignments: [unclassifiedDebtAssignment],
+    incomeAssignments: [],
+    availableModelRows: ["LT Debt (Incl. Current Portion)"]
+  });
+  assert.equal(missingClassificationCorrection.changed, true);
+  const createdClassification = missingClassificationStore.get(classificationSourceKeys(unclassifiedDebtSource)[0]);
+  assert.equal(createdClassification.recommended_model_row, "LT Debt (Incl. Current Portion)");
+  assert.equal(createdClassification.llm_used, true);
+  assert.equal(createdClassification.mapping_passed_validation, true);
+
   console.log("LLM accounting controller workbook and fallback guards passed.");
 }
 

@@ -34,7 +34,10 @@ function loadTypeScriptModule(file) {
   return mod.exports;
 }
 
-const { isPrimaryBalanceSheetStructure } = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "fill-model-service.ts"));
+const { isPrimaryBalanceSheetStructure, __fillModelServiceTestHooks } = loadTypeScriptModule(
+  path.join(repoRoot, "server", "fill-model", "fill-model-service.ts")
+);
+const { primaryBalanceSheetRowsHaveStructuralAnchor, selectPrimaryBalanceSheetStatementCandidates } = __fillModelServiceTestHooks;
 const { classifySourceTableType } = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "sec-filing-package.ts"));
 
 function statement(statementName) {
@@ -70,5 +73,52 @@ assert.equal(
   classifySourceTableType("Consolidated Balance Sheet is estimated to be the following Remainder of 2026 Thereafter finite-lived intangible assets amortization expense"),
   "support_table"
 );
+
+function balanceRow(xbrlConcept, rowLabel, value, rowOrder) {
+  return {
+    statementName: "CONSOLIDATED BALANCE SHEET",
+    sourceTableType: "primary_statement",
+    rowLabel,
+    xbrlConcept,
+    value,
+    unit: "USD",
+    period: { instant: "2026-03-31", periodType: "instant" },
+    consolidated: true,
+    dimensions: [],
+    rowOrder,
+    accession: "0000000000-26-000001"
+  };
+}
+
+const assetRows = [
+  balanceRow("CashAndCashEquivalentsAtCarryingValue", "Cash and cash equivalents", 100, 1),
+  balanceRow("AssetsCurrent", "Total current assets", 300, 2),
+  balanceRow("Assets", "Total assets", 900, 3)
+];
+const liabilityRows = [
+  balanceRow("LiabilitiesCurrent", "Total current liabilities", 250, 1),
+  balanceRow("StockholdersEquity", "Total stockholders' equity", 400, 2),
+  balanceRow("LiabilitiesAndStockholdersEquity", "Total liabilities and stockholders' equity", 900, 3)
+];
+const orphanedDebtDetailRows = [
+  balanceRow("DeferredFinanceCostsNet", "Less unamortized debt discounts and issuance costs", 14, 1)
+];
+
+assert.equal(primaryBalanceSheetRowsHaveStructuralAnchor(assetRows), true);
+assert.equal(primaryBalanceSheetRowsHaveStructuralAnchor(liabilityRows), true);
+assert.equal(primaryBalanceSheetRowsHaveStructuralAnchor(orphanedDebtDetailRows), false);
+
+const selectedSplitStatements = selectPrimaryBalanceSheetStatementCandidates([
+  { statement: { ...statement("CONSOLIDATED BALANCE SHEET ASSETS"), rows: assetRows }, rows: assetRows },
+  { statement: { ...statement("CONSOLIDATED BALANCE SHEET LIABILITIES AND EQUITY"), rows: liabilityRows }, rows: liabilityRows },
+  { statement: { ...statement("CONSOLIDATED BALANCE SHEET"), rows: orphanedDebtDetailRows }, rows: orphanedDebtDetailRows }
+]);
+assert.equal(selectedSplitStatements.length, 2);
+assert.equal(selectedSplitStatements.some((candidate) => candidate.rows === orphanedDebtDetailRows), false);
+
+const fallbackFragment = selectPrimaryBalanceSheetStatementCandidates([
+  { statement: { ...statement("CONSOLIDATED BALANCE SHEET"), rows: orphanedDebtDetailRows }, rows: orphanedDebtDetailRows }
+]);
+assert.equal(fallbackFragment.length, 1);
 
 console.log("Primary balance-sheet structure regression passed.");

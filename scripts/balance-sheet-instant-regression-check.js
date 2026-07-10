@@ -23,6 +23,7 @@ const directBalanceSheetChecks = [
   {
     row: 120,
     label: "cash and cash equivalents",
+    groupCurrentInvestmentsIfNoDedicatedRow: true,
     concepts: [
       "CashAndCashEquivalentsAtCarryingValue",
       "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
@@ -78,6 +79,14 @@ const costcoNetOtherIncomeBridgeChecks = [
   { period: "2025", row: 45, label: "net income", expected: 8099 }
 ];
 
+const currentInvestmentConcepts = [
+  "ShortTermInvestments",
+  "MarketableSecuritiesCurrent",
+  "OtherShortTermInvestments",
+  "AvailableForSaleSecuritiesDebtSecuritiesCurrent",
+  "DebtSecuritiesAvailableForSaleCurrent"
+];
+
 function cellValue(cell) {
   const value = cell.value;
   if (typeof value === "number") return value;
@@ -93,7 +102,9 @@ function valuesMatch(actual, expected) {
 }
 
 async function main() {
-  await postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook });
+  if (!/^(?:1|true|yes)$/i.test(process.env.BALANCE_SHEET_REUSE_OUTPUT || "")) {
+    await postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook });
+  }
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(outputWorkbook);
@@ -106,7 +117,7 @@ async function main() {
 
   for (const { period, col } of periods) {
     for (const check of directBalanceSheetChecks) {
-      const expected = expectedConceptValue(facts, period, check.concepts);
+      const expected = expectedDirectBalanceSheetValue(facts, period, check, model);
       if (expected === null) continue;
       const address = `${columnLetter(col)}${check.row}`;
       const actual = cellValue(model.getCell(check.row, col));
@@ -133,6 +144,7 @@ async function main() {
   if (ticker.toUpperCase() === "COST") {
     errors.push(...validateCostcoNetOtherIncomeBridge(model));
     errors.push(...validateCostcoPreTaxBridgeConsistency(model));
+    errors.push(...validateCostcoSegmentAnalysis(workbook, model));
   }
 
   if (errors.length) {
@@ -141,6 +153,23 @@ async function main() {
   }
 
   console.log(`${ticker} balance-sheet instant regression passed across ${periods.length} quarter column(s): ${outputWorkbook}`);
+}
+
+function expectedDirectBalanceSheetValue(facts, period, check, model) {
+  const direct = expectedConceptValue(facts, period, check.concepts);
+  if (direct === null) return null;
+  if (!check.groupCurrentInvestmentsIfNoDedicatedRow || hasDedicatedCurrentInvestmentRow(model)) return direct;
+  return direct + (expectedConceptValue(facts, period, currentInvestmentConcepts) ?? 0);
+}
+
+function hasDedicatedCurrentInvestmentRow(sheet) {
+  for (let row = 110; row <= Math.min(sheet.rowCount, 170); row += 1) {
+    const label = Array.from({ length: 6 }, (_, index) => String(sheet.getCell(row, index + 1).text || "").trim())
+      .filter(Boolean)
+      .join(" ");
+    if (/short[-\s]?term investments?|current investments?|marketable securities/i.test(label) && !/cash/i.test(label)) return true;
+  }
+  return false;
 }
 
 async function validateWorkbookRecalculationMetadata(file) {
@@ -262,6 +291,67 @@ function validateCostcoPreTaxBridgeConsistency(sheet) {
     }
   }
   return errors;
+}
+
+function validateCostcoSegmentAnalysis(workbook, model) {
+  const errors = [];
+  const segment = workbook.getWorksheet("Segment Analysis");
+  if (!segment) return ["COST output workbook is missing Segment Analysis."];
+
+  for (let col = 1; col <= segment.columnCount; col += 1) {
+    const rawPeriod = String(segment.getCell(5, col).text || segment.getCell(6, col).text || "").trim();
+    if (!/^(?:[1-4]Q\d{2}|20\d{2})$/i.test(rawPeriod) || /e$/i.test(rawPeriod)) continue;
+    const revenueTotal = cellValue(segment.getCell(7, col));
+    const revenueDetail = sumNumericRowValues(segment, 8, 13, col);
+    const modelRevenue = cellValue(model.getCell(28, col));
+    const operatingTotal = cellValue(segment.getCell(33, col));
+    const operatingDetail = sumNumericRowValues(segment, 34, 39, col);
+    const operatingCheck = cellValue(segment.getCell(41, col));
+    const daTotal = cellValue(segment.getCell(51, col));
+    const daDetail = sumNumericRowValues(segment, 52, 57, col);
+    const modelDa = cellValue(model.getCell(60, col));
+    const address = columnLetter(col);
+
+    if (!valuesMatch(revenueTotal, revenueDetail)) {
+      errors.push(`COST ${rawPeriod} Segment Analysis!${address}7 revenue total ${revenueTotal} does not equal detail ${revenueDetail}.`);
+    }
+    if (!valuesMatch(revenueTotal, modelRevenue)) {
+      errors.push(`COST ${rawPeriod} Segment Analysis revenue ${revenueTotal} does not tie to Model revenue ${modelRevenue}.`);
+    }
+    if (!valuesMatch(operatingTotal, operatingDetail)) {
+      errors.push(`COST ${rawPeriod} Segment Analysis!${address}33 operating income ${operatingTotal} does not equal detail ${operatingDetail}.`);
+    }
+    if (!valuesMatch(operatingCheck, 0)) {
+      errors.push(`COST ${rawPeriod} Segment Analysis!${address}41 operating income check is ${operatingCheck}, not zero.`);
+    }
+    if (!valuesMatch(daTotal, daDetail)) {
+      errors.push(`COST ${rawPeriod} Segment Analysis!${address}51 D&A total ${daTotal} does not equal detail ${daDetail}.`);
+    }
+    if (!valuesMatch(daTotal, modelDa)) {
+      errors.push(`COST ${rawPeriod} Segment Analysis D&A ${daTotal} does not tie to Model D&A ${modelDa}.`);
+    }
+  }
+
+  const ledger = workbook.getWorksheet("Segment Assignment Ledger");
+  if (!ledger) return [...errors, "COST output workbook is missing Segment Assignment Ledger."];
+  for (let row = 2; row <= ledger.rowCount; row += 1) {
+    const assignmentStatus = String(ledger.getCell(row, 11).text || "");
+    const validationStatus = String(ledger.getCell(row, 13).text || "");
+    if (assignmentStatus !== "mapped_to_segment_row" || validationStatus === "OK!") continue;
+    errors.push(
+      `COST segment assignment ${ledger.getCell(row, 1).text} ${ledger.getCell(row, 3).text} maps to ${ledger.getCell(row, 10).text} but is ${validationStatus}.`
+    );
+  }
+  return errors;
+}
+
+function sumNumericRowValues(sheet, startRow, endRow, col) {
+  let total = 0;
+  for (let row = startRow; row <= endRow; row += 1) {
+    const value = cellValue(sheet.getCell(row, col));
+    if (typeof value === "number") total += value;
+  }
+  return total;
 }
 
 function findPeriodColumn(sheet, period) {

@@ -45,6 +45,8 @@
     "test:llm-workbench": "node scripts/llm-workbench-check.js",
     "test:llm-accounting-controller": "node scripts/llm-accounting-controller-check.js",
     "test:primary-balance-sheet-structure": "node scripts/primary-balance-sheet-structure-check.js",
+    "test:formula-prefix-normalization": "node scripts/formula-prefix-normalization-check.js",
+    "test:segment-formula-write": "node scripts/segment-formula-write-check.js",
     "test:gold-model-library": "node scripts/gold-model-library-check.js",
     "test:balance-sheet-row-resolver": "node scripts/balance-sheet-row-resolver-check.js",
     "test:source-ledger-status": "node scripts/source-ledger-status-check.js",

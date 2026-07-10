@@ -41,6 +41,8 @@ const {
   balanceSheetRowsEquivalent,
   balanceSheetSectionCompatible,
   balanceSheetLineLooksSubtotalLike,
+  balanceSheetSourceLooksLikeContraDebtAdjustment,
+  balanceSheetSourceLooksLikeDebtCarryingValueAdjustment,
   classifyBalanceSheetSourceSection,
   classifyBalanceSheetResolution
 } = loadTypeScriptModule(sourcePath);
@@ -96,6 +98,34 @@ assert.equal(
   balanceSheetSectionCompatible("Other Non-Current Liabilities", "equity", {
     label: "Redeemable noncontrolling interests in subsidiaries",
     concept: "RedeemableNoncontrollingInterestEquityCarryingAmount"
+  }),
+  true
+);
+assert.equal(
+  classifyBalanceSheetSourceSection("unknown", {
+    label: "Less unamortized debt discounts and issuance costs",
+    concept: "DeferredFinanceCostsNet"
+  }),
+  "non-current liabilities"
+);
+assert.equal(
+  balanceSheetSectionCompatible("LT Debt (Incl. Current Portion)", "unknown", {
+    label: "Less unamortized debt discounts and issuance costs",
+    concept: "DeferredFinanceCostsNet"
+  }),
+  true
+);
+assert.equal(
+  balanceSheetSourceLooksLikeDebtCarryingValueAdjustment({
+    label: "Debt issuance costs, net",
+    concept: "DeferredFinanceCostsNet"
+  }),
+  true
+);
+assert.equal(
+  balanceSheetSourceLooksLikeContraDebtAdjustment({
+    label: "Less unamortized debt discounts and issuance costs",
+    concept: "DeferredFinanceCostsNet"
   }),
   true
 );

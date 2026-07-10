@@ -260,6 +260,17 @@ async function classify(overrides) {
     "LT Debt (Incl. Current Portion)"
   );
 
+  const debtIssuanceCostAdjustment = await classify({
+    label: "Less unamortized debt discounts and issuance costs",
+    xbrlTag: "DeferredFinanceCostsNet",
+    section: "unknown",
+    deterministicCandidate: "Unmapped / Needs Review"
+  });
+  assert.equal(debtIssuanceCostAdjustment.recommended_model_row, "LT Debt (Incl. Current Portion)");
+  assert.equal(debtIssuanceCostAdjustment.is_current, false);
+  assert.equal(debtIssuanceCostAdjustment.is_debt, true);
+  assert.equal(debtIssuanceCostAdjustment.mapping_passed_validation, true);
+
   const currentSelfInsuranceReserve = await classify({
     label: "Less: current portion",
     xbrlTag: "SelfInsuranceReserveCurrent",
@@ -1123,6 +1134,7 @@ async function classify(overrides) {
         xbrlTag: "CashAndCashEquivalentsAtCarryingValue",
         section: "current assets",
         amount: 100,
+        currentPeriodSourceLines: ["Cash and cash equivalents", "Accounts receivable, net", "Total assets"],
         uncertaintyReason: ""
       }),
       request({
@@ -1132,6 +1144,7 @@ async function classify(overrides) {
         xbrlTag: "AccountsReceivableNetCurrent",
         section: "current assets",
         amount: 200,
+        currentPeriodSourceLines: ["Cash and cash equivalents", "Accounts receivable, net", "Total assets"],
         uncertaintyReason: ""
       })
     ],
@@ -1192,6 +1205,12 @@ async function classify(overrides) {
     completeCoveragePayload.statementRows.every((row) => row.targetReason === "complete_primary_statement_coverage"),
     true
   );
+  assert.equal(completeCoveragePayload.statementContexts.length, 1);
+  assert.deepEqual(completeCoveragePayload.statementContexts[0].orderedSourceLines, [
+    "Cash and cash equivalents",
+    "Accounts receivable, net",
+    "Total assets"
+  ]);
   assert.deepEqual(
     Object.keys(completeCoveragePayloads[0].response_format.json_schema.schema.properties.classifications.items.properties).sort(),
     ["confidence", "reason", "recommended_action", "recommended_model_row", "source_row_key"]

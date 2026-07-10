@@ -495,6 +495,31 @@ export function balanceSheetSectionCompatible(
   return true;
 }
 
+export function balanceSheetSourceLooksLikeDebtCarryingValueAdjustment(source: {
+  label?: string;
+  tag?: string;
+  concept?: string;
+}) {
+  const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
+  const compact = compactFinancialText(text);
+  return (
+    /deferredfinancecosts|debtissuancecosts|debtinstrumentunamortizeddiscount|unamortizeddebtdiscount|unamortizeddebtpremium/.test(compact) ||
+    /\bdebt\b.*\b(?:issuance costs?|discounts?|premiums?)\b|\b(?:issuance costs?|discounts?|premiums?)\b.*\bdebt\b/.test(text)
+  );
+}
+
+export function balanceSheetSourceLooksLikeContraDebtAdjustment(source: {
+  label?: string;
+  tag?: string;
+  concept?: string;
+}) {
+  if (!balanceSheetSourceLooksLikeDebtCarryingValueAdjustment(source)) return false;
+  const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
+  const compact = compactFinancialText(text);
+  if (/\bpremiums?\b/.test(text) && !/\bless\b|\bdiscounts?\b|\bissuance costs?\b/.test(text)) return false;
+  return /\bless\b|\bdiscounts?\b|\bissuance costs?\b/.test(text) || /deferredfinancecosts|debtissuancecosts|unamortizeddiscount/.test(compact);
+}
+
 function sourceLooksLikeCurrentLongTermDebtPortion(source: { label?: string; tag?: string; concept?: string }) {
   const text = financialWordsText(`${source.label ?? ""} ${source.tag ?? ""} ${source.concept ?? ""}`);
   return textLooksLikeCurrentDebtPortion(text) || /\bconvertible\b.*\bnotes?\b|\bsenior notes?\b/.test(text);
@@ -525,6 +550,7 @@ export function classifyBalanceSheetSourceSection(
     return section as BalanceSheetSourceSection;
   }
 
+  if (balanceSheetSourceLooksLikeDebtCarryingValueAdjustment(source)) return "non-current liabilities";
   if (/cashandduefrombanks|duefrombanks|interestbearingdeposits?inbanks?/.test(compact)) return "current assets";
   if (/restrictedcash/.test(compact) && currentNonCurrentSignal === "non-current") return "non-current assets";
   if (/shortterminvestments?|marketablesecurities|availableforsalesecurities|debtandequitysecurities|investmentsecurities/.test(compact)) {

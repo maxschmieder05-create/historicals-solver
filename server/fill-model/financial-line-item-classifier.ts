@@ -2,7 +2,8 @@ import { normalizeAccession } from "./sec-accession";
 import {
   balanceSheetRowDefinitionForLabel,
   balanceSheetRowsEquivalent,
-  balanceSheetSectionCompatible
+  balanceSheetSectionCompatible,
+  balanceSheetSourceLooksLikeDebtCarryingValueAdjustment
 } from "./balance-sheet-row-resolver";
 import { currentNonCurrentSignalFromText } from "./current-non-current";
 import {
@@ -188,7 +189,7 @@ export const MODEL_ROW_DEFINITIONS: Record<string, string> = {
   Revolver:
     "True short-term borrowing facilities/instruments, including revolver borrowings, revolving credit facility, short-term borrowings, commercial paper, current borrowings, notes payable current, short-term debt that is clearly a short-term borrowing facility.",
   "LT Debt (Incl. Current Portion)":
-    "Long-term debt instruments including current portion/current maturities, senior notes, convertible senior notes, long-term debt net of current portion plus current portion, long-term debt and finance lease obligations.",
+    "Long-term debt instruments including current portion/current maturities, senior notes, convertible senior notes, long-term debt net of current portion plus current portion, long-term debt and finance lease obligations. Debt discounts and issuance costs are carrying-value adjustments to this row unless a reported net debt balance already includes them.",
   "Deferred Income Taxes":
     "True deferred tax liabilities / deferred income taxes / deferred tax liabilities, non-current / deferred tax assets and liabilities net.",
   "Other Non-Current Liabilities":
@@ -743,6 +744,27 @@ function deterministicFinancialLineItemClassification(
       reason: nonCurrent
         ? "Non-current self-insurance reserves are operating liabilities and belong in Other Non-Current Liabilities, not debt."
         : "The current portion of self-insurance reserves is an accrued operating liability, not current maturities of debt."
+    };
+  }
+
+  if (
+    request.statement === "balance_sheet" &&
+    balanceSheetSourceLooksLikeDebtCarryingValueAdjustment({
+      label: request.cleanLabel || request.reportedLineItemLabel,
+      tag: request.xbrlTag
+    })
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("LT Debt (Incl. Current Portion)"),
+      classification_type: "debt carrying-value adjustment",
+      is_current: false,
+      is_debt: true,
+      is_operating: false,
+      should_exclude_from_other_bucket: true,
+      confidence: "high",
+      reason:
+        "Unamortized debt discounts and debt issuance costs adjust the carrying value of long-term debt; they belong with LT Debt unless the statement already reports a net debt carrying amount that includes the adjustment."
     };
   }
 
@@ -1323,6 +1345,7 @@ async function requestLlmClassification(
     "Use Other buckets only when no dedicated row exists. Do not use residual plugging.",
     "Examples are non-exhaustive: current investments may belong in a dedicated investments row, a cash/current-investments row, a plain cash row when no dedicated investments row exists, or the current-assets residual only when no cash/current-investment row exists; current maturities may belong with LT debt; advertising may belong with SG&A.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver.",
+    "Debt discounts, premiums, and debt issuance costs are debt carrying-value adjustments. Use the ordered statement context to determine whether they adjust LT Debt or should be excluded because a reported net debt balance already includes them.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",
     "When the correct repair is no reported line item, return recommended_action set_zero with explicit_zero_rows populated.",
@@ -1372,6 +1395,7 @@ async function requestStatementLlmClassification(
     "Examples are non-exhaustive: current investments may belong in a dedicated investments row, a cash/current-investments row, a plain cash row when no dedicated investments row exists, or the current-assets residual only when no cash/current-investment row exists; current maturities may belong with LT debt; advertising may belong with SG&A.",
     "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present. Otherwise group them with Cash & Cash Equivalents if the template has a cash row; use the current-assets residual only when there is no cash or current-investment row.",
     "Current maturities/current portion of long-term debt and convertible senior notes belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, notes payable current, and revolving facilities may belong in Revolver/current borrowings.",
+    "Debt discounts, premiums, and debt issuance costs are debt carrying-value adjustments. Compare gross debt, the adjustment, and reported net debt in statementContexts; exclude supporting detail when net debt already includes it, otherwise map the signed adjustment with LT Debt.",
     "Deferred income/revenue is a contract liability, not deferred income taxes. Deferred tax liabilities are Deferred Income Taxes.",
     "Cash-flow-only D&A must not be inserted into income-statement D&A.",
     "When the correct repair is no reported line item, return recommended_action set_zero with explicit_zero_rows populated.",
@@ -1418,6 +1442,7 @@ function statementLlmClassificationPayload(prepared: PreparedLineItemClassificat
     availableModelRows: first?.availableModelRows ?? [],
     modelRowDefinitions: first?.modelRowDefinitions ?? {},
     alreadyMappedRows: first?.alreadyMappedRows ?? [],
+    statementContexts: statementLlmContexts(prepared),
     classificationGoal:
       "Classify only the target rows after reviewing the supplied SEC statement context as if the SEC statement and model template were open side by side. Batches can contain distinct semantic rows from multiple EDGAR filings; use each row's filing, fiscal-period, section, and nearby-row context. A row can map to any available model row whose accounting definition fits; filing order and model order do not need to match. Deterministic candidates are evidence and validation guardrails, not the primary mapper. The examples in the system prompt are non-exhaustive; apply the same accounting-substance reasoning to any random SEC line item.",
     routingPrinciples: GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS,
@@ -1462,6 +1487,32 @@ function statementLlmClassificationPayload(prepared: PreparedLineItemClassificat
         validationError: item.request.validationError ?? ""
       }))
   };
+}
+
+function statementLlmContexts(prepared: PreparedLineItemClassification[]) {
+  const contexts = new Map<
+    string,
+    {
+      filing: FinancialLineItemClassificationRequest["filing"];
+      fiscalPeriod: string;
+      statement: FinancialStatementName;
+      sourceTableType: FinancialSourceTableType;
+      orderedSourceLines: string[];
+    }
+  >();
+  for (const item of prepared) {
+    const request = item.request;
+    const key = [normalizeAccession(request.filing.accession), request.fiscalPeriod, request.statement].join("|");
+    if (contexts.has(key)) continue;
+    contexts.set(key, {
+      filing: request.filing,
+      fiscalPeriod: request.fiscalPeriod,
+      statement: request.statement,
+      sourceTableType: request.sourceTableType,
+      orderedSourceLines: request.currentPeriodSourceLines ?? []
+    });
+  }
+  return Array.from(contexts.values());
 }
 
 function financialLineItemClassificationJsonSchema() {
