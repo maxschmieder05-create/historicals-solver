@@ -802,11 +802,12 @@ const SEC_HEADERS = {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-// The free router selects a currently available zero-cost model that supports
-// the request parameters (notably strict structured JSON output).
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "openrouter/free";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openrouter/free";
-const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "openrouter/free";
+// Use a capable ultra-low-cost model by default; the configured free-router
+// fallback keeps transient provider failures from becoming more expensive.
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_LLM_MAPPING_FALLBACK_MODELS = ["openrouter/free"];
 const LLM_MAPPING_FAST_MODEL = normalizeConfiguredLlmModel(
   process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL,
   DEFAULT_LLM_MAPPING_FAST_MODEL
@@ -821,17 +822,17 @@ const LLM_MAPPING_REVIEW_MODEL = normalizeConfiguredLlmModel(
 );
 const LLM_MAPPING_FAST_FALLBACK_MODELS = llmFallbackModels(
   process.env.LLM_MAPPING_FAST_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
-  [DEFAULT_LLM_MAPPING_COMPLEX_MODEL, DEFAULT_LLM_MAPPING_REVIEW_MODEL],
+  DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
   LLM_MAPPING_FAST_MODEL
 );
 const LLM_MAPPING_COMPLEX_FALLBACK_MODELS = llmFallbackModels(
   process.env.LLM_MAPPING_COMPLEX_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
-  [DEFAULT_LLM_MAPPING_FAST_MODEL, DEFAULT_LLM_MAPPING_REVIEW_MODEL],
+  DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
   LLM_MAPPING_COMPLEX_MODEL
 );
 const LLM_MAPPING_REVIEW_FALLBACK_MODELS = llmFallbackModels(
   process.env.LLM_MAPPING_REVIEW_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
-  [DEFAULT_LLM_MAPPING_COMPLEX_MODEL, DEFAULT_LLM_MAPPING_FAST_MODEL],
+  DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
   LLM_MAPPING_REVIEW_MODEL
 );
 const LLM_MAPPING_HARD_MAX_CALLS = positiveNumber(process.env.LLM_MAPPING_HARD_MAX_CALLS, 12);
