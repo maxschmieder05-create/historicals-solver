@@ -37,6 +37,7 @@
     "test:ibm-income-statement-fail-closed": "node scripts/ibm-income-statement-fail-closed-check.js",
     "test:lly-income-statement-classification": "node scripts/lly-income-statement-classification-check.js",
     "test:amd-income-statement-classification": "node scripts/amd-income-statement-classification-check.js",
+    "test:other-operating-structural": "node scripts/other-operating-structural-check.js",
     "test:amd-balance-sheet-liability-classification": "node scripts/amd-balance-sheet-liability-classification-check.js",
     "test:lly-balance-sheet-classification": "node scripts/lly-balance-sheet-classification-check.js",
     "test:aal-classification-tightening": "node scripts/aal-classification-tightening-check.js",

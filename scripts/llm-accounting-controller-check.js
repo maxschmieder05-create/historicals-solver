@@ -36,7 +36,10 @@ function loadTypeScriptModule(file) {
 }
 
 const { requestAccountingJson } = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "llm-accounting-controller.ts"));
-const { addLlmMappingReviewSheet } = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "fill-model-service.ts"));
+const { classificationSourceKeys } = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "financial-line-item-classifier.ts"));
+const { addLlmMappingReviewSheet, applyLlmMappingReviewCorrections } = loadTypeScriptModule(
+  path.join(repoRoot, "server", "fill-model", "fill-model-service.ts")
+);
 
 async function main() {
   let calls = 0;
@@ -108,6 +111,30 @@ async function main() {
   assert.equal(quotaResult.attemptTelemetry[0].httpStatus, 403);
   assert.equal(quotaResult.attemptTelemetry.length, 1);
 
+  const bodyTimeoutResult = await requestAccountingJson({
+    purpose: "statement_line_item_classification",
+    apiKey: "test-key",
+    endpoint: "https://openrouter.ai/api/v1/chat/completions",
+    model: "nvidia/nemotron-3-super-120b-a12b:free",
+    siteUrl: "http://localhost:3000",
+    appTitle: "Historicals Solver",
+    messages: [{ role: "user", content: "{}" }],
+    jsonSchema: { name: "test", schema: { type: "object" } },
+    maxTokens: 50,
+    maxAttemptsPerModel: 1,
+    timeoutMs: 5,
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      headers: { get: () => null },
+      json: async () => new Promise(() => {})
+    }),
+    validate: () => ({ ok: false, error: "unreachable" })
+  });
+  assert.equal(bodyTimeoutResult.status, "attempted_failed");
+  assert.equal(bodyTimeoutResult.error.includes("timed out after 5ms"), true);
+
   const workbook = new ExcelJS.Workbook();
   addLlmMappingReviewSheet(workbook, [
     {
@@ -147,6 +174,91 @@ async function main() {
   assert.equal(sheet.getRow(2).getCell(headers.indexOf("LLM status") + 1).value, "attempted_failed");
   assert.equal(sheet.getRow(2).getCell(headers.indexOf("LLM attempts") + 1).value, 1);
   assert.equal(sheet.getRow(2).getCell(headers.indexOf("review status") + 1).value, "skipped");
+
+  const source = {
+    period: "1Q26",
+    accession: "0000000000-26-000001",
+    xbrlTag: "OtherAccruedLiabilitiesCurrent",
+    label: "Accrued rebates and returns",
+    amount: 125_000_000
+  };
+  const classification = {
+    source_line_item: source.label,
+    recommended_action: "merge_into_other",
+    recommended_model_row: "Other Current Liabilities",
+    recommended_model_row_mappings: [],
+    explicit_zero_rows: [],
+    classification_type: "other current liability",
+    is_current: true,
+    is_debt: false,
+    is_operating: true,
+    is_tax_related: false,
+    is_deferred_revenue_or_contract_liability: false,
+    is_deferred_tax: false,
+    is_subtotal: false,
+    should_exclude_from_other_bucket: false,
+    confidence: "high",
+    reason: "Initial statement classification.",
+    requires_validation: true,
+    requires_revalidation: true,
+    llm_used: true,
+    llm_status: "completed_validated",
+    mapping_passed_validation: true
+  };
+  const classifications = new Map();
+  classificationSourceKeys(source).forEach((key) => classifications.set(key, classification));
+  const issue = {
+    severity: "error",
+    issueType: "wrong_model_row",
+    period: source.period,
+    sourceLineItemLabel: source.label,
+    sourceXbrlTag: source.xbrlTag,
+    currentModelRow: "Other Current Liabilities",
+    recommendedModelRow: "Accrued Liabilities",
+    reason: "The source is an accrued operating liability and the template has a dedicated accrued-liabilities row.",
+    reusableRule: "Prefer a dedicated accrued-liabilities row over a generic current-liability bucket.",
+    evidence: ["Primary balance sheet / current liabilities"]
+  };
+  const balanceAssignment = {
+    fiscalPeriod: source.period,
+    sourceFilingAccession: source.accession,
+    sourceStatement: "Consolidated Balance Sheets",
+    sourceLineItemLabel: source.label,
+    amount: source.amount,
+    sourceXbrlTag: source.xbrlTag,
+    assignedModelRow: "Other Current Liabilities",
+    assignmentStatus: "grouped_into_model_row",
+    classificationReason: classification.reason,
+    llmUsed: true,
+    validationStatus: "OK!",
+    side: "liabilities_and_equity",
+    sourceSection: "current liabilities",
+    sourceRowKey: "row-1"
+  };
+  const correction = applyLlmMappingReviewCorrections({
+    issues: [issue],
+    classifications,
+    balanceAssignments: [balanceAssignment],
+    incomeAssignments: [],
+    availableModelRows: ["Accrued Liabilities", "Other Current Liabilities"]
+  });
+  assert.equal(correction.changed, true);
+  assert.equal(correction.repairs.length, 1);
+  const corrected = classifications.get(classificationSourceKeys(source)[0]);
+  assert.equal(corrected.recommended_model_row, "Accrued Liabilities");
+  assert.equal(corrected.recommended_action, "remap");
+  assert.equal(corrected.mapping_passed_validation, true);
+  assert.equal(corrected.reason.startsWith("LLM workbook reviewer correction:"), true);
+
+  const rejectedCorrection = applyLlmMappingReviewCorrections({
+    issues: [{ ...issue, recommendedModelRow: "PP&E, Net" }],
+    classifications,
+    balanceAssignments: [balanceAssignment],
+    incomeAssignments: [],
+    availableModelRows: ["PP&E, Net", "Other Current Liabilities"]
+  });
+  assert.equal(rejectedCorrection.changed, false);
+  assert.equal(rejectedCorrection.rejected.some((item) => /section\/side validation/.test(item)), true);
 
   console.log("LLM accounting controller workbook and fallback guards passed.");
 }

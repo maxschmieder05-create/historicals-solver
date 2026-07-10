@@ -81,9 +81,25 @@ async function main() {
   const modelEbitRow = findRow(modelSheet, "EBIT") ?? findRow(modelSheet, "Operating Income");
   const modelDaRow = findRow(modelSheet, "Depreciation & Amortization");
   const otherOperatingRow = findRow(modelSheet, "Other Operating Income (Expense)");
+  const interestIncomeRow = findRow(modelSheet, "Interest Income");
+  const interestExpenseRow = findRow(modelSheet, "Interest (Expense)") ?? findRow(modelSheet, "Interest Expense");
+  const goodwillImpairmentRow = findRow(modelSheet, "Goodwill Impairment");
+  const otherNonOperatingRow = findRow(modelSheet, "Other Non-Operating Income (Expense)");
+  const preTaxIncomeRow = findRow(modelSheet, "Pre-Tax Income (Loss)") ?? findRow(modelSheet, "Pre-Tax Income");
 
-  if (!totalRow || !checkRow || !modelEbitRow || !modelDaRow || !otherOperatingRow) {
-    throw new Error("Workbook is missing Segment Analysis operating income rows or Model EBIT/D&A/other operating rows.");
+  if (
+    !totalRow ||
+    !checkRow ||
+    !modelEbitRow ||
+    !modelDaRow ||
+    !otherOperatingRow ||
+    !interestIncomeRow ||
+    !interestExpenseRow ||
+    !goodwillImpairmentRow ||
+    !otherNonOperatingRow ||
+    !preTaxIncomeRow
+  ) {
+    throw new Error("Workbook is missing Segment Analysis operating income rows or Model income-statement bridge rows.");
   }
 
   const historicalColumns = Array.from({ length: 15 }, (_, index) => index + 6);
@@ -94,7 +110,7 @@ async function main() {
   ]);
   const expectedOtherOperatingByPeriod = new Map([
     ["1Q23", -29.6],
-    ["2023", -132.1]
+    ["2023", -132.0]
   ]);
 
   for (const col of historicalColumns) {
@@ -125,6 +141,33 @@ async function main() {
       const value = numericCell(segmentSheet.getCell(row, col)) ?? 0;
       if (Math.abs(value) > 0.05) nonzeroDetailLabels.add(rowLabel(segmentSheet, row));
     }
+  }
+
+  const fourthQuarterColumn = 9;
+  const annualColumn = 10;
+  const fourthQuarterInterestExpense = numericCell(modelSheet.getCell(interestExpenseRow, fourthQuarterColumn));
+  if (fourthQuarterInterestExpense === null || Math.abs(fourthQuarterInterestExpense - -129.5) > 0.05) {
+    errors.push(
+      `Model!${columnLetter(fourthQuarterColumn)}${interestExpenseRow} 4Q23: expected annual-minus-Q1-Q3 SEC interest expense -129.5, got ${fourthQuarterInterestExpense ?? "[blank]"}.`
+    );
+  }
+  const recalculatedFourthQuarterPretax = [modelEbitRow, interestIncomeRow, interestExpenseRow, goodwillImpairmentRow, otherNonOperatingRow]
+    .map((row) => numericCell(modelSheet.getCell(row, fourthQuarterColumn)))
+    .reduce((total, value) => (value === null ? NaN : total + value), 0);
+  const reportedFourthQuarterPretax = numericCell(modelSheet.getCell(preTaxIncomeRow, fourthQuarterColumn));
+  if (!Number.isFinite(recalculatedFourthQuarterPretax) || reportedFourthQuarterPretax === null || Math.abs(recalculatedFourthQuarterPretax - reportedFourthQuarterPretax) > 0.05) {
+    errors.push(
+      `Model!${columnLetter(fourthQuarterColumn)}${preTaxIncomeRow} 4Q23: recalculated bridge is ${recalculatedFourthQuarterPretax}, but the SEC pre-tax anchor is ${reportedFourthQuarterPretax ?? "[blank]"}.`
+    );
+  }
+  const recalculatedAnnualPretax = [6, 7, 8, 9]
+    .map((col) => numericCell(modelSheet.getCell(preTaxIncomeRow, col)))
+    .reduce((total, value) => (value === null ? NaN : total + value), 0);
+  const reportedAnnualPretax = numericCell(modelSheet.getCell(preTaxIncomeRow, annualColumn));
+  if (!Number.isFinite(recalculatedAnnualPretax) || reportedAnnualPretax === null || Math.abs(recalculatedAnnualPretax - reportedAnnualPretax) > 0.05) {
+    errors.push(
+      `Model!${columnLetter(annualColumn)}${preTaxIncomeRow} FY23: quarterly formula recalculates to ${recalculatedAnnualPretax}, but the SEC annual anchor is ${reportedAnnualPretax ?? "[blank]"}.`
+    );
   }
 
   if (![...nonzeroDetailLabels].some((label) => /other|reconciliation/i.test(label))) {

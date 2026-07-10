@@ -39,7 +39,9 @@ const {
   MODEL_ROW_DEFINITIONS,
   classifyFinancialLineItem,
   classifyFinancialStatementLineItems,
+  classificationPassesValidation,
   classificationModelRowAssignmentForPrimaryStatement,
+  fullStatementLineItemNeedsAnalystPass,
   materialStatementLineItemNeedsAnalystPass,
   modelRowDefinitionsForRows,
   modelRowsMatch,
@@ -172,12 +174,12 @@ function request(overrides) {
     cleanLabel: overrides.label,
     xbrlTag: overrides.xbrlTag,
     amount: overrides.amount ?? 100,
-    unit: "USD",
+    unit: overrides.unit ?? "USD",
     periodType: overrides.periodType ?? "instant",
     section: overrides.section,
     nearbyRows: overrides.nearbyRows ?? [],
     parentSubtotal: overrides.parentSubtotal,
-    isSubtotal: false,
+    isSubtotal: overrides.isSubtotal ?? false,
     priorPeriodSourceLabels: overrides.priorPeriodSourceLabels ?? [],
     currentPeriodSourceLines: overrides.currentPeriodSourceLines ?? [],
     availableModelRows: overrides.availableModelRows ?? availableModelRows,
@@ -257,6 +259,37 @@ async function classify(overrides) {
     classificationModelRowAssignmentForPrimaryStatement(currentMaturities, availableModelRows).modelRow,
     "LT Debt (Incl. Current Portion)"
   );
+
+  const currentSelfInsuranceReserve = await classify({
+    label: "Less: current portion",
+    xbrlTag: "SelfInsuranceReserveCurrent",
+    section: "current liabilities",
+    deterministicCandidate: "LT Debt (Incl. Current Portion)"
+  });
+  assert.equal(currentSelfInsuranceReserve.recommended_model_row, "Accrued Liabilities");
+  assert.equal(currentSelfInsuranceReserve.is_debt, false);
+  assert.equal(currentSelfInsuranceReserve.mapping_passed_validation, true);
+
+  const noncurrentSelfInsuranceReserve = await classify({
+    label: "Insurance reserves, net of current portion",
+    xbrlTag: "SelfInsuranceReserveNoncurrent",
+    section: "current liabilities",
+    deterministicCandidate: "LT Debt (Incl. Current Portion)"
+  });
+  assert.equal(noncurrentSelfInsuranceReserve.recommended_model_row, "Other Non-Current Liabilities");
+  assert.equal(noncurrentSelfInsuranceReserve.is_current, false);
+  assert.equal(noncurrentSelfInsuranceReserve.is_debt, false);
+  assert.equal(noncurrentSelfInsuranceReserve.mapping_passed_validation, true);
+
+  const noncurrentRestrictedCash = await classify({
+    label: "Restricted cash and marketable securities",
+    xbrlTag: "RestrictedCashAndInvestmentsNoncurrent",
+    section: "unknown",
+    deterministicCandidate: "Cash & Cash Equivalents"
+  });
+  assert.equal(noncurrentRestrictedCash.recommended_model_row, "Other Non-Current Assets");
+  assert.equal(noncurrentRestrictedCash.is_current, false);
+  assert.equal(noncurrentRestrictedCash.mapping_passed_validation, true);
 
   const shortTermBorrowings = await classify({
     label: "Short-term borrowings",
@@ -526,6 +559,24 @@ async function classify(overrides) {
     deterministicCandidate: "Other Non-Operating Income / Expense"
   });
   assert.equal(specialItems.recommended_model_row, "Other Operating Income / Expense");
+  assert.equal(
+    classificationPassesValidation(
+      request({
+        label: "Adjustment to withdrawal liability for multiemployer pension funds",
+        xbrlTag: "PensionAndOtherPostretirementBenefitExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      {
+        recommended_model_row: "Other Non-Operating Income / Expense",
+        is_deferred_tax: false,
+        is_debt: false
+      }
+    ),
+    false,
+    "An LLM may not move a primary-statement operating expense below operating income."
+  );
 
   const advertising = await classify({
     label: "Advertising expense",
@@ -638,6 +689,7 @@ async function classify(overrides) {
   assert.equal(llmRequestedPayloads.length, 1);
   assert.equal(llmRequestedPayloads[0].response_format.type, "json_schema");
   assert.equal("temperature" in llmRequestedPayloads[0], false);
+  assert.deepEqual(llmRequestedPayloads[0].reasoning, { effort: "low", exclude: true });
   const llmUserPayload = JSON.parse(llmRequestedPayloads[0].messages[1].content);
   assert.equal(llmUserPayload.reportedLineItemLabel, "Other lease financing obligations");
   assert.equal(llmUserPayload.modelRowDefinitions["LT Debt (Incl. Current Portion)"].includes("Long-term debt instruments"), true);
@@ -808,6 +860,7 @@ async function classify(overrides) {
   assert.equal(statementPayload.modelRowDefinitions["SG&A"].includes("advertising"), true);
   assert.equal(statementBatchPayloads[0].response_format.json_schema.schema.properties.classifications.items.properties.source_row_key.type, "string");
   assert.equal("temperature" in statementBatchPayloads[0], false);
+  assert.deepEqual(statementBatchPayloads[0].reasoning, { effort: "low", exclude: true });
   assert.equal(batchResult.llmCalls, 1);
   assert.equal(batchResult.llmAttempts, 1);
   assert.equal(batchResult.llmSuccessfulCompletions, 1);
@@ -1060,6 +1113,391 @@ async function classify(overrides) {
     "SG&A"
   );
 
+  const completeCoveragePayloads = [];
+  const completeCoverageResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-small-cash",
+        rowOrder: 1,
+        label: "Cash and cash equivalents",
+        xbrlTag: "CashAndCashEquivalentsAtCarryingValue",
+        section: "current assets",
+        amount: 100,
+        uncertaintyReason: ""
+      }),
+      request({
+        sourceRowKey: "row-small-receivables",
+        rowOrder: 2,
+        label: "Accounts receivable, net",
+        xbrlTag: "AccountsReceivableNetCurrent",
+        section: "current assets",
+        amount: 200,
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async (_url, init) => {
+          const body = JSON.parse(init.body);
+          completeCoveragePayloads.push(body);
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-small-cash",
+                          recommended_action: "map",
+                          recommended_model_row: "Cash & Cash Equivalents",
+                          confidence: "high",
+                          reason: "The primary statement presents a cash carrying amount."
+                        },
+                        {
+                          source_row_key: "row-small-receivables",
+                          recommended_action: "map",
+                          recommended_model_row: "Accounts Receivable",
+                          confidence: "high",
+                          reason: "The primary statement presents net accounts receivable."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+      },
+      statementAnalystPass: {
+        enabled: true,
+        materialityThreshold: 500_000,
+        coverage: "all_primary_rows"
+      }
+    }
+  );
+  assert.equal(completeCoveragePayloads.length, 1);
+  const completeCoveragePayload = JSON.parse(completeCoveragePayloads[0].messages[1].content);
+  assert.equal(completeCoveragePayload.statementRows.every((row) => row.target), true);
+  assert.equal(
+    completeCoveragePayload.statementRows.every((row) => row.targetReason === "complete_primary_statement_coverage"),
+    true
+  );
+  assert.deepEqual(
+    Object.keys(completeCoveragePayloads[0].response_format.json_schema.schema.properties.classifications.items.properties).sort(),
+    ["confidence", "reason", "recommended_action", "recommended_model_row", "source_row_key"]
+  );
+  assert.equal(completeCoverageResult.targetCount, 2);
+  assert.equal(completeCoverageResult.llmReviewedCount, 2);
+  assert.equal(completeCoverageResult.acceptedDecisionCount, 2);
+  assert.deepEqual(completeCoverageResult.unreviewedTargetKeys, []);
+  assert.equal(completeCoverageResult.classifications.every((item) => item.classification.llm_used), true);
+
+  const tolerantCoverageResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-tolerant-advertising",
+        rowOrder: 1,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        section: "operating expenses",
+        amount: 200,
+        uncertaintyReason: ""
+      }),
+      request({
+        sourceRowKey: "row-tolerant-debt",
+        rowOrder: 2,
+        label: "Current maturities of long-term debt",
+        xbrlTag: "LongTermDebtCurrent",
+        section: "current liabilities",
+        amount: 100,
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content:
+                      '```json\n[{"recommendedAction":"Map to model row: SG&A","modelRow":"SG&A","certainty":"certain","rationale":"Advertising is an SG&A operating expense."},{"action":"assign","recommendedModelRow":"PP&E, Net","confidence":"high","reason":"Incorrect provider recommendation used to exercise validation."}]\n```'
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          )
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  assert.equal(tolerantCoverageResult.acceptedDecisionCount, 2);
+  assert.deepEqual(tolerantCoverageResult.unreviewedTargetKeys, []);
+  assert.equal(
+    tolerantCoverageResult.classifications.find((item) => item.request.sourceRowKey === "row-tolerant-advertising").classification
+      .recommended_model_row,
+    "SG&A"
+  );
+  const guardedDebt = tolerantCoverageResult.classifications.find(
+    (item) => item.request.sourceRowKey === "row-tolerant-debt"
+  ).classification;
+  assert.equal(guardedDebt.recommended_model_row, "LT Debt (Incl. Current Portion)");
+  assert.equal(guardedDebt.reason.includes("rejected by accounting validation"), true);
+
+  const structurallyValidLlmResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-restricted-cash",
+        label: "Restricted cash and marketable securities",
+        xbrlTag: "RestrictedCashAndInvestmentsNoncurrent",
+        section: "unknown",
+        deterministicCandidate: undefined,
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-restricted-cash",
+                          recommended_action: "map",
+                          recommended_model_row: "Other Non-Current Assets",
+                          confidence: "high",
+                          reason: "The SEC concept is explicitly non-current and the model has no dedicated restricted-cash row."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          )
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  assert.equal(structurallyValidLlmResult.acceptedDecisionCount, 1);
+  assert.equal(structurallyValidLlmResult.classifications[0].classification.mapping_passed_validation, true);
+  assert.equal(structurallyValidLlmResult.classifications[0].classification.recommended_model_row, "Other Non-Current Assets");
+
+  const noncurrentLiabilityLlmResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-environmental-noncurrent",
+        label: "Accrued Capping, Closure, Post-closure and Environmental Costs, Noncurrent",
+        xbrlTag: "AccruedCappingClosurePostClosureAndEnvironmentalCostsNoncurrent",
+        section: "current liabilities",
+        deterministicCandidate: "Other Current Liabilities"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-environmental-noncurrent",
+                          recommended_action: "remap",
+                          recommended_model_row: "Other Non-Current Liabilities",
+                          confidence: "high",
+                          reason: "The XBRL concept explicitly identifies this environmental obligation as non-current."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          )
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  assert.equal(noncurrentLiabilityLlmResult.acceptedDecisionCount, 1);
+  assert.equal(noncurrentLiabilityLlmResult.classifications[0].classification.mapping_passed_validation, true);
+
+  let splitBatchAttempts = 0;
+  const splitBatchRequests = Array.from({ length: 6 }, (_, index) =>
+    request({
+      sourceRowKey: `row-split-${index + 1}`,
+      rowOrder: index + 1,
+      statement: "income_statement",
+      periodType: "duration",
+      label: `Advertising expense ${index + 1}`,
+      xbrlTag: `AdvertisingExpense${index + 1}`,
+      section: "operating expenses"
+    })
+  );
+  const splitBatchResult = await classifyFinancialStatementLineItems(splitBatchRequests, {
+    llm: {
+      enabled: true,
+      apiKey: "test-key",
+      endpoint: "https://example.test/chat/completions",
+      model: "openai/gpt-5.6-terra-pro",
+      siteUrl: "http://localhost:3000",
+      appTitle: "Historicals Solver Test",
+      timeoutMs: 100,
+      fetchImpl: async (_url, init) => {
+        splitBatchAttempts += 1;
+        const body = JSON.parse(init.body);
+        const payload = JSON.parse(body.messages[1].content);
+        if (splitBatchAttempts === 1) {
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: payload.targetSourceRowKeys.map((sourceRowKey) => ({
+                        source_row_key: sourceRowKey,
+                        recommended_action: "map",
+                        ...(sourceRowKey === "row-split-1" ? {} : { recommended_model_row: "SG&A" }),
+                        confidence: "high",
+                        reason: "Advertising is an SG&A operating expense."
+                      }))
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    classifications: payload.targetSourceRowKeys.map((sourceRowKey) => ({
+                      source_row_key: sourceRowKey,
+                      recommended_action: "map",
+                      recommended_model_row: "SG&A",
+                      confidence: "high",
+                      reason: "Advertising is an SG&A operating expense."
+                    }))
+                  })
+                }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+    },
+    statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+  });
+  assert.equal(splitBatchAttempts, 3);
+  assert.equal(splitBatchResult.llmAttempts, 3);
+  assert.equal(splitBatchResult.acceptedDecisionCount, 6);
+  assert.deepEqual(splitBatchResult.unreviewedTargetKeys, []);
+
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        label: "Total current assets",
+        xbrlTag: "AssetsCurrent",
+        section: "current assets",
+        isSubtotal: true
+      })
+    ),
+    false
+  );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        label: "Assets, current",
+        xbrlTag: "AssetsCurrent",
+        section: "current assets"
+      })
+    ),
+    false
+  );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Operating income",
+        xbrlTag: "OperatingIncomeLoss",
+        section: "operating expenses"
+      })
+    ),
+    false
+  );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        label: "Treasury stock shares",
+        xbrlTag: "TreasuryStockCommonShares",
+        section: "equity",
+        unit: "shares"
+      })
+    ),
+    false
+  );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Diluted earnings per share",
+        xbrlTag: "EarningsPerShareDiluted",
+        section: "net income"
+      })
+    ),
+    false
+  );
+
   const failedPayloads = [];
   const failedResult = await classifyFinancialStatementLineItems(
     [
@@ -1228,13 +1666,14 @@ async function classify(overrides) {
       }
     }
   );
-  assert.equal(malformedAttempts, 2);
+  assert.equal(malformedAttempts, 1);
   assert.equal(malformedResult.llmCalls, 0);
   assert.equal(malformedResult.llmAttempts, 1);
-  assert.equal(malformedResult.llmTelemetry[0].repairAttempted, true);
+  assert.equal(malformedResult.llmTelemetry[0].repairAttempted, false);
   assert.equal(malformedResult.llmTelemetry[0].status, "needs_human_review");
   assert.equal(malformedResult.classifications[0].classification.confidence, "low");
   assert.equal(malformedResult.classifications[0].classification.llm_status, "needs_human_review");
+  assert.deepEqual(malformedResult.unreviewedTargetKeys, ["row-bad"]);
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {

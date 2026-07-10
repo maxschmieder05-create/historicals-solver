@@ -156,7 +156,15 @@ export const BALANCE_SHEET_ROW_DEFINITIONS: BalanceSheetRowDefinition[] = [
     kind: "catch_all",
     residualEligible: true,
     aliases: ["Other Long-Term Assets", "Other LT Assets", "Other Assets and Loans", "Other Noncurrent Assets"],
-    tags: ["OtherAssetsNoncurrent", "LongTermInvestments", "InvestmentsNoncurrent", "OperatingLeaseRightOfUseAsset", "OperatingLeaseRightOfUseAssetNet"]
+    tags: [
+      "OtherAssetsNoncurrent",
+      "LongTermInvestments",
+      "InvestmentsNoncurrent",
+      "RestrictedCashAndInvestmentsNoncurrent",
+      "RestrictedCashAndCashEquivalentsNoncurrent",
+      "OperatingLeaseRightOfUseAsset",
+      "OperatingLeaseRightOfUseAssetNet"
+    ]
   },
   {
     canonical: "Accounts Payable",
@@ -173,7 +181,13 @@ export const BALANCE_SHEET_ROW_DEFINITIONS: BalanceSheetRowDefinition[] = [
     kind: "component",
     aliases: ["Accrued Expenses", "Accrued Expenses and Other", "Accrued Expenses and Other Current Liabilities"],
     sourceAliases: ["Accrued and other current liabilities", "Other accrued expenses and liabilities", "Accrued operating liabilities"],
-    tags: ["AccruedLiabilitiesCurrent", "AccruedIncomeTaxesCurrent", "EmployeeRelatedLiabilitiesCurrent", "OtherAccruedLiabilitiesCurrent"]
+    tags: [
+      "AccruedLiabilitiesCurrent",
+      "AccruedIncomeTaxesCurrent",
+      "EmployeeRelatedLiabilitiesCurrent",
+      "OtherAccruedLiabilitiesCurrent",
+      "SelfInsuranceReserveCurrent"
+    ]
   },
   {
     canonical: "Other Current Liabilities",
@@ -277,7 +291,9 @@ export const BALANCE_SHEET_ROW_DEFINITIONS: BalanceSheetRowDefinition[] = [
       "DeferredRevenueNoncurrent",
       "DeferredIncomeNoncurrent",
       "ContractWithCustomerLiabilityNoncurrent",
-      "AssetRetirementObligationsNoncurrent"
+      "AssetRetirementObligationsNoncurrent",
+      "SelfInsuranceReserveNoncurrent",
+      "AccruedCappingClosurePostClosureAndEnvironmentalCostsNoncurrent"
     ]
   },
   {
@@ -502,16 +518,19 @@ export function classifyBalanceSheetSourceSection(
   const isAsset = /\bassets?\b/.test(text) || /asset/.test(compact);
   const isLiability = /\bliabilit(?:y|ies)\b|\bpayable\b|\bdebt\b|\bborrowings?\b|\bobligations?\b/.test(text) || /liabilit|payable|debt|borrowing|obligation/.test(compact);
   if (section === "current assets" || section === "non-current assets" || section === "current liabilities" || section === "non-current liabilities" || section === "equity") {
-    if (section === "current liabilities" && isExplicitNonCurrent && isLiability) return "non-current liabilities";
-    if (section === "non-current liabilities" && isExplicitCurrent && !isExplicitNonCurrent && isLiability) return "current liabilities";
-    if (section === "current assets" && isExplicitNonCurrent && isAsset && !isLiability) return "non-current assets";
-    if (section === "non-current assets" && isExplicitCurrent && !isExplicitNonCurrent && isAsset && !isLiability) return "current assets";
+    if (section === "current liabilities" && isExplicitNonCurrent) return "non-current liabilities";
+    if (section === "non-current liabilities" && isExplicitCurrent && !isExplicitNonCurrent) return "current liabilities";
+    if (section === "current assets" && isExplicitNonCurrent) return "non-current assets";
+    if (section === "non-current assets" && isExplicitCurrent && !isExplicitNonCurrent) return "current assets";
     return section as BalanceSheetSourceSection;
   }
 
   if (/cashandduefrombanks|duefrombanks|interestbearingdeposits?inbanks?/.test(compact)) return "current assets";
+  if (/restrictedcash/.test(compact) && currentNonCurrentSignal === "non-current") return "non-current assets";
   if (/shortterminvestments?|marketablesecurities|availableforsalesecurities|debtandequitysecurities|investmentsecurities/.test(compact)) {
-    return /current/.test(compact) ? "current assets" : "non-current assets";
+    if (currentNonCurrentSignal === "non-current") return "non-current assets";
+    if (currentNonCurrentSignal === "current") return "current assets";
+    return "non-current assets";
   }
   if (/stockholders?equity|shareholders?equity|retainedearnings|treasurystock|aoci|noncontrollinginterest|commonstock|additionalpaidincapital/.test(compact)) return "equity";
   const isCurrent = isExplicitCurrent;

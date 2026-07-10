@@ -212,6 +212,7 @@ type LinkbaseArc = {
 const SEC_DEFAULT_USER_AGENT = process.env.SEC_USER_AGENT || "HistoricalsSolver/0.1 contact@example.com";
 const SEC_ARCHIVE_ROOT = "https://www.sec.gov/Archives/edgar/data";
 const SEC_ARCHIVE_MIN_INTERVAL_MS = Number(process.env.SEC_ARCHIVE_MIN_INTERVAL_MS || 150);
+const SEC_ARCHIVE_FETCH_TIMEOUT_MS = Number(process.env.SEC_ARCHIVE_FETCH_TIMEOUT_MS || 20_000);
 const SEC_FILING_PACKAGE_MAX_FILINGS = Number(process.env.SEC_FILING_PACKAGE_MAX_FILINGS || 24);
 const SEC_FILING_PACKAGE_MAX_ROWS_PER_STATEMENT = Number(process.env.SEC_FILING_PACKAGE_MAX_ROWS_PER_STATEMENT || 2000);
 
@@ -233,7 +234,7 @@ export async function fetchSecFilingPackageSupport(
   }
 
   for (const filing of uniqueFilings) {
-    const secPackage = await fetchSecFilingPackage(filing, headers);
+    const secPackage = await fetchSecFilingPackage(filing, headers).catch(() => null);
     if (secPackage) packages.push(secPackage);
     else warnings.push(`SEC filing package could not be loaded for accession ${filing.accessionNumber}.`);
   }
@@ -259,7 +260,10 @@ async function fetchSecFilingPackage(filing: SecFilingPackageRequest, headers: R
   const key = `${filing.cik}:${normalizeAccession(filing.accessionNumber)}`;
   let cached = packageCache.get(key);
   if (!cached) {
-    cached = fetchSecFilingPackageUncached(filing, headers);
+    cached = fetchSecFilingPackageUncached(filing, headers).catch(() => {
+      packageCache.delete(key);
+      return null;
+    });
     packageCache.set(key, cached);
   }
   return cached;
@@ -970,7 +974,10 @@ async function fetchSecJson(url: string, headers: Record<string, string>) {
 async function fetchSecText(url: string, headers: Record<string, string>, accept: string) {
   let cached = responseTextCache.get(url);
   if (!cached) {
-    cached = fetchSecTextUncached(url, headers, accept);
+    cached = fetchSecTextUncached(url, headers, accept).catch(() => {
+      responseTextCache.delete(url);
+      return null;
+    });
     responseTextCache.set(url, cached);
   }
   return cached;
@@ -979,9 +986,18 @@ async function fetchSecText(url: string, headers: Record<string, string>, accept
 async function fetchSecTextUncached(url: string, headers: Record<string, string>, accept: string) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
     await throttleSecArchiveFetch();
-    const response = await fetch(url, { headers: secHeaders(headers, accept) });
-    if (response.ok) return response.text();
-    if (response.status !== 429) return null;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), Math.max(1_000, SEC_ARCHIVE_FETCH_TIMEOUT_MS));
+    try {
+      const response = await fetch(url, { headers: secHeaders(headers, accept), signal: controller.signal });
+      if (response.ok) return await response.text();
+      if (response.status !== 429 && response.status < 500) return null;
+    } catch {
+      // Retry transient network failures and timeouts. A filing artifact that
+      // remains unavailable is reported by the package loader as an SEC warning.
+    } finally {
+      clearTimeout(timeout);
+    }
     await sleep(750 * (attempt + 1));
   }
   return null;

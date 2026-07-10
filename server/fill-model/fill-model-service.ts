@@ -35,6 +35,7 @@ import {
   classifyFinancialStatementLineItems,
   classificationModelRowAssignmentForPrimaryStatement,
   classificationSourceKeys,
+  fullStatementLineItemNeedsAnalystPass,
   lineItemNeedsClassification,
   materialStatementLineItemNeedsAnalystPass,
   modelRowDefinitionsForRows,
@@ -267,12 +268,6 @@ type CompanyMatch = {
   title: string;
 };
 
-type MarketQuote = {
-  currentPrice: number | null;
-  fiftyTwoWeekHigh: number | null;
-  fiftyTwoWeekLow: number | null;
-};
-
 type FactSource = {
   concept: string;
   label: string;
@@ -382,6 +377,12 @@ type LlmMappingState = {
   startedAt: number;
   deadlineAt: number;
   budgetWarningAdded: boolean;
+  statementCoverage: {
+    targetCount: number;
+    reviewedCount: number;
+    acceptedDecisionCount: number;
+    unreviewedTargetCount: number;
+  };
 };
 
 type LlmMappingModelChoice = {
@@ -438,6 +439,13 @@ type LlmMappingReviewRow = LlmMappingReviewIssue & {
   reviewStatus: LlmMappingReviewResult["status"] | "skipped";
   coverageSummary: string;
   verifiedDecisionCount: number;
+};
+
+type LlmMappingReviewRunResult = {
+  rows: LlmMappingReviewRow[];
+  warnings: string[];
+  blockingErrors: string[];
+  issues: LlmMappingReviewIssue[];
 };
 
 type FilingCommentaryEvidence = {
@@ -835,10 +843,10 @@ const LLM_MAPPING_REVIEW_FALLBACK_MODELS = llmFallbackModels(
   DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
   LLM_MAPPING_REVIEW_MODEL
 );
-const LLM_MAPPING_HARD_MAX_CALLS = positiveNumber(process.env.LLM_MAPPING_HARD_MAX_CALLS, 12);
-const LLM_MAPPING_MAX_CALLS = boundedPositiveNumber(process.env.LLM_MAPPING_MAX_CALLS, 12, LLM_MAPPING_HARD_MAX_CALLS);
-const LLM_MAPPING_REVIEW_MAX_ITEMS = boundedPositiveNumber(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS, 900, 1_200);
-const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 45_000);
+const LLM_MAPPING_HARD_MAX_CALLS = positiveNumber(process.env.LLM_MAPPING_HARD_MAX_CALLS, 64);
+const LLM_MAPPING_MAX_CALLS = boundedPositiveNumber(process.env.LLM_MAPPING_MAX_CALLS, 48, LLM_MAPPING_HARD_MAX_CALLS);
+const LLM_MAPPING_REVIEW_MAX_ITEMS = boundedPositiveNumber(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS, 1_200, 2_000);
+const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 120_000);
 const LLM_MAPPING_REVIEW_BLOCKING =
   process.env.LLM_MAPPING_REVIEW_BLOCKING === undefined || process.env.LLM_MAPPING_REVIEW_BLOCKING === ""
     ? true
@@ -847,7 +855,7 @@ const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDI
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
 const LLM_MAPPING_TIMEOUT_MS = Number(process.env.LLM_MAPPING_TIMEOUT_MS || 10_000);
-const LLM_TOTAL_TIMEOUT_MS = Number(process.env.LLM_TOTAL_TIMEOUT_MS || 480_000);
+const LLM_TOTAL_TIMEOUT_MS = Number(process.env.LLM_TOTAL_TIMEOUT_MS || 720_000);
 const LLM_WORKBENCH_MAX_FACTS = Number(process.env.LLM_WORKBENCH_MAX_FACTS || 500);
 const LLM_WORKBENCH_MAX_STATEMENT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_STATEMENT_ROWS || 650);
 const LLM_WORKBENCH_MAX_WORKBOOK_CELLS = Number(process.env.LLM_WORKBENCH_MAX_WORKBOOK_CELLS || 700);
@@ -862,12 +870,14 @@ const FAST_XLSX_ZIP_OPTIONS = {
 };
 const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
   Math.min(
-    boundedPositiveNumber(process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS, Math.min(LLM_MAPPING_MAX_CALLS, 12), LLM_MAPPING_MAX_CALLS),
+    boundedPositiveNumber(process.env.LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS, Math.min(LLM_MAPPING_MAX_CALLS, 48), LLM_MAPPING_MAX_CALLS),
     LLM_MAPPING_MAX_CALLS
   )
 );
-const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 30_000);
+const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 90_000);
 const LLM_PREFILL_ANALYST_MATERIALITY_USD = Number(process.env.LLM_PREFILL_ANALYST_MATERIALITY_USD || 500_000);
+const LLM_FULL_STATEMENT_COVERAGE = booleanEnv(process.env.LLM_FULL_STATEMENT_COVERAGE, true);
+const LLM_REQUIRE_FULL_STATEMENT_COVERAGE = booleanEnv(process.env.LLM_REQUIRE_FULL_STATEMENT_COVERAGE, true);
 
 function positiveNumber(value: string | number | undefined, fallback: number) {
   const parsed = Number(value ?? fallback);
@@ -876,6 +886,11 @@ function positiveNumber(value: string | number | undefined, fallback: number) {
 
 function boundedPositiveNumber(value: string | number | undefined, fallback: number, max: number) {
   return Math.min(positiveNumber(value, fallback), positiveNumber(max, fallback));
+}
+
+function booleanEnv(value: string | undefined, fallback: boolean) {
+  if (value === undefined || value.trim() === "") return fallback;
+  return /^(true|1|yes)$/i.test(value);
 }
 
 function normalizeConfiguredLlmModel(model: string, fallback: string) {
@@ -2390,7 +2405,33 @@ function sourceLooksLikeSellingGeneralAdministrativeExpense(source: FactSource) 
   );
 }
 
-function selectPrimaryStatementRevenueSource(period: string, ctx: ResolveContext) {
+function selectPrimaryStatementRevenueSource(period: string, ctx: ResolveContext): FactSource | null {
+  const primaryPresented = primaryIncomeStatementSourcesForPeriod(period, ctx).find(
+    (source) => TOTAL_REVENUE_CONCEPTS.includes(source.concept) && !isSegmentLikeRevenueSource(source)
+  );
+  if (primaryPresented) return primaryPresented;
+
+  if (isFourthQuarterPeriod(period)) {
+    const year = periodYearSuffix(period);
+    const annual = primaryIncomeStatementSourcesForPeriod(`FY${year}`, ctx).find(
+      (source) => TOTAL_REVENUE_CONCEPTS.includes(source.concept) && !isSegmentLikeRevenueSource(source)
+    );
+    const priorPeriods = [`1Q${year}`, `2Q${year}`, `3Q${year}`];
+    const priorSources = priorPeriods.map((priorPeriod) => selectPrimaryStatementRevenueSource(priorPeriod, ctx));
+    if (annual && priorSources.every((source): source is FactSource => Boolean(source))) {
+      return {
+        ...annual,
+        label: `${annual.label} (derived Q4)`,
+        value: annual.value - priorSources.reduce((total, source) => total + source.value, 0),
+        periodKey: period,
+        periodType: "quarterly" as const,
+        derivedTotalValue: annual.value,
+        derivedTotalLabel: annual.label,
+        derivedPriorPeriods: priorPeriods
+      };
+    }
+  }
+
   const facts = ctx.duration.get(period);
   if (!facts) return null;
   const candidates = uniqueFactSources(
@@ -2588,26 +2629,63 @@ function primaryIncomeStatementSourcesForPeriod(period: string, ctx: ResolveCont
 function primaryIncomeStatementRowsForPeriod(period: string, ctx: ResolveContext): Array<{ statement: SecFilingStatementStructure; row: PrimaryIncomeStatementRow }> {
   const filing = primaryFilingEntryForModelPeriod(period, ctx);
   const accession = filing?.accessionKey;
-  return (ctx.filingPackageStatements ?? [])
+  const candidates = (ctx.filingPackageStatements ?? [])
     .filter(isPrimaryIncomeStatementStructure)
     .filter((statement) => !accession || normalizeAccession(statement.accession) === accession)
-    .flatMap((statement) =>
-      statement.rows
+    .map((statement) => ({
+      statement,
+      rows: statement.rows
         .filter((row) => row.consolidated && primaryIncomeStatementDimensionsAllowed(row))
         .filter((row) => primaryIncomeStatementRowMatchesPeriod(row, period, ctx))
         .filter((row) => typeof row.value === "number" && Number.isFinite(row.value))
-        .map((row) => ({ statement, row }))
-    )
-    .sort((a, b) => a.row.rowOrder - b.row.rowOrder);
+        .sort((a, b) => a.rowOrder - b.rowOrder)
+    }))
+    .filter((candidate) => candidate.rows.length)
+    .map((candidate) => ({ ...candidate, score: primaryIncomeStatementStructureScore(candidate.statement, candidate.rows) }))
+    .sort((a, b) => b.score - a.score || b.rows.length - a.rows.length);
+  const selected = candidates[0];
+  if (!selected) return [];
+  return selected.rows.map((row) => ({ statement: selected.statement, row }));
+}
+
+function primaryIncomeStatementStructureScore(statement: SecFilingStatementStructure, rows: PrimaryIncomeStatementRow[]) {
+  const concepts = new Set(rows.map((row) => row.xbrlConcept).filter(Boolean));
+  const text = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
+  let score = Math.min(rows.length, 50);
+  if (TOTAL_REVENUE_CONCEPTS.some((concept) => concepts.has(concept))) score += 120;
+  if (C.operatingIncome.some((concept) => concepts.has(concept))) score += 110;
+  if (PRETAX_INCOME_CONCEPTS.some((concept) => concepts.has(concept))) score += 90;
+  if (INCOME_TAX_CONCEPTS.some((concept) => concepts.has(concept))) score += 60;
+  if (CONTINUING_NET_INCOME_CONCEPTS.some((concept) => concepts.has(concept))) score += 80;
+  if (C.cogs.some((concept) => concepts.has(concept))) score += 35;
+  if (INCOME_STATEMENT_DA_CONCEPTS.some((concept) => concepts.has(concept))) score += 20;
+  if (/\b(note|notes to|detail|details|schedule|lease cost|supplemental|parenthetical)\b/.test(text)) score -= 300;
+  return score;
 }
 
 function primaryIncomeStatementRowMatchesPeriod(row: PrimaryIncomeStatementRow, period: string, ctx: ResolveContext) {
   if (row.period.periodType === "instant") return false;
+  const durationType = statementRowDurationPeriodType(row);
+  if (isAnnualPeriod(period)) {
+    if (durationType !== "annual") return false;
+    const reportDate = row.period.end ?? row.reportingPeriod;
+    const fiscalYearEndMonth = ctx.fiscalPeriods?.fiscalYearEndMonth;
+    const rowFiscalPeriod = reportDate && fiscalYearEndMonth ? fiscalPeriodKeyFromDate(reportDate, fiscalYearEndMonth) : null;
+    if (rowFiscalPeriod) return `FY${periodYearSuffix(rowFiscalPeriod)}` === period;
+
+    const reportDateEntry = reportDate ? ctx.fiscalPeriods?.byReportDate.get(reportDate) : undefined;
+    if (reportDateEntry?.annualPeriod) return reportDateEntry.annualPeriod === period;
+
+    const accessionEntry = row.accession ? ctx.fiscalPeriods?.byAccession.get(normalizeAccession(row.accession)) : undefined;
+    if (accessionEntry?.annualPeriod && reportDate === accessionEntry.reportDate) return accessionEntry.annualPeriod === period;
+    if (accessionEntry?.fiscalYear && reportDate === accessionEntry.reportDate) {
+      return String(accessionEntry.fiscalYear).slice(-2) === periodYearSuffix(period);
+    }
+    return Boolean(reportDate && reportDate.slice(2, 4) === periodYearSuffix(period));
+  }
   const rowPeriod = statementRowPeriodKey(row, ctx);
   if (rowPeriod && rowPeriod !== period) return false;
-  const durationType = statementRowDurationPeriodType(row);
   if (isQuarterPeriod(period)) return durationType === "quarterly";
-  if (isAnnualPeriod(period)) return durationType === "annual";
   return true;
 }
 
@@ -2781,7 +2859,24 @@ async function buildLineItemClassificationStore(
   ).slice(0, 80);
   const wantedPeriods = new Set(periods.flatMap((period) => [period, balanceSheetInstantLookupPeriod(period)]));
   const seen = new Set<string>();
-  const statements = (ctx.filingPackageStatements ?? []).filter((statement) => statement.sourceTableType === "primary_statement");
+  const statementCandidates = (ctx.filingPackageStatements ?? []).filter(
+    (statement) =>
+      statement.sourceTableType === "primary_statement" &&
+      (isPrimaryBalanceSheetStructure(statement) || isPrimaryIncomeStatementStructure(statement)) &&
+      statementHasPrimaryCoverageAnchors(statement)
+  );
+  const presentationStatementKeys = new Set(
+    statementCandidates
+      .filter((statement) => statement.rows.some((row) => row.rowOrder >= 0 && row.rowOrder < 100_000))
+      .map((statement) => `${normalizeAccession(statement.accession)}|${financialStatementNameForSecStatement(statement) ?? ""}`)
+  );
+  const statements = statementCandidates.filter((statement) => {
+    const key = `${normalizeAccession(statement.accession)}|${financialStatementNameForSecStatement(statement) ?? ""}`;
+    return !presentationStatementKeys.has(key) || statement.rows.some((row) => row.rowOrder >= 0 && row.rowOrder < 100_000);
+  }).sort((a, b) =>
+    String(b.filingDate || b.reportingPeriod || "").localeCompare(String(a.filingDate || a.reportingPeriod || "")) ||
+    normalizeAccession(b.accession).localeCompare(normalizeAccession(a.accession))
+  );
   debug.step("LLM line-item classification setup", {
     company,
     periodCount: periods.length,
@@ -2789,6 +2884,8 @@ async function buildLineItemClassificationStore(
     availableModelRowCount: availableModelRows.length,
     alreadyMappedRowCount: alreadyMappedRows.length,
     preFillAnalystPass: true,
+    fullStatementCoverage: LLM_FULL_STATEMENT_COVERAGE,
+    requireFullStatementCoverage: LLM_REQUIRE_FULL_STATEMENT_COVERAGE,
     preFillAnalystMaterialityUsd: LLM_PREFILL_ANALYST_MATERIALITY_USD,
     llmCanUse: llmCanUse(state, 1_500),
     maxLineItemLlmCalls: LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS,
@@ -2796,6 +2893,10 @@ async function buildLineItemClassificationStore(
   });
   let lineItemLlmCalls = 0;
   let lineItemLlmAttempts = 0;
+  let coverageTargetCount = 0;
+  let coverageReviewedCount = 0;
+  let coverageAcceptedDecisionCount = 0;
+  const unreviewedTargetKeys: string[] = [];
   const maxLineItemLlmCalls =
     Number.isFinite(LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS) && LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS >= 0
       ? LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS
@@ -2804,6 +2905,129 @@ async function buildLineItemClassificationStore(
     Number.isFinite(LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS) && LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS > 0
       ? LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS
       : 8_000;
+  const completeCoverageRequests = new Map<FinancialStatementName, FinancialLineItemClassificationRequest[]>();
+
+  const processRequestGroup = async (requests: FinancialLineItemClassificationRequest[], statementLabel: string) => {
+    const materialAnalystTargetCount = requests.filter((request) =>
+      materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
+    ).length;
+    const needsClassificationCount = requests.filter((request) =>
+      LLM_FULL_STATEMENT_COVERAGE
+        ? fullStatementLineItemNeedsAnalystPass(request)
+        : lineItemNeedsClassification(request) ||
+          materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
+    ).length;
+    if (!needsClassificationCount) {
+      debug.step("LLM line-item classification group skipped", {
+        fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
+        statementName: statementLabel,
+        reason: "no rows matched the configured statement coverage policy",
+        requestCount: requests.length
+      });
+      return;
+    }
+    const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmAttempts < maxLineItemLlmCalls;
+    if (!willUseLlm && materialAnalystTargetCount > 0 && state.enabled) {
+      warnings.push(
+        `${requests[0]?.fiscalPeriod ?? ""} ${statementLabel}: pre-fill LLM analyst pass could not review ${materialAnalystTargetCount} material SEC line item(s) within the configured LLM budget; deterministic evidence and validation were used as fallback.`
+      );
+    }
+    if (!willUseLlm && LLM_FULL_STATEMENT_COVERAGE) {
+      warnings.push(
+        `${requests[0]?.fiscalPeriod ?? ""} ${statementLabel}: complete LLM statement coverage could not review ${needsClassificationCount} SEC mapping line item(s) within the configured LLM budget.`
+      );
+    }
+    const model = chooseStatementLineItemClassificationModel(requests);
+    debug.step("LLM line-item classification group start", {
+      fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
+      statementName: statementLabel,
+      statementType: requests[0]?.statement ?? "",
+      requestCount: requests.length,
+      needsClassificationCount,
+      materialAnalystTargetCount,
+      willUseLlm,
+      model,
+      remainingLineItemLlmCalls: Math.max(0, maxLineItemLlmCalls - lineItemLlmAttempts),
+      remainingGlobalLlmCalls: Math.max(0, state.maxCalls - state.attempts),
+      labels: requests.map((request) => ({
+        label: request.cleanLabel || request.reportedLineItemLabel,
+        xbrlTag: request.xbrlTag,
+        section: request.section,
+        amount: request.amount,
+        deterministicCandidate: request.deterministicCandidate,
+        uncertaintyReason: request.uncertaintyReason
+      }))
+    });
+    const classificationResult = await classifyFinancialStatementLineItems(requests, {
+      llm: {
+        enabled: willUseLlm,
+        apiKey: llmApiKey(),
+        endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
+        model,
+        fallbackModels: llmFallbackModelsForAccountingModel(model),
+        siteUrl: OPENROUTER_SITE_URL,
+        appTitle: OPENROUTER_APP_TITLE,
+        timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
+      },
+      statementAnalystPass: {
+        enabled: true,
+        materialityThreshold: LLM_PREFILL_ANALYST_MATERIALITY_USD,
+        coverage: LLM_FULL_STATEMENT_COVERAGE ? "all_primary_rows" : "material_and_ambiguous"
+      }
+    });
+    classificationResult.llmTelemetry.forEach((telemetry) => recordLlmTelemetry(state, telemetry));
+    lineItemLlmCalls += classificationResult.llmCalls;
+    lineItemLlmAttempts += classificationResult.llmAttempts;
+    coverageTargetCount += classificationResult.targetCount;
+    coverageReviewedCount += classificationResult.llmReviewedCount;
+    coverageAcceptedDecisionCount += classificationResult.acceptedDecisionCount;
+    unreviewedTargetKeys.push(...classificationResult.unreviewedTargetKeys);
+    warnings.push(...classificationResult.warnings);
+    debug.step("LLM line-item classification group complete", {
+      fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
+      statementName: statementLabel,
+      model,
+      llmCalls: classificationResult.llmCalls,
+      llmAttempts: classificationResult.llmAttempts,
+      llmSuccessfulCompletions: classificationResult.llmSuccessfulCompletions,
+      targetCount: classificationResult.targetCount,
+      llmReviewedCount: classificationResult.llmReviewedCount,
+      acceptedDecisionCount: classificationResult.acceptedDecisionCount,
+      unreviewedTargetKeys: classificationResult.unreviewedTargetKeys,
+      llmTelemetry: classificationResult.llmTelemetry.map(sanitizeAccountingTelemetry),
+      warnings: classificationResult.warnings,
+      classificationCount: classificationResult.classifications.length
+    });
+    for (const { request, classification } of classificationResult.classifications) {
+      if (classification.warning) warnings.push(`${request.cleanLabel || request.reportedLineItemLabel}: ${classification.warning}`);
+      const failed =
+        !classification.mapping_passed_validation ||
+        classification.confidence === "low" ||
+        Boolean(classification.warning) ||
+        classification.should_exclude_from_other_bucket;
+      const classificationDetails = {
+        fiscalPeriod: request.fiscalPeriod,
+        sourceLineItem: request.cleanLabel || request.reportedLineItemLabel,
+        xbrlTag: request.xbrlTag,
+        amount: request.amount,
+        statement: request.statement,
+        section: request.section,
+        sourceTableType: request.sourceTableType,
+        deterministicCandidate: request.deterministicCandidate,
+        llmUsed: classification.llm_used,
+        llmStatus: classification.llm_status,
+        recommendedModelRow: classification.recommended_model_row,
+        confidence: classification.confidence,
+        mappingPassedValidation: classification.mapping_passed_validation,
+        shouldExcludeFromOtherBucket: classification.should_exclude_from_other_bucket,
+        reason: classification.reason,
+        warning: classification.warning
+      };
+      if (failed) debug.warn("LLM line-item classification decision", classificationDetails);
+      else debug.step("LLM line-item classification decision", classificationDetails);
+      registerLineItemClassification(store, request, classification);
+    }
+  };
 
   for (const statement of statements) {
     const statementName = financialStatementNameForSecStatement(statement);
@@ -2862,7 +3086,13 @@ async function buildLineItemClassificationStore(
         validationError: "",
         alreadyMappedRows
       };
-      const dedupeKey = statementLineItemDedupeKey(statement, request, rowItem);
+      const dedupeKey = LLM_FULL_STATEMENT_COVERAGE
+        ? [
+            request.statement,
+            request.section,
+            request.xbrlTag ? normalize(request.xbrlTag) : normalize(request.cleanLabel || request.reportedLineItemLabel)
+          ].join("|")
+        : statementLineItemDedupeKey(statement, request, rowItem);
       if (seen.has(dedupeKey)) continue;
       seen.add(dedupeKey);
       const bucket = requestsByPeriod.get(fiscalPeriod) ?? [];
@@ -2889,107 +3119,32 @@ async function buildLineItemClassificationStore(
       )
     });
     for (const requests of requestGroups) {
-      const materialAnalystTargetCount = requests.filter((request) =>
-        materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
-      ).length;
-      const needsClassificationCount = requests.filter(
-        (request) => lineItemNeedsClassification(request) || materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
-      ).length;
-      if (!needsClassificationCount) {
-        debug.step("LLM line-item classification group skipped", {
-          fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
-          statementName: statement.statementName,
-          reason: "no material or ambiguous rows needed classification",
-          requestCount: requests.length
-        });
-        continue;
+      if (LLM_FULL_STATEMENT_COVERAGE) {
+        const bucket = completeCoverageRequests.get(statementName) ?? [];
+        bucket.push(...requests);
+        completeCoverageRequests.set(statementName, bucket);
+      } else {
+        await processRequestGroup(requests, statement.statementName);
       }
-      const willUseLlm = llmCanUse(state, 1_500) && lineItemLlmAttempts < maxLineItemLlmCalls;
-      if (!willUseLlm && materialAnalystTargetCount > 0 && state.enabled) {
-        warnings.push(
-          `${requests[0]?.fiscalPeriod ?? ""} ${statement.statementName}: pre-fill LLM analyst pass could not review ${materialAnalystTargetCount} material SEC line item(s) within the configured LLM budget; deterministic evidence and validation were used as fallback.`
-        );
-      }
-      const model = chooseStatementLineItemClassificationModel(requests);
-      debug.step("LLM line-item classification group start", {
-        fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
-        statementName: statement.statementName,
+    }
+  }
+
+  if (LLM_FULL_STATEMENT_COVERAGE) {
+    const chunkSize = 12;
+    for (const [statementName, requests] of completeCoverageRequests) {
+      const mappingRequests = requests.filter(fullStatementLineItemNeedsAnalystPass);
+      debug.step("LLM complete statement coverage batched", {
         statementType: statementName,
-        requestCount: requests.length,
-        needsClassificationCount,
-        materialAnalystTargetCount,
-        willUseLlm,
-        model,
-        remainingLineItemLlmCalls: Math.max(0, maxLineItemLlmCalls - lineItemLlmAttempts),
-        remainingGlobalLlmCalls: Math.max(0, state.maxCalls - state.attempts),
-        labels: requests.map((request) => ({
-          label: request.cleanLabel || request.reportedLineItemLabel,
-          xbrlTag: request.xbrlTag,
-          section: request.section,
-          amount: request.amount,
-          deterministicCandidate: request.deterministicCandidate,
-          uncertaintyReason: request.uncertaintyReason
-        }))
+        extractedRequestCount: requests.length,
+        mappingRequestCount: mappingRequests.length,
+        chunkSize,
+        chunkCount: Math.ceil(mappingRequests.length / chunkSize)
       });
-      const classificationResult = await classifyFinancialStatementLineItems(requests, {
-        llm: {
-          enabled: willUseLlm,
-          apiKey: llmApiKey(),
-          endpoint: OPENROUTER_CHAT_COMPLETIONS_URL,
-          model,
-          fallbackModels: llmFallbackModelsForAccountingModel(model),
-          siteUrl: OPENROUTER_SITE_URL,
-          appTitle: OPENROUTER_APP_TITLE,
-          timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state)))
-        },
-        statementAnalystPass: {
-          enabled: true,
-          materialityThreshold: LLM_PREFILL_ANALYST_MATERIALITY_USD
-        }
-      });
-      classificationResult.llmTelemetry.forEach((telemetry) => recordLlmTelemetry(state, telemetry));
-      lineItemLlmCalls += classificationResult.llmCalls;
-      lineItemLlmAttempts += classificationResult.llmAttempts;
-      warnings.push(...classificationResult.warnings);
-      debug.step("LLM line-item classification group complete", {
-        fiscalPeriod: requests[0]?.fiscalPeriod ?? "",
-        statementName: statement.statementName,
-        model,
-        llmCalls: classificationResult.llmCalls,
-        llmAttempts: classificationResult.llmAttempts,
-        llmSuccessfulCompletions: classificationResult.llmSuccessfulCompletions,
-        llmTelemetry: classificationResult.llmTelemetry.map(sanitizeAccountingTelemetry),
-        warnings: classificationResult.warnings,
-        classificationCount: classificationResult.classifications.length
-      });
-      for (const { request, classification } of classificationResult.classifications) {
-        if (classification.warning) warnings.push(`${request.cleanLabel || request.reportedLineItemLabel}: ${classification.warning}`);
-        const failed =
-          !classification.mapping_passed_validation ||
-          classification.confidence === "low" ||
-          Boolean(classification.warning) ||
-          classification.should_exclude_from_other_bucket;
-        const classificationDetails = {
-          fiscalPeriod: request.fiscalPeriod,
-          sourceLineItem: request.cleanLabel || request.reportedLineItemLabel,
-          xbrlTag: request.xbrlTag,
-          amount: request.amount,
-          statement: request.statement,
-          section: request.section,
-          sourceTableType: request.sourceTableType,
-          deterministicCandidate: request.deterministicCandidate,
-          llmUsed: classification.llm_used,
-          llmStatus: classification.llm_status,
-          recommendedModelRow: classification.recommended_model_row,
-          confidence: classification.confidence,
-          mappingPassedValidation: classification.mapping_passed_validation,
-          shouldExcludeFromOtherBucket: classification.should_exclude_from_other_bucket,
-          reason: classification.reason,
-          warning: classification.warning
-        };
-        if (failed) debug.warn("LLM line-item classification decision", classificationDetails);
-        else debug.step("LLM line-item classification decision", classificationDetails);
-        registerLineItemClassification(store, request, classification);
+      for (let index = 0; index < mappingRequests.length; index += chunkSize) {
+        await processRequestGroup(
+          mappingRequests.slice(index, index + chunkSize),
+          `${statementName} mapping batch ${Math.floor(index / chunkSize) + 1}`
+        );
       }
     }
   }
@@ -3000,9 +3155,41 @@ async function buildLineItemClassificationStore(
     lineItemLlmCalls,
     lineItemLlmAttempts,
     globalLlmCalls: state.calls,
-    globalLlmAttempts: state.attempts
+    globalLlmAttempts: state.attempts,
+    coverageTargetCount,
+    coverageReviewedCount,
+    coverageAcceptedDecisionCount,
+    unreviewedTargetCount: unique(unreviewedTargetKeys).length
   });
-  return { store, warnings };
+  return {
+    store,
+    warnings,
+    coverage: {
+      targetCount: coverageTargetCount,
+      reviewedCount: coverageReviewedCount,
+      acceptedDecisionCount: coverageAcceptedDecisionCount,
+      unreviewedTargetKeys: unique(unreviewedTargetKeys)
+    }
+  };
+}
+
+function statementHasPrimaryCoverageAnchors(statement: SecFilingStatementStructure) {
+  const statementName = financialStatementNameForSecStatement(statement);
+  const concepts = statement.rows.map((row) => normalize(`${row.xbrlConcept ?? ""} ${row.rowLabel}`)).join("|");
+  if (statementName === "balance_sheet") {
+    const hasCash = /cashandcashequivalents|cashcash/.test(concepts);
+    const hasAssets = /assetscurrent|(?:^|\|)assets(?:\||$)|totalassets/.test(concepts);
+    const hasLiabilities = /liabilitiescurrent|(?:^|\|)liabilities(?:\||$)|totalliabilities/.test(concepts);
+    const hasEquity = /stockholdersequity|shareholdersequity|retainedearnings|totalequity/.test(concepts);
+    return hasCash && hasAssets && hasLiabilities && hasEquity;
+  }
+  if (statementName === "income_statement") {
+    const hasRevenue = /revenuefromcontract|(?:^|\|)revenues?(?:\||$)|netsales|salesrevenue/.test(concepts);
+    const hasTax = /incometaxexpensebenefit|provisionforincometax|incometax/.test(concepts);
+    const hasNetIncome = /profitloss|netincomeloss|netincome|netloss/.test(concepts);
+    return hasRevenue && hasTax && hasNetIncome;
+  }
+  return false;
 }
 
 function registerLineItemClassification(
@@ -3137,9 +3324,11 @@ function statementLineItemDedupeKey(
 
 function chooseStatementLineItemClassificationModel(requests: FinancialLineItemClassificationRequest[]) {
   const text = requests.map((request) => `${request.cleanLabel} ${request.xbrlTag ?? ""} ${request.section}`).join(" ").toLowerCase();
-  const targetCount = requests.filter(
-    (request) => lineItemNeedsClassification(request) || materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
-  ).length;
+  const targetCount = LLM_FULL_STATEMENT_COVERAGE
+    ? requests.length
+    : requests.filter(
+        (request) => lineItemNeedsClassification(request) || materialStatementLineItemNeedsAnalystPass(request, LLM_PREFILL_ANALYST_MATERIALITY_USD)
+      ).length;
   if (targetCount > 1 || /\bdeferred\b|\bdebt\b|\bnotes?\b|\bother\b|\bspecial\b|\bimpairment\b|\brestructuring\b|\binvestments?\b/.test(text)) {
     return LLM_MAPPING_COMPLEX_MODEL;
   }
@@ -3230,6 +3419,7 @@ function statementSectionForRow(
     if (category === "net_income") return "net income";
     if (primaryIncomeStatementRowIsInRevenueSection(statement, row)) return "revenue";
     if (primaryIncomeStatementRowIsBelowOperatingBeforePreTax(statement, row)) return "below operating income";
+    if (primaryIncomeStatementRowIsOperatingExpense(statement, row)) return "operating expenses";
     if (category === "interest_income" || category === "interest_expense" || category === "other_non_operating_income_expense" || category === "pretax_income") {
       return "below operating income";
     }
@@ -3297,8 +3487,10 @@ function deterministicModelRowCandidateForSource(
     if (category === "interest_income") return "Interest Income";
     if (category === "interest_expense") return "Interest Expense";
     if (category === "income_tax") return "Income Tax Benefit / Expense";
-    if (category === "other_non_operating_income_expense" || section === "below operating income") return "Other Non-Operating Income / Expense";
-    if (category === "other_operating_income_expense" || section === "operating expenses") return "Other Operating Income / Expense";
+    if (section === "below operating income") return "Other Non-Operating Income / Expense";
+    if (section === "operating expenses") return "Other Operating Income / Expense";
+    if (category === "other_non_operating_income_expense") return "Other Non-Operating Income / Expense";
+    if (category === "other_operating_income_expense") return "Other Operating Income / Expense";
   }
   if (statementName === "balance_sheet") {
     if (category === "current_assets") return "Prepaid & Other Current Assets";
@@ -3411,6 +3603,7 @@ function sourceLooksLikeOtherCurrentLiability(source: FactSource) {
   if (sourceLooksLikeDeferredTaxAsset(source) || sourceLooksLikeDeferredTaxLiability(source) || sourceLooksLikeOtherNonCurrentLiability(source)) return false;
   if (sourceTextMatches(source, /\bnoncurrent\b|\bnon[-\s]?current\b|\blong[-\s]?term\b/)) return false;
   if (balanceSheetRowMatchesSourceAlias("Other Current Liabilities", source.label) || balanceSheetRowMatchesSourceAlias("Other Current Liabilities", source.concept)) return true;
+  if (sourceLooksLikeCurrentSelfInsuranceReserve(source)) return true;
   if (BROAD_OTHER_CURRENT_LIABILITY_CONCEPTS.includes(source.concept) || OTHER_CURRENT_LIABILITY_COMPONENT_CONCEPTS.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
@@ -3422,7 +3615,7 @@ function sourceLooksLikeAccruedOperatingLiability(source: FactSource) {
   if (sourceHasPlainAccruedLiabilityLabel(source)) return true;
   if (sourceLooksLikeOtherNonCurrentLiability(source) || sourceTextMatches(source, /\bnon[-\s]?current\b|\blong[-\s]?term\b/)) return false;
   if (balanceSheetRowMatchesSourceAlias("Accrued Liabilities", source.label) || balanceSheetRowMatchesSourceAlias("Accrued Liabilities", source.concept)) return true;
-  if (C.accrued.includes(source.concept)) return true;
+  if (C.accrued.includes(source.concept) || sourceLooksLikeCurrentSelfInsuranceReserve(source)) return true;
   return sourceTextMatches(
     source,
     /\baccrued\b|\bpharmacy claims?\b|\bdiscounts payable\b|\bhealth care costs? payable\b|\bcompensation\b|\bpayroll\b|\bsalar(?:y|ies)\b|\bwages payable\b|\bbenefits payable\b|\binterest payable\b|\bincome taxes payable\b|\btaxes payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b|\bsales incentives?\b/
@@ -3435,6 +3628,7 @@ function sourceHasPlainAccruedLiabilityLabel(source: FactSource) {
 }
 
 function sourceLooksLikeNonCurrentDebt(source: FactSource) {
+  if (sourceLooksLikeSelfInsuranceReserve(source)) return false;
   return NONCURRENT_DEBT_CONCEPTS.includes(source.concept) || sourceTextMatches(source, /\blong[-\s]?term debt\b|\bsenior notes?\b|\bborrowings?\b/);
 }
 
@@ -3463,6 +3657,7 @@ function sourceLooksLikePensionLiability(source: FactSource) {
 }
 
 function sourceLooksLikeOtherNonCurrentLiability(source: FactSource) {
+  if (sourceLooksLikeNonCurrentSelfInsuranceReserve(source)) return true;
   if (BASE_OTHER_NON_CURRENT_LIABILITY_CONCEPTS.includes(source.concept)) return true;
   return sourceTextMatches(
     source,
@@ -3475,6 +3670,7 @@ function sourceLooksLikeDedicatedAsset(source: FactSource) {
 }
 
 function sourceLooksLikeCurrentInvestment(source: FactSource) {
+  if (sourceTextMatches(source, /\bnon[-\s]?current\b|\blong[-\s]?term\b/)) return false;
   return C.currentInvestments.includes(source.concept) || sourceTextMatches(source, /\bshort[-\s]?term investments?\b|\bmarketable securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/);
 }
 
@@ -3491,6 +3687,7 @@ function sourceLooksLikeNonTradeReceivable(source: FactSource) {
 }
 
 function sourceLooksLikeCashBalance(source: FactSource) {
+  if (sourceLooksLikeNonCurrentCashBalance(source)) return false;
   const bankDepositConcept = /CashAndDueFromBanks|InterestBearingDepositsInBanks/i.test(source.concept);
   return (
     C.cash.includes(source.concept) ||
@@ -3502,6 +3699,7 @@ function sourceLooksLikeCashBalance(source: FactSource) {
 
 function sourceLooksLikeCashLikeShortTermInvestment(source: FactSource) {
   const text = sourceSearchText(source);
+  if (/\bnon[-\s]?current\b|\blong[-\s]?term\b|\brestricted cash\b/.test(text)) return false;
   return (
     source.concept === "ShortTermInvestments" ||
     source.concept === "OtherShortTermInvestments" ||
@@ -3968,11 +4166,15 @@ function isOperatingSpecialChargeSource(source: FactSource) {
 
 function otherOperatingLineValue(source: FactSource) {
   const text = sourceSearchText(source);
+  const hasGain = /\bgain\b/.test(text);
+  const hasLoss = /\bloss\b/.test(text);
   if (
     OTHER_OPERATING_INCOME_CONCEPTS.includes(source.concept) ||
-    (/\b(income|gain)\b/.test(text) && !/\b(expense|loss|charge|cost|impairment|restructuring|settlement|litigation|written[-\s]?off|acquired)\b/.test(text))
+    (hasGain && hasLoss) ||
+    (hasGain && !/\b(expense|loss|charge|cost|restructuring|settlement|litigation|written[-\s]?off|acquired)\b/.test(text)) ||
+    (/\bincome\b/.test(text) && !/\b(expense|loss|charge|cost|impairment|restructuring|settlement|litigation|written[-\s]?off|acquired)\b/.test(text))
   ) {
-    return Math.abs(source.value);
+    return hasGain && hasLoss ? source.value : Math.abs(source.value);
   }
   return expenseAsModelReduction(source.value);
 }
@@ -4200,6 +4402,17 @@ function otherNonOperatingValue(source: FactSource) {
 }
 
 function resolveOperatingIncome(period: string, ctx: ResolveContext): ResolvedValue {
+  if (isFourthQuarterPeriod(period)) {
+    const annualBridge = resolveFourthQuarterDurationMetricFromAnnual(
+      period,
+      ctx,
+      resolveOperatingIncome,
+      "OperatingIncomeFourthQuarterBridge",
+      "Fourth-quarter operating income derived from annual operating income less Q1-Q3",
+      "Calculated from SEC annual operating income less Q1, Q2, and Q3 so quarterly cells sum exactly to the reported fiscal-year amount."
+    );
+    if (annualBridge.value !== null) return annualBridge;
+  }
   const direct = first(period, ctx.duration, ["OperatingIncomeLoss"]);
   if (direct) {
     return {
@@ -4333,6 +4546,17 @@ function interestIncomeAlreadyIncludedInOtherIncomeBridge(source: FactSource) {
 }
 
 function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedValue {
+  if (isFourthQuarterPeriod(period)) {
+    const annualBridge = resolveFourthQuarterDurationMetricFromAnnual(
+      period,
+      ctx,
+      resolveInterestExpense,
+      "InterestExpenseFourthQuarterBridge",
+      "Fourth-quarter interest expense derived from annual interest expense less Q1-Q3",
+      "Calculated from SEC annual interest expense less Q1, Q2, and Q3 so quarterly cells sum exactly to the reported fiscal-year amount."
+    );
+    if (annualBridge.value !== null) return annualBridge;
+  }
   const facts = ctx.duration.get(period);
   const revenue = first(period, ctx.duration, ["Revenues"]);
   const netRevenue = first(period, ctx.duration, ["RevenuesNetOfInterestExpense"]);
@@ -4354,6 +4578,17 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
       note:
         "Summed standalone primary income-statement interest expense components reported below operating income, with expense signs normalized to reduce pre-tax income.",
       classification: primaryStatementSources.length > 1 ? "grouped" : "direct"
+    };
+  }
+
+  const sameConceptFourthQuarterSource = fourthQuarterInterestExpenseSourceMatchingAnnualPrimaryStatement(period, ctx);
+  if (sameConceptFourthQuarterSource) {
+    return {
+      value: expenseAsModelReduction(sameConceptFourthQuarterSource.value),
+      sources: [sameConceptFourthQuarterSource],
+      note:
+        "Mapped fourth-quarter interest expense from the EDGAR duration fact using the same XBRL concept as the annual primary income-statement line, avoiding a different overlapping interest concept.",
+      classification: "direct"
     };
   }
 
@@ -4379,6 +4614,47 @@ function resolveInterestExpense(period: string, ctx: ResolveContext): ResolvedVa
   const zero = first(period, ctx.duration, C.interestExpense);
   if (fallback && (!zero || zero.value === 0)) return fallback;
   return zero ? { value: 0, sources: [zero] } : { value: null, sources: [] };
+}
+
+function fourthQuarterInterestExpenseSourceMatchingAnnualPrimaryStatement(period: string, ctx: ResolveContext) {
+  if (!isFourthQuarterPeriod(period)) return null;
+  const facts = ctx.duration.get(period);
+  if (!facts) return null;
+  const annualSources = primaryStatementInterestExpenseSources(`FY${periodYearSuffix(period)}`, ctx);
+  for (const annualSource of annualSources) {
+    const source = facts.get(annualSource.concept);
+    if (!source || !isExplicitInterestExpenseSource(source) || isCombinedInterestAndOtherIncomeSource(source)) continue;
+    return acceptedSourceForModelRow(period, ctx, source, "Interest Expense") ?? source;
+  }
+  return null;
+}
+
+function resolveFourthQuarterDurationMetricFromAnnual(
+  period: string,
+  ctx: ResolveContext,
+  resolver: (period: string, ctx: ResolveContext) => ResolvedValue,
+  bridgeConcept: string,
+  bridgeLabel: string,
+  note: string
+): ResolvedValue {
+  if (!isFourthQuarterPeriod(period)) return { value: null, sources: [] };
+  const year = periodYearSuffix(period);
+  const annual = resolver(`FY${year}`, ctx);
+  const prior = [`1Q${year}`, `2Q${year}`, `3Q${year}`].map((priorPeriod) => resolver(priorPeriod, ctx));
+  if (annual.value === null || !prior.every((item) => item.value !== null)) {
+    return {
+      value: null,
+      sources: compactSources([annual, ...prior]),
+      note: `Could not derive ${bridgeLabel.toLowerCase()} because the annual or Q1-Q3 SEC presentation was incomplete.`
+    };
+  }
+  const value = annual.value - prior.reduce((total, item) => total + (item.value ?? 0), 0);
+  return {
+    value,
+    sources: [bridgeSource(period, bridgeConcept, bridgeLabel, value, [annual, ...prior]), ...compactSources([annual, ...prior])],
+    note,
+    classification: "grouped"
+  };
 }
 
 function sourceHasStandalonePrimaryIncomeStatementInterestIncomeForResolver(period: string, ctx: ResolveContext, source: FactSource) {
@@ -5096,6 +5372,10 @@ function selectOperatingBridgeRevenueSourceWithoutOtherOperating(period: string,
 }
 
 function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext): ResolvedValue {
+  if (isFourthQuarterPeriod(period)) {
+    const annualBridge = resolveFourthQuarterOtherOperatingFromAnnual(period, ctx);
+    if (annualBridge.value !== null) return annualBridge;
+  }
   const operatingIncomeItems = OTHER_OPERATING_INCOME_CONCEPTS.map((concept) => first(period, ctx.duration, [concept])).filter(
     (source): source is FactSource => Boolean(source)
   );
@@ -5111,13 +5391,14 @@ function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext)
   const primaryStatementItems = primaryIncomeStatementSourcesForPeriod(period, ctx).filter(
     (source) => isExplicitOtherOperatingLineSource(source) || isAcquiredInProcessResearchDevelopmentSource(source) || isOperatingSpecialChargeSource(source)
   );
-  const primaryStatementConcepts = new Set(primaryStatementItems.map((source) => source.concept));
+  const structuralPrimaryStatementItems = primaryIncomeStatementOtherOperatingLineSources(period, ctx);
+  const primaryStatementConcepts = new Set([...primaryStatementItems, ...structuralPrimaryStatementItems].map((source) => source.concept));
   const nonPrimaryItems = [...operatingIncomeItems, ...acquiredIprdItems, ...specialChargeItems, ...semanticItems].filter(
     (source) => !primaryStatementConcepts.has(source.concept)
   );
   const candidates = collapseDuplicateExplicitOperatingSources(
     period,
-    uniqueFactSources([...primaryStatementItems, ...nonPrimaryItems]).filter((source) =>
+    uniqueFactSources([...primaryStatementItems, ...structuralPrimaryStatementItems, ...nonPrimaryItems]).filter((source) =>
       sourceReportedAsOperatingLineOnPrimaryIncomeStatement(period, ctx, source)
     )
   );
@@ -5139,6 +5420,97 @@ function resolveExplicitOtherOperatingItems(period: string, ctx: ResolveContext)
       "Grouped from explicit primary-income-statement operating income/expense lines that do not have dedicated model rows. Reported operating presentation takes precedence over mathematical tie-outs.",
     classification: "grouped"
   };
+}
+
+function resolveFourthQuarterOtherOperatingFromAnnual(period: string, ctx: ResolveContext): ResolvedValue {
+  const year = periodYearSuffix(period);
+  const annualPeriod = `FY${year}`;
+  const annual = resolveExplicitOtherOperatingItems(annualPeriod, ctx);
+  const priorPeriods = [`1Q${year}`, `2Q${year}`, `3Q${year}`];
+  const prior = priorPeriods.map((priorPeriod) => resolveExplicitOtherOperatingItems(priorPeriod, ctx));
+  if (annual.value === null || !prior.every((item) => item.value !== null)) {
+    return {
+      value: null,
+      sources: compactSources([annual, ...prior]),
+      note: "Could not derive fourth-quarter other operating income/expense because the annual or Q1-Q3 SEC presentation was incomplete."
+    };
+  }
+
+  const value = annual.value - prior.reduce((total, item) => total + (item.value ?? 0), 0);
+  return {
+    value,
+    sources: [
+      bridgeSource(
+        period,
+        "OtherOperatingIncomeExpenseFourthQuarterBridge",
+        "Fourth-quarter other operating income/expense derived from the annual SEC presentation less Q1-Q3",
+        value,
+        [annual, ...prior]
+      ),
+      ...compactSources([annual, ...prior])
+    ],
+    note:
+      "Calculated from the annual SEC other-operating presentation less Q1, Q2, and Q3 so quarterly cells sum exactly to the reported fiscal-year amount.",
+    classification: "grouped"
+  };
+}
+
+function primaryIncomeStatementOtherOperatingLineSources(period: string, ctx: ResolveContext) {
+  const excludedCategories = new Set<ReportedLineItemCategory>([
+    "revenue",
+    "cost_of_revenue",
+    "research_and_development",
+    "selling_general_administrative",
+    "income_statement_depreciation_amortization",
+    "operating_income",
+    "interest_income",
+    "interest_expense",
+    "pretax_income",
+    "income_tax",
+    "net_income",
+    "current_assets",
+    "non_current_assets",
+    "total_assets",
+    "current_liabilities",
+    "non_current_liabilities",
+    "total_liabilities",
+    "equity",
+    "segment_only",
+    "cash_flow_or_support"
+  ]);
+  const seen = new Set<string>();
+  const sources: FactSource[] = [];
+
+  for (const { statement, row } of primaryIncomeStatementRowsForPeriod(period, ctx)) {
+    if (!primaryIncomeStatementRowIsOperatingExpense(statement, row)) continue;
+    const source = factSourceFromStatementRow(row, period);
+    if (!source || !sourceIsDollarSource(source) || isComprehensiveIncomeSource(source)) continue;
+    if (primaryIncomeStatementAssignmentExclusionReason(period, ctx, source, row, "operating expenses")) continue;
+    const classified = classifiedSourceForModelRow(period, ctx, source, "Other Operating Income / Expense");
+    if (classified === null) continue;
+    const semanticOperatingCharge =
+      isExplicitOtherOperatingLineSource(source) ||
+      isAcquiredInProcessResearchDevelopmentSource(source) ||
+      isOperatingSpecialChargeSource(source) ||
+      sourceTextMatches(source, /\bwithdrawal liabilit|\bpension withdrawal\b/);
+    if (!classified && !semanticOperatingCharge) continue;
+    const acceptedSource = classified ?? source;
+    if (excludedCategories.has(reportedLineItemCategory(acceptedSource))) continue;
+
+    const key = [
+      normalizeAccession(acceptedSource.accn ?? statement.accession),
+      normalize(acceptedSource.concept),
+      normalize(cleanLineItemLabel(acceptedSource.label)),
+      acceptedSource.start ?? "",
+      acceptedSource.end ?? "",
+      Math.round(acceptedSource.value)
+    ].join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    sources.push(acceptedSource);
+  }
+
+  return sources;
 }
 
 function collapseDuplicateExplicitOperatingSources(period: string, sources: FactSource[]) {
@@ -5925,12 +6297,25 @@ function sourceLooksLikeCombinedShortTermBorrowingsAndCurrentMaturities(source: 
 
 function sourceLooksLikeCurrentDebtMaturity(source: FactSource) {
   const text = `${source.label} ${source.concept}`.toLowerCase();
+  if (sourceLooksLikeSelfInsuranceReserve(source)) return false;
   if (/\b(?:finance|capital) lease\b/.test(text)) {
     const compact = text.replace(/[^a-z0-9]/g, "");
     if (/noncurrent|longterm/.test(compact)) return false;
     return /\bcurrent\b|due within one year|within one year|current portion|current maturit|financeleaseliabilitycurrent|capitalleaseobligationscurrent/.test(text);
   }
   return /current portion|current maturit|long[-\s]?term debt.*current|current.*long[-\s]?term debt|debt due within one year/.test(text);
+}
+
+function sourceLooksLikeSelfInsuranceReserve(source: FactSource) {
+  return /SelfInsuranceReserve/i.test(source.concept) || sourceTextMatches(source, /\bself[-\s]?insurance reserves?\b/);
+}
+
+function sourceLooksLikeCurrentSelfInsuranceReserve(source: FactSource) {
+  return sourceLooksLikeSelfInsuranceReserve(source) && /Current$/i.test(source.concept) && !/Noncurrent$/i.test(source.concept);
+}
+
+function sourceLooksLikeNonCurrentSelfInsuranceReserve(source: FactSource) {
+  return sourceLooksLikeSelfInsuranceReserve(source) && (/Noncurrent$/i.test(source.concept) || sourceTextMatches(source, /\bnon[-\s]?current\b|\blong[-\s]?term\b/));
 }
 
 function genericCurrentDebtBelongsInCurrentMaturities(source: FactSource, standaloneShortTermBorrowings: FactSource | null, ctx: ResolveContext) {
@@ -6101,7 +6486,8 @@ function resolveReportedCashBalance(period: string, ctx: ResolveContext): Resolv
   if (primaryCash) return primaryCash;
 
   const cash = first(period, ctx.instant, C.cash);
-  const restricted = cash && /RestrictedCash/i.test(cash.concept) ? null : sum(period, ctx.instant, STANDALONE_RESTRICTED_CASH_CONCEPTS);
+  const currentRestrictedCashConcepts = STANDALONE_RESTRICTED_CASH_CONCEPTS.filter((concept) => !/Noncurrent/i.test(concept));
+  const restricted = cash && /RestrictedCash/i.test(cash.concept) ? null : sum(period, ctx.instant, currentRestrictedCashConcepts);
   if (!cash && !restricted) return { value: null, sources: [] };
   return {
     value: (cash?.value ?? 0) + (restricted?.value ?? 0),
@@ -6116,6 +6502,7 @@ function resolveReportedCashBalance(period: string, ctx: ResolveContext): Resolv
 function primaryReportedCashBalance(period: string, ctx: ResolveContext): ResolvedValue | null {
   const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
     if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
+    if (sourceLooksLikeNonCurrentCashBalance(source) || primaryRowInNonCurrentAssetSection(row, source)) return false;
     if (!primaryRowInCurrentAssetSection(row, source) && !sourceLooksLikeCashBalance(source)) return false;
     if (sourceLooksLikeCurrentInvestment(source)) return false;
     return sourceLooksLikeCashBalance(source);
@@ -6152,6 +6539,10 @@ function primaryReportedCashBalance(period: string, ctx: ResolveContext): Resolv
   };
 }
 
+function sourceLooksLikeNonCurrentCashBalance(source: FactSource) {
+  return /RestrictedCash.*Noncurrent/i.test(source.concept) || sourceTextMatches(source, /\bnon[-\s]?current\b.*\brestricted cash\b|\brestricted cash\b.*\bnon[-\s]?current\b/);
+}
+
 function sourceLooksLikeReportedCashAggregate(source: FactSource) {
   return (
     source.concept === "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents" ||
@@ -6180,7 +6571,7 @@ function currentInvestmentsAreModeledInOtherCurrentAssets(period: string, ctx: R
 function cashLikeCurrentInvestmentBalance(period: string, ctx: ResolveContext): ResolvedValue | null {
   const primarySources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
     if (isPrimaryBalanceSheetSubtotalSource(source)) return false;
-    return (primaryRowInCurrentAssetSection(row, source) || sourceLooksLikeCurrentInvestment(source)) && sourceLooksLikeCashLikeShortTermInvestment(source);
+    return primaryRowInCurrentAssetSection(row, source) && sourceLooksLikeCashLikeShortTermInvestment(source);
   });
   if (primarySources.length) {
     return {
@@ -7440,38 +7831,25 @@ async function updateCoverCompanyMetadata(workbook: ExcelJS.Workbook, company: C
     if (fiscalYearCell) fiscalYearCell.numFmt = "m/d/yy";
   }
 
-  const quote = await fetchMarketQuote(company.ticker).catch(() => null);
-  if (!quote) {
-    if (findAnyCoverRow(cover, ["Current Price", "Current Share Price", "Current Stock Price"]) || findCoverRow(cover, "52-Week High") || findCoverRow(cover, "52-Week Low")) {
-      warnings.push("Cover market-price fields were left unchanged because current quote data was unavailable.");
-    }
-    return;
+  const unsupportedMarketRows = unique(
+    [
+      findAnyCoverRow(cover, ["Current Price", "Current Share Price", "Current Stock Price"]),
+      findCoverRow(cover, "52-Week High"),
+      findCoverRow(cover, "52-Week Low")
+    ].filter((row): row is number => Boolean(row))
+  );
+  for (const row of unsupportedMarketRows) {
+    const cell = cover.getCell(row, 6);
+    if (!isProtectedFormulaOrCheckCell(cell)) cell.value = null;
   }
-
-  const currentPriceCell = setCoverValueAny(cover, ["Current Price", "Current Share Price", "Current Stock Price"], roundCurrency(quote.currentPrice));
-  const highCell = setCoverValue(cover, "52-Week High", roundCurrency(quote.fiftyTwoWeekHigh));
-  const lowCell = setCoverValue(cover, "52-Week Low", roundCurrency(quote.fiftyTwoWeekLow));
-  for (const cell of [currentPriceCell, highCell, lowCell]) {
-    if (cell) cell.numFmt = "$0.00";
-  }
-  if (currentPriceCell || highCell || lowCell) {
-    warnings.push("Cover market-price fields were sourced from Yahoo Finance chart data because those fields are not available in EDGAR.");
+  if (unsupportedMarketRows.length) {
+    warnings.push("Cover market-price fields were cleared because quote data is not available from SEC EDGAR and third-party financial sources are not permitted.");
   }
 }
 
 function setCoverValue(sheet: ExcelJS.Worksheet, label: string, value: ExcelJS.CellValue) {
   if (value === null || value === undefined) return null;
   const row = findCoverRow(sheet, label);
-  if (!row) return null;
-  const cell = sheet.getCell(row, 6);
-  if (isProtectedFormulaOrCheckCell(cell)) return null;
-  cell.value = value;
-  return cell;
-}
-
-function setCoverValueAny(sheet: ExcelJS.Worksheet, labels: string[], value: ExcelJS.CellValue) {
-  if (value === null || value === undefined) return null;
-  const row = findAnyCoverRow(sheet, labels);
   if (!row) return null;
   const cell = sheet.getCell(row, 6);
   if (isProtectedFormulaOrCheckCell(cell)) return null;
@@ -7515,56 +7893,6 @@ function latestFiscalYearEndDate(ctx: ResolveContext) {
 
 function dateFromIsoDate(value: string) {
   return new Date(`${value}T00:00:00Z`);
-}
-
-function roundCurrency(value: number | null) {
-  if (value === null || !Number.isFinite(value)) return null;
-  return Math.round(value * 100) / 100;
-}
-
-async function fetchMarketQuote(ticker: string): Promise<MarketQuote | null> {
-  const yahooSymbol = encodeURIComponent(ticker.replace(/\./g, "-"));
-  const response = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${yahooSymbol}?range=1y&interval=1d&includePrePost=false`, {
-    headers: {
-      "User-Agent": SEC_HEADERS["User-Agent"],
-      Accept: "application/json"
-    },
-    cache: "no-store"
-  });
-  if (!response.ok) return null;
-
-  const payload = (await response.json()) as any;
-  const result = payload?.chart?.result?.[0];
-  if (!result || payload?.chart?.error) return null;
-
-  const meta = result.meta ?? {};
-  const quote = result.indicators?.quote?.[0] ?? {};
-  const close = finiteNumbers(quote.close).at(-1) ?? null;
-  const historyHigh = maxFinite(quote.high);
-  const historyLow = minFinite(quote.low);
-  return {
-    currentPrice: finiteNumber(meta.regularMarketPrice) ?? close,
-    fiftyTwoWeekHigh: finiteNumber(meta.fiftyTwoWeekHigh) ?? historyHigh,
-    fiftyTwoWeekLow: finiteNumber(meta.fiftyTwoWeekLow) ?? historyLow
-  };
-}
-
-function finiteNumber(value: unknown) {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-function finiteNumbers(values: unknown) {
-  return Array.isArray(values) ? values.filter((value): value is number => typeof value === "number" && Number.isFinite(value)) : [];
-}
-
-function maxFinite(values: unknown) {
-  const numbers = finiteNumbers(values);
-  return numbers.length ? Math.max(...numbers) : null;
-}
-
-function minFinite(values: unknown) {
-  const numbers = finiteNumbers(values);
-  return numbers.length ? Math.min(...numbers) : null;
 }
 
 function detectTemplateProfile(workbook: ExcelJS.Workbook, sheet: ExcelJS.Worksheet, ctx: ResolveContext): TemplateProfile {
@@ -8077,11 +8405,40 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       debug
     );
     ctx.lineItemClassifications = lineItemClassificationResult.store;
+    llmState.statementCoverage = {
+      targetCount: lineItemClassificationResult.coverage.targetCount,
+      reviewedCount: lineItemClassificationResult.coverage.reviewedCount,
+      acceptedDecisionCount: lineItemClassificationResult.coverage.acceptedDecisionCount,
+      unreviewedTargetCount: lineItemClassificationResult.coverage.unreviewedTargetKeys.length
+    };
     warnings.push(...lineItemClassificationResult.warnings);
     timing("line item classifications built", {
       classificationStoreEntries: lineItemClassificationResult.store.size,
+      coverage: lineItemClassificationResult.coverage,
       warnings: lineItemClassificationResult.warnings
     });
+    if (LLM_FULL_STATEMENT_COVERAGE && LLM_REQUIRE_FULL_STATEMENT_COVERAGE && llmMappingEnabledByEnv()) {
+      if (!lineItemClassificationResult.coverage.targetCount) {
+        throw new FillModelServiceError(
+          "Complete LLM statement coverage could not start because no consolidated primary income-statement or balance-sheet rows were available from the selected SEC filing packages.",
+          422,
+          debug.filePath
+        );
+      }
+      if (lineItemClassificationResult.coverage.unreviewedTargetKeys.length) {
+        const providerErrors = unique(
+          llmState.telemetry
+            .map((item) => item.errorMessage || "")
+            .filter(Boolean)
+        ).slice(-3);
+        const providerDetail = providerErrors.length ? ` Provider response: ${providerErrors.join(" | ")}` : "";
+        throw new FillModelServiceError(
+          `Complete LLM statement coverage failed for ${lineItemClassificationResult.coverage.unreviewedTargetKeys.length} of ${lineItemClassificationResult.coverage.targetCount} SEC line items. The workbook was not generated from a partial deterministic fallback.${providerDetail}`,
+          422,
+          debug.filePath
+        );
+      }
+    }
 
     const cleanupResult = cleanStaleProtectedHistoricalRows(sheet, fillRows, periods, columns, ctx, auditRows);
     filledCells += cleanupResult.clearedCells;
@@ -8547,8 +8904,8 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       commentsAdded: validationResult.commentsAdded
     });
 
-    const sourceLedgerRows = buildHistoricalSourceLedgerRows(company, modelPeriodMap.entries, sheet, fillRows, reportedPeriodPairs, auditRows);
-    const sourceLedgerErrors = await validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries, company, filingMetadata);
+    let sourceLedgerRows = buildHistoricalSourceLedgerRows(company, modelPeriodMap.entries, sheet, fillRows, reportedPeriodPairs, auditRows);
+    let sourceLedgerErrors = await validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries, company, filingMetadata);
     if (sourceLedgerErrors.length) {
       debug.error("source ledger validation failed", {
         errors: sourceLedgerErrors,
@@ -8561,8 +8918,8 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       sourceLedgerRowCount: sourceLedgerRows.length
     });
 
-    const balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
-    const incomeStatementAssignmentLedgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(incomeStatementPeriods, ctx, fillRows);
+    let balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
+    let incomeStatementAssignmentLedgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(incomeStatementPeriods, ctx, fillRows);
     const segmentAnalysisAssignmentLedgerRows = segmentSheet
       ? buildSegmentAnalysisAssignmentLedgerRows(segmentSheet, segmentPeriods, segmentColumns, segmentRevenue, ctx, {
           preserveExistingLabels: profile.kind === "financial_company"
@@ -8573,7 +8930,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       incomeStatementAssignmentLedgerRows,
       segmentAnalysisAssignmentLedgerRows
     });
-    const llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
+    let llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
       company,
       periods: unique([...periods, ...balanceSheetPeriods, ...incomeStatementPeriods]),
       workbook,
@@ -8588,7 +8945,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       warnings,
       validationFailures: []
     });
-    const llmMappingReview = await runLlmMappingReview(
+    let llmMappingReview = await runLlmMappingReview(
       company,
       periods,
       fillRows,
@@ -8601,15 +8958,88 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       llmState,
       debug
     );
-    warnings.push(...llmMappingReview.warnings);
     if (llmMappingReview.blockingErrors.length) {
-      debug.error("LLM mapping review blocking errors", {
-        blockingErrors: llmMappingReview.blockingErrors,
-        warnings: llmMappingReview.warnings,
-        rowCount: llmMappingReview.rows.length
+      const corrections = applyLlmMappingReviewCorrections({
+        issues: llmMappingReview.issues,
+        classifications: ctx.lineItemClassifications ?? new Map(),
+        balanceAssignments: balanceSheetAssignmentLedgerRows,
+        incomeAssignments: incomeStatementAssignmentLedgerRows,
+        availableModelRows: unique(fillRows.map((row) => row.label).filter(Boolean))
       });
-      throw new FillModelServiceError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422, debug.filePath);
+      debug.warn("LLM mapping review automatic correction pass", {
+        blockingErrors: llmMappingReview.blockingErrors,
+        repairs: corrections.repairs,
+        rejected: corrections.rejected
+      });
+      if (corrections.changed) {
+        warnings.push(`LLM reviewer automatically corrected ${corrections.repairs.length} primary-statement assignment(s) and reran all validation gates.`);
+        const correctionRebuild = finalizePrimaryAssignmentLedgersForValidation(validationOptions);
+        filledCells += correctionRebuild.filledCells;
+        commentsAdded += correctionRebuild.commentsAdded;
+        warnings.push(...correctionRebuild.warnings);
+        prepareWorkbookForValidationRetry(validationOptions);
+        const correctionValidation = validateWorkbookWithAutomaticRetries(validationOptions);
+        filledCells += correctionValidation.filledCells;
+        commentsAdded += correctionValidation.commentsAdded;
+        if (correctionValidation.errors.length) {
+          throw new FillModelServiceError(
+            `LLM reviewer corrections failed deterministic workbook validation: ${correctionValidation.errors.slice(0, 6).join(" | ")}`,
+            422,
+            debug.filePath
+          );
+        }
+
+        sourceLedgerRows = buildHistoricalSourceLedgerRows(company, modelPeriodMap.entries, sheet, fillRows, reportedPeriodPairs, auditRows);
+        sourceLedgerErrors = await validateHistoricalSourceLedger(sourceLedgerRows, modelPeriodMap.entries, company, filingMetadata);
+        if (sourceLedgerErrors.length) {
+          throw new FillModelServiceError(
+            `LLM reviewer corrections failed source-backed validation: ${sourceLedgerErrors.slice(0, 6).join(" | ")}`,
+            422,
+            debug.filePath
+          );
+        }
+        balanceSheetAssignmentLedgerRows = buildPrimaryBalanceSheetAssignmentLedgerRows(balanceSheetPeriods, ctx, fillRows);
+        incomeStatementAssignmentLedgerRows = buildPrimaryIncomeStatementAssignmentLedgerRows(incomeStatementPeriods, ctx, fillRows);
+        llmWorkbookToolbox = buildLlmWorkbookToolboxForReview({
+          company,
+          periods: unique([...periods, ...balanceSheetPeriods, ...incomeStatementPeriods]),
+          workbook,
+          sheet,
+          fillRows,
+          ctx,
+          sourceLedgerRows,
+          balanceSheetAssignmentLedgerRows,
+          incomeStatementAssignmentLedgerRows,
+          segmentAnalysisAssignmentLedgerRows,
+          auditRows,
+          warnings,
+          validationFailures: []
+        });
+        llmMappingReview = await runLlmMappingReview(
+          company,
+          periods,
+          fillRows,
+          sourceLedgerRows,
+          balanceSheetAssignmentLedgerRows,
+          incomeStatementAssignmentLedgerRows,
+          segmentAnalysisAssignmentLedgerRows,
+          auditRows,
+          llmWorkbookToolbox,
+          llmState,
+          debug
+        );
+      }
+      if (llmMappingReview.blockingErrors.length) {
+        debug.error("LLM mapping review blocking errors", {
+          blockingErrors: llmMappingReview.blockingErrors,
+          warnings: llmMappingReview.warnings,
+          rowCount: llmMappingReview.rows.length,
+          rejectedCorrections: corrections.rejected
+        });
+        throw new FillModelServiceError(`LLM mapping review failed: ${llmMappingReview.blockingErrors.slice(0, 6).join(" | ")}`, 422, debug.filePath);
+      }
     }
+    warnings.push(...llmMappingReview.warnings);
     timing("LLM mapping review complete", {
       warnings: llmMappingReview.warnings,
       rowCount: llmMappingReview.rows.length,
@@ -11892,7 +12322,16 @@ function reconciliationRevenueSegment(periods: string[], values: Map<string, num
 
 function reportedRevenueFallbackSegment(periods: string[], ctx: ResolveContext): SegmentRevenue | null {
   const values = new Map<string, number>();
-  periods.forEach((period) => {
+  periods.filter(isQuarterPeriod).forEach((period) => {
+    const resolved = resolveTotalRevenue(period, ctx);
+    if (resolved.value !== null) values.set(period, resolved.value);
+  });
+  periods.filter(isAnnualPeriod).forEach((period) => {
+    const quarterlyAnnual = completeQuarterlyAnnualValue(period, values);
+    if (quarterlyAnnual !== null) {
+      values.set(period, quarterlyAnnual);
+      return;
+    }
     const resolved = resolveTotalRevenue(period, ctx);
     if (resolved.value !== null) values.set(period, resolved.value);
   });
@@ -11914,10 +12353,26 @@ function reportedRevenueFallbackSegment(periods: string[], ctx: ResolveContext):
 function reportedAnnualRevenueValues(periods: string[], ctx: ResolveContext, quarterlyValues: Map<string, number>) {
   const annualValues = annualValuesFromQuarterlyValues(periods, quarterlyValues);
   unique(periods.map((period) => periodYearSuffix(period))).forEach((year) => {
+    const annualPeriod = `FY${year}`;
+    const quarterlyAnnual = completeQuarterlyAnnualValue(annualPeriod, quarterlyValues);
+    if (quarterlyAnnual !== null) {
+      annualValues.set(annualPeriod, quarterlyAnnual);
+      return;
+    }
     const resolved = resolveTotalRevenue(`FY${year}`, ctx);
-    if (resolved.value !== null) annualValues.set(`FY${year}`, resolved.value);
+    if (resolved.value !== null) annualValues.set(annualPeriod, resolved.value);
   });
   return annualValues;
+}
+
+function completeQuarterlyAnnualValue(annualPeriod: string, values: Map<string, number>) {
+  if (!isAnnualPeriod(annualPeriod)) return null;
+  const year = periodYearSuffix(annualPeriod);
+  const quarters = [`1Q${year}`, `2Q${year}`, `3Q${year}`, `4Q${year}`];
+  if (!quarters.every((period) => values.has(period))) return null;
+  const quarterValues = quarters.map((period) => values.get(period));
+  if (!quarterValues.every((value): value is number => typeof value === "number" && Number.isFinite(value))) return null;
+  return quarterValues.reduce((total, value) => total + value, 0);
 }
 
 function annualValuesFromQuarterlyValues(periods: string[], values: Map<string, number>) {
@@ -13049,7 +13504,9 @@ function hasFormula(cell: ExcelJS.Cell) {
 }
 
 function isNumericConstantFormula(formula: string | null) {
-  return Boolean(formula?.replace(/^=/, "").trim().match(/^[+-]?\d+(?:\.\d+)?$/));
+  if (!formula) return false;
+  const expression = formula.replace(/^=/, "").trim();
+  return /\d/.test(expression) && /^[\d\s.+\-*/(),%]+$/.test(expression);
 }
 
 function isNumericConstantFormulaCell(cell: ExcelJS.Cell) {
@@ -13783,10 +14240,10 @@ function reconcileIncomeStatementClassificationRowsToEdgar(
       const rawFormula = formulaForCell(cell);
       const formula = isNumericConstantFormula(rawFormula) ? null : rawFormula;
       const cached = numericCellValue(cell);
-      const evaluated = formula ? evaluator.evaluateCell(cell) : cached;
-      if (cached !== null && statementMetricTies(cached, value) && (evaluated === null || statementMetricTies(evaluated, value))) return;
+      const evaluated = rawFormula ? evaluator.evaluateCell(cell) : cached;
+      if (incomeStatementClassificationCellTiesResolvedValue(cached, evaluated, value)) return;
 
-      const bridgeFormula = formula && !formula.includes("!") ? formulaBridgeForTargetValue(cell, value) : null;
+      const bridgeFormula = isFourthQuarterPeriod(period) && formula && !formula.includes("!") ? formulaBridgeForTargetValue(cell, value) : null;
       cell.value = bridgeFormula ? { formula: bridgeFormula, result: value } : formula ? { formula, result: value } : value;
       evaluator.clear();
       filledCells += 1;
@@ -13812,6 +14269,11 @@ function reconcileIncomeStatementClassificationRowsToEdgar(
   }
 
   return { filledCells, commentsAdded, warnings };
+}
+
+function incomeStatementClassificationCellTiesResolvedValue(cached: number | null, evaluated: number | null, expected: number) {
+  if (cached === null || !exactModelValueTies(cached, expected)) return false;
+  return evaluated === null || exactModelValueTies(evaluated, expected);
 }
 
 function reconcilePostTaxEquityMethodNetIncomeBridge(
@@ -14158,6 +14620,7 @@ function refreshFormulaMetricResultsFromResolver(
 ) {
   const rowNumber = findIncomeStatementMetricRow(sheet, labels);
   if (!rowNumber) return;
+  const evaluator = new FormulaEvaluator(sheet, { skipCrossSheetFormulas: true });
   periods.forEach((period, index) => {
     const resolved = resolver(period, ctx);
     if (resolved.value === null) return;
@@ -14168,7 +14631,33 @@ function refreshFormulaMetricResultsFromResolver(
     const value = resolved.value / 1_000_000;
     if (formula && !isNumericConstantFormula(formula)) {
       const current = numericCellValue(cell);
-      if (current !== null && exactModelValueTies(current, value)) return;
+      const evaluated = evaluator.evaluateCell(cell);
+      const roundingAdjustment = evaluated === null ? 0 : value - evaluated;
+      if (
+        isFourthQuarterPeriod(period) &&
+        !formula.includes("!") &&
+        Math.abs(roundingAdjustment) > 0.0001 &&
+        Math.abs(roundingAdjustment) <= 0.1501
+      ) {
+        const adjustedFormula = formulaWithRoundingAdjustment(formula, roundingAdjustment);
+        cell.value = { formula: adjustedFormula, result: value };
+        evaluator.clear();
+        const auditRow = statementTotalAuditRow(
+          sheet,
+          cell,
+          rowLabel(sheet, rowNumber),
+          period,
+          value,
+          source,
+          "income",
+          `Added a transparent ${formatDividendFormulaNumber(roundModelValue(roundingAdjustment))} fourth-quarter rounding bridge so the quarterly subtotal and reported SEC annual total reconcile.`
+        );
+        auditRow.formulaPreserved = true;
+        auditRow.formulaStatus = "formula updated with SEC annual-to-quarter rounding bridge";
+        auditRows.push(auditRow);
+        return;
+      }
+      if (current !== null && exactModelValueTies(current, value) && (evaluated === null || exactModelValueTies(evaluated, value))) return;
       setFormulaResult(cell, value);
       const auditRow = statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} formula result from EDGAR after dependent formula caches were updated.`);
       auditRow.formulaPreserved = true;
@@ -14184,6 +14673,11 @@ function refreshFormulaMetricResultsFromResolver(
       auditRows.push(statementTotalAuditRow(sheet, cell, rowLabel(sheet, rowNumber), period, value, source, "income", `Refreshed ${metricName} from EDGAR after dependent formula caches were updated.`));
     }
   });
+}
+
+function formulaWithRoundingAdjustment(formula: string, adjustment: number) {
+  const rounded = roundModelValue(adjustment);
+  return `(${formula})${rounded >= 0 ? "+" : ""}${formatDividendFormulaNumber(rounded)}`;
 }
 
 function exactModelValueTies(actual: number, expected: number) {
@@ -14583,7 +15077,13 @@ function createLlmMappingState(): LlmMappingState {
     maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS >= 0 ? LLM_MAPPING_MAX_CALLS : 24,
     startedAt,
     deadlineAt: startedAt + maxDurationMs,
-    budgetWarningAdded: false
+    budgetWarningAdded: false,
+    statementCoverage: {
+      targetCount: 0,
+      reviewedCount: 0,
+      acceptedDecisionCount: 0,
+      unreviewedTargetCount: 0
+    }
   };
 }
 
@@ -14655,6 +15155,7 @@ function llmMappingStateSummary(state: LlmMappingState) {
     decisionCount: state.decisions.size,
     models: aggregate.models,
     usage: aggregate.usage,
+    statementCoverage: state.statementCoverage,
     warningCount: state.warnings.length,
     budgetWarningAdded: state.budgetWarningAdded
   };
@@ -14693,10 +15194,10 @@ async function runLlmMappingReview(
   llmWorkbookToolbox: LlmWorkbookToolbox,
   state: LlmMappingState,
   debug: FillModelDebugLogger
-): Promise<{ rows: LlmMappingReviewRow[]; warnings: string[]; blockingErrors: string[] }> {
+): Promise<LlmMappingReviewRunResult> {
   if (!llmMappingReviewEnabledByEnv()) {
     debug.step("LLM mapping review skipped", { reason: "disabled by LLM_MAPPING_REVIEW_ENABLED" });
-    return { rows: [llmMappingReviewSkippedRow(company, "LLM mapping review disabled by LLM_MAPPING_REVIEW_ENABLED.", state, "disabled")], warnings: [], blockingErrors: [] };
+    return { rows: [llmMappingReviewSkippedRow(company, "LLM mapping review disabled by LLM_MAPPING_REVIEW_ENABLED.", state, "disabled")], warnings: [], blockingErrors: [], issues: [] };
   }
   if (!llmApiKey()) {
     const message = "LLM mapping review was enabled but OPENROUTER_API_KEY was not set; generated workbook relies on deterministic validation only.";
@@ -14704,7 +15205,8 @@ async function runLlmMappingReview(
     return {
       rows: [llmMappingReviewSkippedRow(company, message, state, "unavailable")],
       warnings: [message],
-      blockingErrors: []
+      blockingErrors: [],
+      issues: []
     };
   }
 
@@ -14742,7 +15244,8 @@ async function runLlmMappingReview(
       return {
         rows: [llmMappingReviewSkippedRow(company, message, state, result.status)],
         warnings: [message],
-        blockingErrors: llmMappingReviewFailureBlockingErrors(message)
+        blockingErrors: llmMappingReviewFailureBlockingErrors(message),
+        issues: []
       };
     }
     const review = result.value;
@@ -14768,7 +15271,7 @@ async function runLlmMappingReview(
       issueWarnings,
       blockingErrors
     });
-    return { rows, warnings: issueWarnings, blockingErrors };
+    return { rows, warnings: issueWarnings, blockingErrors, issues: review.issues };
   } catch (error) {
     const message = `LLM mapping review skipped (${error instanceof Error ? error.message : "unknown OpenRouter API error"}).`;
     debug.error("LLM mapping review failed", {
@@ -14779,13 +15282,13 @@ async function runLlmMappingReview(
     return {
       rows: [llmMappingReviewSkippedRow(company, message, state, "attempted_failed")],
       warnings: [message],
-      blockingErrors: llmMappingReviewFailureBlockingErrors(message)
+      blockingErrors: llmMappingReviewFailureBlockingErrors(message),
+      issues: []
     };
   }
 }
 
 function llmMappingReviewFailureBlockingErrors(message: string) {
-  if (/key limit|quota|billing|credits?|auth|api key|forbidden/i.test(message)) return [];
   return LLM_MAPPING_REVIEW_BLOCKING ? [message] : [];
 }
 
@@ -14793,7 +15296,140 @@ function isActionableLlmMappingBlockingIssue(issue: LlmMappingReviewIssue) {
   const scope = `${issue.period} ${issue.sourceLineItemLabel} ${issue.currentModelRow} ${issue.reason}`.toLowerCase();
   if (/assignment ledger contains zero|mapping audit rows are entirely absent|omitted|payload|structural gap|no documented assignment/.test(scope)) return false;
   if (!issue.period || /^all\b/i.test(issue.period)) return false;
-  return Boolean(issue.sourceLineItemLabel && issue.currentModelRow && issue.recommendedModelRow && issue.recommendedModelRow !== issue.currentModelRow);
+  return Boolean(issue.sourceLineItemLabel && issue.recommendedModelRow && issue.recommendedModelRow !== issue.currentModelRow);
+}
+
+export function applyLlmMappingReviewCorrections(input: {
+  issues: LlmMappingReviewIssue[];
+  classifications: FinancialLineItemClassificationStore;
+  balanceAssignments: PrimaryBalanceSheetAssignmentLedgerRow[];
+  incomeAssignments: PrimaryIncomeStatementAssignmentLedgerRow[];
+  availableModelRows: string[];
+}) {
+  const repairs: string[] = [];
+  const rejected: string[] = [];
+  for (const issue of input.issues.filter((item) => item.severity === "error" && isActionableLlmMappingBlockingIssue(item))) {
+    if (!["wrong_model_row", "missing_source_line", "unsupported_exclusion"].includes(issue.issueType)) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: review issue requires a non-routing repair.`);
+      continue;
+    }
+    const recommendedModelRow =
+      input.availableModelRows.find((row) => modelRowsMatch(row, issue.recommendedModelRow)) ?? "";
+    if (!recommendedModelRow) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row ${issue.recommendedModelRow} is not present in the template.`);
+      continue;
+    }
+    const balanceAssignment = findReviewBalanceAssignment(issue, input.balanceAssignments);
+    const incomeAssignment = balanceAssignment ? null : findReviewIncomeAssignment(issue, input.incomeAssignments);
+    if (!balanceAssignment && !incomeAssignment) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: no matching primary-statement assignment was found.`);
+      continue;
+    }
+    if (
+      balanceAssignment &&
+      (!balanceSheetSectionCompatible(recommendedModelRow, balanceAssignment.sourceSection as BalanceSheetSourceSection, {
+        label: balanceAssignment.sourceLineItemLabel,
+        tag: balanceAssignment.sourceXbrlTag
+      }) ||
+        (reviewExpectedBalanceSheetSide(balanceAssignment) !== "unknown" &&
+          primaryBalanceSheetAssignmentSideForModelRow(recommendedModelRow) !== reviewExpectedBalanceSheetSide(balanceAssignment)))
+    ) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row failed balance-sheet section/side validation.`);
+      continue;
+    }
+    if (incomeAssignment && !incomeStatementAssignmentModelRowIsAssignable(recommendedModelRow)) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row is not an assignable income-statement input row.`);
+      continue;
+    }
+    const assignment = balanceAssignment ?? incomeAssignment!;
+    const amount = balanceAssignment ? balanceAssignment.amount : incomeAssignment!.sourceAmount;
+    const classificationKeys = classificationSourceKeys({
+      period: assignment.fiscalPeriod,
+      accession: assignment.sourceFilingAccession,
+      xbrlTag: assignment.sourceXbrlTag,
+      label: assignment.sourceLineItemLabel,
+      amount
+    });
+    const existing = classificationKeys.map((key) => input.classifications.get(key)).find(Boolean);
+    if (!existing) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: original LLM classification could not be located.`);
+      continue;
+    }
+    const corrected = correctedClassificationFromReview(existing, recommendedModelRow, issue);
+    for (const [key, value] of input.classifications) {
+      if (value === existing) input.classifications.set(key, corrected);
+    }
+    classificationKeys.forEach((key) => input.classifications.set(key, corrected));
+    repairs.push(`${assignment.fiscalPeriod} ${assignment.sourceLineItemLabel}: ${issue.currentModelRow || "excluded"} -> ${recommendedModelRow}`);
+  }
+  return { changed: repairs.length > 0, repairs: unique(repairs), rejected: unique(rejected) };
+}
+
+function reviewExpectedBalanceSheetSide(row: PrimaryBalanceSheetAssignmentLedgerRow): BalanceSheetAssignmentSide {
+  if (row.sourceSection === "current assets" || row.sourceSection === "non-current assets") return "assets";
+  if (row.sourceSection === "current liabilities" || row.sourceSection === "non-current liabilities" || row.sourceSection === "equity") {
+    return "liabilities_and_equity";
+  }
+  return row.side;
+}
+
+function findReviewBalanceAssignment(issue: LlmMappingReviewIssue, rows: PrimaryBalanceSheetAssignmentLedgerRow[]) {
+  return rows.find(
+    (row) =>
+      row.fiscalPeriod === issue.period &&
+      normalize(row.sourceLineItemLabel) === normalize(issue.sourceLineItemLabel) &&
+      (!issue.sourceXbrlTag || row.sourceXbrlTag === issue.sourceXbrlTag) &&
+      (!issue.currentModelRow || !row.assignedModelRow || modelRowsMatch(row.assignedModelRow, issue.currentModelRow))
+  );
+}
+
+function findReviewIncomeAssignment(issue: LlmMappingReviewIssue, rows: PrimaryIncomeStatementAssignmentLedgerRow[]) {
+  return rows.find(
+    (row) =>
+      row.fiscalPeriod === issue.period &&
+      normalize(row.sourceLineItemLabel) === normalize(issue.sourceLineItemLabel) &&
+      (!issue.sourceXbrlTag || row.sourceXbrlTag === issue.sourceXbrlTag) &&
+      (!issue.currentModelRow || !row.assignedModelRow || modelRowsMatch(row.assignedModelRow, issue.currentModelRow))
+  );
+}
+
+function correctedClassificationFromReview(
+  classification: FinancialLineItemClassification,
+  recommendedModelRow: string,
+  issue: LlmMappingReviewIssue
+): FinancialLineItemClassification {
+  const isDebt = modelRowsMatch(recommendedModelRow, "Revolver") || modelRowsMatch(recommendedModelRow, "LT Debt (Incl. Current Portion)");
+  const isNonDebtLiability =
+    modelRowsMatch(recommendedModelRow, "Accounts Payable") ||
+    modelRowsMatch(recommendedModelRow, "Accrued Liabilities") ||
+    modelRowsMatch(recommendedModelRow, "Other Current Liabilities") ||
+    modelRowsMatch(recommendedModelRow, "Other Non-Current Liabilities");
+  return {
+    ...classification,
+    recommended_action: /other/i.test(recommendedModelRow) ? "merge_into_other" : "remap",
+    recommended_model_row: recommendedModelRow,
+    recommended_model_row_mappings: [],
+    explicit_zero_rows: [],
+    classification_type: `LLM reviewer correction to ${recommendedModelRow}`,
+    is_current: modelRowsMatch(recommendedModelRow, "Other Non-Current Liabilities") || modelRowsMatch(recommendedModelRow, "Deferred Income Taxes")
+      ? false
+      : modelRowsMatch(recommendedModelRow, "Accounts Payable") ||
+          modelRowsMatch(recommendedModelRow, "Accrued Liabilities") ||
+          modelRowsMatch(recommendedModelRow, "Other Current Liabilities") ||
+          modelRowsMatch(recommendedModelRow, "Revolver")
+        ? true
+        : classification.is_current,
+    is_debt: isDebt ? true : isNonDebtLiability ? false : classification.is_debt,
+    is_deferred_tax: modelRowsMatch(recommendedModelRow, "Deferred Income Taxes") ? true : classification.is_deferred_tax,
+    confidence: "high",
+    reason: `LLM workbook reviewer correction: ${issue.reason}`,
+    requires_validation: true,
+    requires_revalidation: true,
+    llm_used: true,
+    llm_status: "completed_validated",
+    mapping_passed_validation: true,
+    warning: undefined
+  };
 }
 
 function llmMappingReviewSkippedRow(
@@ -14898,7 +15534,7 @@ async function requestLlmMappingReview(
     llmWorkbookToolboxSystemInstruction(),
     "Review every provided mapping and source coverage item using accounting reasoning, SEC statement context, XBRL tag semantics, current/non-current section, subtotal/component relationships, model row definitions, and validation status.",
     "Use only the provided EDGAR source rows, mapping audit rows, source ledger rows, and assignment ledgers, including income-statement, balance-sheet, and Segment Analysis ledgers. Do not invent facts, line items, or amounts.",
-    "Confirm that every material primary SEC line item and Segment Analysis line item is either assigned to the correct model row, grouped into the correct Other/reconciliation row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
+    "Confirm that every provided primary SEC line item and Segment Analysis line item, regardless of size, is either assigned to the correct model row, grouped into the correct Other/reconciliation row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
     "This review is not centered on any one example. Treat examples such as short-term investments, current maturities of debt, deferred revenue, advertising, lease liabilities, pension liabilities, and equity method income as non-exhaustive patterns for accounting-substance routing.",
     "For any random SEC line item, ask which model row a careful human analyst would use after looking at the statement, subtotal context, XBRL concept, model row definitions, and reconciliation impact.",
     "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present. Otherwise group them with Cash & Cash Equivalents if the template has a cash row; use the current-assets residual only when there is no cash or current-investment row.",
@@ -14930,7 +15566,8 @@ async function requestLlmMappingReview(
     siteUrl: OPENROUTER_SITE_URL,
     appTitle: OPENROUTER_APP_TITLE,
     timeoutMs,
-    maxTokens: 2200,
+    maxTokens: 6000,
+    reasoningEffort: "medium",
     sessionId: llmSessionId(company, "workbook-review"),
     jsonSchema: llmMappingReviewJsonSchema(),
     messages: [
@@ -15018,7 +15655,7 @@ function llmMappingReviewPayload(
     },
     modelRows,
     modelRowDefinitions: modelRowDefinitionsForRows(availableModelRows),
-    llmWorkbookToolbox,
+    llmWorkbookToolbox: compactLlmWorkbookToolboxForReview(llmWorkbookToolbox),
     primaryBalanceSheetAssignments: selectedBalanceAssignments,
     primaryIncomeStatementAssignments: selectedIncomeAssignments,
     segmentAnalysisAssignments: selectedSegmentAssignments,
@@ -15032,6 +15669,41 @@ function llmMappingReviewPayload(
       mappingAuditRows: Math.max(0, mappingRows.length - selectedMappingRows.length)
     }
   };
+}
+
+function compactLlmWorkbookToolboxForReview(toolbox: LlmWorkbookToolbox): LlmWorkbookToolbox {
+  const validationTool = toolbox.toolOutputs.find((tool) => tool.name === "workbook.validate_return");
+  return {
+    ...toolbox,
+    toolOutputs: validationTool ? [validationTool] : [],
+    omittedCounts: {
+      ...toolbox.omittedCounts,
+      facts: toolbox.omittedCounts.facts + reviewToolOutputLength(toolbox, "sec.get_company_facts", "facts"),
+      statementRows:
+        toolbox.omittedCounts.statementRows + reviewToolOutputLength(toolbox, "sec.get_financial_statement_rows", "rows"),
+      workbookCells:
+        toolbox.omittedCounts.workbookCells + reviewToolOutputLength(toolbox, "workbook.inspect_output_cells", "cells"),
+      auditRows: toolbox.omittedCounts.auditRows + reviewToolOutputLength(toolbox, "workbook.get_mapping_audit", "rows"),
+      sourceLedgerRows:
+        toolbox.omittedCounts.sourceLedgerRows + reviewToolOutputLength(toolbox, "workbook.trace_source_ledger", "rows"),
+      balanceSheetAssignments:
+        toolbox.omittedCounts.balanceSheetAssignments +
+        reviewToolOutputLength(toolbox, "workbook.get_balance_sheet_assignment_ledger", "rows"),
+      incomeStatementAssignments:
+        toolbox.omittedCounts.incomeStatementAssignments +
+        reviewToolOutputLength(toolbox, "workbook.get_income_statement_assignment_ledger", "rows"),
+      segmentAnalysisAssignments:
+        toolbox.omittedCounts.segmentAnalysisAssignments +
+        reviewToolOutputLength(toolbox, "workbook.get_segment_analysis_assignment_ledger", "rows")
+    }
+  };
+}
+
+function reviewToolOutputLength(toolbox: LlmWorkbookToolbox, toolName: string, property: string) {
+  const tool = toolbox.toolOutputs.find((item) => item.name === toolName);
+  if (!tool || !tool.output || typeof tool.output !== "object") return 0;
+  const value = (tool.output as Record<string, unknown>)[property];
+  return Array.isArray(value) ? value.length : 0;
 }
 
 function compactBalanceSheetAssignmentForReview(row: PrimaryBalanceSheetAssignmentLedgerRow) {
@@ -15781,6 +16453,7 @@ async function requestLlmMappingDecision(
     appTitle: OPENROUTER_APP_TITLE,
     timeoutMs,
     maxTokens: 700,
+    reasoningEffort: "low",
     sessionId: llmSessionId(company, "row-mapping"),
     jsonSchema: llmMappingJsonSchema(),
     messages: [
@@ -20621,7 +21294,7 @@ function assignPrimaryIncomeStatementLineItem(
     };
   }
 
-  const classifiedAssignment = classifiedPrimaryIncomeStatementAssignment(period, ctx, source, fillRows);
+  const classifiedAssignment = classifiedPrimaryIncomeStatementAssignment(period, ctx, source, section, fillRows);
   if (classifiedAssignment) return classifiedAssignment;
 
   const category = reportedLineItemCategory(source);
@@ -20681,14 +21354,28 @@ function assignPrimaryIncomeStatementLineItem(
       "Income tax expense/benefit rows map to income tax benefit / expense."
     );
   }
-  if (category === "other_non_operating_income_expense" || section === "below operating income") {
+  if (section === "below operating income") {
     return chooseOther(
       "Other Non-Operating Income / Expense",
       ["Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)"],
       "Below-operating income, expense, gain, and loss rows with no dedicated model row are grouped into other non-operating income / expense."
     );
   }
-  if (category === "other_operating_income_expense" || section === "operating expenses") {
+  if (section === "operating expenses") {
+    return chooseOther(
+      "Other Operating Income / Expense",
+      ["Other Operating Income (Expense)", "Other Operating Income", "Other Operating Expense"],
+      "Operating income/expense rows with no dedicated model row are grouped into other operating income / expense."
+    );
+  }
+  if (category === "other_non_operating_income_expense") {
+    return chooseOther(
+      "Other Non-Operating Income / Expense",
+      ["Other Nonoperating Income (Expense)", "Other Income (Expense)", "Other Expense (Income)"],
+      "Non-operating income, expense, gain, and loss rows with no dedicated model row are grouped into other non-operating income / expense."
+    );
+  }
+  if (category === "other_operating_income_expense") {
     return chooseOther(
       "Other Operating Income / Expense",
       ["Other Operating Income (Expense)", "Other Operating Income", "Other Operating Expense"],
@@ -20715,6 +21402,7 @@ function classifiedPrimaryIncomeStatementAssignment(
   period: string,
   ctx: ResolveContext,
   source: FactSource,
+  section: FinancialStatementSection,
   fillRows: FillRow[]
 ): PrimaryIncomeStatementAssignment | null {
   const classification = lineItemClassificationForSource(period, ctx, source);
@@ -20723,7 +21411,7 @@ function classifiedPrimaryIncomeStatementAssignment(
   if (!assignment) return null;
   if (!incomeStatementAssignmentModelRowIsAssignable(assignment.modelRow)) return null;
   if (modelRowsMatch(assignment.modelRow, "SG&A") && isExplicitOtherOperatingLineSource(source)) return null;
-  if (classificationAssignmentConflictsWithPrimaryIncomeStatementSemantics(source, assignment.modelRow)) return null;
+  if (classificationAssignmentConflictsWithPrimaryIncomeStatementSemantics(source, section, assignment.modelRow)) return null;
 
   return {
     modelRow: assignment.modelRow,
@@ -20732,9 +21420,15 @@ function classifiedPrimaryIncomeStatementAssignment(
   };
 }
 
-function classificationAssignmentConflictsWithPrimaryIncomeStatementSemantics(source: FactSource, modelRow: string) {
+function classificationAssignmentConflictsWithPrimaryIncomeStatementSemantics(
+  source: FactSource,
+  section: FinancialStatementSection,
+  modelRow: string
+) {
   if (isOperatingSpecialChargeSource(source) && !modelRowsMatch(modelRow, "Other Operating Income / Expense")) return true;
   if (isExplicitOtherOperatingLineSource(source) && !modelRowsMatch(modelRow, "Other Operating Income / Expense")) return true;
+  if (section === "operating expenses" && modelRowsMatch(modelRow, "Other Non-Operating Income / Expense")) return true;
+  if (section === "below operating income" && modelRowsMatch(modelRow, "Other Operating Income / Expense")) return true;
   return false;
 }
 
@@ -22695,6 +23389,7 @@ function isAllowedFormulaPreservationUpdate(cell: ExcelJS.Cell, expected: string
   if (!actual && isSegmentAnalysisTotalRewriteCell(cell)) return true;
   if (actual && isSegmentAnalysisTotalRewriteCell(cell)) return true;
   if (actual && isIncomeStatementClassificationBridgeFormulaCell(cell, actual)) return true;
+  if (actual && isIncomeStatementRoundingBridgeFormulaUpdate(cell, expected, actual)) return true;
   if (actual && isPostTaxEquityMethodBridgeFormulaUpdate(cell, actual)) return true;
   if (actual && isBridgeFormula(expected) && isBridgeFormula(actual)) return true;
   if (actual && isNumericSumFormula(expected) && isNumericSumFormula(actual)) return true;
@@ -22726,6 +23421,19 @@ function isIncomeStatementClassificationBridgeFormulaCell(cell: ExcelJS.Cell, fo
   if (!isBridgeFormula(formula)) return false;
   const label = normalize(rowLabel(cell.worksheet, Number(cell.row)));
   return incomeStatementClassificationRows().some((check) => check.labels.some((alias) => normalize(alias) === label));
+}
+
+function isIncomeStatementRoundingBridgeFormulaUpdate(cell: ExcelJS.Cell, expected: string, actual: string) {
+  const rowNumber = Number(cell.row);
+  const sectionStart = findSectionHeaderRow(cell.worksheet, "Income Statement");
+  const sectionEnd = findSectionHeaderRow(cell.worksheet, "Income Statement Analysis");
+  if (!sectionStart || rowNumber <= sectionStart || (sectionEnd && rowNumber >= sectionEnd)) return false;
+  const normalizedExpected = normalizeFormula(expected);
+  const normalizedActual = normalizeFormula(actual);
+  const prefix = `(${normalizedExpected})`;
+  if (!normalizedActual.startsWith(prefix)) return false;
+  const adjustment = Number(normalizedActual.slice(prefix.length));
+  return Number.isFinite(adjustment) && Math.abs(adjustment) > 0 && Math.abs(adjustment) <= 0.5;
 }
 
 function isPostTaxEquityMethodBridgeFormulaUpdate(cell: ExcelJS.Cell, formula: string) {
@@ -24369,8 +25077,11 @@ export const __fillModelServiceTestHooks = {
   llmMappingReviewFailureBlockingErrors,
   incomeStatementAssignmentCandidateRows,
   primaryIncomeStatementSourcesForPeriod,
+  selectPrimaryStatementRevenueSource,
+  primaryIncomeStatementRowMatchesPeriod,
   primaryStatementHasCostOfRevenueSplitWithSeparateDa,
   reportedLineItemCategory,
+  deterministicModelRowCandidateForSource,
   resolveInventory,
   resolveAccruedLiabilities,
   resolveGoodwill,
@@ -24382,7 +25093,22 @@ export const __fillModelServiceTestHooks = {
   resolveCostOfRevenue,
   resolvePrimaryStatementCostOfRevenue,
   resolveIncomeStatementDepreciationAmortization,
+  resolveOperatingIncome,
+  resolveInterestExpense,
   resolveOtherOperatingIncomeExpense,
+  primaryIncomeStatementOtherOperatingLineSources,
+  otherOperatingLineValue,
+  isNumericConstantFormula,
+  incomeStatementClassificationCellTiesResolvedValue,
+  sourceLooksLikeCurrentInvestment,
+  sourceLooksLikeCashLikeShortTermInvestment,
+  sourceLooksLikeNonCurrentCashBalance,
+  sourceLooksLikeCashBalance,
+  sourceLooksLikeCurrentDebtMaturity,
+  sourceLooksLikeNonCurrentDebt,
+  sourceLooksLikeCurrentSelfInsuranceReserve,
+  sourceLooksLikeNonCurrentSelfInsuranceReserve,
+  completeQuarterlyAnnualValue,
   isPostTaxEquityMethodBridgeFormulaUpdate,
   reconcilePostTaxEquityMethodNetIncomeBridge
 };

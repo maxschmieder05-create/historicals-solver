@@ -77,6 +77,8 @@ export type AccountingLlmRequest<T> = {
   messages: AccountingLlmMessage[];
   jsonSchema: unknown;
   maxTokens: number;
+  maxAttemptsPerModel?: number;
+  reasoningEffort?: "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
   timeoutMs: number;
   enabled?: boolean;
   sessionId?: string;
@@ -114,6 +116,10 @@ type OpenRouterRequestShape = {
   max_tokens?: number;
   max_completion_tokens?: number;
   temperature?: number;
+  reasoning?: {
+    effort: "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
+    exclude: boolean;
+  };
   session_id?: string;
 };
 
@@ -146,16 +152,25 @@ export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>)
   const modelCandidates = uniqueModels([request.model, ...(request.fallbackModels ?? [])]);
   const attemptTelemetry: AccountingLlmTelemetry[] = [];
   let lastResult: AccountingLlmResult<T> | null = null;
+  let lastCompletedFailure: AccountingLlmResult<T> | null = null;
+  const maxAttemptsPerModel = Math.max(1, Math.min(4, Math.floor(request.maxAttemptsPerModel ?? 1)));
 
   for (const model of modelCandidates) {
-    const result = await requestAccountingJsonForModel({ ...request, model });
-    attemptTelemetry.push(...(result.attemptTelemetry ?? [result.telemetry]));
-    if (result.value) return { ...result, attemptTelemetry };
-    lastResult = result;
-    if (!llmResultEligibleForFallback(result)) break;
+    for (let attempt = 0; attempt < maxAttemptsPerModel; attempt += 1) {
+      const result = await requestAccountingJsonForModel({ ...request, model });
+      attemptTelemetry.push(...(result.attemptTelemetry ?? [result.telemetry]));
+      if (result.value) return { ...result, attemptTelemetry };
+      lastResult = result;
+      if (result.rawText) lastCompletedFailure = result;
+      if (!llmResultEligibleForFallback(result)) break;
+    }
+    if (lastResult && !llmResultEligibleForFallback(lastResult)) break;
   }
 
-  if (lastResult) return { ...lastResult, attemptTelemetry };
+  if (lastResult) {
+    const resultToReturn = llmResultEligibleForFallback(lastResult) && lastCompletedFailure ? lastCompletedFailure : lastResult;
+    return { ...resultToReturn, attemptTelemetry };
+  }
   return requestAccountingJsonForModel(request);
 }
 
@@ -368,7 +383,8 @@ function buildOpenRouterRequestShape<T>(
     messages: request.messages,
     session_id: request.sessionId,
     provider: responseFormat ? { require_parameters: true, sort: "throughput" } : { sort: "throughput" },
-    response_format: responseFormat
+    response_format: responseFormat,
+    reasoning: request.reasoningEffort ? { effort: request.reasoningEffort, exclude: true } : undefined
   };
 
   if (capabilities.supportsMaxCompletionTokens && !capabilities.supportsMaxTokens) {
@@ -417,29 +433,32 @@ async function postOpenRouterJson<T>(
   const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
   try {
-    const response = await Promise.race([
-      fetchImpl(request.endpoint, {
-        method: "POST",
-        signal: controller.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${request.apiKey}`,
-          "HTTP-Referer": request.siteUrl,
-          "X-OpenRouter-Title": request.appTitle,
-          "X-Title": request.appTitle,
-          "X-OpenRouter-Metadata": "enabled",
-          ...(request.sessionId ? { "x-session-id": request.sessionId } : {})
-        },
-        body: JSON.stringify(shape)
-      }),
-      new Promise<Response>((_, reject) => {
+    const { response, body } = await Promise.race([
+      (async () => {
+        const response = await fetchImpl(request.endpoint, {
+          method: "POST",
+          signal: controller.signal,
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${request.apiKey}`,
+            "HTTP-Referer": request.siteUrl,
+            "X-OpenRouter-Title": request.appTitle,
+            "X-Title": request.appTitle,
+            "X-OpenRouter-Metadata": "enabled",
+            ...(request.sessionId ? { "x-session-id": request.sessionId } : {})
+          },
+          body: JSON.stringify(shape)
+        });
+        const body = await response.json().catch(() => null);
+        return { response, body };
+      })(),
+      new Promise<never>((_, reject) => {
         timeout = setTimeout(() => {
           controller.abort();
           reject(new Error(`OpenRouter ${request.purpose} timed out after ${request.timeoutMs}ms`));
         }, request.timeoutMs);
       })
     ]);
-    const body = await response.json().catch(() => null);
     const telemetry = telemetryFromOpenRouterResponse(
       request,
       shape,
@@ -525,7 +544,7 @@ function parseAndValidateResponse<T>(
 ): { ok: true; validation: Extract<AccountingLlmValidationResult<T>, { ok: true }> } | { ok: false; error: string; needsHumanReview: boolean } {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
+    parsed = parseLlmJson(text);
   } catch (error) {
     return {
       ok: false,
@@ -536,6 +555,34 @@ function parseAndValidateResponse<T>(
   const validation = validate(parsed);
   if (validation.ok) return { ok: true, validation };
   return { ok: false, error: validation.error, needsHumanReview: validation.needsHumanReview !== false };
+}
+
+function parseLlmJson(text: string) {
+  const trimmed = text.trim();
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // Some compatible providers wrap otherwise-valid structured output in a
+    // markdown fence despite response_format. Strip only the wrapper and keep
+    // schema validation as the authority for the parsed value.
+  }
+  const unfenced = trimmed
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  try {
+    return JSON.parse(unfenced);
+  } catch {
+    const objectStart = unfenced.indexOf("{");
+    const arrayStart = unfenced.indexOf("[");
+    const start = [objectStart, arrayStart].filter((index) => index >= 0).sort((a, b) => a - b)[0];
+    if (start === undefined) throw new Error("LLM response did not contain a JSON object or array");
+    const open = unfenced[start];
+    const close = open === "[" ? "]" : "}";
+    const end = unfenced.lastIndexOf(close);
+    if (end <= start) throw new Error("LLM response contained incomplete JSON");
+    return JSON.parse(unfenced.slice(start, end + 1));
+  }
 }
 
 function telemetryFromOpenRouterResponse<T>(
@@ -654,6 +701,8 @@ function responseOutputText(body: any) {
       .join("")
       .trim();
   }
+  const reasoning = body?.choices?.[0]?.message?.reasoning;
+  if (typeof reasoning === "string" && /[\[{]/.test(reasoning)) return reasoning.trim();
   const chunks: string[] = [];
   for (const item of body?.output ?? []) {
     if (item?.type !== "message") continue;
