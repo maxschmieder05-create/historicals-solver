@@ -68,8 +68,8 @@ const segment = {
   annualValues: new Map([["FY23", 70_000_000]])
 };
 
-assert.equal(writeSegmentFourthQuarterBridgeFormula(sheet, 8, columns, periods, 3, segment, "values", 40), true);
-assert.deepEqual(sheet.getCell("I8").value, { formula: "100-SUM(F8:H8)", result: 40 });
+assert.equal(writeSegmentFourthQuarterBridgeFormula(sheet, 8, columns, periods, 3, segment, "values", 40), false);
+assert.deepEqual(sheet.getCell("I8").value, { formula: "70-SUM(F8:H8)", result: 10 });
 assert.equal(
   writeSegmentMetricPreservingFormula(sheet.getCell("J8"), 100, {
     sheet,
@@ -80,9 +80,9 @@ assert.equal(
     segment,
     metric: "values"
   }),
-  true
+  false
 );
-assert.deepEqual(sheet.getCell("J8").value, { formula: "SUM(F8:I8)", result: 100 });
+assert.deepEqual(sheet.getCell("J8").value, { formula: "SUM(F8:I8)", result: 70 });
 
 sheet.getCell("C35").value = "Canada Operating Income";
 for (const address of ["F35", "G35", "H35", "I35"]) sheet.getCell(address).value = 0;
@@ -97,9 +97,13 @@ assert.equal(
     segment: { ...segment, operatingIncome: new Map([["FY23", 50_000_000]]) },
     metric: "operatingIncome"
   }),
-  true
+  false
 );
-assert.equal(sheet.getCell("J35").value, 50, "a disclosed annual value must replace a non-reconciling quarterly-sum formula");
+assert.deepEqual(
+  sheet.getCell("J35").value,
+  { formula: "SUM(F35:I35)" },
+  "a disclosed annual value must not replace a non-reconciling template formula"
+);
 
 sheet.getCell("K8").value = { formula: "'Revenue Build'!K8", result: 1 };
 assert.equal(writeSegmentMetricPreservingFormula(sheet.getCell("K8"), 25), true);
@@ -138,9 +142,10 @@ const daAddback = writeHistoricalEbitdaDaAddback(
   },
   daAuditRows
 );
-assert.equal(daAddback.filledCells, 1);
-assert.equal(model.getCell("F60").value, 25);
-assert.equal(daAuditRows[0].validationStatus, "OK!");
+assert.equal(daAddback.filledCells, 0);
+assert.deepEqual(model.getCell("F60").value, { formula: "-F34" });
+assert.match(daAddback.warnings[0], /formula was preserved/i);
+assert.equal(daAuditRows.length, 0);
 sheet.getCell("C51").value = "Total D&A";
 sheet.getCell("C59").value = "D&A Check";
 for (let row = 52; row <= 57; row += 1) sheet.getCell(row, 6).value = 0;
@@ -148,19 +153,21 @@ const auditRows = [];
 const reconciliation = reconcileSegmentMetricRowsToModelRow(sheet, ["1Q23"], [6], [52, 53, 54, 55, 56, 57], "D&A", auditRows, [
   "Depreciation & Amortization"
 ]);
-assert.equal(reconciliation.filledCells, 1);
+assert.equal(reconciliation.filledCells, 0);
 assert.equal(
   [52, 53, 54, 55, 56, 57].reduce((total, row) => total + (Number(sheet.getCell(row, 6).value) || 0), 0),
-  25
+  0
 );
-assert.match(sheet.getCell("C57").text, /Other \/ Reconciliation D&A/i);
-assert.equal(auditRows[0].validationStatus, "OK!");
+assert.equal(sheet.getCell("C57").text, "");
+assert.equal(auditRows.length, 0);
 
 sheet.getCell("C70").value = "Other International Operating Income";
 sheet.getCell("F70").value = 0;
 sheet.getCell("C71").value = "451";
 sheet.getCell("F71").value = 0;
+assert.equal(findSegmentResidualRow(sheet, [70, 71], 6, "Operating Income"), 70);
+assert.equal(sheet.getCell("C71").text, "451");
+sheet.getCell("C71").value = "Other / Reconciliation Operating Income";
 assert.equal(findSegmentResidualRow(sheet, [70, 71], 6, "Operating Income"), 71);
-assert.match(sheet.getCell("C71").text, /Other \/ Reconciliation Operating Income/i);
 
 console.log("Segment formula-write and annual bridge checks passed.");
