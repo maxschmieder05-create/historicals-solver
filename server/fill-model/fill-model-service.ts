@@ -482,6 +482,7 @@ type LlmMappingState = {
   enabled: boolean;
   mappingEnabled: boolean;
   reviewEnabled: boolean;
+  analystMode: boolean;
   signal?: AbortSignal;
   decisions: Map<number, FillRow | null>;
   warnings: string[];
@@ -494,6 +495,8 @@ type LlmMappingState = {
   telemetry: AccountingLlmTelemetry[];
   statusCounts: Record<AccountingLlmStatus, number>;
   maxCalls: number;
+  reservedReviewCalls: number;
+  reservedReviewMs: number;
   startedAt: number;
   deadlineAt: number;
   budgetWarningAdded: boolean;
@@ -967,12 +970,13 @@ function currentSecHeaders(accept = "application/json") {
 const OPENROUTER_CHAT_COMPLETIONS_URL = process.env.OPENROUTER_CHAT_COMPLETIONS_URL || "https://openrouter.ai/api/v1/chat/completions";
 const OPENROUTER_APP_TITLE = process.env.OPENROUTER_APP_TITLE || "Historicals Solver";
 const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost:3000";
-// Use a capable ultra-low-cost model by default; the configured free-router
-// fallback keeps transient provider failures from becoming more expensive.
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "deepseek/deepseek-v4-flash";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "deepseek/deepseek-v4-flash";
-const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "deepseek/deepseek-v4-flash";
-const DEFAULT_LLM_MAPPING_FALLBACK_MODELS = ["openrouter/free"];
+// The LLM is the responsible analyst, so use an accounting-capable frontier
+// model for both primary statement work and recovery. A capable paid fallback
+// prevents provider latency from silently downgrading the workbook to rules.
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "openai/gpt-5.6-sol-pro";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-5.6-sol-pro";
+const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "openai/gpt-5.6-sol-pro";
+const DEFAULT_LLM_MAPPING_FALLBACK_MODELS = ["anthropic/claude-sonnet-5"];
 const LLM_MAPPING_FAST_MODEL = normalizeConfiguredLlmModel(
   process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL,
   DEFAULT_LLM_MAPPING_FAST_MODEL
@@ -1000,18 +1004,29 @@ const LLM_MAPPING_REVIEW_FALLBACK_MODELS = llmFallbackModels(
   DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
   LLM_MAPPING_REVIEW_MODEL
 );
+// In analyst mode the LLM owns primary-statement classification and recovery.
+// Deterministic code gathers EDGAR evidence, writes the workbook, and validates
+// the result, but it must not silently replace an unavailable analyst with the
+// legacy mapper.
+const LLM_ANALYST_MODE = booleanEnv(process.env.LLM_ANALYST_MODE, true);
 const LLM_MAPPING_HARD_MAX_CALLS = positiveNumber(process.env.LLM_MAPPING_HARD_MAX_CALLS, 64);
 const LLM_MAPPING_MAX_CALLS = boundedPositiveNumber(process.env.LLM_MAPPING_MAX_CALLS, 48, LLM_MAPPING_HARD_MAX_CALLS);
+const LLM_MAPPING_REVIEW_RESERVED_CALLS = nonNegativeNumber(process.env.LLM_MAPPING_REVIEW_RESERVED_CALLS, 6);
+const LLM_MAPPING_REVIEW_RESERVED_MS = nonNegativeNumber(process.env.LLM_MAPPING_REVIEW_RESERVED_MS, 300_000);
 const LLM_MAPPING_REVIEW_MAX_ITEMS = boundedPositiveNumber(process.env.LLM_MAPPING_REVIEW_MAX_ITEMS, 1_200, 2_000);
-const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 120_000);
-const LLM_MAPPING_REVIEW_AUTOCORRECT = booleanEnv(process.env.LLM_MAPPING_REVIEW_AUTOCORRECT, false);
+const LLM_MAPPING_RECOVERY_MAX_ITEMS = boundedPositiveNumber(process.env.LLM_MAPPING_RECOVERY_MAX_ITEMS, 220, 500);
+// A recovery review reasons across several interdependent statement equations.
+// Frontier reasoning models can legitimately need more than two minutes for
+// this pass, especially when the provider queues a large structured response.
+const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 240_000);
+const LLM_MAPPING_REVIEW_AUTOCORRECT = booleanEnv(process.env.LLM_MAPPING_REVIEW_AUTOCORRECT, LLM_ANALYST_MODE);
 const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
 const LLM_MAPPING_TIMEOUT_MS = Number(process.env.LLM_MAPPING_TIMEOUT_MS || 10_000);
-// Keep LLM work comfortably inside the API's 15-minute request ceiling so
-// validation, OOXML restoration, and response serialization always have time.
-const LLM_TOTAL_TIMEOUT_MS = Math.min(Number(process.env.LLM_TOTAL_TIMEOUT_MS || 480_000), 480_000);
+// Keep LLM work inside the API's 15-minute request ceiling while leaving a
+// protected recovery window after slow provider responses.
+const LLM_TOTAL_TIMEOUT_MS = Math.min(Number(process.env.LLM_TOTAL_TIMEOUT_MS || 780_000), 780_000);
 const LLM_WORKBENCH_MAX_FACTS = Number(process.env.LLM_WORKBENCH_MAX_FACTS || 500);
 const LLM_WORKBENCH_MAX_STATEMENT_ROWS = Number(process.env.LLM_WORKBENCH_MAX_STATEMENT_ROWS || 650);
 const LLM_WORKBENCH_MAX_WORKBOOK_CELLS = Number(process.env.LLM_WORKBENCH_MAX_WORKBOOK_CELLS || 700);
@@ -1033,10 +1048,7 @@ const LLM_LINE_ITEM_CLASSIFICATION_MAX_CALLS = Number(
 const LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS = Number(process.env.LLM_LINE_ITEM_CLASSIFICATION_TIMEOUT_MS || 90_000);
 const LLM_PREFILL_ANALYST_MATERIALITY_USD = Number(process.env.LLM_PREFILL_ANALYST_MATERIALITY_USD || 500_000);
 const LLM_FULL_STATEMENT_COVERAGE = booleanEnv(process.env.LLM_FULL_STATEMENT_COVERAGE, true);
-// Deterministic SEC coverage and workbook tie-outs are the hard gate. Complete
-// LLM coverage is advisory by default so provider latency/outages cannot block
-// an otherwise fully validated workbook.
-const LLM_REQUIRE_FULL_STATEMENT_COVERAGE = booleanEnv(process.env.LLM_REQUIRE_FULL_STATEMENT_COVERAGE, false);
+const LLM_REQUIRE_FULL_STATEMENT_COVERAGE = booleanEnv(process.env.LLM_REQUIRE_FULL_STATEMENT_COVERAGE, LLM_ANALYST_MODE);
 
 function positiveNumber(value: string | number | undefined, fallback: number) {
   const parsed = Number(value ?? fallback);
@@ -1045,6 +1057,11 @@ function positiveNumber(value: string | number | undefined, fallback: number) {
 
 function boundedPositiveNumber(value: string | number | undefined, fallback: number, max: number) {
   return Math.min(positiveNumber(value, fallback), positiveNumber(max, fallback));
+}
+
+function nonNegativeNumber(value: string | number | undefined, fallback: number) {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 }
 
 function booleanEnv(value: string | undefined, fallback: boolean) {
@@ -2947,6 +2964,14 @@ function isPrimaryIncomeStatementStructure(statement: SecFilingStatementStructur
   const text = `${statement.statementName} ${statement.roleUri ?? ""}`.toLowerCase();
   const combinesIncomeAndComprehensiveIncome =
     /\b(?:income|earnings|operations?|profit|loss)\b.*\b(?:and|&)\b.*\b(?:other\s+)?comprehensive (?:income|loss)\b/.test(text);
+  const equityRollForwardMarkers = [
+    /shares? of common stock/,
+    /additional paid[-\s]?in capital/,
+    /retained earnings|accumulated deficit/,
+    /accumulated other comprehensive/,
+    /stock issued|stock repurchased|share[-\s]?based compensation/
+  ].filter((pattern) => pattern.test(text)).length;
+  if (equityRollForwardMarkers >= 2) return false;
   if (/\b(cash flows?|balance sheets?|financial position|stockholders?|shareholders?|equity)\b/.test(text)) return false;
   if (/\b(?:other\s+)?comprehensive (?:income|loss)\b/.test(text) && !combinesIncomeAndComprehensiveIncome) {
     return false;
@@ -3461,7 +3486,7 @@ async function buildLineItemClassificationStore(
         appTitle: OPENROUTER_APP_TITLE,
         timeoutMs: Math.max(1_000, Math.min(lineItemLlmTimeoutMs, llmTimeRemainingMs(state))),
         deadlineAt: state.deadlineAt,
-        maxAttempts: Math.max(0, Math.min(maxLineItemLlmCalls - lineItemLlmAttempts, state.maxCalls - state.attempts))
+        maxAttempts: Math.max(0, Math.min(maxLineItemLlmCalls - lineItemLlmAttempts, llmMappingAttemptsRemaining(state)))
       },
       statementAnalystPass: {
         enabled: true,
@@ -11010,7 +11035,10 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
       mismatchedPeriods: primaryBalanceSheetAssignmentDiagnostics(balanceSheetPeriods, validationBalanceAssignments, ctx)
     });
 
-    let validationResult = validateWorkbookWithAutomaticRetries(validationOptions);
+    const analystOwnsValidationRecovery = llmAnalystControlsValidation(llmState);
+    let validationResult = analystOwnsValidationRecovery
+      ? validateWorkbookForAnalystRecovery(validationOptions)
+      : validateWorkbookWithAutomaticRetries(validationOptions);
     throwIfFillAborted(input.signal, debug.filePath);
     filledCells += validationResult.filledCells;
     commentsAdded += validationResult.commentsAdded;
@@ -11088,7 +11116,9 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
         commentsAdded += recoveryFinalization.commentsAdded;
         warnings.push(...recoveryFinalization.warnings);
         prepareWorkbookForValidationRetry(validationOptions);
-        const recoveredValidation = validateWorkbookWithAutomaticRetries(validationOptions);
+        const recoveredValidation = analystOwnsValidationRecovery
+          ? validateWorkbookForAnalystRecovery(validationOptions)
+          : validateWorkbookWithAutomaticRetries(validationOptions);
         filledCells += recoveredValidation.filledCells;
         commentsAdded += recoveredValidation.commentsAdded;
         const attemptOffset = validationResult.attempts.length;
@@ -11193,7 +11223,9 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
         commentsAdded += correctionRebuild.commentsAdded;
         warnings.push(...correctionRebuild.warnings);
         prepareWorkbookForValidationRetry(validationOptions);
-        const correctionValidation = validateWorkbookWithAutomaticRetries(validationOptions);
+        const correctionValidation = analystOwnsValidationRecovery
+          ? validateWorkbookForAnalystRecovery(validationOptions)
+          : validateWorkbookWithAutomaticRetries(validationOptions);
         filledCells += correctionValidation.filledCells;
         commentsAdded += correctionValidation.commentsAdded;
         if (correctionValidation.errors.length) {
@@ -19025,6 +19057,7 @@ function createLlmMappingState(signal?: AbortSignal): LlmMappingState {
     enabled: requestedByEnv && hasApiKey,
     mappingEnabled: mappingEnabledByEnv && hasApiKey,
     reviewEnabled: reviewEnabledByEnv && hasApiKey,
+    analystMode: LLM_ANALYST_MODE && mappingEnabledByEnv && reviewEnabledByEnv && hasApiKey,
     signal,
     decisions: new Map(),
     warnings: requestedByEnv && !hasApiKey ? ["LLM mapping or review was enabled but the endpoint-specific API key was not set; deterministic EDGAR mapping and validation were used."] : [],
@@ -19037,6 +19070,11 @@ function createLlmMappingState(signal?: AbortSignal): LlmMappingState {
     telemetry: [],
     statusCounts: emptyLlmStatusCounts(),
     maxCalls: Number.isFinite(LLM_MAPPING_MAX_CALLS) && LLM_MAPPING_MAX_CALLS >= 0 ? LLM_MAPPING_MAX_CALLS : 24,
+    reservedReviewCalls: Math.min(
+      Number.isFinite(LLM_MAPPING_REVIEW_RESERVED_CALLS) ? LLM_MAPPING_REVIEW_RESERVED_CALLS : 6,
+      Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24
+    ),
+    reservedReviewMs: Number.isFinite(LLM_MAPPING_REVIEW_RESERVED_MS) ? LLM_MAPPING_REVIEW_RESERVED_MS : 180_000,
     startedAt,
     deadlineAt: startedAt + maxDurationMs,
     budgetWarningAdded: false,
@@ -19102,7 +19140,17 @@ function llmCanUse(state: LlmMappingState, minRemainingMs = 1_000) {
 }
 
 function llmMappingCanUse(state: LlmMappingState, minRemainingMs = 1_000) {
-  return state.mappingEnabled && llmCanUse(state, minRemainingMs);
+  if (!state.mappingEnabled || !state.enabled) return false;
+  if (llmMappingAttemptsRemaining(state) <= 0) return false;
+  return llmTimeRemainingMs(state) >= minRemainingMs + state.reservedReviewMs;
+}
+
+function llmMappingAttemptsRemaining(state: LlmMappingState) {
+  return Math.max(0, state.maxCalls - state.reservedReviewCalls - state.attempts);
+}
+
+function llmAnalystControlsValidation(state: LlmMappingState) {
+  return state.analystMode && state.enabled && state.mappingEnabled && state.reviewEnabled;
 }
 
 function llmMappingStateSummary(state: LlmMappingState) {
@@ -19111,6 +19159,7 @@ function llmMappingStateSummary(state: LlmMappingState) {
     enabled: state.enabled,
     mappingEnabled: state.mappingEnabled,
     reviewEnabled: state.reviewEnabled,
+    analystMode: state.analystMode,
     calls: state.calls,
     attempts: state.attempts,
     successfulCompletions: state.successfulCompletions,
@@ -19119,6 +19168,9 @@ function llmMappingStateSummary(state: LlmMappingState) {
     affectedOutputDecisions: state.affectedOutputDecisions,
     statusCounts: state.statusCounts,
     maxCalls: state.maxCalls,
+    mappingAttemptsRemaining: llmMappingAttemptsRemaining(state),
+    reservedReviewCalls: state.reservedReviewCalls,
+    reservedReviewMs: state.reservedReviewMs,
     remainingMs: llmTimeRemainingMs(state),
     decisionCount: state.decisions.size,
     models: aggregate.models,
@@ -19163,7 +19215,7 @@ function llmMappingReviewEnabledByEnv() {
 }
 
 function llmMappingReviewBlockingEnabled() {
-  return booleanEnv(process.env.LLM_MAPPING_REVIEW_BLOCKING, false);
+  return booleanEnv(process.env.LLM_MAPPING_REVIEW_BLOCKING, LLM_ANALYST_MODE);
 }
 
 async function runLlmMappingReview(
@@ -19291,6 +19343,12 @@ function isActionableLlmMappingBlockingIssue(issue: LlmMappingReviewIssue) {
   const scope = `${issue.period} ${issue.sourceLineItemLabel} ${issue.currentModelRow} ${issue.reason}`.toLowerCase();
   if (/assignment ledger contains zero|mapping audit rows are entirely absent|omitted|payload|structural gap|no documented assignment/.test(scope)) return false;
   if (!issue.period || /^all\b/i.test(issue.period)) return false;
+  if (
+    issue.issueType === "unsupported_exclusion" &&
+    (!issue.recommendedModelRow || modelRowsMatch(issue.recommendedModelRow, issue.currentModelRow))
+  ) {
+    return Boolean(issue.sourceLineItemLabel && issue.currentModelRow);
+  }
   return Boolean(issue.sourceLineItemLabel && issue.recommendedModelRow && issue.recommendedModelRow !== issue.currentModelRow);
 }
 
@@ -19308,32 +19366,10 @@ export function applyLlmMappingReviewCorrections(input: {
       rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: review issue requires a non-routing repair.`);
       continue;
     }
-    const recommendedModelRow =
-      input.availableModelRows.find((row) => modelRowsMatch(row, issue.recommendedModelRow)) ?? "";
-    if (!recommendedModelRow) {
-      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row ${issue.recommendedModelRow} is not present in the template.`);
-      continue;
-    }
     const balanceAssignment = findReviewBalanceAssignment(issue, input.balanceAssignments);
     const incomeAssignment = balanceAssignment ? null : findReviewIncomeAssignment(issue, input.incomeAssignments);
     if (!balanceAssignment && !incomeAssignment) {
       rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: no matching primary-statement assignment was found.`);
-      continue;
-    }
-    if (
-      balanceAssignment &&
-      (!balanceSheetSectionCompatible(recommendedModelRow, balanceAssignment.sourceSection as BalanceSheetSourceSection, {
-        label: balanceAssignment.sourceLineItemLabel,
-        tag: balanceAssignment.sourceXbrlTag
-      }) ||
-        (reviewExpectedBalanceSheetSide(balanceAssignment) !== "unknown" &&
-          primaryBalanceSheetAssignmentSideForModelRow(recommendedModelRow) !== reviewExpectedBalanceSheetSide(balanceAssignment)))
-    ) {
-      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row failed balance-sheet section/side validation.`);
-      continue;
-    }
-    if (incomeAssignment && !incomeStatementAssignmentModelRowIsAssignable(recommendedModelRow)) {
-      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row is not an assignable income-statement input row.`);
       continue;
     }
     const assignment = balanceAssignment ?? incomeAssignment!;
@@ -19352,16 +19388,77 @@ export function applyLlmMappingReviewCorrections(input: {
         assignment.sourceLineItemLabel,
         balanceAssignment?.sourceSection ?? incomeAssignment?.sourceSection ?? "unknown"
       );
-    const corrected = correctedClassificationFromReview(seed, recommendedModelRow, issue);
-    if (existing) {
-      for (const [key, value] of input.classifications) {
-        if (value === existing) input.classifications.set(key, corrected);
-      }
+    const shouldExclude =
+      issue.issueType === "unsupported_exclusion" &&
+      (!issue.recommendedModelRow || modelRowsMatch(issue.recommendedModelRow, issue.currentModelRow));
+    if (shouldExclude) {
+      const corrected = excludedClassificationFromReview(seed, issue);
+      replaceClassificationInStore(input.classifications, classificationKeys, existing, corrected);
+      repairs.push(`${assignment.fiscalPeriod} ${assignment.sourceLineItemLabel}: excluded as subtotal/component to prevent double-counting`);
+      continue;
     }
-    classificationKeys.forEach((key) => input.classifications.set(key, corrected));
+    const recommendedModelRow =
+      input.availableModelRows.find((row) => modelRowsMatch(row, issue.recommendedModelRow)) ?? "";
+    if (!recommendedModelRow) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row ${issue.recommendedModelRow} is not present in the template.`);
+      continue;
+    }
+    if (
+      balanceAssignment &&
+      (!balanceSheetSectionCompatible(recommendedModelRow, balanceAssignment.sourceSection as BalanceSheetSourceSection, {
+        label: balanceAssignment.sourceLineItemLabel,
+        tag: balanceAssignment.sourceXbrlTag
+      }) ||
+        (reviewExpectedBalanceSheetSide(balanceAssignment) !== "unknown" &&
+          primaryBalanceSheetAssignmentSideForModelRow(recommendedModelRow) !== reviewExpectedBalanceSheetSide(balanceAssignment)))
+    ) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row failed balance-sheet section/side validation.`);
+      continue;
+    }
+    if (incomeAssignment && !incomeStatementAssignmentModelRowIsAssignable(recommendedModelRow)) {
+      rejected.push(`${issue.period} ${issue.sourceLineItemLabel}: recommended row is not an assignable income-statement input row.`);
+      continue;
+    }
+    const corrected = correctedClassificationFromReview(seed, recommendedModelRow, issue);
+    replaceClassificationInStore(input.classifications, classificationKeys, existing, corrected);
     repairs.push(`${assignment.fiscalPeriod} ${assignment.sourceLineItemLabel}: ${issue.currentModelRow || "excluded"} -> ${recommendedModelRow}`);
   }
   return { changed: repairs.length > 0, repairs: unique(repairs), rejected: unique(rejected) };
+}
+
+function replaceClassificationInStore(
+  store: FinancialLineItemClassificationStore,
+  classificationKeys: string[],
+  existing: FinancialLineItemClassification | undefined,
+  corrected: FinancialLineItemClassification
+) {
+  if (existing) {
+    for (const [key, value] of store) {
+      if (value === existing) store.set(key, corrected);
+    }
+  }
+  classificationKeys.forEach((key) => store.set(key, corrected));
+}
+
+function excludedClassificationFromReview(
+  classification: FinancialLineItemClassification,
+  issue: LlmMappingReviewIssue
+): FinancialLineItemClassification {
+  return {
+    ...classification,
+    recommended_action: "exclude",
+    classification_type: "LLM reviewer subtotal/component exclusion",
+    is_subtotal: true,
+    should_exclude_from_other_bucket: true,
+    confidence: "high",
+    reason: `LLM workbook reviewer exclusion: ${issue.reason}`,
+    requires_validation: true,
+    requires_revalidation: true,
+    llm_used: true,
+    llm_status: "completed_validated",
+    mapping_passed_validation: true,
+    warning: undefined
+  };
 }
 
 function reviewExpectedBalanceSheetSide(row: PrimaryBalanceSheetAssignmentLedgerRow): BalanceSheetAssignmentSide {
@@ -19560,13 +19657,15 @@ async function requestLlmMappingReview(
   const apiKey = llmApiKey();
 
   const system = [
-    "You are an accounting review controller for an EDGAR-sourced financial model historicals system.",
+    "You are the responsible human-equivalent financial analyst for an EDGAR-sourced financial model historicals system, not an advisory reviewer around a deterministic mapper.",
     llmWorkbookToolboxSystemInstruction(),
     "Review every provided mapping and source coverage item using accounting reasoning, SEC statement context, XBRL tag semantics, current/non-current section, subtotal/component relationships, model row definitions, and validation status.",
     "Use only the provided EDGAR source rows, mapping audit rows, source ledger rows, and assignment ledgers, including income-statement, balance-sheet, and Segment Analysis ledgers. Do not invent facts, line items, or amounts.",
     "Confirm that every provided primary SEC line item and Segment Analysis line item, regardless of size, is either assigned to the correct model row, grouped into the correct Other/reconciliation row because no better row exists, explicitly excluded with a valid accounting reason, or preserved as a formula with source support.",
     "This review is not centered on any one example. Treat examples such as short-term investments, current maturities of debt, deferred revenue, advertising, lease liabilities, pension liabilities, and equity method income as non-exhaustive patterns for accounting-substance routing.",
     "For any random SEC line item, ask which model row a careful human analyst would use after looking at the statement, subtotal context, XBRL concept, model row definitions, and reconciliation impact.",
+    "When workbook.validate_return contains blocking failures, actively diagnose them from the supplied EDGAR statement rows and assignment ledgers. Do not approve the workbook or merely repeat the validation text. Return an error issue for every source-row routing decision that must change, using the exact period, sourceLineItemLabel, sourceXbrlTag, currentModelRow, and an available recommendedModelRow so the controller can apply the correction and rerun validation.",
+    "Treat a failed accounting equation as evidence that one or more classifications, exclusions, signs, or subtotal/component decisions must be reconsidered across the whole statement. Compare all affected sibling lines together rather than reviewing each failed formula in isolation.",
     "Current marketable securities, available-for-sale securities, and short-term investments belong in a dedicated current-investments row when present. Otherwise group them with Cash & Cash Equivalents if the template has a cash row; use the current-assets residual only when there is no cash or current-investment row.",
     "Current maturities/current portion of long-term debt belong with LT Debt including current portion, not Revolver. Short-term borrowings, commercial paper, and notes payable current may belong in Revolver/current borrowings.",
     "Deferred revenue or contract liabilities are operating liabilities, not deferred income taxes. Deferred tax assets/liabilities require tax-specific semantics.",
@@ -19655,7 +19754,7 @@ function llmMappingReviewPayload(
     classification: row.classification
   }));
   const availableModelRows = unique(fillRows.map((row) => row.label).filter(Boolean));
-  const maxItems = Number.isFinite(LLM_MAPPING_REVIEW_MAX_ITEMS) && LLM_MAPPING_REVIEW_MAX_ITEMS > 0 ? LLM_MAPPING_REVIEW_MAX_ITEMS : Number.POSITIVE_INFINITY;
+  const maxItems = llmMappingReviewItemLimit(llmWorkbookToolbox);
   const balanceAssignments = latestSemanticReviewRows(balanceSheetAssignmentLedgerRows, (row) =>
     [
       normalize(row.sourceLineItemLabel),
@@ -19718,11 +19817,14 @@ function llmMappingReviewPayload(
     company: { ticker: company.ticker, name: company.title, cik: company.cik },
     periods,
     reviewInstructions: {
+      mode: llmWorkbookToolbox.verificationGate.blockingFailures.length ? "validation_recovery" : "final_workbook_review",
       sourceOfTruth: "All source values and source labels must come from SEC EDGAR evidence included in this payload.",
       accountingGoal:
         "Verify every source line is either correctly transferred into a model row or Segment Analysis row, deliberately grouped, explicitly excluded, or preserved by supported formula logic. Apply this to the whole template, not just the example rules.",
       routingPolicy:
         "Act like a human analyst with the SEC filing, Model tab, and Segment Analysis tab open side by side: choose the destination row by accounting substance, statement or segment-table context, XBRL semantics, subtotal context, model row definitions, and reconciliation impact.",
+      failedValidationPolicy:
+        "If workbook.validate_return failed, diagnose the underlying source-row decisions and emit exact actionable error issues. Never approve, restate the error without a correction, or defer to the deterministic mapper.",
       coverageCompaction:
         "Repeated period instances of the same source-tag/label to model-row decision are represented by the latest period. Every distinct destination, assignment status, section, side, mapping type, and validation status remains a separate review item; the representative retains the latest classification reason for review.",
       examplesAreNonExhaustive: true,
@@ -19757,6 +19859,19 @@ function llmMappingReviewPayload(
       mappingAuditRows: auditRows.length - mappingRows.length
     }
   };
+}
+
+function llmMappingReviewItemLimit(llmWorkbookToolbox: LlmWorkbookToolbox) {
+  const configured =
+    Number.isFinite(LLM_MAPPING_REVIEW_MAX_ITEMS) && LLM_MAPPING_REVIEW_MAX_ITEMS > 0
+      ? LLM_MAPPING_REVIEW_MAX_ITEMS
+      : Number.POSITIVE_INFINITY;
+  if (!llmWorkbookToolbox.verificationGate.blockingFailures.length) return configured;
+  const recoveryLimit =
+    Number.isFinite(LLM_MAPPING_RECOVERY_MAX_ITEMS) && LLM_MAPPING_RECOVERY_MAX_ITEMS > 0
+      ? LLM_MAPPING_RECOVERY_MAX_ITEMS
+      : 220;
+  return Math.min(configured, recoveryLimit);
 }
 
 function latestSemanticReviewRows<T>(rows: T[], semanticKey: (row: T) => string) {
@@ -20358,7 +20473,7 @@ async function llmAssistedFillRow(
       debug,
       state.signal,
       state.deadlineAt,
-      Math.max(0, state.maxCalls - state.attempts)
+      llmMappingAttemptsRemaining(state)
     );
     throwIfFillAborted(state.signal, debug.filePath);
     recordLlmTelemetryAttempts(state, result);
@@ -21631,6 +21746,20 @@ function validateWorkbookWithAutomaticRetries(options: WorkbookValidationRetryOp
   }
 
   return { errors, attempts, filledCells, commentsAdded };
+}
+
+function validateWorkbookForAnalystRecovery(options: WorkbookValidationRetryOptions): {
+  errors: string[];
+  attempts: ValidationRetryAttempt[];
+  filledCells: number;
+  commentsAdded: number;
+} {
+  return {
+    errors: runWorkbookReturnValidation(options),
+    attempts: [],
+    filledCells: 0,
+    commentsAdded: 0
+  };
 }
 
 function shouldStopRepeatedUnrepairableValidationFailure(previousSignature: string, nextSignature: string, repairChangedCells: number) {
@@ -32503,6 +32632,7 @@ export const __fillModelServiceTestHooks = {
   validationRepairStrategy,
   validationFailureSignature,
   shouldStopRepeatedUnrepairableValidationFailure,
+  validateWorkbookForAnalystRecovery,
   primaryBalanceSheetRowsHaveStructuralAnchor,
   isPrimaryIncomeStatementStructure,
   selectPrimaryBalanceSheetStatementCandidates,
@@ -32521,6 +32651,9 @@ export const __fillModelServiceTestHooks = {
   llmApiKeyForEndpoint,
   createLlmMappingState,
   llmMappingCanUse,
+  llmMappingAttemptsRemaining,
+  llmAnalystControlsValidation,
+  llmMappingReviewItemLimit,
   llmMappingStateSummary,
   llmMappingReviewFailureBlockingErrors,
   runLlmMappingReview,

@@ -177,7 +177,8 @@ export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>)
     Date.now() + configuredTimeoutMs
   );
 
-  for (const model of modelCandidates) {
+  for (let modelIndex = 0; modelIndex < modelCandidates.length; modelIndex += 1) {
+    const model = modelCandidates[modelIndex];
     for (let attempt = 0; attempt < maxAttemptsPerModel; attempt += 1) {
       const remainingAttempts = maxTotalAttempts - attemptedTelemetryCount(attemptTelemetry);
       if (remainingAttempts <= 0) return lastResult ?? accountingLlmAttemptBudgetResult(request, attemptTelemetry);
@@ -188,12 +189,18 @@ export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>)
       }
       const remainingMs = requestDeadlineAt - Date.now();
       if (remainingMs <= 0) return lastResult ? { ...lastResult, attemptTelemetry } : accountingLlmDeadlineResult(request, attemptTelemetry);
+      // A timeout from the preferred provider must leave enough of the shared
+      // request budget for a configured fallback. Without this reserve, the
+      // first model can consume the entire deadline and the fallback is only
+      // nominally configured.
+      const hasLaterFallback = modelIndex < modelCandidates.length - 1;
+      const modelAttemptMs = hasLaterFallback ? Math.max(1, Math.floor(remainingMs * 0.75)) : remainingMs;
       const result = await requestAccountingJsonForModel({
         ...request,
         model,
         maxTotalAttempts: remainingAttempts,
         deadlineAt: requestDeadlineAt,
-        timeoutMs: Math.max(1, Math.min(configuredTimeoutMs, remainingMs))
+        timeoutMs: Math.max(1, Math.min(configuredTimeoutMs, modelAttemptMs))
       });
       attemptTelemetry.push(...(result.attemptTelemetry ?? [result.telemetry]));
       if (accountingLlmResultHasValue(result)) return { ...result, attemptTelemetry };

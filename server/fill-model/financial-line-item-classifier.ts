@@ -460,7 +460,7 @@ async function classifyFinancialStatementLineItemsWithinBudget(
   if (result.value) {
     const response = result.value;
     const byRowKey = new Map(response.classifications.map((item) => [item.source_row_key, item]));
-    const merged = classificationTargets.map((item) => {
+    let merged = classificationTargets.map((item) => {
       const llmDecision = item.needsLlm ? byRowKey.get(item.rowKey) : null;
       if (!llmDecision) return { request: item.request, classification: item.initialClassification };
       return {
@@ -472,11 +472,32 @@ async function classifyFinancialStatementLineItemsWithinBudget(
         })
       };
     });
-    const missingTargets = targets.filter((item) => !byRowKey.has(item.rowKey));
-    const warnings = missingTargets.map(
-      (item) =>
-        `${item.request.cleanLabel || item.request.reportedLineItemLabel}: statement-level LLM did not return a classification; deterministic fallback was used.`
-    );
+    const missingTargets = targets.filter((item) => {
+      const decision = byRowKey.get(item.rowKey);
+      return !decision || !statementDecisionWasAcceptedFromLlm(decision);
+    });
+    let retryResult: FinancialStatementLineItemClassificationResult | null = null;
+    if (missingTargets.length && attemptBudget.remaining > 0 && !llm.signal?.aborted) {
+      retryResult = await classifyFinancialStatementLineItemsWithinBudget(
+        missingTargets.map((item) => item.request),
+        options,
+        attemptBudget
+      );
+      const retryByKey = new Map(
+        retryResult.classifications.map((item, index) => [sourceRowKeyForRequest(item.request, index), item.classification])
+      );
+      merged = merged.map((item) => {
+        const key = sourceRowKeyForRequest(item.request, 0);
+        const retried = retryByKey.get(key);
+        return retried ? { request: item.request, classification: retried } : item;
+      });
+    }
+    const warnings = retryResult
+      ? retryResult.warnings
+      : missingTargets.map(
+          (item) =>
+            `${item.request.cleanLabel || item.request.reportedLineItemLabel}: statement-level LLM did not return a classification; deterministic fallback was used.`
+        );
     const reviewed = merged.filter(({ classification }) => classification.llm_used);
     const accepted = reviewed.filter(({ classification }) => statementClassificationAccepted(classification));
     const acceptedRequests = new Set(accepted.map(({ request }) => request));
@@ -486,10 +507,10 @@ async function classifyFinancialStatementLineItemsWithinBudget(
     return {
       classifications: merged,
       warnings,
-      llmCalls: telemetry.filter((item) => item.completed).length,
-      llmAttempts: telemetry.filter((item) => item.attempted).length,
-      llmSuccessfulCompletions: telemetry.filter((item) => item.completed).length,
-      llmTelemetry: telemetry,
+      llmCalls: telemetry.filter((item) => item.completed).length + (retryResult?.llmCalls ?? 0),
+      llmAttempts: telemetry.filter((item) => item.attempted).length + (retryResult?.llmAttempts ?? 0),
+      llmSuccessfulCompletions: telemetry.filter((item) => item.completed).length + (retryResult?.llmSuccessfulCompletions ?? 0),
+      llmTelemetry: [...telemetry, ...(retryResult?.llmTelemetry ?? [])],
       targetCount: classificationTargets.length,
       llmReviewedCount: reviewed.length,
       acceptedDecisionCount: accepted.length,
@@ -666,7 +687,7 @@ export function fullStatementLineItemNeedsAnalystPass(request: FinancialLineItem
   }
   if (
     request.statement === "income_statement" &&
-    (/\bgross profit\b|\bgross margin\b|\boperating income\b|\boperating loss\b|\bincome (?:loss )?from operations\b|\bincome before (?:income )?tax|\bpretax (?:income|loss)\b|\bnet income\b|\bnet loss\b|\bprofit loss\b/.test(
+    (/\bgross profit\b|\bgross margin\b|\boperating income\b|\boperating loss\b|\bincome (?:loss )?from operations\b|\bincome before (?:provision for )?(?:income )?tax|\bpretax (?:income|loss)\b|\bnet income\b|\bnet loss\b|\bprofit loss\b/.test(
       text
     ) ||
       /^(?:grossprofit|operatingincomeloss|incomelossfromcontinuingoperationsbeforeincometaxes|incomelossfromcontinuingoperations|profitloss|netincomeloss)$/.test(
@@ -1373,7 +1394,9 @@ const INCOME_STATEMENT_CLASSIFICATION_ROWS = [
 
 export function classificationPassesValidation(request: FinancialLineItemClassificationRequest, classification: FinancialLineItemClassification) {
   const action = classification.recommended_action ?? "map";
-  if (action === "exclude") return request.isSubtotal;
+  if (action === "exclude") {
+    return request.isSubtotal || analystSupportedSubtotalExclusion(classification);
+  }
   if (action === "set_zero" || action === "keep_existing" || action === "split_across_rows") return false;
   if (action !== "map" && action !== "remap" && action !== "merge_into_other") return false;
   if (request.isSubtotal) return false;
@@ -1395,6 +1418,13 @@ export function classificationPassesValidation(request: FinancialLineItemClassif
     return incomeStatementClassificationPassesTrustedValidation(request, requestedRow, action, semantics);
   }
   return false;
+}
+
+function analystSupportedSubtotalExclusion(classification: FinancialLineItemClassification) {
+  if (!classification.is_subtotal || classification.confidence === "low") return false;
+  return /subtotal|duplicate|double[-\s]?count|components? (?:are|is|mapped|reported|presented) separately|already (?:mapped|included|captured)/i.test(
+    classification.reason || ""
+  );
 }
 
 function trustedSourceSemantics(request: FinancialLineItemClassificationRequest) {
@@ -1557,11 +1587,17 @@ function balanceSheetClassificationPassesTrustedValidation(
 ) {
   const definition = balanceSheetRowDefinitionForLabel(row) ?? balanceSheetRowDefinitionForLabel(availableRow);
   if (!definition || definition.family === "totals" || definition.kind === "subtotal" || definition.kind === "total") return false;
+  const analystSupportedGenericCurrentDebt =
+    semantics.balanceSheetSection === "current liabilities" &&
+    semantics.debt &&
+    !semantics.shortTermBorrowing &&
+    (modelRowsMatch(row, "LT Debt (Incl. Current Portion)") || modelRowsMatch(row, "Total Debt"));
   if (
     !balanceSheetSectionCompatible(row, semantics.balanceSheetSection, {
       label: request.cleanLabel || request.reportedLineItemLabel,
       tag: request.xbrlTag
-    })
+    }) &&
+    !analystSupportedGenericCurrentDebt
   ) {
     return false;
   }
@@ -1585,7 +1621,11 @@ function balanceSheetTargetAllowedForSection(
   if (section === "non-current assets") return family === "non_current_assets";
   if (section === "current liabilities") {
     if (family === "current_liabilities") return true;
-    return semantics.currentLongTermDebt && (modelRowsMatch(row, "LT Debt (Incl. Current Portion)") || modelRowsMatch(row, "Total Debt"));
+    return (
+      semantics.debt &&
+      !semantics.shortTermBorrowing &&
+      (modelRowsMatch(row, "LT Debt (Incl. Current Portion)") || modelRowsMatch(row, "Total Debt"))
+    );
   }
   if (section === "non-current liabilities") return family === "non_current_liabilities";
   if (section === "equity") {
@@ -2135,6 +2175,12 @@ function statementDecisionToClassification(
           ? true
           : fallback.is_operating,
     is_deferred_tax: modelRowsMatch(requestedRow, "Deferred Income Taxes") ? true : fallback.is_deferred_tax,
+    is_subtotal:
+      decision.recommended_action === "exclude"
+        ? /subtotal|duplicate|double[-\s]?count|components? (?:are|is|mapped|reported|presented) separately|already (?:mapped|included|captured)/i.test(
+            decision.reason
+          )
+        : fallback.is_subtotal,
     should_exclude_from_other_bucket: !isReusableOtherBucketModelRow(requestedRow),
     confidence: decision.confidence,
     reason: decision.reason,

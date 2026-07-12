@@ -115,9 +115,29 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
 
     process.env.LLM_MAPPING_REVIEW_ENABLED = "true";
     process.env.LLM_MAPPING_REVIEW_BLOCKING = "true";
+    process.env.LLM_MAPPING_ENABLED = "true";
     process.env.OPENROUTER_API_KEY = "test-key";
     process.env.OPENAI_API_KEY = "test-key";
     process.env.ACCOUNTING_LLM_API_KEY = "test-key";
+    const analystState = __fillModelServiceTestHooks.createLlmMappingState();
+    assert.equal(analystState.analystMode, true, "LLM analyst mode must own the workflow when mapping and review are available");
+    assert.equal(__fillModelServiceTestHooks.llmAnalystControlsValidation(analystState), true);
+    assert.ok(analystState.reservedReviewCalls > 0, "classification must reserve calls for validation recovery");
+    const reviewToolbox = (blockingFailures) => ({ verificationGate: { blockingFailures } });
+    assert.ok(
+      __fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox([])) >
+        __fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox(["failed accounting equation"])),
+      "validation recovery must use a smaller, context-safe evidence workbench than final review"
+    );
+    assert.equal(__fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox(["failed accounting equation"])), 220);
+    analystState.attempts = analystState.maxCalls - analystState.reservedReviewCalls;
+    assert.equal(__fillModelServiceTestHooks.llmMappingAttemptsRemaining(analystState), 0);
+    assert.equal(
+      __fillModelServiceTestHooks.llmMappingCanUse(analystState, 1),
+      false,
+      "pre-fill classification must stop before consuming the review/recovery reserve"
+    );
+
     const exhaustedState = __fillModelServiceTestHooks.createLlmMappingState();
     exhaustedState.attempts = exhaustedState.maxCalls;
     const exhaustedBudgetBlocking = await runEarlyReview(exhaustedState);
@@ -498,6 +518,42 @@ async function main() {
         : { ok: false, error: "not recovered", needsHumanReview: true }
   });
   assert.equal(transportFailureCalls, 2, "transient transport errors should advance to a configured fallback model");
+
+  let timeoutFallbackCalls = 0;
+  const timeoutFallbackStartedAt = Date.now();
+  const timeoutFallbackRecovery = await requestAccountingJson({
+    purpose: "workbook_mapping_review",
+    apiKey: "test-key",
+    endpoint: "https://openrouter.ai/api/v1/chat/completions",
+    model: "openai/gpt-5.6-sol-pro",
+    fallbackModels: ["anthropic/claude-sonnet-5"],
+    siteUrl: "http://localhost:3000",
+    appTitle: "Historicals Solver",
+    messages: [{ role: "user", content: "{}" }],
+    jsonSchema: { name: "timeout_fallback_recovery", schema: { type: "object" } },
+    maxTokens: 25,
+    maxAttemptsPerModel: 1,
+    maxTotalAttempts: 2,
+    timeoutMs: 160,
+    fetchImpl: async (_url, init) => {
+      timeoutFallbackCalls += 1;
+      const body = JSON.parse(init.body);
+      if (body.model === "openai/gpt-5.6-sol-pro") {
+        return new Promise((_resolve, reject) => {
+          init.signal.addEventListener("abort", () => reject(new Error("preferred model timed out")), { once: true });
+        });
+      }
+      assert.equal(body.model, "anthropic/claude-sonnet-5");
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200 });
+    },
+    validate: (value) =>
+      value && value.ok === true
+        ? { ok: true, value, validated: true, affectedOutput: true }
+        : { ok: false, error: "not recovered", needsHumanReview: true }
+  });
+  assert.equal(timeoutFallbackRecovery.status, "completed_validated");
+  assert.equal(timeoutFallbackCalls, 2, "a preferred-model timeout must preserve time for the configured fallback");
+  assert.ok(Date.now() - timeoutFallbackStartedAt < 300, "timeout fallback must remain inside the shared deadline");
   assert.equal(transportFailureRecovery.status, "completed_validated");
   assert.equal(transportFailureRecovery.attemptTelemetry.length, 2);
   assert.match(transportFailureRecovery.attemptTelemetry[0].errorMessage, /fetch failed/i);
@@ -832,6 +888,63 @@ async function main() {
   assert.equal(createdClassification.recommended_model_row, "LT Debt (Incl. Current Portion)");
   assert.equal(createdClassification.llm_used, true);
   assert.equal(createdClassification.mapping_passed_validation, true);
+
+  const subtotalSource = {
+    period: "3Q26",
+    accession: "0000000000-26-000003",
+    xbrlTag: "NonoperatingIncomeExpense",
+    label: "Interest and other income (loss), net",
+    amount: 79000000
+  };
+  const subtotalClassification = {
+    ...classification,
+    source_line_item: subtotalSource.label,
+    recommended_action: "merge_into_other",
+    recommended_model_row: "Other Non-Operating Income / Expense",
+    classification_type: "combined non-operating line",
+    is_current: null,
+    is_operating: false,
+    reason: "Initial whole-statement assignment."
+  };
+  const subtotalClassifications = new Map();
+  classificationSourceKeys(subtotalSource).forEach((key) => subtotalClassifications.set(key, subtotalClassification));
+  const subtotalExclusion = applyLlmMappingReviewCorrections({
+    issues: [
+      {
+        severity: "error",
+        issueType: "unsupported_exclusion",
+        period: subtotalSource.period,
+        sourceLineItemLabel: subtotalSource.label,
+        sourceXbrlTag: subtotalSource.xbrlTag,
+        currentModelRow: "Other Non-Operating Income / Expense",
+        recommendedModelRow: "Other Non-Operating Income / Expense",
+        reason: "The combined line is a subtotal of separately mapped interest income, interest expense, and other income components.",
+        reusableRule: "Exclude a reported subtotal when its disclosed components are mapped separately.",
+        evidence: ["Primary income statement and failed EBIT-to-pre-tax bridge"]
+      }
+    ],
+    classifications: subtotalClassifications,
+    balanceAssignments: [],
+    incomeAssignments: [
+      {
+        fiscalPeriod: subtotalSource.period,
+        sourceFilingAccession: subtotalSource.accession,
+        sourceStatement: "Consolidated Statements of Operations",
+        sourceLineItemLabel: subtotalSource.label,
+        sourceAmount: subtotalSource.amount,
+        sourceXbrlTag: subtotalSource.xbrlTag,
+        assignedModelRow: "Other Non-Operating Income / Expense",
+        sourceSection: "below operating income"
+      }
+    ],
+    availableModelRows: ["Other Non-Operating Income / Expense"]
+  });
+  assert.equal(subtotalExclusion.changed, true, "the LLM reviewer must be able to exclude a double-counted subtotal");
+  const excludedSubtotal = subtotalClassifications.get(classificationSourceKeys(subtotalSource)[0]);
+  assert.equal(excludedSubtotal.recommended_action, "exclude");
+  assert.equal(excludedSubtotal.is_subtotal, true);
+  assert.equal(excludedSubtotal.llm_used, true);
+  assert.match(excludedSubtotal.reason, /reviewer exclusion/i);
 
   console.log("LLM accounting controller workbook and fallback guards passed.");
 }

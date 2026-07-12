@@ -75,6 +75,15 @@ assert.equal(
   false,
   "a comprehensive-loss-only title must not pass without an income/operations component"
 );
+assert.equal(
+  hooks.isPrimaryIncomeStatementStructure(
+    statementStructure(
+      "Shares of Common Stock Common Stock and Additional Paid-In Capital Retained Earnings (Accumulated Deficit) Accumulated Other Comprehensive Income Net income Stock repurchased"
+    )
+  ),
+  false,
+  "an equity roll-forward whose extracted table text contains net income must not be misclassified as an income statement"
+);
 
 function statementRow(rowOrder, rowLabel, xbrlConcept, value) {
   return {

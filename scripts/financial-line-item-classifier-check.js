@@ -337,6 +337,16 @@ async function classify(overrides) {
       expected: true
     },
     {
+      name: "generic current debt may map to debt including current portion when it is not identified as short-term borrowing",
+      request: request({
+        label: "Debt, Current",
+        xbrlTag: "DebtCurrent",
+        section: "current liabilities"
+      }),
+      row: "LT Debt (Incl. Current Portion)",
+      expected: true
+    },
+    {
       name: "commercial paper maps to Revolver/current borrowings",
       request: request({
         label: "Commercial paper",
@@ -506,6 +516,38 @@ async function classify(overrides) {
     });
     assert.equal(actual, testCase.expected, testCase.name);
   }
+  const combinedNonOperatingRequest = request({
+    label: "Interest and other income (loss), net",
+    xbrlTag: "NonoperatingIncomeExpense",
+    statement: "income_statement",
+    section: "below operating income",
+    periodType: "duration",
+    isSubtotal: false
+  });
+  assert.equal(
+    classificationPassesValidation(combinedNonOperatingRequest, {
+      recommended_action: "exclude",
+      recommended_model_row: "Other Non-Operating Income / Expense",
+      is_subtotal: true,
+      confidence: "high",
+      mapping_passed_validation: true,
+      reason: "This combined subtotal would double-count components that are reported and mapped separately."
+    }),
+    true,
+    "a high-confidence LLM subtotal exclusion must survive when the parser missed the subtotal"
+  );
+  assert.equal(
+    classificationPassesValidation(combinedNonOperatingRequest, {
+      recommended_action: "exclude",
+      recommended_model_row: "Other Non-Operating Income / Expense",
+      is_subtotal: false,
+      confidence: "high",
+      mapping_passed_validation: true,
+      reason: "Exclude without accounting evidence."
+    }),
+    false,
+    "an unsupported exclusion must still fail closed"
+  );
 
   const rejectedWholeStatementRevenueMapping = await classifyFinancialStatementLineItems(
     [
@@ -2014,14 +2056,14 @@ async function classify(overrides) {
     },
     statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
   });
-  assert.equal(splitBatchAttempts, 1, "one malformed row must not discard the rest of a validated statement batch");
-  assert.equal(splitBatchResult.llmAttempts, 1);
-  assert.equal(splitBatchResult.llmReviewedCount, 5);
-  assert.equal(splitBatchResult.acceptedDecisionCount, 5);
-  assert.deepEqual(splitBatchResult.unreviewedTargetKeys, ["row-split-1"]);
+  assert.equal(splitBatchAttempts, 2, "one malformed row must receive a focused retry without discarding valid peer decisions");
+  assert.equal(splitBatchResult.llmAttempts, 2);
+  assert.equal(splitBatchResult.llmReviewedCount, 6);
+  assert.equal(splitBatchResult.acceptedDecisionCount, 6);
+  assert.deepEqual(splitBatchResult.unreviewedTargetKeys, []);
   assert.equal(
     splitBatchResult.classifications.find((item) => item.request.sourceRowKey === "row-split-1").classification.llm_used,
-    false
+    true
   );
   assert.equal(
     splitBatchResult.classifications
@@ -2112,6 +2154,79 @@ async function classify(overrides) {
     partialBatchResult.classifications.find((item) => item.request.sourceRowKey === "row-partial-unclassified").classification.llm_used,
     false
   );
+
+  let omittedRowRetryAttempts = 0;
+  const omittedRowRetryTargets = [];
+  const omittedRowRetryResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-retry-other-operating",
+        rowOrder: 1,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Unclassified operating extension line",
+        xbrlTag: "ExampleUnclassifiedOperatingExtension",
+        section: "operating expenses",
+        uncertaintyReason: "No independently validated deterministic classification exists."
+      }),
+      request({
+        sourceRowKey: "row-retry-advertising",
+        rowOrder: 2,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        section: "operating expenses",
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        maxAttempts: 2,
+        fetchImpl: async (_url, init) => {
+          omittedRowRetryAttempts += 1;
+          const payload = JSON.parse(init.body).messages.at(-1);
+          const requestPayload = JSON.parse(payload.content);
+          omittedRowRetryTargets.push(requestPayload.targetSourceRowKeys);
+          const sourceRowKey = omittedRowRetryAttempts === 1 ? "row-retry-advertising" : "row-retry-other-operating";
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: sourceRowKey,
+                          recommended_action: "map",
+                          recommended_model_row: omittedRowRetryAttempts === 1 ? "SG&A" : "Other Operating Income / Expense",
+                          confidence: "high",
+                          reason: "Accounting-substance assignment from the whole-statement context."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  assert.equal(omittedRowRetryAttempts, 2, "an omitted difficult row must receive a focused follow-up analyst pass");
+  assert.deepEqual(omittedRowRetryTargets[1], ["row-retry-other-operating"]);
+  assert.equal(omittedRowRetryResult.acceptedDecisionCount, 2);
+  assert.deepEqual(omittedRowRetryResult.unreviewedTargetKeys, []);
 
   let invalidLargeBatchAttempts = 0;
   const invalidLargeBatchRequests = Array.from({ length: 12 }, (_, index) =>
