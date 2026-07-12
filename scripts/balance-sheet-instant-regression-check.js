@@ -3,6 +3,7 @@ const fs = require("node:fs/promises");
 const ExcelJS = require("exceljs");
 const JSZip = require("jszip");
 const { postWorkbook } = require("./fill-workbook-api");
+const { requireSecRegressionHeaders } = require("./sec-regression-identity");
 
 const repoRoot = path.resolve(__dirname, "..");
 const ticker = process.env.BALANCE_SHEET_TICKER || process.env.COST_TICKER || "COST";
@@ -15,9 +16,7 @@ const outputWorkbook =
   path.join(repoRoot, `tmp/${ticker.toLowerCase()}-balance-sheet-instant-regression-output.xlsx`);
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
-const secHeaders = {
-  "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver regression contact@example.com"
-};
+const secHeaders = requireSecRegressionHeaders();
 
 const directBalanceSheetChecks = [
   {

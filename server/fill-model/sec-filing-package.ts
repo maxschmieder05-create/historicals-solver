@@ -1,4 +1,5 @@
 import { normalizeAccession } from "./sec-accession";
+import { secRequestHeaders } from "./sec-http";
 
 export type SecFilingPackageRequest = {
   cik: string;
@@ -209,23 +210,109 @@ type LinkbaseArc = {
   arcrole?: string;
 };
 
-const SEC_DEFAULT_USER_AGENT = process.env.SEC_USER_AGENT || "HistoricalsSolver/0.1 contact@example.com";
+type TtlCacheEntry<V> = {
+  value: V;
+  expiresAt: number;
+};
+
+class BoundedTtlLruCache<K, V> {
+  private readonly entries = new Map<K, TtlCacheEntry<V>>();
+
+  constructor(
+    private readonly maxEntries: number,
+    private readonly ttlMs: number,
+    private readonly now: () => number = Date.now
+  ) {}
+
+  get(key: K): V | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    // Map insertion order is the LRU order. Reinsert a hit as most-recently used.
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.value;
+  }
+
+  set(key: K, value: V): void {
+    const now = this.now();
+    this.pruneExpired(now);
+    this.entries.delete(key);
+    this.entries.set(key, { value, expiresAt: now + this.ttlMs });
+    while (this.entries.size > this.maxEntries) {
+      const oldest = this.entries.keys().next().value as K | undefined;
+      if (oldest === undefined) break;
+      this.entries.delete(oldest);
+    }
+  }
+
+  delete(key: K): boolean {
+    return this.entries.delete(key);
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  get size(): number {
+    this.pruneExpired(this.now());
+    return this.entries.size;
+  }
+
+  keys(): K[] {
+    this.pruneExpired(this.now());
+    return Array.from(this.entries.keys());
+  }
+
+  private pruneExpired(now: number): void {
+    for (const [key, entry] of this.entries) {
+      if (entry.expiresAt <= now) this.entries.delete(key);
+    }
+  }
+}
+
 const SEC_ARCHIVE_ROOT = "https://www.sec.gov/Archives/edgar/data";
-const SEC_ARCHIVE_MIN_INTERVAL_MS = Number(process.env.SEC_ARCHIVE_MIN_INTERVAL_MS || 150);
-const SEC_ARCHIVE_FETCH_TIMEOUT_MS = Number(process.env.SEC_ARCHIVE_FETCH_TIMEOUT_MS || 20_000);
+const SEC_ARCHIVE_MIN_INTERVAL_MS = boundedEnvironmentInteger(process.env.SEC_ARCHIVE_MIN_INTERVAL_MS, 150, 25, 2_000);
+const SEC_ARCHIVE_FETCH_TIMEOUT_MS = boundedEnvironmentInteger(process.env.SEC_ARCHIVE_FETCH_TIMEOUT_MS, 20_000, 1_000, 120_000);
+const SEC_ARCHIVE_RETRY_BASE_DELAY_MS = boundedEnvironmentInteger(process.env.SEC_ARCHIVE_RETRY_BASE_DELAY_MS, 750, 1, 10_000);
 const SEC_FILING_PACKAGE_MAX_FILINGS = Number(process.env.SEC_FILING_PACKAGE_MAX_FILINGS || 24);
 const SEC_FILING_PACKAGE_MAX_ROWS_PER_STATEMENT = Number(process.env.SEC_FILING_PACKAGE_MAX_ROWS_PER_STATEMENT || 2000);
+const SEC_FILING_RESPONSE_CACHE_MAX_ENTRIES = boundedEnvironmentInteger(process.env.SEC_FILING_RESPONSE_CACHE_MAX_ENTRIES, 128, 1, 10_000);
+const SEC_FILING_PACKAGE_CACHE_MAX_ENTRIES = boundedEnvironmentInteger(process.env.SEC_FILING_PACKAGE_CACHE_MAX_ENTRIES, 32, 1, 1_000);
+const SEC_FILING_CACHE_TTL_MS = boundedEnvironmentInteger(process.env.SEC_FILING_CACHE_TTL_MS, 30 * 60 * 1000, 1_000, 24 * 60 * 60 * 1000);
 
 const responseTextCache = new Map<string, Promise<string | null>>();
 const responseJsonCache = new Map<string, Promise<any | null>>();
 const packageCache = new Map<string, Promise<SecFilingPackage | null>>();
+// Request-scoped abort signals must never be attached to promises shared by
+// other fills. Keep completed values separately so abortable callers can reuse
+// stable cache entries while doing their own cancellable work on a cache miss.
+// Only successful values are retained. Network/HTTP/parse failures remain
+// immediately retryable instead of becoming process-lifetime negative entries.
+const completedResponseTextCache = new BoundedTtlLruCache<string, string>(
+  SEC_FILING_RESPONSE_CACHE_MAX_ENTRIES,
+  SEC_FILING_CACHE_TTL_MS
+);
+const completedResponseJsonCache = new BoundedTtlLruCache<string, any>(
+  SEC_FILING_RESPONSE_CACHE_MAX_ENTRIES,
+  SEC_FILING_CACHE_TTL_MS
+);
+const completedPackageCache = new BoundedTtlLruCache<string, SecFilingPackage>(
+  SEC_FILING_PACKAGE_CACHE_MAX_ENTRIES,
+  SEC_FILING_CACHE_TTL_MS
+);
 let lastSecArchiveFetchAt = 0;
 let secArchiveFetchQueue = Promise.resolve();
 
 export async function fetchSecFilingPackageSupport(
   filings: SecFilingPackageRequest[],
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<SecFilingPackageSupport> {
+  throwIfAborted(signal);
   const uniqueFilings = uniqueFilingsByAccession(filings).slice(0, SEC_FILING_PACKAGE_MAX_FILINGS);
   const packages: SecFilingPackage[] = [];
   const warnings: string[] = [];
@@ -234,9 +321,15 @@ export async function fetchSecFilingPackageSupport(
   }
 
   for (const filing of uniqueFilings) {
-    const secPackage = await fetchSecFilingPackage(filing, headers).catch(() => null);
-    if (secPackage) packages.push(secPackage);
-    else warnings.push(`SEC filing package could not be loaded for accession ${filing.accessionNumber}.`);
+    throwIfAborted(signal);
+    try {
+      const secPackage = await fetchSecFilingPackage(filing, headers, signal);
+      if (secPackage) packages.push(secPackage);
+      else warnings.push(`SEC filing package could not be loaded for accession ${filing.accessionNumber}.`);
+    } catch (error) {
+      if (signal?.aborted || isAbortError(error)) throw error;
+      warnings.push(`SEC filing package could not be loaded for accession ${filing.accessionNumber}.`);
+    }
   }
 
   const statements = packages.flatMap((item) => item.statements);
@@ -249,48 +342,63 @@ export async function fetchSecXbrlFrame(
   tag: string,
   unit: string,
   period: string,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  signal?: AbortSignal
 ) {
   const pathParts = [taxonomy, tag, unit, period].map(encodeURIComponent);
   const url = `https://data.sec.gov/api/xbrl/frames/${pathParts.join("/")}.json`;
-  return fetchSecJson(url, headers);
+  return fetchSecJson(url, headers, signal);
 }
 
-async function fetchSecFilingPackage(filing: SecFilingPackageRequest, headers: Record<string, string>) {
+async function fetchSecFilingPackage(filing: SecFilingPackageRequest, headers: Record<string, string>, signal?: AbortSignal) {
   const key = `${filing.cik}:${normalizeAccession(filing.accessionNumber)}`;
+  const completed = completedPackageCache.get(key);
+  if (completed !== undefined) return completed;
+  if (signal) {
+    throwIfAborted(signal);
+    const value = await fetchSecFilingPackageUncached(filing, headers, signal);
+    throwIfAborted(signal);
+    if (value !== null) completedPackageCache.set(key, value);
+    return value;
+  }
   let cached = packageCache.get(key);
   if (!cached) {
-    cached = fetchSecFilingPackageUncached(filing, headers).catch(() => {
-      packageCache.delete(key);
-      return null;
-    });
-    packageCache.set(key, cached);
+    cached = fetchSecFilingPackageUncached(filing, headers)
+      .then((value) => {
+        if (value !== null) completedPackageCache.set(key, value);
+        return value;
+      })
+      .catch(() => null);
+    cacheInFlight(packageCache, key, cached, SEC_FILING_PACKAGE_CACHE_MAX_ENTRIES);
   }
   return cached;
 }
 
 async function fetchSecFilingPackageUncached(
   filing: SecFilingPackageRequest,
-  headers: Record<string, string>
+  headers: Record<string, string>,
+  signal?: AbortSignal
 ): Promise<SecFilingPackage | null> {
+  throwIfAborted(signal);
   const cikNoLeadingZeroes = String(Number(filing.cik));
   const accessionKey = normalizeAccession(filing.accessionNumber);
   const baseUrl = `${SEC_ARCHIVE_ROOT}/${cikNoLeadingZeroes}/${accessionKey}`;
   const indexUrl = `${baseUrl}/index.json`;
   const warnings: string[] = [];
-  const index = (await fetchSecJson(indexUrl, headers)) as SecArchiveIndex | null;
+  const index = (await fetchSecJson(indexUrl, headers, signal)) as SecArchiveIndex | null;
   const indexItems = index?.directory?.item ?? [];
   if (!indexItems.length) return null;
 
   const artifacts = discoverFilingArtifacts(indexItems, filing, baseUrl);
   const [primaryHtml, instanceXml, presentationXml, calculationXml, labelXml, definitionXml] = await Promise.all([
-    artifacts.primary_html ? fetchSecText(artifacts.primary_html.url, headers, "text/html") : Promise.resolve(null),
-    artifacts.instance ? fetchSecText(artifacts.instance.url, headers, "application/xml") : Promise.resolve(null),
-    artifacts.presentation ? fetchSecText(artifacts.presentation.url, headers, "application/xml") : Promise.resolve(null),
-    artifacts.calculation ? fetchSecText(artifacts.calculation.url, headers, "application/xml") : Promise.resolve(null),
-    artifacts.label ? fetchSecText(artifacts.label.url, headers, "application/xml") : Promise.resolve(null),
-    artifacts.definition ? fetchSecText(artifacts.definition.url, headers, "application/xml") : Promise.resolve(null)
+    artifacts.primary_html ? fetchSecText(artifacts.primary_html.url, headers, "text/html", signal) : Promise.resolve(null),
+    artifacts.instance ? fetchSecText(artifacts.instance.url, headers, "application/xml", signal) : Promise.resolve(null),
+    artifacts.presentation ? fetchSecText(artifacts.presentation.url, headers, "application/xml", signal) : Promise.resolve(null),
+    artifacts.calculation ? fetchSecText(artifacts.calculation.url, headers, "application/xml", signal) : Promise.resolve(null),
+    artifacts.label ? fetchSecText(artifacts.label.url, headers, "application/xml", signal) : Promise.resolve(null),
+    artifacts.definition ? fetchSecText(artifacts.definition.url, headers, "application/xml", signal) : Promise.resolve(null)
   ]);
+  throwIfAborted(signal);
 
   if (!primaryHtml) warnings.push(`Primary filing HTML was not available for accession ${filing.accessionNumber}.`);
   if (!instanceXml) warnings.push(`XBRL instance XML was not discovered for accession ${filing.accessionNumber}.`);
@@ -391,7 +499,7 @@ function discoverFilingArtifacts(
 function parseInstanceXml(xml: string): ParsedInstance {
   const contexts = parseInstanceContexts(xml);
   const units = parseInstanceUnits(xml);
-  const facts: ParsedFact[] = [];
+  const parsedFacts: ParsedFact[] = [];
   const seen = new Set<string>();
   const factPattern = /<([A-Za-z_][\w.-]*):([A-Za-z_][\w.-]*)\b([^>]*)\bcontextRef=["']([^"']+)["']([^>]*)>([\s\S]*?)<\/\1:\2>/g;
 
@@ -410,7 +518,7 @@ function parseInstanceXml(xml: string): ParsedInstance {
     const key = `${localName}|${contextRef}|${unit ?? ""}|${rawValue}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    facts.push({
+    parsedFacts.push({
       concept: localName,
       taxonomy: prefix,
       contextRef,
@@ -423,6 +531,8 @@ function parseInstanceXml(xml: string): ParsedInstance {
     });
   }
 
+  const facts = preferMostPreciseDuplicateFacts(parsedFacts);
+
   const factsByConcept = new Map<string, ParsedFact[]>();
   for (const fact of facts) {
     const conceptFacts = factsByConcept.get(fact.concept) ?? [];
@@ -431,6 +541,42 @@ function parseInstanceXml(xml: string): ParsedInstance {
   }
 
   return { contexts, units, facts, factsByConcept };
+}
+
+function preferMostPreciseDuplicateFacts(facts: ParsedFact[]) {
+  const groups = new Map<string, ParsedFact[]>();
+  for (const fact of facts) {
+    const key = [fact.taxonomy ?? "", fact.concept, fact.contextRef, fact.unit ?? fact.unitRef ?? ""].join("|");
+    const group = groups.get(key) ?? [];
+    group.push(fact);
+    groups.set(key, group);
+  }
+
+  const preferred: ParsedFact[] = [];
+  for (const group of groups.values()) {
+    if (group.length === 1 || !group.every((fact) => typeof fact.value === "number" && Number.isFinite(fact.value))) {
+      preferred.push(...group);
+      continue;
+    }
+
+    const bestPrecision = Math.max(...group.map(numericFactPrecision));
+    const mostPrecise = group.filter((fact) => numericFactPrecision(fact) === bestPrecision);
+    const seenValues = new Set<string>();
+    for (const fact of mostPrecise) {
+      const valueKey = `${fact.value}|${fact.rawValue}`;
+      if (seenValues.has(valueKey)) continue;
+      seenValues.add(valueKey);
+      preferred.push(fact);
+    }
+  }
+  return preferred;
+}
+
+function numericFactPrecision(fact: ParsedFact) {
+  if (/^inf$/i.test(fact.decimals ?? "")) return Number.POSITIVE_INFINITY;
+  if (fact.decimals === undefined || fact.decimals === "") return Number.NEGATIVE_INFINITY;
+  const decimals = Number(fact.decimals);
+  return Number.isFinite(decimals) ? decimals : Number.NEGATIVE_INFINITY;
 }
 
 function parseInstanceContexts(xml: string) {
@@ -955,74 +1101,164 @@ function inferCurrentNonCurrentSection(parts: string[]): "current" | "non_curren
   return undefined;
 }
 
-async function fetchSecJson(url: string, headers: Record<string, string>) {
+async function fetchSecJson(url: string, headers: Record<string, string>, signal?: AbortSignal) {
+  const completed = completedResponseJsonCache.get(url);
+  if (completed !== undefined) return completed;
+  if (signal) {
+    throwIfAborted(signal);
+    const text = await fetchSecText(url, headers, "application/json", signal);
+    throwIfAborted(signal);
+    const value = parseSecJson(text);
+    if (value !== null) completedResponseJsonCache.set(url, value);
+    else completedResponseTextCache.delete(url);
+    return value;
+  }
   let cached = responseJsonCache.get(url);
   if (!cached) {
     cached = fetchSecText(url, headers, "application/json").then((text) => {
-      if (!text) return null;
-      try {
-        return JSON.parse(text);
-      } catch {
-        return null;
-      }
+      const value = parseSecJson(text);
+      if (value !== null) completedResponseJsonCache.set(url, value);
+      else completedResponseTextCache.delete(url);
+      return value;
     });
-    responseJsonCache.set(url, cached);
+    cacheInFlight(responseJsonCache, url, cached, SEC_FILING_RESPONSE_CACHE_MAX_ENTRIES);
   }
   return cached;
 }
 
-async function fetchSecText(url: string, headers: Record<string, string>, accept: string) {
+function parseSecJson(text: string | null) {
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function cacheInFlight<K, V>(
+  cache: Map<K, Promise<V>>,
+  key: K,
+  promise: Promise<V>,
+  maxEntries: number
+): void {
+  cache.delete(key);
+  cache.set(key, promise);
+  while (cache.size > maxEntries) {
+    const oldest = cache.keys().next().value as K | undefined;
+    if (oldest === undefined) break;
+    cache.delete(oldest);
+  }
+
+  const removeIfCurrent = () => {
+    if (cache.get(key) === promise) cache.delete(key);
+  };
+  // Supply both handlers so this housekeeping branch never creates an
+  // unhandled rejection when a lower-level request fails.
+  void promise.then(removeIfCurrent, removeIfCurrent);
+}
+
+async function fetchSecText(url: string, headers: Record<string, string>, accept: string, signal?: AbortSignal) {
+  const completed = completedResponseTextCache.get(url);
+  if (completed !== undefined) return completed;
+  if (signal) {
+    throwIfAborted(signal);
+    const value = await fetchSecTextUncached(url, headers, accept, signal);
+    throwIfAborted(signal);
+    if (value !== null) completedResponseTextCache.set(url, value);
+    return value;
+  }
   let cached = responseTextCache.get(url);
   if (!cached) {
-    cached = fetchSecTextUncached(url, headers, accept).catch(() => {
-      responseTextCache.delete(url);
-      return null;
-    });
-    responseTextCache.set(url, cached);
+    cached = fetchSecTextUncached(url, headers, accept)
+      .then((value) => {
+        if (value !== null) completedResponseTextCache.set(url, value);
+        return value;
+      })
+      .catch(() => null);
+    cacheInFlight(responseTextCache, url, cached, SEC_FILING_RESPONSE_CACHE_MAX_ENTRIES);
   }
   return cached;
 }
 
-async function fetchSecTextUncached(url: string, headers: Record<string, string>, accept: string) {
+async function fetchSecTextUncached(url: string, headers: Record<string, string>, accept: string, signal?: AbortSignal) {
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    await throttleSecArchiveFetch();
+    throwIfAborted(signal);
+    await throttleSecArchiveFetch(signal);
+    throwIfAborted(signal);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), Math.max(1_000, SEC_ARCHIVE_FETCH_TIMEOUT_MS));
+    const onAbort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    const timeout = setTimeout(() => controller.abort(), SEC_ARCHIVE_FETCH_TIMEOUT_MS);
     try {
       const response = await fetch(url, { headers: secHeaders(headers, accept), signal: controller.signal });
       if (response.ok) return await response.text();
       if (response.status !== 429 && response.status < 500) return null;
-    } catch {
+    } catch (error) {
+      if (signal?.aborted || (isAbortError(error) && controller.signal.reason === signal?.reason)) {
+        throwIfAborted(signal);
+        throw error;
+      }
       // Retry transient network failures and timeouts. A filing artifact that
       // remains unavailable is reported by the package loader as an SEC warning.
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
     }
-    await sleep(750 * (attempt + 1));
+    if (attempt < 2) await sleep(SEC_ARCHIVE_RETRY_BASE_DELAY_MS * (attempt + 1), signal);
   }
   return null;
 }
 
 function secHeaders(headers: Record<string, string>, accept: string) {
-  return {
-    ...headers,
-    "User-Agent": headers["User-Agent"] || SEC_DEFAULT_USER_AGENT,
-    Accept: accept
-  };
+  return secRequestHeaders(headers, accept);
 }
 
-async function throttleSecArchiveFetch() {
+async function throttleSecArchiveFetch(signal?: AbortSignal) {
+  throwIfAborted(signal);
   const queued = secArchiveFetchQueue.then(async () => {
+    throwIfAborted(signal);
     const waitMs = Math.max(0, SEC_ARCHIVE_MIN_INTERVAL_MS - (Date.now() - lastSecArchiveFetchAt));
-    if (waitMs > 0) await sleep(waitMs);
+    if (waitMs > 0) await sleep(waitMs, signal);
+    throwIfAborted(signal);
     lastSecArchiveFetchAt = Date.now();
   });
   secArchiveFetchQueue = queued.catch(() => undefined);
   await queued;
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal) {
+  if (!signal) return new Promise<void>((resolve) => setTimeout(resolve, ms));
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(finish, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError(signal));
+    };
+    function finish() {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) onAbort();
+  });
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError(signal);
+}
+
+function abortError(signal?: AbortSignal) {
+  if (signal?.reason instanceof Error) return signal.reason;
+  const error = new Error("SEC filing-package request was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown) {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function conceptFromHref(href: string): ParsedConceptRef | null {
@@ -1153,3 +1389,33 @@ function uniqueFilingsByAccession(filings: SecFilingPackageRequest[]) {
 function unique<T>(items: T[]) {
   return Array.from(new Set(items));
 }
+
+function boundedEnvironmentInteger(value: string | undefined, fallback: number, min: number, max: number) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.floor(parsed)));
+}
+
+export const __secFilingPackageTestHooks = {
+  parseInstanceXml,
+  preferMostPreciseDuplicateFacts,
+  createBoundedTtlLruCache: (maxEntries: number, ttlMs: number, now?: () => number) =>
+    new BoundedTtlLruCache<unknown, unknown>(maxEntries, ttlMs, now),
+  fetchSecText,
+  clearCaches: () => {
+    responseTextCache.clear();
+    responseJsonCache.clear();
+    packageCache.clear();
+    completedResponseTextCache.clear();
+    completedResponseJsonCache.clear();
+    completedPackageCache.clear();
+  },
+  cacheState: () => ({
+    inFlightResponseText: responseTextCache.size,
+    inFlightResponseJson: responseJsonCache.size,
+    inFlightPackages: packageCache.size,
+    completedResponseTextKeys: completedResponseTextCache.keys(),
+    completedResponseJsonKeys: completedResponseJsonCache.keys(),
+    completedPackageKeys: completedPackageCache.keys()
+  })
+};

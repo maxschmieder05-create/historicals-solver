@@ -553,7 +553,7 @@ export function classifyBalanceSheetSourceSection(
   if (balanceSheetSourceLooksLikeDebtCarryingValueAdjustment(source)) return "non-current liabilities";
   if (/cashandduefrombanks|duefrombanks|interestbearingdeposits?inbanks?/.test(compact)) return "current assets";
   if (/restrictedcash/.test(compact) && currentNonCurrentSignal === "non-current") return "non-current assets";
-  if (/shortterminvestments?|marketablesecurities|availableforsalesecurities|debtandequitysecurities|investmentsecurities/.test(compact)) {
+  if (/shortterminvestments?|marketablesecurities|availableforsalesecurities|debtandequitysecurities|equitysecurities|investmentsecurities/.test(compact)) {
     if (currentNonCurrentSignal === "non-current") return "non-current assets";
     if (currentNonCurrentSignal === "current") return "current assets";
     return "non-current assets";
@@ -592,12 +592,16 @@ export function classifyBalanceSheetResolution(input: BalanceSheetResolvedCellIn
   const sources = input.sources ?? [];
   const nonModelSources = sources.filter((source) => source.sourceLayer !== "model");
   const text = `${input.classification ?? ""} ${input.note ?? ""} ${sources.map((source) => `${source.concept ?? ""} ${source.label ?? ""} ${source.note ?? ""}`).join(" ")}`;
-  if (Math.abs(input.value) <= 0.0001 && (!nonModelSources.length || /not reported|no separate|no current sec source|not applicable|explicit(?:ly)? zero/i.test(text))) {
+  if (
+    Math.abs(input.value) <= 0.0001 &&
+    nonModelSources.length > 0 &&
+    nonModelSources.every((source) => typeof source.value === "number" && Number.isFinite(source.value) && Math.abs(source.value) <= 0.0001)
+  ) {
     return {
       state: "explicit_zero_not_applicable",
       canonicalModelRow,
       residualFormula: "",
-      reason: input.note || "The current SEC filing did not disclose an applicable balance for this row."
+      reason: input.note || "The current SEC filing contains an explicit zero-valued source for this row."
     };
   }
 
@@ -606,7 +610,12 @@ export function classifyBalanceSheetResolution(input: BalanceSheetResolvedCellIn
     input.classification === "residual" ||
     /\bresidual\b|\bderived\b|\bcalculated\b|\bless\b|\bexcluding\b|\bminus\b/i.test(text) ||
     Boolean(definition?.residualEligible && sources.length > 1);
-  if (looksResidual && definition?.residualEligible === true && nonModelSources.length) {
+  if (
+    looksResidual &&
+    definition?.residualEligible === true &&
+    nonModelSources.length > 0 &&
+    nonModelSources.every((source) => typeof source.value === "number" && Number.isFinite(source.value))
+  ) {
     return {
       state: "residual_calculated",
       canonicalModelRow,
@@ -615,7 +624,10 @@ export function classifyBalanceSheetResolution(input: BalanceSheetResolvedCellIn
     };
   }
 
-  if (nonModelSources.length) {
+  if (
+    nonModelSources.length &&
+    nonModelSources.every((source) => typeof source.value === "number" && Number.isFinite(source.value))
+  ) {
     return {
       state: "direct_sec_sourced",
       canonicalModelRow,

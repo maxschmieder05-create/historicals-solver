@@ -101,6 +101,8 @@ type TextSignals = {
   normalized: string;
 };
 
+export type WorkbookModelTypeSignalScan = TextSignals;
+
 type StructuredClassificationSignals = Pick<CompanyModelTypeSignals, "companyName" | "ticker" | "sic" | "sicDescription">;
 
 export function modelTypeDisplayName(modelType: GoldModelType) {
@@ -183,8 +185,13 @@ export function findVerifiedGoldModelForCompany(scan: GoldModelLibraryScan, comp
   const matches = scan.models
     .filter((model) => model.usableAsGold && model.verifiedByUser)
     .map((model) => {
+      const modelCik = normalizeCik(model.cik ?? "");
+      // CIK is the immutable SEC issuer identity. A ticker or company name can
+      // be reused, renamed, or entered incorrectly in a manifest, so those
+      // weaker fields must never override an explicit conflicting CIK.
+      if (cik && modelCik && modelCik !== cik) return { model, score: 0 };
       let score = 0;
-      if (cik && normalizeCik(model.cik ?? "") === cik) score += 100;
+      if (cik && modelCik === cik) score += 100;
       if (ticker && normalize(model.ticker ?? "") === ticker) score += 80;
       if (title && normalize(model.companyName ?? "") === title) score += 50;
       if (title && normalize(model.companyName ?? "").includes(title)) score += 20;
@@ -196,6 +203,8 @@ export function findVerifiedGoldModelForCompany(scan: GoldModelLibraryScan, comp
 }
 
 export function classifyCompanyModelTypeFromSecSignals(signals: CompanyModelTypeSignals): ModelTypeClassification {
+  const sicClassification = classifyStructuredSicModelType(signals);
+  if (sicClassification) return sicClassification;
   const text = [
     signals.companyName,
     signals.ticker,
@@ -210,28 +219,32 @@ export function classifyCompanyModelTypeFromSecSignals(signals: CompanyModelType
   return classifyTextModelType(text, "sec_filing_signals", "Company SEC filing signals", signals);
 }
 
-export function classifyWorkbookModelType(workbook: ExcelJS.Workbook, templateProfileKind?: string | null): ModelTypeClassification {
-  const text = workbookTextSignals(workbook);
-  const classification = classifyTextModelType(text.text, "workbook", "Workbook labels and sheet names");
-  if (classification.modelType !== "unknown") return classification;
-  const profile = normalize(templateProfileKind ?? "");
-  if (profile === "financialcompany") {
-    return {
-      modelType: "financial_services_broker_dealer",
-      confidence: "medium",
-      source: "template_profile",
-      rationale: ["Template profile detection selected the financial-company workbook profile."]
-    };
-  }
-  if (profile === "owlstandard") {
-    return {
-      modelType: "standard_operating_company",
-      confidence: "medium",
-      source: "template_profile",
-      rationale: ["Template profile detection selected the standard operating-company workbook profile."]
-    };
-  }
-  return classification;
+function classifyStructuredSicModelType(signals: CompanyModelTypeSignals): ModelTypeClassification | null {
+  const sic = String(signals.sic ?? "").replace(/\D/g, "").padStart(4, "0").slice(-4);
+  if (!/^\d{4}$/.test(sic) || sic === "0000") return null;
+
+  let modelType: GoldModelType | null = null;
+  if (["4911", "4922", "4923", "4924", "4925", "4931", "4932", "4939", "4941"].includes(sic)) modelType = "utility";
+  else if (sic === "6798") modelType = "reit_real_estate";
+  else if (/^6[01]\d{2}$/.test(sic)) modelType = "bank";
+  else if (/^62\d{2}$/.test(sic)) modelType = "financial_services_broker_dealer";
+  else if (/^6[34]\d{2}$/.test(sic)) modelType = "insurance";
+  if (!modelType) return null;
+
+  return {
+    modelType,
+    confidence: "high",
+    source: "sec_filing_signals",
+    rationale: [`SEC SIC ${sic}${signals.sicDescription ? ` (${signals.sicDescription})` : ""} identifies a ${modelTypeDisplayName(modelType)} company.`]
+  };
+}
+
+export function classifyWorkbookModelType(
+  workbook: ExcelJS.Workbook,
+  precomputedSignals?: WorkbookModelTypeSignalScan
+): ModelTypeClassification {
+  const text = precomputedSignals ?? scanWorkbookModelTypeSignals(workbook);
+  return classifyTextModelType(text.text, "workbook", "Workbook labels and sheet names");
 }
 
 export function classifyTemplateModelTypeFromProfile(templateProfileKind: string): ModelTypeClassification {
@@ -265,7 +278,16 @@ export function classifyModelTypeFromGoldReference(model: GoldModelMetadata): Mo
 }
 
 export function checkModelTemplateCompatibility(company: ModelTypeClassification, template: ModelTypeClassification) {
-  if (company.modelType === "unknown" || template.modelType === "unknown") {
+  if (company.modelType === "unknown") {
+    return { compatible: true, message: null as string | null };
+  }
+  if (template.modelType === "unknown") {
+    if (company.confidence === "high" && isSpecializedCompanyModelType(company.modelType)) {
+      return {
+        compatible: false,
+        message: `This company appears to require a ${modelTypeDisplayName(company.modelType)} model template. The uploaded template could not be identified as a compatible specialized model.`
+      };
+    }
     return { compatible: true, message: null as string | null };
   }
   if (company.modelType === "standard_operating_company" && template.modelType !== "standard_operating_company") {
@@ -288,9 +310,6 @@ export function checkModelTemplateCompatibility(company: ModelTypeClassification
   }
   if (company.modelType !== "standard_operating_company" && template.modelType !== "standard_operating_company") {
     if (company.modelType === template.modelType) return { compatible: true, message: null as string | null };
-    if (isFinancialCompanyModelType(company.modelType) && isFinancialCompanyModelType(template.modelType)) {
-      return { compatible: true, message: null as string | null };
-    }
     return {
       compatible: false,
       message: `This company appears to require a ${modelTypeDisplayName(company.modelType)} model template. The uploaded ${modelTypeDisplayName(template.modelType)} template is not compatible.`
@@ -834,7 +853,7 @@ function addScore(target: { score: number; reasons: string[] }, signals: TextSig
   target.reasons.push(reason);
 }
 
-function workbookTextSignals(workbook: ExcelJS.Workbook) {
+export function scanWorkbookModelTypeSignals(workbook: ExcelJS.Workbook): WorkbookModelTypeSignalScan {
   const chunks: string[] = [];
   chunks.push(...workbook.worksheets.map((sheet) => sheet.name));
   for (const sheet of workbook.worksheets) {
@@ -849,17 +868,32 @@ function textSignals(text: string): TextSignals {
 
 function sheetLabels(sheet: ExcelJS.Worksheet, maxRows: number, maxColumns: number) {
   const labels: string[] = [];
-  for (let row = 1; row <= Math.min(sheet.rowCount, maxRows); row += 1) {
-    for (let col = 1; col <= Math.min(sheet.columnCount, maxColumns); col += 1) {
-      const text = cellDisplay(sheet.getCell(row, col)).trim();
-      if (text && /[A-Za-z]{3,}/.test(text)) labels.push(text);
-    }
-  }
+  const maxLabels = 10_000;
+  const maxCharacters = 500_000;
+  const maxCharactersPerCell = 1_000;
+  let characterCount = 0;
+  sheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+    if (rowNumber > maxRows || labels.length >= maxLabels || characterCount >= maxCharacters) return;
+    row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+      if (colNumber > maxColumns || labels.length >= maxLabels || characterCount >= maxCharacters) return;
+      const text = cellDisplay(cell).trim();
+      if (!text || !/[A-Za-z]{3,}/.test(text)) return;
+      const remaining = maxCharacters - characterCount;
+      const bounded = text.slice(0, Math.min(maxCharactersPerCell, remaining));
+      if (!bounded) return;
+      labels.push(bounded);
+      characterCount += bounded.length;
+    });
+  });
   return labels;
 }
 
 function isFinancialCompanyModelType(modelType: GoldModelType) {
   return modelType === "financial_services_broker_dealer" || modelType === "bank" || modelType === "insurance";
+}
+
+function isSpecializedCompanyModelType(modelType: GoldModelType) {
+  return modelType !== "unknown" && modelType !== "standard_operating_company";
 }
 
 function cellDisplay(cell: ExcelJS.Cell) {

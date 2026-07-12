@@ -178,6 +178,77 @@ assert.equal(byLabel.has("Accounts receivable (net of allowance of $12)"), false
 
 const accrued = hooks.resolveAccruedLiabilities("1Q26", ctx);
 assert.equal(accrued.value, 5_785_000_000);
+
+const completeNoDebtRows = [
+  balanceRow(1, "Total assets", "Assets", 100_000_000, "non_current"),
+  balanceRow(2, "Cash and cash equivalents", "CashAndCashEquivalentsAtCarryingValue", 20_000_000, "current"),
+  balanceRow(3, "Accounts receivable", "AccountsReceivableNetCurrent", 10_000_000, "current"),
+  balanceRow(4, "Property and equipment, net", "PropertyPlantAndEquipmentNet", 70_000_000, "non_current"),
+  balanceRow(5, "Total liabilities", "Liabilities", 40_000_000, "non_current"),
+  balanceRow(6, "Accounts payable", "AccountsPayableCurrent", 10_000_000, "current"),
+  balanceRow(7, "Other liabilities", "OtherLiabilitiesCurrent", 30_000_000, "current"),
+  balanceRow(8, "Stockholders' equity", "StockholdersEquity", 60_000_000, "equity"),
+  balanceRow(9, "Total liabilities and stockholders' equity", "LiabilitiesAndStockholdersEquity", 100_000_000, "equity")
+];
+const completeNoDebtCtx = {
+  ...ctx,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map(
+        completeNoDebtRows.map((row) => [
+          row.xbrlConcept,
+          {
+            concept: row.xbrlConcept,
+            label: row.rowLabel,
+            value: row.value,
+            unit: "USD",
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant"
+          }
+        ])
+      )
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Condensed Consolidated Balance Sheets",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      rows: completeNoDebtRows
+    }
+  ]
+};
+for (const [resolved, conceptPattern] of [
+  [hooks.resolveCurrentDebt("1Q26", completeNoDebtCtx), /DebtDerivedZeroFromCompleteBalanceSheet/],
+  [hooks.resolveRevolverCurrentDebt("1Q26", completeNoDebtCtx), /ShortTermBorrowingsDerivedZeroFromCompleteBalanceSheet/],
+  [hooks.resolveLongTermDebtInclCurrentPortion("1Q26", completeNoDebtCtx), /DebtDerivedZeroFromCompleteBalanceSheet/],
+  [hooks.resolveDeferredTaxLiability("1Q26", completeNoDebtCtx), /DeferredTaxLiabilityDerivedZeroFromCompleteBalanceSheet/]
+]) {
+  assert.equal(resolved.value, 0, "A complete, reconciled primary SEC balance sheet with no debt line should derive debt as zero.");
+  assert.equal(resolved.sources[0].sourceLayer, "derived");
+  assert.match(resolved.sources[0].concept, conceptPattern);
+  assert.ok(resolved.sources.slice(1).some((source) => source.accn === accession), "The zero-debt proof must retain its SEC filing anchor.");
+}
+const incompleteNoDebtCtx = {
+  ...completeNoDebtCtx,
+  filingPackageStatements: [
+    {
+      ...completeNoDebtCtx.filingPackageStatements[0],
+      rows: completeNoDebtRows.filter((row) => row.xbrlConcept !== "LiabilitiesAndStockholdersEquity" && row.xbrlConcept !== "StockholdersEquity")
+    }
+  ]
+};
+assert.equal(
+  hooks.resolveCurrentDebt("1Q26", incompleteNoDebtCtx).value,
+  null,
+  "An incomplete balance sheet cannot certify debt absence as zero."
+);
 assert.equal(accrued.sources.some((source) => source.concept === "LongTermDebtCurrent"), false);
 
 const otherCurrent = hooks.resolveOtherCurrentLiabilities("1Q26", ctx);
@@ -287,6 +358,209 @@ assert.equal(
   14_624_000_000
 );
 assert.equal(ibmLikeLedger.some((row) => /Remainder|Thereafter/.test(row.sourceLineItemLabel)), false);
+
+const inventoryAndPpeHierarchyRows = [
+  {
+    ...ibmLikeRow(1, "Inventory, Finished Goods, Net of Reserves", "InventoryFinishedGoodsNetOfReserves", 500_000_000),
+    parentSubtotal: { label: "Inventory, Net", concept: "InventoryNet", relationship: "calculation", weight: 1 }
+  },
+  {
+    ...ibmLikeRow(2, "Inventory, Work in Process, Net of Reserves", "InventoryWorkInProcessNetOfReserves", 200_000_000),
+    parentSubtotal: { label: "Inventory, Net", concept: "InventoryNet", relationship: "calculation", weight: 1 }
+  },
+  {
+    ...ibmLikeRow(3, "Inventory, Raw Materials, Net of Reserves", "InventoryRawMaterialsNetOfReserves", 300_000_000),
+    parentSubtotal: { label: "Inventory, Net", concept: "InventoryNet", relationship: "calculation", weight: 1 }
+  },
+  ibmLikeRow(4, "Inventory, Net", "InventoryNet", 1_000_000_000),
+  ibmLikeRow(5, "Property, Plant and Equipment, Net", "PropertyPlantAndEquipmentNet", 2_000_000_000, "non_current"),
+  {
+    ...ibmLikeRow(6, "Land", "Land", 100_000_000, "non_current"),
+    currentNonCurrentSection: undefined,
+    parentSubtotal: undefined
+  },
+  {
+    ...ibmLikeRow(
+      7,
+      "Amount of post-employment obligations and deferred tax liability, after deferred tax asset, and other liabilities expected to be paid after one year",
+      "PostEmploymentObligationsDeferredIncomeTaxesAndOtherLongTermLiabilities",
+      700_000_000,
+      "non_current"
+    ),
+    parentSubtotal: { label: "Assets", concept: "Assets", relationship: "calculation" }
+  },
+  {
+    ...ibmLikeRow(8, "Deferred Income Taxes and Other Assets, Noncurrent", "DeferredIncomeTaxesAndOtherAssetsNoncurrent", 400_000_000, "non_current"),
+    parentSubtotal: { label: "Assets", concept: "Assets", relationship: "calculation" }
+  }
+];
+const inventoryAndPpeHierarchyCtx = {
+  ...ctx,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map(
+        inventoryAndPpeHierarchyRows.map((row) => [
+          row.xbrlConcept,
+          {
+            concept: row.xbrlConcept,
+            label: row.rowLabel,
+            value: row.value,
+            unit: "USD",
+            taxonomy: row.taxonomy,
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant",
+            reportDate
+          }
+        ])
+      )
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Consolidated Balance Sheet",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      filingDate: "2026-05-06",
+      rows: inventoryAndPpeHierarchyRows
+    }
+  ]
+};
+const inventoryAndPpeHierarchyFillRows = ["Inventory", "PP&E, Net", "Other Non-Current Assets", "Other Non-Current Liabilities"].map((label, index) => ({
+  row: index + 10,
+  label,
+  classification: "direct",
+  statement: "balance",
+  kind: "instant",
+  scale: 1_000_000
+}));
+const inventoryAndPpeHierarchyLedger = hooks.buildPrimaryBalanceSheetAssignmentLedgerRows(
+  ["1Q26"],
+  inventoryAndPpeHierarchyCtx,
+  inventoryAndPpeHierarchyFillRows
+);
+assert.equal(
+  inventoryAndPpeHierarchyLedger.filter((row) => row.assignedModelRow === "Inventory").reduce((total, row) => total + row.amount, 0),
+  1_000_000_000,
+  "A reported inventory carrying total and its raw/WIP/finished-goods detail must enter the assignment ledger exactly once."
+);
+assert.equal(
+  inventoryAndPpeHierarchyLedger.some((row) => row.sourceXbrlTag === "InventoryNet"),
+  false,
+  "The inventory aggregate should be excluded when primary-statement component detail reconciles to it."
+);
+const standaloneLandAssignment = inventoryAndPpeHierarchyLedger.find((row) => row.sourceXbrlTag === "Land");
+assert.equal(standaloneLandAssignment.assignmentStatus, "explicitly_excluded_with_reason");
+assert.match(standaloneLandAssignment.classificationReason, /PP&E gross component detail/);
+const compoundLongTermLiabilityAssignment = inventoryAndPpeHierarchyLedger.find(
+  (row) => row.sourceXbrlTag === "PostEmploymentObligationsDeferredIncomeTaxesAndOtherLongTermLiabilities"
+);
+assert.equal(compoundLongTermLiabilityAssignment.assignedModelRow, "Other Non-Current Liabilities");
+assert.equal(compoundLongTermLiabilityAssignment.side, "liabilities_and_equity");
+const deferredTaxAndOtherAssetAssignment = inventoryAndPpeHierarchyLedger.find(
+  (row) => row.sourceXbrlTag === "DeferredIncomeTaxesAndOtherAssetsNoncurrent"
+);
+assert.equal(deferredTaxAndOtherAssetAssignment.assignedModelRow, "Other Non-Current Assets");
+assert.equal(deferredTaxAndOtherAssetAssignment.side, "assets");
+assert.equal(
+  inventoryAndPpeHierarchyLedger
+    .filter((row) => row.side === "assets" && row.assignmentStatus !== "explicitly_excluded_with_reason")
+    .reduce((total, row) => total + row.amount, 0),
+  3_400_000_000,
+  "Compound post-employment/deferred-tax liabilities and covered PP&E detail must not inflate the assignment-ledger asset total."
+);
+
+const treasuryPrimaryRow = {
+  ...balanceRow(1, "Treasury Stock, Common, Value", "TreasuryStockCommonValue", 100_000_000, "equity"),
+  parentSubtotal: { label: "Stockholders' equity", concept: "StockholdersEquity", relationship: "calculation" }
+};
+const treasuryCtx = {
+  ...ctx,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map([
+        [
+          "TreasuryStockCommonValue",
+          {
+            concept: "TreasuryStockCommonValue",
+            label: "Treasury Stock, Common, Value",
+            value: 100_000_000,
+            unit: "USD",
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant"
+          }
+        ],
+        [
+          "CommonStockSharesHeldInEmployeeTrust",
+          {
+            concept: "CommonStockSharesHeldInEmployeeTrust",
+            label: "Common Stock, Shares Held in Employee Trust",
+            value: 10_000_000,
+            unit: "USD",
+            sourceLayer: "sec_live_companyfacts",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant"
+          }
+        ]
+      ])
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Condensed Consolidated Balance Sheets",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      filingDate: "2026-05-06",
+      rows: [treasuryPrimaryRow]
+    }
+  ]
+};
+assert.equal(hooks.resolveTreasuryStockOnly("1Q26", treasuryCtx).value, -110_000_000);
+const treasuryWorkbook = new ExcelJS.Workbook();
+const treasurySheet = treasuryWorkbook.addWorksheet("Model");
+treasurySheet.getCell("A1").value = "Balance Sheet";
+treasurySheet.getCell("A2").value = "Treasury Stock";
+treasurySheet.getCell("C2").value = -110;
+treasurySheet.getCell("A3").value = "Cash Flow Statement";
+const treasuryFillRows = [
+  {
+    row: 2,
+    label: "Treasury Stock",
+    classification: "direct",
+    statement: "balance",
+    kind: "instant",
+    scale: 1_000_000,
+    resolver: hooks.resolveTreasuryStockOnly
+  }
+];
+const treasuryWarnings = [];
+const treasuryErrors = hooks.validatePrimaryBalanceSheetAssignmentCoverage(
+  treasurySheet,
+  ["1Q26"],
+  [3],
+  treasuryCtx,
+  new hooks.FormulaEvaluator(treasurySheet, { useCachedFormulaResults: false, allowCachedFormulaResultFallback: false }),
+  treasuryWarnings,
+  treasuryFillRows
+);
+assert.equal(treasuryErrors.length, 0, treasuryErrors.join("\n"));
+assert.ok(
+  treasuryWarnings.some((warning) => /employee-trust contra-equity support/.test(warning)),
+  "A treasury row that ties current SEC treasury plus employee-trust contra-equity should pass with a narrow-primary-ledger advisory."
+);
 
 assert.equal(
   hooks.reportedLineItemCategory({
@@ -465,7 +739,11 @@ const tslaLedger = hooks.buildPrimaryBalanceSheetAssignmentLedgerRows(["1Q26"], 
 const tslaByLabel = new Map(tslaLedger.map((row) => [row.sourceLineItemLabel, row]));
 
 assert.equal(hooks.resolveAccruedLiabilities("1Q26", tslaCtx).value, 14_554_000_000);
-assert.equal(hooks.resolveGoodwill("1Q26", tslaCtx).value, 0);
+assert.equal(
+  hooks.resolveGoodwill("1Q26", tslaCtx).value,
+  null,
+  "A missing goodwill disclosure must remain unresolved instead of being converted into an invented zero."
+);
 
 const tslaOtherNonCurrentLiabilities = hooks.resolveOtherNonCurrentLiabilities("1Q26", tslaCtx);
 assert.equal(tslaOtherNonCurrentLiabilities.value, 17_059_000_000);
@@ -526,8 +804,223 @@ const coverageErrors = hooks.validatePrimaryBalanceSheetAssignmentCoverage(
   coverageWarnings,
   fillRows.map((row) => ({ ...row, row: row.row + 1 }))
 );
-assert.equal(coverageErrors.length, 0);
-assert.ok(coverageWarnings.some((warning) => /Balance Sheet 4Q25: no primary balance sheet assignment ledger rows/.test(warning)));
+assert.ok(
+  coverageErrors.some((error) => /Balance Sheet 4Q25: no primary balance sheet assignment ledger rows/.test(error)),
+  "Every reported SEC balance-sheet period must fail closed when its assignment ledger is missing."
+);
+assert.equal(
+  coverageWarnings.some((warning) => /Balance Sheet 4Q25: no primary balance sheet assignment ledger rows/.test(warning)),
+  false,
+  "Missing reported-period coverage is a blocking error, not an advisory warning."
+);
+
+const globallyEmptyBalanceLedgerCtx = {
+  ...ctx,
+  filingPackageStatements: []
+};
+const emptyBalanceLedgerErrors = hooks.validatePrimaryBalanceSheetAssignmentCoverage(
+  validationSheet,
+  ["1Q26"],
+  [3],
+  globallyEmptyBalanceLedgerCtx,
+  new hooks.FormulaEvaluator(validationSheet, { useCachedFormulaResults: false, allowCachedFormulaResultFallback: false }),
+  [],
+  fillRows.map((row) => ({ ...row, row: row.row + 1 }))
+);
+assert.ok(
+  emptyBalanceLedgerErrors.some((error) => /Balance Sheet 1Q26: no primary balance sheet assignment ledger rows/.test(error)),
+  "A globally empty balance-sheet assignment ledger must fail closed when the requested period is SEC-reported."
+);
+
+const investmentAssetRow = {
+  ...balanceRow(
+    1,
+    "Equity Securities without Readily Determinable Fair Value, Amount",
+    "EquitySecuritiesWithoutReadilyDeterminableFairValueAmount",
+    62_300_000,
+    "non_current"
+  ),
+  parentSubtotal: { label: "Assets", concept: "Assets", relationship: "calculation" }
+};
+const investmentCtx = {
+  ...ctx,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map([
+        [
+          investmentAssetRow.xbrlConcept,
+          {
+            concept: investmentAssetRow.xbrlConcept,
+            label: investmentAssetRow.rowLabel,
+            value: investmentAssetRow.value,
+            unit: "USD",
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant"
+          }
+        ]
+      ])
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Condensed Consolidated Balance Sheets",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      rows: [investmentAssetRow]
+    }
+  ]
+};
+const investmentLedger = hooks.buildPrimaryBalanceSheetAssignmentLedgerRows(
+  ["1Q26"],
+  investmentCtx,
+  ["Other Non-Current Assets", "Common Stock & APIC"].map((label, index) => ({
+    row: index + 1,
+    label,
+    classification: "direct",
+    statement: "balance",
+    kind: "instant",
+    scale: 1_000_000
+  }))
+);
+assert.equal(investmentLedger[0].assignedModelRow, "Other Non-Current Assets");
+assert.equal(investmentLedger[0].side, "assets");
+
+const duplicateAccruedRows = [
+  balanceRow(1, "Accrued Liabilities, Current", "AccruedLiabilitiesCurrent", 263_100_000),
+  balanceRow(2, "Accrued liabilities", "AccruedLiabilitiesCurrent", 263_100_000.00000003),
+  balanceRow(3, "Accrued Income Taxes, Current", "AccruedIncomeTaxesCurrent", 249_100_000)
+];
+const duplicateAccruedCtx = {
+  ...ctx,
+  filingPackageStatements: [
+    {
+      statementName: "Condensed Consolidated Balance Sheets",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      rows: duplicateAccruedRows
+    }
+  ]
+};
+assert.equal(
+  hooks.resolveAccruedLiabilities("1Q26", duplicateAccruedCtx).value,
+  512_200_000,
+  "Equivalent primary-statement facts from HTML and presentation structures must be counted once before adding separately reported tax accruals."
+);
+
+function combinedBalanceRow(rowOrder, rowLabel, xbrlConcept, value, section, parentConcept) {
+  return {
+    ...balanceRow(rowOrder, rowLabel, xbrlConcept, value, section),
+    parentSubtotal: {
+      label: parentConcept,
+      concept: parentConcept,
+      relationship: "calculation"
+    }
+  };
+}
+
+const combinedIntangibleRows = [
+  combinedBalanceRow(1, "Cash and cash equivalents", "CashAndCashEquivalentsAtCarryingValue", 100_000_000, "current", "AssetsCurrent"),
+  combinedBalanceRow(2, "Goodwill and acquisition-related intangible assets, net", "IntangibleAssetsNetIncludingGoodwill", 330_000_000, "non_current", "Assets"),
+  combinedBalanceRow(3, "Other assets", "OtherAssetsNoncurrent", 670_000_000, "non_current", "Assets"),
+  combinedBalanceRow(4, "Total assets", "Assets", 1_100_000_000, "non_current", "Assets"),
+  combinedBalanceRow(5, "Accounts payable", "AccountsPayableCurrent", 100_000_000, "current", "LiabilitiesCurrent"),
+  combinedBalanceRow(6, "Other long-term liabilities", "OtherLiabilitiesNoncurrent", 200_000_000, "non_current", "Liabilities"),
+  combinedBalanceRow(7, "Additional paid-in capital", "AdditionalPaidInCapital", 800_000_000, "non_current", "StockholdersEquity"),
+  combinedBalanceRow(8, "Total liabilities and stockholders' equity", "LiabilitiesAndStockholdersEquity", 1_100_000_000, "non_current", "LiabilitiesAndStockholdersEquity")
+];
+const separateIntangibleFact = {
+  concept: "FiniteLivedIntangibleAssetsNet",
+  label: "Finite-lived intangible assets, net",
+  value: 62_000_000,
+  unit: "USD",
+  sourceLayer: "sec_filing_package",
+  accn: accession,
+  end: reportDate,
+  periodKey: "1Q26",
+  periodType: "instant"
+};
+const combinedIntangibleCtx = {
+  ...ctx,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map([
+        ["FiniteLivedIntangibleAssetsNet", separateIntangibleFact],
+        ...combinedIntangibleRows.map((row) => [
+          row.xbrlConcept,
+          {
+            concept: row.xbrlConcept,
+            label: row.rowLabel,
+            value: row.value,
+            unit: "USD",
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "instant"
+          }
+        ])
+      ])
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Condensed Consolidated Balance Sheets",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      rows: combinedIntangibleRows
+    }
+  ]
+};
+const combinedGoodwill = hooks.resolveGoodwill("1Q26", combinedIntangibleCtx);
+assert.equal(
+  combinedGoodwill.value,
+  268_000_000,
+  "Goodwill must be derived from an SEC combined intangibles-and-goodwill balance less same-period separately disclosed SEC intangibles."
+);
+assert.equal(combinedGoodwill.sources[0].concept, "GoodwillDerivedFromCombinedIntangibles");
+assert.equal(combinedGoodwill.sources[0].value, 268_000_000, "The final goodwill derivation must be recorded separately from its SEC inputs.");
+
+const combinedFillRows = [
+  ["Cash & Cash Equivalents", 2],
+  ["Intangible Assets, Net", 3],
+  ["Goodwill", 4],
+  ["Other Non-Current Assets", 5],
+  ["Accounts Payable", 6],
+  ["Other Non-Current Liabilities", 7],
+  ["Common Stock & APIC", 8]
+].map(([label, row]) => ({ row, label, classification: "direct", statement: "balance", kind: "instant", scale: 1_000_000 }));
+const combinedWorkbook = new ExcelJS.Workbook();
+const combinedSheet = combinedWorkbook.addWorksheet("Model");
+combinedSheet.getCell("A1").value = "Balance Sheet";
+for (const fillRow of combinedFillRows) combinedSheet.getCell(fillRow.row, 1).value = fillRow.label;
+[100, 62, 268, 670, 100, 200, 800].forEach((value, index) => combinedSheet.getCell(index + 2, 2).value = value);
+combinedSheet.getCell("A9").value = "Cash Flow Statement";
+const combinedWarnings = [];
+assert.deepEqual(
+  hooks.validatePrimaryBalanceSheetAssignmentCoverage(
+    combinedSheet,
+    ["1Q26"],
+    [2],
+    combinedIntangibleCtx,
+    new hooks.FormulaEvaluator(combinedSheet, { useCachedFormulaResults: false, allowCachedFormulaResultFallback: false }),
+    combinedWarnings,
+    combinedFillRows
+  ),
+  [],
+  "A combined SEC carrying amount must reconcile across separate Intangible Assets and Goodwill model rows without double-counting."
+);
+assert.ok(combinedWarnings.some((warning) => /reports intangibles including goodwill/i.test(warning)));
 
 const workbook = new ExcelJS.Workbook();
 const formulaSheet = workbook.addWorksheet("Model");

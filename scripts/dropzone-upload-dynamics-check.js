@@ -24,10 +24,11 @@ const checks = [
     message: "Native file input must remain wired to capture and bubble change/input events."
   },
   {
-    ok: /const SUPPORTED_WORKBOOK_EXTENSIONS = \["\.xlsx", "\.xlsm"\]/.test(source)
+    ok: /const SUPPORTED_WORKBOOK_EXTENSIONS = \["\.xlsx"\]/.test(source)
       && /accept=\{SUPPORTED_WORKBOOK_ACCEPT\}/.test(source)
-      && /macroEnabled\.12/.test(source),
-    message: "Workbook picker must accept both .xlsx and .xlsm Open XML workbook files."
+      && /spreadsheetml\.sheet/.test(source)
+      && !/macroEnabled\.12/.test(source),
+    message: "Workbook picker must accept .xlsx files and must not advertise unsafe .xlsm support."
   },
   {
     ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*type\.toLowerCase\(\)[\s\S]*types\.includes\("files"\)[\s\S]*application\/x-moz-file[\s\S]*public\.file-url[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
@@ -109,7 +110,7 @@ const checks = [
     message: "Dropzone must capture drag/drop events before the transparent native input can swallow the drop."
   },
   {
-    ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not a supported \.xlsx or \.xlsm workbook/.test(source),
+    ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not a supported \.xlsx workbook/.test(source),
     message: "Invalid workbook selections must clear both selected-file state and the native input."
   },
   {

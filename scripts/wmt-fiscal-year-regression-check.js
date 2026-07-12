@@ -1,6 +1,7 @@
 const path = require("node:path");
 const ExcelJS = require("exceljs");
 const { postWorkbook } = require("./fill-workbook-api");
+const { requireSecRegressionHeaders } = require("./sec-regression-identity");
 
 const repoRoot = path.resolve(__dirname, "..");
 const ticker = process.env.WMT_TICKER || "WMT";
@@ -9,9 +10,7 @@ const inputWorkbook = process.env.WMT_INPUT_WORKBOOK || "/Users/maxschmieder/Dow
 const outputWorkbook = process.env.WMT_OUTPUT_WORKBOOK || path.join(repoRoot, "tmp", "wmt-fiscal-year-regression-output.xlsx");
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
-const secHeaders = {
-  "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver WMT regression contact@example.com"
-};
+const secHeaders = requireSecRegressionHeaders();
 
 const anchorRows = [
   { label: "Revenue", concepts: ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"], kind: "duration" },

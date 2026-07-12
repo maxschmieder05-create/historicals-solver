@@ -3,6 +3,7 @@ import {
   balanceSheetRowDefinitionForLabel,
   balanceSheetRowsEquivalent,
   balanceSheetSectionCompatible,
+  classifyBalanceSheetSourceSection,
   balanceSheetSourceLooksLikeDebtCarryingValueAdjustment
 } from "./balance-sheet-row-resolver";
 import { currentNonCurrentSignalFromText } from "./current-non-current";
@@ -113,7 +114,10 @@ type LlmClassificationOptions = {
   siteUrl: string;
   appTitle: string;
   timeoutMs?: number;
+  deadlineAt?: number;
+  maxAttempts?: number;
   fetchImpl?: typeof fetch;
+  signal?: AbortSignal;
 };
 
 type ClassifierOptions = {
@@ -144,6 +148,7 @@ type StatementLlmClassificationDecision = {
   recommended_model_row: string;
   confidence: FinancialLineItemClassification["confidence"];
   reason: string;
+  decision_origin: "validated_llm" | "deterministic_fallback";
 };
 
 type StatementLlmClassificationResponse = {
@@ -317,11 +322,9 @@ export function classificationSourceKeys(input: {
   const label = normalizeKey(input.label ?? "");
   const amount = typeof input.amount === "number" && Number.isFinite(input.amount) ? String(Math.round(input.amount)) : "";
   const keys = [
-    ["period", period, accession, concept, label, amount],
-    ["period-concept-label", period, accession, concept, label],
-    ["period-concept", period, accession, concept],
-    ["accession-concept-label", accession, concept, label],
-    ["concept-label", concept, label]
+    ["period-source", period, accession, concept, label, amount],
+    ["period-concept-label", period, concept, label, amount],
+    ["accession-concept-label", accession, concept, label, amount]
   ]
     .map((parts) => parts.filter(Boolean).join("|"))
     .filter(Boolean);
@@ -331,6 +334,7 @@ export function classificationSourceKeys(input: {
 export function lineItemNeedsClassification(request: FinancialLineItemClassificationRequest) {
   if (request.isSubtotal) return false;
   if (request.sourceTableType !== "primary_statement" && request.sourceTableType !== "cash_flow_reconciliation") return false;
+  if (aggregateOperatingExpenseSourceHasReportedComponents(request)) return false;
   const text = requestSearchText(request);
   if (AMBIGUOUS_LINE_ITEM_TERMS.some((term) => text.includes(term))) return true;
   if (/short[-\s]?term|current investments?|marketable securities|available[-\s]?for[-\s]?sale securities|current maturit|current portion|senior notes?|convertible|contract liabilit|deferred revenue|deferred income|spare parts?|supplies|in[-\s]?process research|special items?|other/.test(text)) return true;
@@ -348,6 +352,7 @@ export function materialStatementLineItemNeedsAnalystPass(
 ) {
   if (request.sourceTableType !== "primary_statement") return false;
   if (request.statement !== "income_statement" && request.statement !== "balance_sheet") return false;
+  if (aggregateOperatingExpenseSourceHasReportedComponents(request)) return false;
   if (request.unit && !/usd/i.test(request.unit)) return false;
   if (typeof request.amount !== "number" || !Number.isFinite(request.amount)) return false;
   const threshold = Number.isFinite(materialityThreshold) && materialityThreshold >= 0
@@ -402,9 +407,27 @@ export async function classifyFinancialLineItem(
   return failedLlmClassification(request, fallback, result.status, result.error || result.telemetry.errorMessage || "unknown classifier LLM error");
 }
 
+const DEFAULT_STATEMENT_LLM_ATTEMPT_BUDGET = 1;
+
+type StatementLlmAttemptBudget = {
+  remaining: number;
+};
+
 export async function classifyFinancialStatementLineItems(
   requests: FinancialLineItemClassificationRequest[],
   options: ClassifierOptions = {}
+): Promise<FinancialStatementLineItemClassificationResult> {
+  const configuredAttemptBudget = options.llm?.maxAttempts;
+  const attemptBudget = Number.isFinite(configuredAttemptBudget)
+    ? Math.max(0, Math.floor(configuredAttemptBudget!))
+    : DEFAULT_STATEMENT_LLM_ATTEMPT_BUDGET;
+  return classifyFinancialStatementLineItemsWithinBudget(requests, options, { remaining: attemptBudget });
+}
+
+async function classifyFinancialStatementLineItemsWithinBudget(
+  requests: FinancialLineItemClassificationRequest[],
+  options: ClassifierOptions,
+  attemptBudget: StatementLlmAttemptBudget
 ): Promise<FinancialStatementLineItemClassificationResult> {
   const prepared = requests.map((request, index) => prepareLineItemClassification(request, index, options));
   const classificationTargets = prepared.filter((item) => item.needsClassification);
@@ -427,8 +450,13 @@ export async function classifyFinancialStatementLineItems(
   }
 
   const llm = options.llm!;
-  const result = await requestStatementLlmClassification(prepared, targets, llm);
+  if (attemptBudget.remaining <= 0) {
+    return statementLlmBudgetExhaustedResult(classificationTargets, targets);
+  }
+  const result = await requestStatementLlmClassification(prepared, targets, llm, attemptBudget.remaining);
   const telemetry = result.attemptTelemetry ?? [result.telemetry];
+  const currentAttempts = telemetry.filter((item) => item.attempted).length;
+  attemptBudget.remaining = Math.max(0, attemptBudget.remaining - currentAttempts);
   if (result.value) {
     const response = result.value;
     const byRowKey = new Map(response.classifications.map((item) => [item.source_row_key, item]));
@@ -439,7 +467,7 @@ export async function classifyFinancialStatementLineItems(
         request: item.request,
         classification: finalizeClassification(item.request, {
           ...statementDecisionToClassification(item, llmDecision),
-          llm_used: result.telemetry.affectedOutput,
+          llm_used: statementDecisionWasAcceptedFromLlm(llmDecision) && result.telemetry.affectedOutput,
           llm_status: result.status
         })
       };
@@ -468,10 +496,10 @@ export async function classifyFinancialStatementLineItems(
       unreviewedTargetKeys
     };
   }
-  if (statementClassificationFailureShouldSplit(result, requests.length)) {
+  if (attemptBudget.remaining > 0 && !llm.signal?.aborted && statementClassificationFailureShouldSplit(result, requests.length)) {
     const midpoint = Math.ceil(requests.length / 2);
-    const left = await classifyFinancialStatementLineItems(requests.slice(0, midpoint), options);
-    const right = await classifyFinancialStatementLineItems(requests.slice(midpoint), options);
+    const left = await classifyFinancialStatementLineItemsWithinBudget(requests.slice(0, midpoint), options, attemptBudget);
+    const right = await classifyFinancialStatementLineItemsWithinBudget(requests.slice(midpoint), options, attemptBudget);
     return {
       classifications: [...left.classifications, ...right.classifications],
       warnings: [...left.warnings, ...right.warnings],
@@ -509,6 +537,32 @@ export async function classifyFinancialStatementLineItems(
   };
 }
 
+function statementLlmBudgetExhaustedResult(
+  classificationTargets: PreparedLineItemClassification[],
+  targets: PreparedLineItemClassification[]
+): FinancialStatementLineItemClassificationResult {
+  const message = "statement-level LLM request-attempt budget was exhausted";
+  return {
+    classifications: classificationTargets.map((item) => ({
+      request: item.request,
+      classification: item.needsLlm
+        ? failedLlmClassification(item.request, item.fallback, "attempted_failed", message)
+        : item.initialClassification
+    })),
+    warnings: targets.map(
+      (item) => `${item.request.cleanLabel || item.request.reportedLineItemLabel}: ${message}; deterministic fallback was used.`
+    ),
+    llmCalls: 0,
+    llmAttempts: 0,
+    llmSuccessfulCompletions: 0,
+    llmTelemetry: [],
+    targetCount: classificationTargets.length,
+    llmReviewedCount: 0,
+    acceptedDecisionCount: 0,
+    unreviewedTargetKeys: classificationTargets.map((item) => item.rowKey)
+  };
+}
+
 function statementClassificationFailureShouldSplit(
   result: AccountingLlmResult<StatementLlmClassificationResponse>,
   requestCount: number
@@ -530,14 +584,11 @@ function statementClassificationFailureShouldSplit(
 
 function statementClassificationAccepted(classification: FinancialLineItemClassification) {
   if (!classification.llm_used || classification.confidence === "low" || classification.warning) return false;
-  if (
-    classification.recommended_action === "exclude" ||
-    classification.recommended_action === "set_zero" ||
-    classification.recommended_action === "keep_existing"
-  ) {
-    return true;
-  }
   return classification.mapping_passed_validation;
+}
+
+function statementDecisionWasAcceptedFromLlm(decision: StatementLlmClassificationDecision) {
+  return decision.decision_origin === "validated_llm";
 }
 
 function prepareLineItemClassification(
@@ -600,11 +651,15 @@ export function fullStatementLineItemNeedsAnalystPass(request: FinancialLineItem
   ) {
     return false;
   }
+  if (aggregateOperatingExpenseSourceHasReportedComponents(request)) return false;
   const text = `${request.cleanLabel || request.reportedLineItemLabel} ${request.xbrlTag ?? ""}`.toLowerCase();
   const tagCompact = (request.xbrlTag ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
   if (
     /\bper (?:common )?share\b|\bearnings per share\b|\beps\b|\bweighted average (?:number of )?shares?\b|\bshares? (?:outstanding|used|weighted)\b|\bnumber of shares?\b/.test(
       text
+    ) ||
+    /earningspershare|incomelosspercommonshare|weightedaveragenumberof.*shares|commonstocksharesoutstanding|preferredstocksharesoutstanding|dividendspershare/.test(
+      tagCompact
     )
   ) {
     return false;
@@ -629,6 +684,21 @@ export function fullStatementLineItemNeedsAnalystPass(request: FinancialLineItem
     return false;
   }
   return true;
+}
+
+function aggregateOperatingExpenseSourceHasReportedComponents(request: FinancialLineItemClassificationRequest) {
+  if (request.statement !== "income_statement" || request.section !== "operating expenses") return false;
+  const concept = normalizeKey((request.xbrlTag ?? "").split(":").pop() ?? "");
+  const label = normalizeKey(request.cleanLabel || request.reportedLineItemLabel);
+  const aggregatePattern = /^(?:total)?(?:operating(?:costs?and)?expenses?(?:andother)?|costsandexpenses(?:andother)?)$/;
+  if (!aggregatePattern.test(concept) && !aggregatePattern.test(label)) return false;
+
+  const componentPattern =
+    /costof.*(?:revenue|sales|goods|products?|services?|sold)|researchanddevelopment|productdevelopment|sellingandmarketing|generalandadministrative|sellinggeneralandadministrative|depreciation|amortization|restructuring|impairment|specialcharges?|acquiredinprocess|technologyandcontent|fulfillment|fuelandpurchasedpower|purchasedpower|otheroperating(?:income|expense)/;
+  return (request.currentPeriodSourceLines ?? []).some((sourceLine) => {
+    const normalized = normalizeKey(sourceLine);
+    return Boolean(normalized && normalized !== label && !aggregatePattern.test(normalized) && componentPattern.test(normalized));
+  });
 }
 
 export function modelRowsMatch(a: string, b: string) {
@@ -994,6 +1064,37 @@ function deterministicFinancialLineItemClassification(
     };
   }
 
+  if (request.statement === "income_statement" && request.section === "below operating income") {
+    const semantics = trustedSourceSemantics(request);
+    const target = semantics.netInterestExpense
+      ? preferred("Interest Expense")
+      : semantics.netInterestIncome
+        ? preferred("Interest Income")
+        : semantics.combinedNetInterest
+          ? preferred("Other Non-Operating Income / Expense")
+          : null;
+    if (target) {
+      return {
+        ...base,
+        recommended_model_row: target,
+        classification_type: semantics.netInterestExpense
+          ? "net non-operating interest expense"
+          : semantics.netInterestIncome
+            ? "net non-operating interest income"
+            : "combined net interest income expense",
+        is_current: null,
+        is_operating: false,
+        should_exclude_from_other_bucket: !modelRowsMatch(target, "Other Non-Operating Income / Expense"),
+        confidence: "high",
+        reason: semantics.netInterestExpense
+          ? "A primary-statement interest expense explicitly net of interest income remains an Interest Expense line."
+          : semantics.netInterestIncome
+            ? "A primary-statement interest income line explicitly net of interest expense remains an Interest Income line."
+            : "An undirected combined interest income/expense net line remains in Other Non-Operating Income / Expense rather than being forced into one interest direction."
+      };
+    }
+  }
+
   const excludesAcquiredInProcessCost =
     /\bexclud(?:e|es|ing)\b.*\bacquired\b.*\bin[-\s]?process\b.*\bcost\b/.test(ownText) ||
     /researchanddevelopmentexpenseexcludingacquiredinprocesscost/i.test(request.xbrlTag ?? "");
@@ -1050,7 +1151,8 @@ function deterministicFinancialLineItemClassification(
   if (
     request.statement === "income_statement" &&
     request.section === "operating expenses" &&
-    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(ownText)
+    (/\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b/.test(ownText) ||
+      /\b(?:company[-\s]?(?:owned(?:\s+and\s+operated)?|operated)|franchised|other) restaurants?\b.*\b(?:costs?|expenses?)\b|\brestaurants?\b.*\b(?:occupancy|operating) expenses?\b/.test(text))
   ) {
     return {
       ...base,
@@ -1219,7 +1321,7 @@ function finalizeClassification(
   classification: FinancialLineItemClassification
 ): FinancialLineItemClassification {
   const recommended = normalizeModelRow(classification.recommended_model_row) || classification.recommended_model_row;
-  const mappingPassedValidation = classification.mapping_passed_validation || classificationPassesValidation(request, { ...classification, recommended_model_row: recommended });
+  const mappingPassedValidation = classificationPassesValidation(request, { ...classification, recommended_model_row: recommended });
   return {
     ...classification,
     recommended_action: classification.recommended_action || "map",
@@ -1253,83 +1355,441 @@ function failedLlmClassification(
   });
 }
 
+type TrustedSourceSemantics = ReturnType<typeof trustedSourceSemantics>;
+
+const INCOME_STATEMENT_CLASSIFICATION_ROWS = [
+  "Revenue",
+  "COGS / Cost of Goods Sold",
+  "SG&A",
+  "R&D",
+  "D&A",
+  "Other Operating Income / Expense",
+  "Interest Income",
+  "Interest Expense",
+  "Goodwill Impairment",
+  "Other Non-Operating Income / Expense",
+  "Income Tax Benefit / Expense"
+] as const;
+
 export function classificationPassesValidation(request: FinancialLineItemClassificationRequest, classification: FinancialLineItemClassification) {
-  const text = requestSearchText(request);
-  const row = classification.recommended_model_row;
-  if (request.isSubtotal || /unmapped|needs review/i.test(row)) return false;
-  if (modelRowsMatch(row, "D&A") && request.statement !== "income_statement") return false;
-  if (modelRowsMatch(row, "D&A") && /cash flows?|operating activities|reconciliation|supplemental/.test(text)) return false;
-  if (modelRowsMatch(row, "Revolver") && /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|convertible|senior notes?/.test(text)) return false;
-  if (modelRowsMatch(row, "Deferred Income Taxes") && !classification.is_deferred_tax) return false;
-  if ((modelRowsMatch(row, "Accrued Liabilities") || modelRowsMatch(row, "Other Current Liabilities")) && classification.is_debt) return false;
+  const action = classification.recommended_action ?? "map";
+  if (action === "exclude") return request.isSubtotal;
+  if (action === "set_zero" || action === "keep_existing" || action === "split_across_rows") return false;
+  if (action !== "map" && action !== "remap" && action !== "merge_into_other") return false;
+  if (request.isSubtotal) return false;
+  if (aggregateOperatingExpenseSourceHasReportedComponents(request)) return false;
+  if (request.sourceTableType !== "primary_statement") return false;
+
+  const requestedRow = normalizeModelRow(classification.recommended_model_row ?? "") || classification.recommended_model_row;
+  if (!requestedRow || /unmapped|needs review/i.test(requestedRow)) return false;
+  const availableRow = request.availableModelRows.find((row) => modelRowsMatch(row, requestedRow));
+  if (!availableRow) return false;
+
+  const semantics = trustedSourceSemantics(request);
+  if (request.statement === "balance_sheet") {
+    if (request.periodType !== "instant") return false;
+    return balanceSheetClassificationPassesTrustedValidation(request, requestedRow, availableRow, action, semantics);
+  }
+  if (request.statement === "income_statement") {
+    if (request.periodType !== "duration") return false;
+    return incomeStatementClassificationPassesTrustedValidation(request, requestedRow, action, semantics);
+  }
+  return false;
+}
+
+function trustedSourceSemantics(request: FinancialLineItemClassificationRequest) {
+  const ownText = [request.reportedLineItemLabel, request.cleanLabel, request.xbrlTag ?? ""]
+    .join(" ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+  const parentText = [request.parentSubtotal?.label ?? "", request.parentSubtotal?.concept ?? ""]
+    .join(" ")
+    .replace(/([a-z])([A-Z])/g, "$1 $2")
+    .toLowerCase();
+  const compact = normalizeKey(ownText);
+  const balanceSheetSection = classifyBalanceSheetSourceSection(request.section, {
+    label: request.cleanLabel || request.reportedLineItemLabel,
+    tag: request.xbrlTag
+  });
+  const deferredTax = /\bdeferred\b.*\btax(?:es)?\b|\btax(?:es)?\b.*\bdeferred\b/.test(ownText) || /deferred(?:income)?tax/.test(compact);
+  const deferredRevenue =
+    /\bdeferred (?:income|revenue)\b|\bunearned revenue\b|\bcontract liabilit|\bcustomer advances?\b/.test(ownText) ||
+    /contractwithcustomerliability|deferredrevenue|deferredincome|unearnedrevenue|customeradvances/.test(compact);
+  const selfInsurance = /\bself[-\s]?insurance reserves?\b/.test(ownText) || /selfinsurancereserve/.test(compact);
+  const pension = /\bpension\b|\bpostretirement\b|\bdefined benefit\b/.test(ownText) || /pension|postretirement|definedbenefit/.test(compact);
+  const financeLease = /\bfinance lease\b|\bcapital lease\b|\blease financing\b/.test(ownText) || /financelease|capitallease|leasefinancing/.test(compact);
+  const investmentSecurities =
+    /\bshort[-\s]?term investments?\b|\bcurrent investments?\b|\bmarketable securities\b|\binvestment securities\b|\bdebt and equity securities\b|\bequity securities\b|\bavailable[-\s]?for[-\s]?sale securities\b/.test(
+      ownText
+    ) || /shortterminvest|marketablesecurit|investmentsecurit|equitysecurit|availableforsalesecurit/.test(compact);
+  const currentLongTermDebt =
+    /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|\blong[-\s]?term debt\b.*\bcurrent\b|\bconvertible\b.*\bnotes?\b|\bsenior notes?\b/.test(
+      ownText
+    ) || /longtermdebtcurrent|currentportionoflongtermdebt|currentmaturitiesoflongtermdebt/.test(compact);
+  const shortTermBorrowing =
+    /\bshort[-\s]?term borrowings?\b|\bcommercial paper\b|\brevolver\b|\brevolving credit\b|\bline of credit\b|\bcurrent borrowings?\b|\bnotes? payable\b.*\bcurrent\b/.test(
+      ownText
+    ) || /shorttermborrowing|commercialpaper|revolvingcreditfacilitycurrent|currentborrowings|notespayablecurrent/.test(compact);
+  const debtAdjustment = balanceSheetSourceLooksLikeDebtCarryingValueAdjustment({
+    label: request.cleanLabel || request.reportedLineItemLabel,
+    tag: request.xbrlTag
+  });
+  const debt =
+    !selfInsurance &&
+    !pension &&
+    !deferredRevenue &&
+    !investmentSecurities &&
+    (currentLongTermDebt || shortTermBorrowing || debtAdjustment || /\bdebt\b|\bborrowings?\b|\bnotes?\b|\bterm loans?\b/.test(ownText));
+  const acquiredInProcessResearchDevelopment =
+    !/\bexclud(?:e|es|ing)\b.*\bacquired\b.*\bin[-\s]?process\b/.test(ownText) &&
+    (/\bacquired\b.*\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bin[-\s]?process\b.*\bresearch\b.*\bdevelopment\b|\bipr&d\b|\biprd\b/.test(
+      ownText
+    ) || /acquiredinprocessresearchanddevelopment/.test(compact));
+  const restaurantDirectCost =
+    /\b(?:company[-\s]?(?:owned(?:\s+and\s+operated)?|operated)|franchised|other) restaurants?\b.*\b(?:costs?|expenses?)\b|\brestaurants?\b.*\b(?:occupancy|operating) expenses?\b/.test(
+      `${ownText} ${parentText}`
+    ) || /companyoperatedrestaurantexpense|franchisedrestaurantexpense|restaurantoperatingexpense/.test(compact);
+  const directCost =
+    /\bcost\b.*\b(?:sales|revenue|goods|products?|services?|operations?)\b|\b(?:sales|revenue|goods|products?|services?|operations?)\b.*\bcost\b|\bmerchandise costs?\b|\bfulfillment\b.*\b(?:costs?|expense)\b|\bfuel and purchased power\b|\bpurchased power\b.*\b(?:cost|expense)\b|\bproduction costs?\b/.test(
+      ownText
+    ) || /costofgoods|costofrevenue|costofsales|fuelandpurchasedpower/.test(compact) || restaurantDirectCost;
+  const depreciationAmortizationMention =
+    /\bdepreciation\b|\bamortization\b|\bdepletion\b|\bd&a\b/.test(ownText) || /depreciationandamortization/.test(compact);
+  const depreciationAmortizationExcluded =
+    /\b(?:exclud(?:e|es|ed|ing)|exclusive of|before)\b(?:\s+\w+){0,3}\s+\b(?:depreciation|amortization|depletion|d&a)\b/.test(ownText) ||
+    /(?:excluding|exclusiveof|before)(?:depreciation|amortization|depletion)/.test(compact);
+  const rawInterestIncome = /\binterest income\b|\binterest and dividend income\b/.test(ownText) || /interestincome/.test(compact);
+  const rawInterestExpense = /\binterest expense\b|\binterest and debt expense\b|\bdebt expense\b/.test(ownText) || /interestexpense/.test(compact);
+  const netInterestExpense =
+    /\binterest expense\b.*\bnet of\b.*\binterest income\b/.test(ownText) ||
+    /^(?:[^ ]*\s+)*interest expense,? net\b/.test(ownText) ||
+    /interestexpensenonoperatingnet/.test(compact);
+  const netInterestIncome =
+    /\binterest income\b.*\bnet of\b.*\binterest expense\b/.test(ownText) ||
+    /interestincomenonoperatingnet/.test(compact);
+  const combinedNetInterest =
+    /\binterest income\s*\(expense\),?\s*net\b|\binterest income\s*\/\s*expense\b|\bnet interest income\s*\(expense\)/.test(ownText) ||
+    /interestincomeexpensenonoperatingnet/.test(compact) ||
+    (rawInterestIncome && rawInterestExpense && !netInterestExpense && !netInterestIncome);
+
+  return {
+    ownText,
+    compact,
+    balanceSheetSection,
+    deferredTax,
+    deferredRevenue,
+    selfInsurance,
+    pension,
+    financeLease,
+    lease: /\blease liabilit|\blease obligations?\b/.test(ownText) || /leaseliabilit|leaseobligation/.test(compact),
+    assetRetirementObligation: /\basset retirement obligations?\b/.test(ownText) || /assetretirementobligation/.test(compact),
+    restrictedCash: /\brestricted cash\b/.test(ownText) || /restrictedcash/.test(compact),
+    cashAggregate: /cashcashequivalentsrestrictedcash/.test(compact),
+    cash:
+      /\bcash(?: and| &)? cash equivalents?\b|\bcash and equivalents?\b|\bcash and due from banks?\b|\binterest[-\s]?bearing deposits? in banks?\b/.test(
+        ownText
+      ) || /cashandcashequivalents|cashandduefrombanks|interestbearingdepositsinbanks/.test(compact),
+    investmentSecurities,
+    receivable: /\baccounts? receivables?\b|\btrade receivables?\b/.test(ownText) || /accountsreceivable|tradeaccountsreceivable|receivablesnetcurrent/.test(compact),
+    inventory:
+      /\binventor(?:y|ies)\b|\bspare parts?\b|\bparts and supplies\b|\baircraft fuel\b|\braw materials?\b|\bwork[-\s]?in[-\s]?process\b|\bfinished goods?\b/.test(
+        ownText
+      ) || /inventory|partsandsupplies/.test(compact),
+    propertyPlantEquipment:
+      /\bproperty\b.*\bplant\b.*\bequipment\b|\bproperty and equipment\b|\bpp&e\b|\butility plant\b|\breal estate investment propert/.test(ownText) ||
+      /propertyplantandequipment|propertyandequipmentnet|utilityplant|realestateinvestmentproperty/.test(compact),
+    intangible: /\bintangible assets?\b|\btrademarks?\b|\bcustomer relationships?\b/.test(ownText) || /intangibleassets|trademarks/.test(compact),
+    goodwill: /\bgoodwill\b/.test(ownText) || /goodwill/.test(compact),
+    accountsPayable: /\baccounts? payable\b|\btrade payables?\b|\bvendor payables?\b|\bpharmacy costs? payable\b/.test(ownText) || /accountspayable|tradepayable/.test(compact),
+    accrued:
+      /\baccrued\b|\bcompensation\b|\bpayroll\b|\bwages payable\b|\bbenefits payable\b|\binterest payable\b|\brebates?\b|\breturns?\b|\bpromotions?\b/.test(
+        ownText
+      ) || /accruedliabilit|employeerelatedliabilit|interestpayable/.test(compact),
+    currentTaxPayable: /\bincome taxes? payable\b|\btaxes payable\b|\baccrued income taxes\b/.test(ownText) || /incometaxespayable|accruedincometaxes/.test(compact),
+    currentLongTermDebt,
+    shortTermBorrowing,
+    debtAdjustment,
+    debt,
+    commonCapital:
+      !investmentSecurities &&
+      (/\bcommon stock\b|\badditional paid[-\s]?in capital\b|\bpaid[-\s]?in capital\b|\bcapital in excess\b/.test(ownText) ||
+        /commonstock|additionalpaidincapital/.test(compact)),
+    retainedEarnings: /\bretained earnings\b|\bretained deficit\b|\baccumulated deficit\b/.test(ownText) || /retainedearningsaccumulateddeficit/.test(compact),
+    treasuryStock: /\btreasury stock\b|\bcontra[-\s]?equity\b|\besop\b|\bemployee benefit trust\b/.test(ownText) || /treasurystock/.test(compact),
+    accumulatedOtherComprehensiveIncome:
+      /\baccumulated other comprehensive (?:income|loss)\b|\baoci\b/.test(ownText) || /accumulatedothercomprehensiveincomeloss/.test(compact),
+    noncontrollingInterest: /\bnon[-\s]?controlling interests?\b|\bminority interest\b/.test(ownText) || /noncontrollinginterest|minorityinterest/.test(compact),
+    redeemableNoncontrollingInterest:
+      /\bredeemable\b.*\bnon[-\s]?controlling interests?\b|\bnon[-\s]?controlling interests?\b.*\bredeemable\b|\bredeemable nci\b/.test(ownText) ||
+      /redeemablenoncontrollinginterest/.test(compact),
+    acquiredInProcessResearchDevelopment,
+    researchDevelopment:
+      acquiredInProcessResearchDevelopment ||
+      /\bresearch\b|\br&d\b|\bproduct development\b|\bengineering expense\b|\btechnology development\b|\btechnology and content\b/.test(ownText) ||
+      /researchanddevelopment|productdevelopment|technologydevelopment/.test(compact),
+    sellingGeneralAdministrative:
+      /\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bsales and marketing\b|\bselling and marketing\b|\bsales expense\b|\bselling expense\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b|\bsg&a\b/.test(
+        ownText
+      ) || /sellinggeneralandadministrative|advertisingexpense|salesandmarketing/.test(compact),
+    depreciationAmortization: depreciationAmortizationMention && !depreciationAmortizationExcluded && !directCost,
+    directCost,
+    goodwillImpairment: /\bgoodwill\b.*\bimpairment\b|\bimpairment\b.*\bgoodwill\b/.test(ownText) || /goodwillimpairment/.test(compact),
+    specialOperating:
+      /\bspecial items?\b|\brestructuring\b|\bimpairment\b|\bspecial charges?\b|\bintegration costs?\b|\blitigation\b|\bsettlement\b|\baccretion\b/.test(
+        ownText
+      ),
+    combinedInterestOther: /\binterest\b.*\bother\b|\bother\b.*\binterest\b/.test(ownText),
+    combinedNetInterest,
+    netInterestExpense,
+    netInterestIncome,
+    interestIncome: rawInterestIncome && !netInterestExpense && !combinedNetInterest,
+    interestExpense: rawInterestExpense && !netInterestIncome && !combinedNetInterest,
+    incomeTaxExpense: /\bincome tax(?:es)?\b|\bprovision for (?:income )?tax(?:es)?\b/.test(ownText) || /incometaxexpensebenefit|provisionforincometax/.test(compact)
+  };
+}
+
+function balanceSheetClassificationPassesTrustedValidation(
+  request: FinancialLineItemClassificationRequest,
+  row: string,
+  availableRow: string,
+  action: FinancialLineItemClassification["recommended_action"],
+  semantics: TrustedSourceSemantics
+) {
+  const definition = balanceSheetRowDefinitionForLabel(row) ?? balanceSheetRowDefinitionForLabel(availableRow);
+  if (!definition || definition.family === "totals" || definition.kind === "subtotal" || definition.kind === "total") return false;
   if (
-    requestLooksLikeSelfInsuranceReserve(request, text) &&
-    (modelRowsMatch(row, "Revolver") || modelRowsMatch(row, "LT Debt (Incl. Current Portion)"))
-  ) return false;
-  if (requestLooksLikeSelfInsuranceReserve(request, text)) {
-    const nonCurrent = currentNonCurrentSignalFromText(text) === "non-current" || /Noncurrent/i.test(request.xbrlTag ?? "");
-    return nonCurrent
-      ? modelRowsMatch(row, "Other Non-Current Liabilities")
-      : modelRowsMatch(row, "Accrued Liabilities") || modelRowsMatch(row, "Other Current Liabilities");
-  }
-  if (
-    request.statement === "balance_sheet" &&
-    (/\bredeemable\b.*\bnon[-\s]?controlling interests?\b|\bnon[-\s]?controlling interests?\b.*\bredeemable\b|\bredeemable nci\b/.test(text) ||
-      /RedeemableNoncontrollingInterest/i.test(request.xbrlTag ?? "")) &&
-    (modelRowsMatch(row, "Mezzanine Equity") || modelRowsMatch(row, "Other Non-Current Liabilities"))
-  ) {
-    return true;
-  }
-  if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /inventor|spare parts?|aircraft fuel|supplies/.test(text)) return false;
-  if (modelRowsMatch(row, "Prepaid & Other Current Assets") && /short[-\s]?term investments?|marketable securities|available[-\s]?for[-\s]?sale securities/.test(text)) {
-    const hasCurrentInvestmentsRow = request.availableModelRows.some((availableRow) =>
-      /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(availableRow) &&
-      !/cash.*(short[-\s]?term investments?|current investments?|marketable securities)|(short[-\s]?term investments?|current investments?|marketable securities).*cash/i.test(availableRow)
-    );
-    const hasCashAndCurrentInvestmentsRow = request.availableModelRows.some((availableRow) =>
-      /cash.*(short[-\s]?term investments?|current investments?|marketable securities)|(short[-\s]?term investments?|current investments?|marketable securities).*cash/i.test(availableRow)
-    );
-    const hasCashRow = request.availableModelRows.some((availableRow) => modelRowsMatch(availableRow, "Cash & Cash Equivalents"));
-    if (hasCurrentInvestmentsRow || hasCashAndCurrentInvestmentsRow || hasCashRow) return false;
-  }
-  if (modelRowsMatch(row, "Cash & Cash Equivalents") && /short[-\s]?term investments?|marketable securities|available[-\s]?for[-\s]?sale securities/.test(text)) {
-    const hasCurrentInvestmentsRow = request.availableModelRows.some((availableRow) =>
-      /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(availableRow) &&
-      !/cash.*(short[-\s]?term investments?|current investments?|marketable securities)|(short[-\s]?term investments?|current investments?|marketable securities).*cash/i.test(availableRow)
-    );
-    if (hasCurrentInvestmentsRow) return false;
-  }
-  if (modelRowsMatch(row, "Common Stock & APIC") && /\binvestment securities\b|\bdebt and equity securities\b|\bavailable[-\s]?for[-\s]?sale securities\b|\bmarketable securities\b/.test(text)) return false;
-  if (request.section === "current assets" && !modelRowsMatch(row, "Cash & Cash Equivalents") && !modelRowsMatch(row, "Short-Term Investments") && !modelRowsMatch(row, "Accounts Receivable") && !modelRowsMatch(row, "Inventory") && !modelRowsMatch(row, "Prepaid & Other Current Assets")) return false;
-  if (request.section === "non-current assets" && !modelRowsMatch(row, "PP&E, Net") && !modelRowsMatch(row, "Intangible Assets, Net") && !modelRowsMatch(row, "Goodwill") && !modelRowsMatch(row, "Other Non-Current Assets")) return false;
-  if (request.section === "current liabilities" && !modelRowsMatch(row, "Accounts Payable") && !modelRowsMatch(row, "Accrued Liabilities") && !modelRowsMatch(row, "Other Current Liabilities") && !modelRowsMatch(row, "Revolver") && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)")) return false;
-  if (request.section === "non-current liabilities" && !modelRowsMatch(row, "LT Debt (Incl. Current Portion)") && !modelRowsMatch(row, "Deferred Income Taxes") && !modelRowsMatch(row, "Other Non-Current Liabilities")) return false;
-  if (request.section === "equity" && !modelRowsMatch(row, "Common Stock & APIC") && !modelRowsMatch(row, "Retained Earnings") && !modelRowsMatch(row, "Treasury Stock") && !modelRowsMatch(row, "AOCI") && !modelRowsMatch(row, "Noncontrolling Interests")) return false;
-  if (modelRowsMatch(row, "Other Current Liabilities") && /\baccrued\b.*\b(rebates?|returns?|promotions?|compensation|payroll|tax(?:es)?)\b/.test(text)) return false;
-  if (
-    request.statement === "balance_sheet" &&
-    !balanceSheetSectionCompatible(row, request.section, {
+    !balanceSheetSectionCompatible(row, semantics.balanceSheetSection, {
       label: request.cleanLabel || request.reportedLineItemLabel,
       tag: request.xbrlTag
     })
   ) {
     return false;
   }
-  if (
-    request.statement === "income_statement" &&
-    request.section === "operating expenses" &&
-    modelRowsMatch(row, "Other Non-Operating Income / Expense")
-  ) {
-    return false;
+
+  const routeTarget = trustedBalanceSheetRouteTarget(request, semantics);
+  if (!balanceSheetTargetAllowedForSection(row, definition.family, semantics, routeTarget)) return false;
+  if (routeTarget && !modelRowsMatch(row, routeTarget)) return false;
+  if (!balanceSheetTargetHasTrustedSemantics(request, row, definition.kind, semantics)) return false;
+  if (action === "merge_into_other" && definition.kind !== "catch_all") return false;
+  return true;
+}
+
+function balanceSheetTargetAllowedForSection(
+  row: string,
+  family: string,
+  semantics: TrustedSourceSemantics,
+  routeTarget: string | null
+) {
+  const section = semantics.balanceSheetSection;
+  if (section === "current assets") return family === "current_assets";
+  if (section === "non-current assets") return family === "non_current_assets";
+  if (section === "current liabilities") {
+    if (family === "current_liabilities") return true;
+    return semantics.currentLongTermDebt && (modelRowsMatch(row, "LT Debt (Incl. Current Portion)") || modelRowsMatch(row, "Total Debt"));
   }
+  if (section === "non-current liabilities") return family === "non_current_liabilities";
+  if (section === "equity") {
+    if (family === "equity") return true;
+    return semantics.redeemableNoncontrollingInterest && modelRowsMatch(row, "Other Non-Current Liabilities");
+  }
+  return Boolean(routeTarget && modelRowsMatch(row, routeTarget));
+}
+
+function trustedBalanceSheetRouteTarget(request: FinancialLineItemClassificationRequest, semantics: TrustedSourceSemantics) {
+  const preferred = (...rows: string[]) => rows.find((row) => modelRowAvailable(row, request.availableModelRows)) ?? null;
+  const section = semantics.balanceSheetSection;
+  if (semantics.redeemableNoncontrollingInterest) return preferred("Mezzanine Equity", "Other Non-Current Liabilities");
+  if (semantics.selfInsurance) {
+    return section === "non-current liabilities"
+      ? preferred("Other Non-Current Liabilities")
+      : preferred("Accrued Liabilities", "Other Current Liabilities");
+  }
+  if (semantics.debtAdjustment || semantics.currentLongTermDebt || semantics.financeLease) {
+    return preferred("LT Debt (Incl. Current Portion)", "Current Portion of Long-Term Debt", "Total Debt");
+  }
+  if (semantics.shortTermBorrowing) return preferred("Revolver");
+  if (semantics.deferredTax) {
+    if (section === "current assets") return preferred("Prepaid & Other Current Assets");
+    if (section === "non-current assets") {
+      const dedicatedAssetRow = request.availableModelRows.find((row) => /deferred.*tax.*asset/i.test(row));
+      return dedicatedAssetRow ?? preferred("Other Non-Current Assets");
+    }
+    if (section === "current liabilities") return preferred("Other Current Liabilities");
+    return preferred("Deferred Income Taxes", "Other Non-Current Liabilities");
+  }
+  if (semantics.deferredRevenue) {
+    return section === "non-current liabilities" ? preferred("Other Non-Current Liabilities") : preferred("Other Current Liabilities");
+  }
+  if (semantics.pension) {
+    return section === "current liabilities"
+      ? preferred("Other Current Liabilities")
+      : preferred("Pension Liabilities", "Other Non-Current Liabilities");
+  }
+  if (semantics.lease) {
+    return section === "non-current liabilities"
+      ? preferred("Lease Liabilities", "Other Non-Current Liabilities")
+      : preferred("Other Current Liabilities");
+  }
+  if (semantics.assetRetirementObligation) return preferred("Other Non-Current Liabilities");
+  if (semantics.investmentSecurities) {
+    if (section === "current assets") {
+      const dedicatedInvestmentRow = request.availableModelRows.find(
+        (row) =>
+          /short[-\s]?term investments?|current investments?|marketable securities|investment securities/i.test(row) &&
+          !/cash.*(?:investments?|securities)|(?:investments?|securities).*cash/i.test(row)
+      );
+      if (dedicatedInvestmentRow) return dedicatedInvestmentRow;
+      const combinedCashRow = request.availableModelRows.find((row) => /cash.*(?:investments?|securities)|(?:investments?|securities).*cash/i.test(row));
+      return combinedCashRow ?? preferred("Cash & Cash Equivalents", "Prepaid & Other Current Assets");
+    }
+    return preferred("Other Non-Current Assets");
+  }
+  if (semantics.restrictedCash && !semantics.cashAggregate) {
+    return section === "non-current assets" ? preferred("Other Non-Current Assets") : preferred("Prepaid & Other Current Assets");
+  }
+  if (semantics.cash) return preferred("Cash & Cash Equivalents");
+  if (semantics.receivable) return preferred("Accounts Receivable", "Prepaid & Other Current Assets");
+  if (semantics.inventory) return preferred("Inventory", "Prepaid & Other Current Assets");
+  if (semantics.propertyPlantEquipment) return preferred("PP&E, Net", "Other Non-Current Assets");
+  if (semantics.intangible) return preferred("Intangible Assets, Net", "Other Non-Current Assets");
+  if (semantics.goodwill && !semantics.goodwillImpairment) return preferred("Goodwill", "Other Non-Current Assets");
+  if (semantics.accountsPayable) return preferred("Accounts Payable", "Accrued Liabilities", "Other Current Liabilities");
+  if ((semantics.accrued || semantics.currentTaxPayable) && section === "current liabilities") {
+    return preferred("Accrued Liabilities", "Other Current Liabilities");
+  }
+  if (semantics.debt) return preferred("LT Debt (Incl. Current Portion)", "Total Debt");
+  if (semantics.treasuryStock) return preferred("Treasury Stock");
+  if (semantics.retainedEarnings) return preferred("Retained Earnings");
+  if (semantics.accumulatedOtherComprehensiveIncome) return preferred("AOCI");
+  if (semantics.noncontrollingInterest) return preferred("Noncontrolling Interests");
+  if (semantics.commonCapital) return preferred("Common Stock & APIC");
+  return null;
+}
+
+function balanceSheetTargetHasTrustedSemantics(
+  request: FinancialLineItemClassificationRequest,
+  row: string,
+  kind: string,
+  semantics: TrustedSourceSemantics
+) {
+  if (modelRowsMatch(row, "Cash & Cash Equivalents")) return semantics.cash || semantics.investmentSecurities;
+  if (modelRowsMatch(row, "Short-Term Investments")) return semantics.investmentSecurities;
+  if (modelRowsMatch(row, "Accounts Receivable")) return semantics.receivable;
+  if (modelRowsMatch(row, "Inventory")) return semantics.inventory;
+  if (modelRowsMatch(row, "PP&E, Net")) return semantics.propertyPlantEquipment;
+  if (modelRowsMatch(row, "Intangible Assets, Net")) return semantics.intangible;
+  if (modelRowsMatch(row, "Goodwill")) return semantics.goodwill && !semantics.goodwillImpairment;
+  if (modelRowsMatch(row, "Accounts Payable")) return semantics.accountsPayable;
+  if (modelRowsMatch(row, "Accrued Liabilities")) return semantics.accrued || semantics.currentTaxPayable || semantics.selfInsurance;
+  if (modelRowsMatch(row, "Revolver")) return semantics.shortTermBorrowing && !semantics.currentLongTermDebt;
+  if (modelRowsMatch(row, "LT Debt (Incl. Current Portion)") || modelRowsMatch(row, "Total Debt")) {
+    return semantics.debt || semantics.currentLongTermDebt || semantics.debtAdjustment || semantics.financeLease;
+  }
+  if (modelRowsMatch(row, "Current Portion of Long-Term Debt")) return semantics.currentLongTermDebt;
+  if (modelRowsMatch(row, "Deferred Income Taxes")) return semantics.deferredTax && /liabilit/.test(semantics.balanceSheetSection);
+  if (modelRowsMatch(row, "Lease Liabilities")) return semantics.lease;
+  if (modelRowsMatch(row, "Pension Liabilities")) return semantics.pension;
+  if (modelRowsMatch(row, "Common Stock & APIC")) return semantics.commonCapital;
+  if (modelRowsMatch(row, "Retained Earnings")) return semantics.retainedEarnings;
+  if (modelRowsMatch(row, "Treasury Stock")) return semantics.treasuryStock;
+  if (modelRowsMatch(row, "AOCI")) return semantics.accumulatedOtherComprehensiveIncome;
+  if (modelRowsMatch(row, "Noncontrolling Interests")) return semantics.noncontrollingInterest && !semantics.redeemableNoncontrollingInterest;
+  if (modelRowsMatch(row, "Mezzanine Equity")) return semantics.redeemableNoncontrollingInterest;
+  if (kind === "catch_all") return true;
+  return sourceMatchesBalanceSheetRowDefinition(request, row);
+}
+
+function sourceMatchesBalanceSheetRowDefinition(request: FinancialLineItemClassificationRequest, row: string) {
+  const definition = balanceSheetRowDefinitionForLabel(row);
+  if (!definition) return false;
+  const sourceTag = normalizeKey((request.xbrlTag ?? "").split(":").pop() ?? "");
+  const sourceLabel = normalizeKey(request.cleanLabel || request.reportedLineItemLabel);
+  return [...definition.tags, ...definition.aliases, ...(definition.sourceAliases ?? []), definition.canonical].some((candidate) => {
+    const key = normalizeKey(candidate);
+    return Boolean(key && (key === sourceTag || key === sourceLabel));
+  });
+}
+
+function incomeStatementClassificationPassesTrustedValidation(
+  request: FinancialLineItemClassificationRequest,
+  row: string,
+  action: FinancialLineItemClassification["recommended_action"],
+  semantics: TrustedSourceSemantics
+) {
+  const canonicalRow = INCOME_STATEMENT_CLASSIFICATION_ROWS.find((candidate) => modelRowsMatch(row, candidate));
+  if (!canonicalRow) return false;
+  const allowedRows = incomeStatementRowsAllowedForSection(request.section);
+  if (!allowedRows.some((candidate) => modelRowsMatch(canonicalRow, candidate))) return false;
+  const routeTarget = trustedIncomeStatementRouteTarget(request, semantics);
+  if (routeTarget && !modelRowsMatch(canonicalRow, routeTarget)) return false;
+  if (!incomeStatementTargetHasTrustedSemantics(canonicalRow, request, semantics)) return false;
   if (
-    request.statement === "income_statement" &&
-    request.section === "below operating income" &&
-    modelRowsMatch(row, "Other Operating Income / Expense")
+    action === "merge_into_other" &&
+    !modelRowsMatch(canonicalRow, "Other Operating Income / Expense") &&
+    !modelRowsMatch(canonicalRow, "Other Non-Operating Income / Expense")
   ) {
     return false;
   }
   return true;
+}
+
+function incomeStatementRowsAllowedForSection(section: FinancialStatementSection): readonly string[] {
+  if (section === "revenue") return ["Revenue"];
+  if (section === "operating expenses") {
+    return ["COGS / Cost of Goods Sold", "SG&A", "R&D", "D&A", "Goodwill Impairment", "Other Operating Income / Expense"];
+  }
+  if (section === "below operating income") {
+    return ["Interest Income", "Interest Expense", "Goodwill Impairment", "Other Non-Operating Income / Expense"];
+  }
+  if (section === "tax") return ["Income Tax Benefit / Expense"];
+  return [];
+}
+
+function trustedIncomeStatementRouteTarget(request: FinancialLineItemClassificationRequest, semantics: TrustedSourceSemantics) {
+  const preferred = (...rows: string[]) => rows.find((row) => modelRowAvailable(row, request.availableModelRows)) ?? null;
+  if (request.section === "revenue") return preferred("Revenue");
+  if (request.section === "tax" && semantics.incomeTaxExpense) return preferred("Income Tax Benefit / Expense");
+  if (semantics.acquiredInProcessResearchDevelopment) return preferred("Other Operating Income / Expense", "R&D");
+  if (semantics.researchDevelopment) return preferred("R&D");
+  if (semantics.sellingGeneralAdministrative) return preferred("SG&A");
+  if (semantics.directCost) return preferred("COGS / Cost of Goods Sold");
+  if (semantics.depreciationAmortization) return preferred("D&A");
+  if (semantics.goodwillImpairment) {
+    return preferred(
+      "Goodwill Impairment",
+      request.section === "operating expenses" ? "Other Operating Income / Expense" : "Other Non-Operating Income / Expense"
+    );
+  }
+  if (semantics.specialOperating) {
+    return request.section === "operating expenses"
+      ? preferred("Other Operating Income / Expense")
+      : preferred("Other Non-Operating Income / Expense");
+  }
+  if (semantics.netInterestExpense) return preferred("Interest Expense");
+  if (semantics.netInterestIncome) return preferred("Interest Income");
+  if (semantics.combinedInterestOther || semantics.combinedNetInterest) return preferred("Other Non-Operating Income / Expense");
+  if (semantics.interestIncome) return preferred("Interest Income");
+  if (semantics.interestExpense) return preferred("Interest Expense");
+  return null;
+}
+
+function incomeStatementTargetHasTrustedSemantics(
+  row: string,
+  request: FinancialLineItemClassificationRequest,
+  semantics: TrustedSourceSemantics
+) {
+  if (modelRowsMatch(row, "Revenue")) return request.section === "revenue";
+  if (modelRowsMatch(row, "COGS / Cost of Goods Sold")) return semantics.directCost;
+  if (modelRowsMatch(row, "SG&A")) return semantics.sellingGeneralAdministrative;
+  if (modelRowsMatch(row, "R&D")) return semantics.researchDevelopment;
+  if (modelRowsMatch(row, "D&A")) return semantics.depreciationAmortization;
+  if (modelRowsMatch(row, "Goodwill Impairment")) return semantics.goodwillImpairment;
+  if (modelRowsMatch(row, "Interest Income")) return (semantics.interestIncome || semantics.netInterestIncome) && !semantics.combinedInterestOther;
+  if (modelRowsMatch(row, "Interest Expense")) return (semantics.interestExpense || semantics.netInterestExpense) && !semantics.combinedInterestOther;
+  if (modelRowsMatch(row, "Income Tax Benefit / Expense")) return request.section === "tax" && semantics.incomeTaxExpense;
+  if (modelRowsMatch(row, "Other Operating Income / Expense")) return request.section === "operating expenses";
+  if (modelRowsMatch(row, "Other Non-Operating Income / Expense")) return request.section === "below operating income";
+  return false;
 }
 
 async function requestLlmClassification(
@@ -1361,6 +1821,8 @@ async function requestLlmClassification(
     siteUrl: options.siteUrl,
     appTitle: options.appTitle,
     timeoutMs: options.timeoutMs ?? 15_000,
+    deadlineAt: options.deadlineAt,
+    signal: options.signal,
     maxTokens: 700,
     reasoningEffort: "low",
     fetchImpl: options.fetchImpl,
@@ -1381,7 +1843,8 @@ async function requestLlmClassification(
 async function requestStatementLlmClassification(
   prepared: PreparedLineItemClassification[],
   targets: PreparedLineItemClassification[],
-  options: LlmClassificationOptions
+  options: LlmClassificationOptions,
+  maxTotalAttempts: number
 ): Promise<AccountingLlmResult<StatementLlmClassificationResponse>> {
   const system = [
     "You are a structured accounting classifier for SEC EDGAR financial statement line items.",
@@ -1412,8 +1875,11 @@ async function requestStatementLlmClassification(
     siteUrl: options.siteUrl,
     appTitle: options.appTitle,
     timeoutMs: options.timeoutMs ?? 15_000,
+    deadlineAt: options.deadlineAt,
+    signal: options.signal,
     maxTokens: Math.max(3_000, Math.min(12_000, 1_200 + targets.length * 400)),
     maxAttemptsPerModel: /(?:deepseek-v4-flash|^openrouter\/free|:free$)/i.test(options.model.trim()) ? 2 : 1,
+    maxTotalAttempts,
     reasoningEffort: "low",
     fetchImpl: options.fetchImpl,
     jsonSchema: financialStatementLineItemClassificationJsonSchema(),
@@ -1677,56 +2143,8 @@ function statementDecisionToClassification(
     llm_used: false,
     mapping_passed_validation: false
   };
-  classification.mapping_passed_validation =
-    classificationPassesValidation(target.request, classification) ||
-    statementDecisionPassesStructuralGuardrails(target.request, classification);
+  classification.mapping_passed_validation = classificationPassesValidation(target.request, classification);
   return classification;
-}
-
-function statementDecisionPassesStructuralGuardrails(
-  request: FinancialLineItemClassificationRequest,
-  classification: FinancialLineItemClassification
-) {
-  if (["exclude", "set_zero", "keep_existing"].includes(classification.recommended_action)) return true;
-  const row = classification.recommended_model_row;
-  if (!row || /unmapped|needs review/i.test(row) || !modelRowAvailable(row, request.availableModelRows)) return false;
-  const text = requestSearchText(request);
-  if (request.statement === "balance_sheet") {
-    if (!balanceSheetRowDefinitionForLabel(row)) return false;
-    if (
-      !balanceSheetSectionCompatible(row, request.section, {
-        label: request.cleanLabel || request.reportedLineItemLabel,
-        tag: request.xbrlTag
-      })
-    ) {
-      return false;
-    }
-    if (modelRowsMatch(row, "Revolver") && /\bcurrent maturit|\bcurrent portion\b.*\blong[-\s]?term debt|convertible|senior notes?/.test(text)) {
-      return false;
-    }
-    if (
-      requestLooksLikeSelfInsuranceReserve(request, text) &&
-      (modelRowsMatch(row, "Revolver") || modelRowsMatch(row, "LT Debt (Incl. Current Portion)"))
-    ) {
-      return false;
-    }
-    if (modelRowsMatch(row, "Deferred Income Taxes") && !/\bdeferred\b.*\btax|\btax\b.*\bdeferred/.test(text)) return false;
-    return true;
-  }
-  if (request.statement !== "income_statement") return false;
-  if (request.section === "revenue") return modelRowsMatch(row, "Revenue");
-  if (request.section === "operating expenses") {
-    return ["COGS / Cost of Goods Sold", "SG&A", "R&D", "D&A", "Other Operating Income / Expense"].some((candidate) =>
-      modelRowsMatch(row, candidate)
-    );
-  }
-  if (request.section === "below operating income") {
-    return ["Interest Income", "Interest Expense", "Goodwill Impairment", "Other Non-Operating Income / Expense"].some((candidate) =>
-      modelRowsMatch(row, candidate)
-    );
-  }
-  if (request.section === "tax") return modelRowsMatch(row, "Income Tax Benefit / Expense");
-  return false;
 }
 
 function validateFinancialLineItemClassification(
@@ -1739,16 +2157,10 @@ function validateFinancialLineItemClassification(
     ...shape.value,
     recommended_model_row: normalizeModelRow(shape.value.recommended_model_row) || shape.value.recommended_model_row
   };
-  const actionIsValidNonMapping =
-    normalized.recommended_action === "exclude" ||
-    normalized.recommended_action === "set_zero" ||
-    normalized.recommended_action === "keep_existing";
-  const validated =
-    actionIsValidNonMapping ||
-    classificationPassesValidation(request, {
-      ...normalized,
-      mapping_passed_validation: false
-    });
+  const validated = classificationPassesValidation(request, {
+    ...normalized,
+    mapping_passed_validation: false
+  });
   if (!validated) {
     return {
       ok: false,
@@ -1779,12 +2191,12 @@ function validateStatementLineItemClassification(
   const targetByKey = new Map(targets.map((target) => [target.rowKey, target]));
   const seen = new Set<string>();
   const classifications: StatementLlmClassificationDecision[] = [];
-  for (let index = 0; index < rawClassifications.length; index += 1) {
-    const item = rawClassifications[index];
+  const rejected: string[] = [];
+  for (const item of rawClassifications) {
     if (!isRecord(item)) {
       return { ok: false, needsHumanReview: true, error: "Every statement classification must be a JSON object." };
     }
-    const sourceRowKey = statementDecisionSourceRowKey(item, targets, rawClassifications.length, index);
+    const sourceRowKey = statementDecisionSourceRowKey(item);
     if (!sourceRowKey) {
       return { ok: false, needsHumanReview: true, error: "Every statement classification must include source_row_key." };
     }
@@ -1799,7 +2211,15 @@ function validateStatementLineItemClassification(
       firstString(item, ["recommended_action", "recommendedAction", "action", "operation"])
     );
     const confidence = normalizeStatementDecisionConfidence(firstString(item, ["confidence", "certainty"]));
-    if (!recommendedAction) return { ok: false, needsHumanReview: true, error: `${sourceRowKey}: recommended_action is invalid.` };
+    if (!recommendedAction) {
+      seen.add(sourceRowKey);
+      if (target.deterministicIsValidated) {
+        classifications.push(statementDeterministicFallbackDecision(target, "LLM recommended_action was invalid"));
+      } else {
+        rejected.push(`${sourceRowKey}: recommended_action is invalid.`);
+      }
+      continue;
+    }
     const rawRecommendedRow = firstString(item, [
       "recommended_model_row",
       "recommendedModelRow",
@@ -1810,58 +2230,74 @@ function validateStatementLineItemClassification(
     ]);
     const rawReason = firstString(item, ["reason", "rationale", "explanation"]);
     if (rawRecommendedRow === null && !["exclude", "keep_existing"].includes(recommendedAction)) {
-      return { ok: false, needsHumanReview: true, error: `${sourceRowKey}: recommended_model_row must be a string.` };
+      seen.add(sourceRowKey);
+      if (target.deterministicIsValidated) {
+        classifications.push(statementDeterministicFallbackDecision(target, "LLM omitted the required recommended_model_row"));
+      } else {
+        rejected.push(`${sourceRowKey}: recommended_model_row must be a string.`);
+      }
+      continue;
     }
     let normalized: StatementLlmClassificationDecision = {
       source_row_key: sourceRowKey,
       recommended_action: recommendedAction,
       recommended_model_row: normalizeModelRow(rawRecommendedRow ?? "") || rawRecommendedRow || target.fallback.recommended_model_row,
       confidence,
-      reason: rawReason || "LLM whole-statement accounting classification."
+      reason: rawReason || "LLM whole-statement accounting classification.",
+      decision_origin: "validated_llm"
     };
     const expanded = statementDecisionToClassification(target, normalized);
-    const actionIsValidNonMapping =
-      normalized.recommended_action === "exclude" ||
-      normalized.recommended_action === "set_zero" ||
-      normalized.recommended_action === "keep_existing";
-    const validated = actionIsValidNonMapping || expanded.mapping_passed_validation;
+    const validated = expanded.mapping_passed_validation;
     if (!validated || normalized.confidence === "low") {
       if (target.deterministicIsValidated) {
-        normalized = {
-          source_row_key: sourceRowKey,
-          recommended_action: target.initialClassification.recommended_action,
-          recommended_model_row: target.initialClassification.recommended_model_row,
-          confidence: "medium",
-          reason: !validated
-            ? `LLM recommendation ${normalized.recommended_model_row || normalized.recommended_action} was rejected by accounting validation; retained the independently validated mapping ${target.initialClassification.recommended_model_row}.`
-            : `LLM returned low confidence; retained the independently validated mapping ${target.initialClassification.recommended_model_row}.`
-        };
+        normalized = statementDeterministicFallbackDecision(
+          target,
+          !validated
+            ? `LLM recommendation ${normalized.recommended_model_row || normalized.recommended_action} was rejected by accounting validation`
+            : "LLM returned low confidence"
+        );
       } else {
-        return {
-          ok: false,
-          needsHumanReview: true,
-          error: !validated
+        rejected.push(
+          !validated
             ? `${target.request.cleanLabel || target.request.reportedLineItemLabel}: LLM decision failed deterministic accounting validation for ${normalized.recommended_model_row}.`
             : `${target.request.cleanLabel || target.request.reportedLineItemLabel}: LLM returned low confidence without a validated fallback.`
-        };
+        );
+        seen.add(sourceRowKey);
+        continue;
       }
     }
     classifications.push(normalized);
     seen.add(sourceRowKey);
   }
   const missing = targets.filter((target) => !seen.has(target.rowKey));
-  if (missing.length) {
+  if (!classifications.length) {
     return {
       ok: false,
       needsHumanReview: true,
-      error: `Statement classifier omitted target row(s): ${missing.map((target) => target.rowKey).join(", ")}.`
+      error:
+        rejected[0] ??
+        `Statement classifier omitted target row(s): ${missing.map((target) => target.rowKey).join(", ")}.`
     };
   }
   return {
     ok: true,
     value: { classifications },
     validated: true,
-    affectedOutput: classifications.length > 0
+    affectedOutput: classifications.some(statementDecisionWasAcceptedFromLlm)
+  };
+}
+
+function statementDeterministicFallbackDecision(
+  target: PreparedLineItemClassification,
+  rejectionReason: string
+): StatementLlmClassificationDecision {
+  return {
+    source_row_key: target.rowKey,
+    recommended_action: target.initialClassification.recommended_action,
+    recommended_model_row: target.initialClassification.recommended_model_row,
+    confidence: "medium",
+    reason: `${rejectionReason}; retained the independently validated mapping ${target.initialClassification.recommended_model_row}.`,
+    decision_origin: "deterministic_fallback"
   };
 }
 
@@ -1881,25 +2317,8 @@ function statementDecisionLooksLikeSingleItem(value: Record<string, any>) {
   );
 }
 
-function statementDecisionSourceRowKey(
-  item: Record<string, any>,
-  targets: PreparedLineItemClassification[],
-  decisionCount: number,
-  index: number
-) {
-  const explicit = firstString(item, ["source_row_key", "sourceRowKey", "row_key", "rowKey"]);
-  if (explicit) return explicit;
-  const label = firstString(item, ["source_line_item", "sourceLineItem", "reportedLineItemLabel", "label"]);
-  if (label) {
-    const normalizedLabel = normalizeKey(label);
-    const matches = targets.filter(
-      (target) =>
-        normalizeKey(target.request.cleanLabel || target.request.reportedLineItemLabel) === normalizedLabel ||
-        normalizeKey(target.request.reportedLineItemLabel) === normalizedLabel
-    );
-    if (matches.length === 1) return matches[0].rowKey;
-  }
-  return decisionCount === targets.length ? targets[index]?.rowKey ?? null : null;
+function statementDecisionSourceRowKey(item: Record<string, any>) {
+  return firstString(item, ["source_row_key"]);
 }
 
 function normalizeStatementDecisionAction(value: string | null): FinancialLineItemClassification["recommended_action"] | null {

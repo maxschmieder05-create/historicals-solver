@@ -39,6 +39,7 @@ const {
   MODEL_ROW_DEFINITIONS,
   classifyFinancialLineItem,
   classifyFinancialStatementLineItems,
+  classificationSourceKeys,
   classificationPassesValidation,
   classificationModelRowAssignmentForPrimaryStatement,
   fullStatementLineItemNeedsAnalystPass,
@@ -50,6 +51,47 @@ const {
 
 const availableModelRows = Object.keys(MODEL_ROW_DEFINITIONS);
 const modelRowDefinitions = modelRowDefinitionsForRows(availableModelRows);
+const scopedClassificationKeys = classificationSourceKeys({
+  period: "1Q26",
+  accession: "0000000000-26-000001",
+  xbrlTag: "ExampleExtensionConcept",
+  label: "Example extension line",
+  amount: 100
+});
+assert.ok(
+  scopedClassificationKeys.every((key) => /1q26|000000000026000001/.test(key)),
+  "Classification keys must remain period/accession scoped."
+);
+assert.ok(
+  !scopedClassificationKeys.some((key) => key === "concept-label|exampleextensionconcept|exampleextensionline"),
+  "A generic concept/label key must not leak one filing's classification into another period."
+);
+const firstSameConceptPresentationKeys = classificationSourceKeys({
+  period: "FY25",
+  accession: "0000000000-25-000001",
+  xbrlTag: "UtilityOperatingCosts",
+  label: "Purchased power",
+  amount: 250
+});
+const secondSameConceptPresentationKeys = classificationSourceKeys({
+  period: "FY25",
+  accession: "0000000000-25-000001",
+  xbrlTag: "UtilityOperatingCosts",
+  label: "Operations and maintenance",
+  amount: 250
+});
+const sameConceptPresentationStore = new Map();
+firstSameConceptPresentationKeys.forEach((key) =>
+  sameConceptPresentationStore.set(key, { recommended_model_row: "COGS / Cost of Goods Sold" })
+);
+const inheritedSameConceptDecision = secondSameConceptPresentationKeys
+  .map((key) => sameConceptPresentationStore.get(key))
+  .find(Boolean);
+assert.equal(
+  inheritedSameConceptDecision,
+  undefined,
+  "Distinct presentation rows using the same period and XBRL concept must not inherit each other's classification decision."
+);
 assert.equal(modelRowsMatch("Research & Development (R&D)", "R&D"), true);
 assert.equal(modelRowsMatch("Selling, General & Administration (SG&A)", "SG&A"), true);
 assert.equal(
@@ -196,6 +238,332 @@ async function classify(overrides) {
 }
 
 (async () => {
+  const trustedValidationCases = [
+    {
+      name: "R&D operating expense cannot map to Revenue even when prior validation and LLM flags claim success",
+      request: request({
+        label: "Research and development expense",
+        xbrlTag: "ResearchAndDevelopmentExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "Revenue",
+      expected: false
+    },
+    {
+      name: "R&D operating expense maps to R&D",
+      request: request({
+        label: "Research and development expense",
+        xbrlTag: "ResearchAndDevelopmentExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "R&D",
+      expected: true
+    },
+    {
+      name: "pension obligations cannot self-certify as deferred taxes through an LLM flag",
+      request: request({
+        label: "Pension obligations",
+        xbrlTag: "PensionLiabilitiesNoncurrent",
+        section: "non-current liabilities"
+      }),
+      row: "Deferred Income Taxes",
+      expected: false
+    },
+    {
+      name: "pension obligations fall back to other non-current liabilities when no pension row exists",
+      request: request({
+        label: "Pension obligations",
+        xbrlTag: "PensionLiabilitiesNoncurrent",
+        section: "non-current liabilities"
+      }),
+      row: "Other Non-Current Liabilities",
+      expected: true
+    },
+    {
+      name: "true deferred tax liabilities pass even when the LLM flag is false",
+      request: request({
+        label: "Deferred tax liabilities, non-current",
+        xbrlTag: "DeferredTaxLiabilitiesNoncurrent",
+        section: "non-current liabilities"
+      }),
+      row: "Deferred Income Taxes",
+      expected: true
+    },
+    {
+      name: "contract liabilities cannot map to deferred taxes",
+      request: request({
+        label: "Contract liabilities, non-current",
+        xbrlTag: "ContractWithCustomerLiabilityNoncurrent",
+        section: "non-current liabilities"
+      }),
+      row: "Deferred Income Taxes",
+      expected: false
+    },
+    {
+      name: "cash-flow reconciliation D&A cannot populate income-statement D&A",
+      request: request({
+        label: "Depreciation and amortization",
+        xbrlTag: "DepreciationDepletionAndAmortization",
+        statement: "cash_flow",
+        sourceTableType: "cash_flow_reconciliation",
+        section: "unknown",
+        periodType: "duration"
+      }),
+      row: "D&A",
+      expected: false
+    },
+    {
+      name: "current maturities of long-term debt cannot map to Revolver",
+      request: request({
+        label: "Current maturities of long-term debt",
+        xbrlTag: "LongTermDebtCurrent",
+        section: "current liabilities"
+      }),
+      row: "Revolver",
+      expected: false
+    },
+    {
+      name: "current maturities of long-term debt map to debt including current portion",
+      request: request({
+        label: "Current maturities of long-term debt",
+        xbrlTag: "LongTermDebtCurrent",
+        section: "current liabilities"
+      }),
+      row: "LT Debt (Incl. Current Portion)",
+      expected: true
+    },
+    {
+      name: "commercial paper maps to Revolver/current borrowings",
+      request: request({
+        label: "Commercial paper",
+        xbrlTag: "CommercialPaper",
+        section: "current liabilities"
+      }),
+      row: "Revolver",
+      expected: true
+    },
+    {
+      name: "inventory-like assets cannot be hidden in the current-assets catch-all",
+      request: request({
+        label: "Spare parts and supplies inventory",
+        xbrlTag: "InventoryPartsAndSupplies",
+        section: "current assets"
+      }),
+      row: "Prepaid & Other Current Assets",
+      expected: false
+    },
+    {
+      name: "inventory-like assets map to Inventory",
+      request: request({
+        label: "Spare parts and supplies inventory",
+        xbrlTag: "InventoryPartsAndSupplies",
+        section: "current assets"
+      }),
+      row: "Inventory",
+      expected: true
+    },
+    {
+      name: "equity securities without a readily determinable fair value remain investment assets",
+      request: request({
+        label: "Equity Securities without Readily Determinable Fair Value, Amount",
+        xbrlTag: "EquitySecuritiesWithoutReadilyDeterminableFairValueAmount",
+        section: "unknown"
+      }),
+      row: "Other Non-Current Assets",
+      expected: true
+    },
+    {
+      name: "equity securities cannot map to common stock and APIC merely because the label contains equity",
+      request: request({
+        label: "Equity Securities without Readily Determinable Fair Value, Amount",
+        xbrlTag: "EquitySecuritiesWithoutReadilyDeterminableFairValueAmount",
+        section: "unknown"
+      }),
+      row: "Common Stock & APIC",
+      expected: false
+    },
+    {
+      name: "utility direct costs can map to COGS without a ticker-specific rule",
+      request: request({
+        label: "Fuel and purchased power expense",
+        xbrlTag: "UtilityFuelAndPurchasedPower",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "COGS / Cost of Goods Sold",
+      expected: true
+    },
+    {
+      name: "cost of revenue excluding D&A maps to COGS",
+      request: request({
+        label: "Cost of revenue, excluding depreciation and amortization",
+        xbrlTag: "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "COGS / Cost of Goods Sold",
+      expected: true
+    },
+    {
+      name: "cost of revenue excluding D&A cannot map to D&A",
+      request: request({
+        label: "Cost of revenue, exclusive of depreciation",
+        xbrlTag: "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "D&A",
+      expected: false
+    },
+    {
+      name: "net interest expense maps to Interest Expense",
+      request: request({
+        label: "Interest expense, net of interest income",
+        xbrlTag: "InterestExpenseNonOperatingNet",
+        statement: "income_statement",
+        section: "below operating income",
+        periodType: "duration"
+      }),
+      row: "Interest Expense",
+      expected: true
+    },
+    {
+      name: "net interest expense cannot map to Interest Income",
+      request: request({
+        label: "Interest expense, net of interest income",
+        xbrlTag: "InterestExpenseNonOperatingNet",
+        statement: "income_statement",
+        section: "below operating income",
+        periodType: "duration"
+      }),
+      row: "Interest Income",
+      expected: false
+    },
+    {
+      name: "ambiguous interest income expense net belongs in other non-operating",
+      request: request({
+        label: "Interest income (expense), net",
+        xbrlTag: "InterestIncomeExpenseNonOperatingNet",
+        statement: "income_statement",
+        section: "below operating income",
+        periodType: "duration"
+      }),
+      row: "Other Non-Operating Income / Expense",
+      expected: true
+    },
+    {
+      name: "ambiguous interest income expense net cannot self-select Interest Income",
+      request: request({
+        label: "Interest income (expense), net",
+        xbrlTag: "InterestIncomeExpenseNonOperatingNet",
+        statement: "income_statement",
+        section: "below operating income",
+        periodType: "duration"
+      }),
+      row: "Interest Income",
+      expected: false
+    },
+    {
+      name: "advertising cannot be hidden in other operating expense when SG&A exists",
+      request: request({
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "Other Operating Income / Expense",
+      expected: false
+    },
+    {
+      name: "advertising maps to SG&A",
+      request: request({
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      }),
+      row: "SG&A",
+      expected: true
+    }
+  ];
+  for (const testCase of trustedValidationCases) {
+    const actual = classificationPassesValidation(testCase.request, {
+      recommended_action: "map",
+      recommended_model_row: testCase.row,
+      is_deferred_tax: !testCase.expected,
+      is_debt: !testCase.expected,
+      mapping_passed_validation: true,
+      reason: "Untrusted LLM assertion"
+    });
+    assert.equal(actual, testCase.expected, testCase.name);
+  }
+
+  const rejectedWholeStatementRevenueMapping = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-trusted-gate-rd",
+        rowOrder: 1,
+        label: "Research and development expense",
+        xbrlTag: "ResearchAndDevelopmentExpense",
+        statement: "income_statement",
+        section: "operating expenses",
+        periodType: "duration"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.2",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-trusted-gate-rd",
+                          recommended_action: "remap",
+                          recommended_model_row: "Revenue",
+                          confidence: "high",
+                          reason: "Malicious semantic remap used to exercise the trusted gate."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          )
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  const rejectedWholeStatementClassification = rejectedWholeStatementRevenueMapping.classifications[0].classification;
+  assert.equal(rejectedWholeStatementClassification.recommended_model_row, "R&D");
+  assert.match(rejectedWholeStatementClassification.reason, /rejected by accounting validation/i);
+  assert.equal(rejectedWholeStatementClassification.llm_used, false);
+  assert.equal(rejectedWholeStatementRevenueMapping.llmReviewedCount, 0);
+  assert.equal(rejectedWholeStatementRevenueMapping.acceptedDecisionCount, 0);
+  assert.deepEqual(rejectedWholeStatementRevenueMapping.unreviewedTargetKeys, ["row-trusted-gate-rd"]);
+  assert.equal(rejectedWholeStatementRevenueMapping.llmTelemetry[0].affectedOutput, false);
+
   const incomeStatementCostSubtotal = {
     label: "Cost of sales, operating expenses, and other-net",
     concept: "CostOfSalesOperatingExpensesAndOtherNet"
@@ -617,6 +985,59 @@ async function classify(overrides) {
     uncertaintyReason: ""
   });
   assert.equal(costOfSales.recommended_model_row, "COGS / Cost of Goods Sold");
+
+  const companyOperatedRestaurantExpenses = await classify({
+    label: "Company-owned and operated restaurant expenses",
+    xbrlTag: "CompanyOperatedRestaurantExpenses",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(companyOperatedRestaurantExpenses.recommended_model_row, "COGS / Cost of Goods Sold");
+  assert.equal(companyOperatedRestaurantExpenses.mapping_passed_validation, true);
+
+  const restaurantFoodAndPaper = await classify({
+    label: "Food & paper",
+    xbrlTag: "FoodAndPaperExpense",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    parentSubtotal: { label: "Company-owned and operated restaurant expenses" },
+    uncertaintyReason: ""
+  });
+  assert.equal(restaurantFoodAndPaper.recommended_model_row, "COGS / Cost of Goods Sold");
+  assert.equal(restaurantFoodAndPaper.mapping_passed_validation, true);
+
+  const costExcludingDa = await classify({
+    label: "Cost of revenue, excluding depreciation and amortization",
+    xbrlTag: "CostOfRevenueExcludingDepreciationDepletionAndAmortization",
+    statement: "income_statement",
+    section: "operating expenses",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(costExcludingDa.recommended_model_row, "COGS / Cost of Goods Sold");
+
+  const netInterestExpense = await classify({
+    label: "Interest expense, net of interest income",
+    xbrlTag: "InterestExpenseNonOperatingNet",
+    statement: "income_statement",
+    section: "below operating income",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(netInterestExpense.recommended_model_row, "Interest Expense");
+
+  const ambiguousNetInterest = await classify({
+    label: "Interest income (expense), net",
+    xbrlTag: "InterestIncomeExpenseNonOperatingNet",
+    statement: "income_statement",
+    section: "below operating income",
+    periodType: "duration",
+    uncertaintyReason: ""
+  });
+  assert.equal(ambiguousNetInterest.recommended_model_row, "Other Non-Operating Income / Expense");
 
   assert.equal(lineItemNeedsClassification(request({ label: "Deferred income", section: "current liabilities" })), true);
   assert.equal(lineItemNeedsClassification(request({ label: "Marketable securities", section: "current assets" })), true);
@@ -1260,7 +1681,7 @@ async function classify(overrides) {
                 {
                   message: {
                     content:
-                      '```json\n[{"recommendedAction":"Map to model row: SG&A","modelRow":"SG&A","certainty":"certain","rationale":"Advertising is an SG&A operating expense."},{"action":"assign","recommendedModelRow":"PP&E, Net","confidence":"high","reason":"Incorrect provider recommendation used to exercise validation."}]\n```'
+                      '```json\n[{"source_row_key":"row-tolerant-debt","action":"assign","recommendedModelRow":"PP&E, Net","confidence":"high","reason":"Incorrect provider recommendation used to exercise validation."},{"source_row_key":"row-tolerant-advertising","recommendedAction":"Map to model row: SG&A","modelRow":"SG&A","certainty":"certain","rationale":"Advertising is an SG&A operating expense."}]\n```'
                   }
                 }
               ]
@@ -1271,18 +1692,155 @@ async function classify(overrides) {
       statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
     }
   );
-  assert.equal(tolerantCoverageResult.acceptedDecisionCount, 2);
-  assert.deepEqual(tolerantCoverageResult.unreviewedTargetKeys, []);
+  assert.equal(tolerantCoverageResult.llmReviewedCount, 1);
+  assert.equal(tolerantCoverageResult.acceptedDecisionCount, 1);
+  assert.deepEqual(tolerantCoverageResult.unreviewedTargetKeys, ["row-tolerant-debt"]);
   assert.equal(
     tolerantCoverageResult.classifications.find((item) => item.request.sourceRowKey === "row-tolerant-advertising").classification
       .recommended_model_row,
     "SG&A"
+  );
+  assert.equal(
+    tolerantCoverageResult.classifications.find((item) => item.request.sourceRowKey === "row-tolerant-advertising").classification.llm_used,
+    true
   );
   const guardedDebt = tolerantCoverageResult.classifications.find(
     (item) => item.request.sourceRowKey === "row-tolerant-debt"
   ).classification;
   assert.equal(guardedDebt.recommended_model_row, "LT Debt (Incl. Current Portion)");
   assert.equal(guardedDebt.reason.includes("rejected by accounting validation"), true);
+  assert.equal(guardedDebt.llm_used, false);
+
+  const lowConfidenceCoverageResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-low-confidence-advertising",
+        rowOrder: 1,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        section: "operating expenses",
+        amount: 200,
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        fetchImpl: async () =>
+          new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-low-confidence-advertising",
+                          recommended_action: "map",
+                          recommended_model_row: "SG&A",
+                          confidence: "low",
+                          reason: "The provider was not confident enough to certify this decision."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          )
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  const lowConfidenceFallback = lowConfidenceCoverageResult.classifications[0].classification;
+  assert.equal(lowConfidenceFallback.recommended_model_row, "SG&A");
+  assert.match(lowConfidenceFallback.reason, /LLM returned low confidence/i);
+  assert.equal(lowConfidenceFallback.llm_used, false);
+  assert.equal(lowConfidenceCoverageResult.llmReviewedCount, 0);
+  assert.equal(lowConfidenceCoverageResult.acceptedDecisionCount, 0);
+  assert.deepEqual(lowConfidenceCoverageResult.unreviewedTargetKeys, ["row-low-confidence-advertising"]);
+  assert.equal(lowConfidenceCoverageResult.llmTelemetry[0].affectedOutput, false);
+
+  let missingSourceKeyAttempts = 0;
+  const missingSourceKeyResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-missing-key-advertising",
+        rowOrder: 1,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        section: "operating expenses",
+        uncertaintyReason: ""
+      }),
+      request({
+        sourceRowKey: "row-missing-key-debt",
+        rowOrder: 2,
+        label: "Current maturities of long-term debt",
+        xbrlTag: "LongTermDebtCurrent",
+        section: "current liabilities",
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        maxAttempts: 1,
+        fetchImpl: async () => {
+          missingSourceKeyAttempts += 1;
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          recommended_action: "map",
+                          recommended_model_row: "SG&A",
+                          confidence: "high",
+                          reason: "Advertising is an SG&A operating expense."
+                        },
+                        {
+                          recommended_action: "map",
+                          recommended_model_row: "LT Debt (Incl. Current Portion)",
+                          confidence: "high",
+                          reason: "Current maturities are part of long-term debt."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  assert.equal(missingSourceKeyAttempts, 1);
+  assert.equal(missingSourceKeyResult.llmAttempts, 1);
+  assert.equal(missingSourceKeyResult.acceptedDecisionCount, 0);
+  assert.equal(missingSourceKeyResult.classifications.every((item) => item.classification.llm_used === false), true);
+  assert.match(missingSourceKeyResult.warnings.join("\n"), /must include source_row_key/i);
 
   const structurallyValidLlmResult = await classifyFinancialStatementLineItems(
     [
@@ -1405,6 +1963,7 @@ async function classify(overrides) {
       siteUrl: "http://localhost:3000",
       appTitle: "Historicals Solver Test",
       timeoutMs: 100,
+      maxAttempts: 3,
       fetchImpl: async (_url, init) => {
         splitBatchAttempts += 1;
         const body = JSON.parse(init.body);
@@ -1455,10 +2014,161 @@ async function classify(overrides) {
     },
     statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
   });
-  assert.equal(splitBatchAttempts, 3);
-  assert.equal(splitBatchResult.llmAttempts, 3);
-  assert.equal(splitBatchResult.acceptedDecisionCount, 6);
-  assert.deepEqual(splitBatchResult.unreviewedTargetKeys, []);
+  assert.equal(splitBatchAttempts, 1, "one malformed row must not discard the rest of a validated statement batch");
+  assert.equal(splitBatchResult.llmAttempts, 1);
+  assert.equal(splitBatchResult.llmReviewedCount, 5);
+  assert.equal(splitBatchResult.acceptedDecisionCount, 5);
+  assert.deepEqual(splitBatchResult.unreviewedTargetKeys, ["row-split-1"]);
+  assert.equal(
+    splitBatchResult.classifications.find((item) => item.request.sourceRowKey === "row-split-1").classification.llm_used,
+    false
+  );
+  assert.equal(
+    splitBatchResult.classifications
+      .filter((item) => item.request.sourceRowKey !== "row-split-1")
+      .every((item) => item.classification.llm_used),
+    true
+  );
+
+  let partialBatchAttempts = 0;
+  const partialBatchResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-partial-unclassified",
+        rowOrder: 1,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Unclassified operating extension line",
+        xbrlTag: "ExampleUnclassifiedOperatingExtension",
+        section: "operating expenses",
+        uncertaintyReason: "No independently validated deterministic classification exists."
+      }),
+      request({
+        sourceRowKey: "row-partial-advertising",
+        rowOrder: 2,
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Advertising expense",
+        xbrlTag: "AdvertisingExpense",
+        section: "operating expenses",
+        uncertaintyReason: ""
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.6-terra-pro",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 100,
+        maxAttempts: 1,
+        fetchImpl: async () => {
+          partialBatchAttempts += 1;
+          return new Response(
+            JSON.stringify({
+              choices: [
+                {
+                  message: {
+                    content: JSON.stringify({
+                      classifications: [
+                        {
+                          source_row_key: "row-partial-unclassified",
+                          recommended_action: "map",
+                          recommended_model_row: "Revenue",
+                          confidence: "high",
+                          reason: "Intentionally invalid cross-section recommendation."
+                        },
+                        {
+                          source_row_key: "row-partial-advertising",
+                          recommended_action: "map",
+                          recommended_model_row: "SG&A",
+                          confidence: "high",
+                          reason: "Advertising is an SG&A operating expense."
+                        }
+                      ]
+                    })
+                  }
+                }
+              ]
+            }),
+            { status: 200 }
+          );
+        }
+      },
+      statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+    }
+  );
+  assert.equal(partialBatchAttempts, 1);
+  assert.equal(partialBatchResult.llmAttempts, 1);
+  assert.equal(partialBatchResult.acceptedDecisionCount, 1, "valid peer decisions must survive one rejected row in the same batch");
+  assert.deepEqual(partialBatchResult.unreviewedTargetKeys, ["row-partial-unclassified"]);
+  assert.equal(
+    partialBatchResult.classifications.find((item) => item.request.sourceRowKey === "row-partial-advertising").classification.llm_used,
+    true
+  );
+  assert.equal(
+    partialBatchResult.classifications.find((item) => item.request.sourceRowKey === "row-partial-unclassified").classification.llm_used,
+    false
+  );
+
+  let invalidLargeBatchAttempts = 0;
+  const invalidLargeBatchRequests = Array.from({ length: 12 }, (_, index) =>
+    request({
+      sourceRowKey: `row-bounded-invalid-${index + 1}`,
+      rowOrder: index + 1,
+      statement: "income_statement",
+      periodType: "duration",
+      label: `Unclassified operating line bounded ${index + 1}`,
+      xbrlTag: `ExampleUnclassifiedOperatingLine${index + 1}`,
+      section: "operating expenses",
+      uncertaintyReason: "No independently validated deterministic classification exists for this extension line."
+    })
+  );
+  const invalidLargeBatchResult = await classifyFinancialStatementLineItems(invalidLargeBatchRequests, {
+    llm: {
+      enabled: true,
+      apiKey: "test-key",
+      endpoint: "https://example.test/chat/completions",
+      model: "openai/gpt-5.6-terra-pro",
+      fallbackModels: ["deepseek/deepseek-v4-flash", "anthropic/claude-sonnet-4"],
+      siteUrl: "http://localhost:3000",
+      appTitle: "Historicals Solver Test",
+      timeoutMs: 1_000,
+      maxAttempts: 4,
+      fetchImpl: async (_url, init) => {
+        invalidLargeBatchAttempts += 1;
+        const body = JSON.parse(init.body);
+        const payload = JSON.parse(body.messages[1].content);
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    classifications: payload.targetSourceRowKeys.map((sourceRowKey) => ({
+                      source_row_key: sourceRowKey,
+                      recommended_action: "map",
+                      confidence: "high",
+                      reason: "Intentionally invalid because the required model row is missing."
+                    }))
+                  })
+                }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+    },
+    statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+  });
+  assert.equal(invalidLargeBatchAttempts, 4, "recursive split retries must share one hard provider-attempt budget");
+  assert.equal(invalidLargeBatchResult.llmAttempts, 4);
+  assert.equal(invalidLargeBatchResult.acceptedDecisionCount, 0);
+  assert.equal(invalidLargeBatchResult.unreviewedTargetKeys.length, 12);
+  assert.equal(invalidLargeBatchResult.classifications.every((item) => item.classification.llm_used === false), true);
 
   assert.equal(
     fullStatementLineItemNeedsAnalystPass(
@@ -1516,6 +2226,86 @@ async function classify(overrides) {
     ),
     false
   );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Basic",
+        xbrlTag: "EarningsPerShareBasic",
+        section: "operating expenses",
+        unit: "USD/shares"
+      })
+    ),
+    false,
+    "camel-case EPS concepts must stay out of full-statement mapping coverage even when the filing label is only Basic/Diluted"
+  );
+
+  const aggregateOperatingExpenseRequest = request({
+    statement: "income_statement",
+    periodType: "duration",
+    label: "Operating expenses",
+    xbrlTag: "acme:TotalOperatingCostsAndExpenses",
+    section: "operating expenses",
+    amount: 519_000_000,
+    currentPeriodSourceLines: [
+      "Cost of product and service sold",
+      "Research and development expense",
+      "Selling and marketing expense",
+      "General and administrative expense",
+      "Operating expenses",
+      "Operating income"
+    ],
+    deterministicCandidate: "Other Operating Income / Expense"
+  });
+  assert.equal(lineItemNeedsClassification(aggregateOperatingExpenseRequest), false);
+  assert.equal(materialStatementLineItemNeedsAnalystPass(aggregateOperatingExpenseRequest), false);
+  assert.equal(fullStatementLineItemNeedsAnalystPass(aggregateOperatingExpenseRequest), false);
+  assert.equal(
+    classificationPassesValidation(aggregateOperatingExpenseRequest, {
+      source_line_item: "Operating expenses",
+      recommended_action: "merge_into_other",
+      recommended_model_row: "Other Operating Income / Expense",
+      recommended_model_row_mappings: [],
+      explicit_zero_rows: [],
+      classification_type: "LLM aggregate expense assignment",
+      is_current: null,
+      is_debt: false,
+      is_operating: true,
+      is_tax_related: false,
+      is_deferred_revenue_or_contract_liability: false,
+      is_deferred_tax: false,
+      is_subtotal: false,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Map the aggregate to other operating expense.",
+      requires_validation: true,
+      requires_revalidation: true,
+      llm_used: true,
+      mapping_passed_validation: true
+    }),
+    false,
+    "an aggregate operating-expense total must not become a detail-row assignment when its reported components are available"
+  );
+  let aggregateOperatingExpenseLlmCalls = 0;
+  const aggregateOperatingExpenseCoverage = await classifyFinancialStatementLineItems([aggregateOperatingExpenseRequest], {
+    llm: {
+      enabled: true,
+      apiKey: "test-key",
+      endpoint: "https://openrouter.ai/api/v1/chat/completions",
+      model: "deepseek/deepseek-v4-flash",
+      siteUrl: "http://localhost:3000",
+      appTitle: "Historicals Solver",
+      fetchImpl: async () => {
+        aggregateOperatingExpenseLlmCalls += 1;
+        throw new Error("aggregate subtotal should never be sent to the LLM");
+      }
+    },
+    statementAnalystPass: { enabled: true, coverage: "all_primary_rows" }
+  });
+  assert.equal(aggregateOperatingExpenseLlmCalls, 0);
+  assert.equal(aggregateOperatingExpenseCoverage.targetCount, 0);
+  assert.equal(aggregateOperatingExpenseCoverage.classifications.length, 0);
 
   const failedPayloads = [];
   const failedResult = await classifyFinancialStatementLineItems(
@@ -1693,6 +2483,47 @@ async function classify(overrides) {
   assert.equal(malformedResult.classifications[0].classification.confidence, "low");
   assert.equal(malformedResult.classifications[0].classification.llm_status, "needs_human_review");
   assert.deepEqual(malformedResult.unreviewedTargetKeys, ["row-bad"]);
+
+  let deadlineAbortObserved = false;
+  const deadlineStartedAt = Date.now();
+  const deadlineResult = await classifyFinancialStatementLineItems(
+    [
+      request({
+        sourceRowKey: "row-deadline",
+        rowOrder: 6,
+        label: "Other current notes payable",
+        xbrlTag: "NotesPayableCurrent",
+        section: "current liabilities",
+        deterministicCandidate: "Other Current Liabilities",
+        uncertaintyReason: "notes payable requires statement-level review"
+      })
+    ],
+    {
+      llm: {
+        enabled: true,
+        apiKey: "test-key",
+        endpoint: "https://example.test/chat/completions",
+        model: "openai/gpt-5.2",
+        siteUrl: "http://localhost:3000",
+        appTitle: "Historicals Solver Test",
+        timeoutMs: 1_000,
+        deadlineAt: Date.now() + 50,
+        fetchImpl: async (_url, init) =>
+          new Promise((_resolve, reject) => {
+            const onAbort = () => {
+              deadlineAbortObserved = true;
+              reject(new Error("deadline abort"));
+            };
+            if (init.signal?.aborted) onAbort();
+            else init.signal?.addEventListener("abort", onAbort, { once: true });
+          })
+      }
+    }
+  );
+  assert.equal(deadlineAbortObserved, true, "the statement classifier must forward its global LLM deadline to the controller");
+  assert.ok(Date.now() - deadlineStartedAt < 500, "the statement classifier must not outlive its global LLM deadline through recursive retries");
+  assert.equal(deadlineResult.llmCalls, 0);
+  assert.equal(deadlineResult.classifications[0].classification.llm_used, false);
 
   console.log("Financial line item classifier rules passed.");
 })().catch((error) => {

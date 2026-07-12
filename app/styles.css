@@ -181,6 +181,17 @@ h1 {
   gap: 8px;
 }
 
+.optionalLabel {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.fieldHint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 label {
   color: #283849;
   font-size: 14px;
@@ -385,6 +396,33 @@ input::placeholder {
   background: #9aabba;
 }
 
+.formActions {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
+.cancel {
+  min-height: 52px;
+  border: 1px solid rgba(180, 35, 24, 0.28);
+  border-radius: 8px;
+  background: #fff5f4;
+  color: var(--bad);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 16px;
+  font-weight: 800;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+
+.cancel:hover {
+  border-color: rgba(180, 35, 24, 0.5);
+  background: #ffe9e7;
+}
+
 .spin {
   animation: spin 850ms linear infinite;
 }
@@ -514,9 +552,14 @@ input::placeholder {
 
   .searchBox,
   .dropzone,
-  .primary {
+  .primary,
+  .cancel {
     width: 100%;
     min-width: 0;
+  }
+
+  .formActions {
+    grid-template-columns: 1fr;
   }
 
   .selectedFile {

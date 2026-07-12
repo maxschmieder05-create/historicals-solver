@@ -1,6 +1,7 @@
 const path = require("node:path");
 const ExcelJS = require("exceljs");
 const { postWorkbook } = require("./fill-workbook-api");
+const { requireSecRegressionHeaders } = require("./sec-regression-identity");
 
 const repoRoot = path.resolve(__dirname, "..");
 const inputWorkbook =
@@ -10,9 +11,7 @@ const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model
 const ticker = process.env.GOOG_TICKER || "GOOG";
 const cik = process.env.GOOG_CIK || "0001652044";
 
-const secHeaders = {
-  "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver regression contact@example.com"
-};
+const secHeaders = requireSecRegressionHeaders();
 
 const checks = [
   { row: 120, label: "cash plus current marketable securities", resolver: expectedCashAndCurrentInvestments },

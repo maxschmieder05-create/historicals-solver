@@ -37,6 +37,9 @@ function loadTypeScriptModule(file) {
 }
 
 const { __fillModelServiceTestHooks: hooks } = loadTypeScriptModule(sourcePath);
+const { classificationSourceKeys } = loadTypeScriptModule(
+  path.join(repoRoot, "server", "fill-model", "financial-line-item-classifier.ts")
+);
 
 const accession = "000000248826000001";
 const reportDate = "2026-03-28";
@@ -226,6 +229,118 @@ assert.match(da.note, /primary income statement/i);
 const otherOperating = hooks.resolveOtherOperatingIncomeExpense("1Q26", ctx);
 assert.equal(otherOperating.value, 0);
 
+const broadSga = hooks.resolveSellingGeneralAdministrativeExpense("1Q26", ctx);
+assert.equal(broadSga.value, -1_253_000_000);
+assert.equal(broadSga.sources.length, 1, "a genuinely broad primary SG&A line must not be duplicated with component disclosures");
+
+const splitSgaRows = [
+  statementRow(1, "Revenue", "RevenueFromContractWithCustomerExcludingAssessedTax", 1_000_000_000),
+  statementRow(2, "Cost of revenue", "CostOfGoodsAndServicesSold", 400_000_000),
+  statementRow(3, "Research and development", "ResearchAndDevelopmentExpense", 100_000_000),
+  statementRow(4, "Selling and Marketing expense", "SellingAndMarketingExpense", 93_492_000),
+  statementRow(5, "General and Administrative expense", "SellingGeneralAndAdministrativeExpense", 25_029_000),
+  statementRow(6, "Total operating expenses", "OperatingExpenses", 218_521_000),
+  statementRow(7, "Operating income", "OperatingIncomeLoss", 381_479_000),
+  statementRow(8, "Income before income taxes", "IncomeLossFromContinuingOperationsBeforeIncomeTaxes", 381_479_000),
+  statementRow(9, "Income tax expense", "IncomeTaxExpenseBenefit", 80_000_000),
+  statementRow(10, "Net income", "NetIncomeLoss", 301_479_000)
+];
+const splitSgaCtx = {
+  ...ctx,
+  duration: new Map([
+    [
+      "1Q26",
+      new Map(
+        splitSgaRows.map((row) => [
+          row.xbrlConcept,
+          {
+            concept: row.xbrlConcept,
+            label: row.rowLabel,
+            value: row.value,
+            unit: "USD",
+            taxonomy: row.taxonomy,
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            start: row.period.start,
+            end: reportDate,
+            periodKey: "1Q26",
+            periodType: "quarterly",
+            reportDate
+          }
+        ])
+      )
+    ]
+  ]),
+  filingPackageStatements: [
+    {
+      statementName: "Condensed Consolidated Statements of Operations",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: reportDate,
+      form: "10-Q",
+      filingDate: "2026-05-06",
+      rows: splitSgaRows
+    }
+  ]
+};
+
+const splitSga = hooks.resolveSellingGeneralAdministrativeExpense("1Q26", splitSgaCtx);
+assert.equal(
+  splitSga.value,
+  -118_521_000,
+  "a broad SG&A taxonomy concept presented only as G&A must not eclipse a separately reported selling/marketing component"
+);
+assert.deepEqual(
+  splitSga.sources.map((source) => source.label),
+  ["Selling and Marketing expense", "General and Administrative expense"]
+);
+assert.match(splitSga.note, /separately presented primary-income-statement/i);
+
+const partialSplitClassificationStore = new Map();
+classificationSourceKeys({
+  period: "1Q26",
+  accession,
+  xbrlTag: "SellingAndMarketingExpense",
+  label: "Selling and Marketing expense",
+  amount: 93_492_000
+}).forEach((key) => {
+  partialSplitClassificationStore.set(key, {
+    recommended_model_row: "Other Operating Income / Expense",
+    confidence: "high",
+    mapping_passed_validation: true,
+    should_exclude_from_other_bucket: false,
+    reason: "Regression-only conflicting classification",
+    llm_used: true
+  });
+});
+const incompleteSplitSga = hooks.resolveSellingGeneralAdministrativeExpense("1Q26", {
+  ...splitSgaCtx,
+  lineItemClassifications: partialSplitClassificationStore
+});
+assert.equal(
+  incompleteSplitSga.value,
+  null,
+  "split SG&A must fail closed if validation drops either the selling/marketing or G&A component"
+);
+
+const splitSgaWorkbook = new ExcelJS.Workbook();
+const splitSgaSheet = splitSgaWorkbook.addWorksheet("Model");
+splitSgaSheet.getCell("C25").value = "Income Statement";
+splitSgaSheet.getCell("C32").value = "Selling, General & Administration (SG&A)";
+splitSgaSheet.getCell("F32").value = -25.029;
+const splitSgaAuditRows = [];
+const splitSgaReconciliation = hooks.reconcileIncomeStatementClassificationRowsToEdgar(
+  splitSgaSheet,
+  ["1Q26"],
+  [6],
+  splitSgaCtx,
+  splitSgaAuditRows
+);
+assert.equal(splitSgaReconciliation.filledCells, 1);
+assert.equal(splitSgaSheet.getCell("F32").value, -118.521);
+assert.equal(splitSgaAuditRows[0].conceptsUsed.includes("SellingAndMarketingExpense"), true);
+assert.equal(splitSgaAuditRows[0].conceptsUsed.includes("SellingGeneralAndAdministrativeExpense"), true);
+
 const workbook = new ExcelJS.Workbook();
 const sheet = workbook.addWorksheet("Model");
 sheet.getCell("A40").value = "x";
@@ -240,5 +355,58 @@ assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("Q45")
 assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("T45"), "T42+T44+T49"), true);
 assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("Q50"), "SUM(Q45:Q47)"), true);
 assert.equal(hooks.isPostTaxEquityMethodBridgeFormulaUpdate(sheet.getCell("T50"), "SUM(T45:T48)"), true);
+
+const globallyEmptyIncomeLedgerCtx = {
+  ...ctx,
+  filingPackageStatements: []
+};
+const emptyLedgerWorkbook = new ExcelJS.Workbook();
+const emptyLedgerSheet = emptyLedgerWorkbook.addWorksheet("Model");
+const emptyIncomeLedgerErrors = hooks.validatePrimaryIncomeStatementAssignmentCoverage(
+  emptyLedgerSheet,
+  ["1Q26"],
+  [2],
+  globallyEmptyIncomeLedgerCtx,
+  new hooks.FormulaEvaluator(emptyLedgerSheet, { useCachedFormulaResults: false, allowCachedFormulaResultFallback: false }),
+  [],
+  fillRows
+);
+assert.ok(
+  emptyIncomeLedgerErrors.some((error) => /Income Statement 1Q26: no primary income statement assignment ledger rows/.test(error)),
+  "A globally empty income-statement assignment ledger must fail closed when the requested period is SEC-reported."
+);
+
+const customPrimaryWorkbook = new ExcelJS.Workbook();
+const customPrimarySheet = customPrimaryWorkbook.addWorksheet("Operating Model");
+customPrimarySheet.getCell("A1").value = "Income Statement";
+const customPrimaryFillRows = fillRows.map((row, index) => ({ ...row, row: index + 3 }));
+customPrimaryFillRows.forEach((row) => {
+  customPrimarySheet.getCell(row.row, 1).value = row.label;
+});
+const customPrimaryErrors = hooks.validateWorkbookBeforeReturn(
+  customPrimaryWorkbook,
+  ["1Q26"],
+  [2],
+  globallyEmptyIncomeLedgerCtx,
+  [],
+  "Operating Model",
+  {
+    kind: "generic",
+    confidence: "high",
+    rationale: ["Regression fixture for a detected primary sheet with a nonstandard name."],
+    sheetName: "Operating Model",
+    hasSegmentAnalysis: false
+  },
+  [],
+  [],
+  ["1Q26"],
+  [2],
+  customPrimaryFillRows,
+  []
+);
+assert.ok(
+  customPrimaryErrors.some((error) => /Income Statement 1Q26: no primary income statement assignment ledger rows/.test(error)),
+  "Final validation must run on the detected primary worksheet even when it is not literally named Model."
+);
 
 console.log("AMD income statement classification regression passed.");

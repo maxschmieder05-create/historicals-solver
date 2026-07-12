@@ -6,8 +6,29 @@ const DEFAULT_TIMEOUT_MS = Number(process.env.FILL_API_TIMEOUT_MS || 30 * 60 * 1
 
 async function postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook, timeoutMs = DEFAULT_TIMEOUT_MS }) {
   await fsp.mkdir(path.dirname(outputWorkbook), { recursive: true });
-  await runCurl(
-    [
+  const { args, stdinText } = buildCurlInvocation({
+    apiUrl,
+    ticker,
+    inputWorkbook,
+    outputWorkbook,
+    timeoutMs,
+    accessKey: deploymentAccessKey()
+  });
+  await runCurl(args, timeoutMs, stdinText);
+  await new Promise((resolve) => setTimeout(resolve, 1500));
+}
+
+function buildCurlInvocation({ apiUrl, ticker, inputWorkbook, outputWorkbook, timeoutMs = DEFAULT_TIMEOUT_MS, accessKey = "" }) {
+  const normalizedAccessKey = String(accessKey).trim();
+  if (/[\r\n\0]/.test(normalizedAccessKey)) {
+    throw new Error("Fill API access keys cannot contain line breaks or null bytes.");
+  }
+  const stdinText = normalizedAccessKey
+    ? `header = "Authorization: Bearer ${escapeCurlConfigValue(normalizedAccessKey)}"\n`
+    : "";
+  return {
+    args: [
+      ...(stdinText ? ["--config", "-"] : []),
       "--silent",
       "--show-error",
       "--fail-with-body",
@@ -21,14 +42,21 @@ async function postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook, tim
       `file=@${inputWorkbook}`,
       apiUrl
     ],
-    timeoutMs
-  );
-  await new Promise((resolve) => setTimeout(resolve, 1500));
+    stdinText
+  };
 }
 
-function runCurl(args, timeoutMs) {
+function deploymentAccessKey() {
+  return process.env.FILL_API_KEY?.trim() || process.env.HISTORICALS_API_KEY?.trim() || "";
+}
+
+function escapeCurlConfigValue(value) {
+  return value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function runCurl(args, timeoutMs, stdinText = "") {
   return new Promise((resolve, reject) => {
-    const child = spawn("curl", args, { stdio: ["ignore", "ignore", "pipe"] });
+    const child = spawn("curl", args, { stdio: [stdinText ? "pipe" : "ignore", "ignore", "pipe"] });
     const stderr = [];
     const timer = setTimeout(() => {
       child.kill("SIGTERM");
@@ -36,6 +64,10 @@ function runCurl(args, timeoutMs) {
     }, timeoutMs + 5_000);
 
     child.stderr.on("data", (chunk) => stderr.push(chunk));
+    if (stdinText && child.stdin) {
+      child.stdin.on("error", () => undefined);
+      child.stdin.end(stdinText);
+    }
     child.on("error", (error) => {
       clearTimeout(timer);
       reject(error);
@@ -48,4 +80,10 @@ function runCurl(args, timeoutMs) {
   });
 }
 
-module.exports = { postWorkbook };
+module.exports = {
+  postWorkbook,
+  __fillWorkbookApiTestHooks: {
+    buildCurlInvocation,
+    deploymentAccessKey
+  }
+};

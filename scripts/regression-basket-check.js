@@ -6,6 +6,7 @@ const Module = require("node:module");
 const ts = require("typescript");
 const ExcelJS = require("exceljs");
 const { postWorkbook } = require("./fill-workbook-api");
+const { requireSecRegressionHeaders } = require("./sec-regression-identity");
 
 const repoRoot = path.resolve(__dirname, "..");
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
@@ -15,11 +16,10 @@ const baselineOut = process.env.REGRESSION_BASELINE_OUT ? path.resolve(process.e
 const compareBaseline = process.env.REGRESSION_COMPARE_BASELINE ? path.resolve(process.env.REGRESSION_COMPARE_BASELINE) : "";
 const allowMissingInputs = process.env.REGRESSION_ALLOW_MISSING_INPUTS === "1";
 const routingOnly = process.env.REGRESSION_ROUTING_ONLY === "1";
+const reuseExistingOutputs = process.env.REGRESSION_REUSE_OUTPUT === "1";
 const quiet = process.env.REGRESSION_QUIET === "1";
-const secHeaders = {
-  "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver regression harness contact@example.com"
-};
-const secFetchTimeoutMs = Number(process.env.SEC_FETCH_TIMEOUT_MS || 60_000);
+const secHeaders = requireSecRegressionHeaders();
+const secFetchTimeoutMs = Number(process.env.REGRESSION_SEC_FETCH_TIMEOUT_MS || process.env.SEC_FETCH_TIMEOUT_MS || 60_000);
 
 const defaultStandardTemplate = path.join(os.homedir(), "Desktop", "Owl Fund Integrated Model Template (03-Sep-2025)_v25 (3).xlsx");
 const defaultFinancialTemplate = path.join(os.homedir(), "Desktop", "Jefferies Financial Group Inc. (JEF)_Valuation Workbook (10-Mar-2026) (1).xlsx");
@@ -93,6 +93,11 @@ const incomeChecks = [
     label: "SG&A",
     aliases: ["Selling, General & Administration (SG&A)", "SG&A", "Selling General and Administrative", "Selling, General and Administrative"],
     concepts: ["SellingGeneralAndAdministrativeExpense", "SellingGeneralAndAdministrativeExpenseExcludingDepreciationDepletionAndAmortization", "GeneralAndAdministrativeExpense"],
+    aggregateConcepts: ["SellingGeneralAndAdministrativeExpense", "SellingGeneralAndAdministrativeExpenseExcludingDepreciationDepletionAndAmortization"],
+    componentConceptGroups: [
+      ["SellingAndMarketingExpense", "SalesAndMarketingExpense", "SellingExpense"],
+      ["GeneralAndAdministrativeExpense"]
+    ],
     sign: "expense",
     required: true
   },
@@ -151,6 +156,7 @@ const incomeChecks = [
     aliases: ["Other Non-Operating Income / Expense", "Other Non-Operating Income (Expense)", "Other Income (Expense)", "Other Income / Expense"],
     concepts: ["OtherNonoperatingIncomeExpense", "NonoperatingIncomeExpense", "OtherIncomeExpenseNet", "OtherIncome", "OtherExpense"],
     sign: "reported",
+    allowGroupedLedger: true,
     optionalIfNoSource: true
   },
   {
@@ -170,7 +176,7 @@ const incomeChecks = [
     label: "Tax Expense / Benefit",
     aliases: ["Income Tax Benefit (Expense)", "Income Tax Expense", "Tax Expense", "Provision for Income Taxes"],
     concepts: ["IncomeTaxExpenseBenefit"],
-    sign: "expense",
+    sign: "invert_reported",
     required: true
   },
   {
@@ -221,9 +227,16 @@ const balanceSheetChecks = [
     required: true
   },
   {
+    key: "parent_equity",
+    label: "Total Shareholders' Equity",
+    aliases: ["Total Shareholder's Equity", "Total Shareholders' Equity", "Total Stockholders' Equity", "Shareholders' Equity", "Stockholders' Equity"],
+    concepts: ["StockholdersEquity", "PartnersCapital"],
+    required: true
+  },
+  {
     key: "total_equity",
-    label: "Total Equity",
-    aliases: ["Total Shareholder's Equity", "Total Shareholders' Equity", "Total Stockholders' Equity", "Total Equity", "Shareholders' Equity", "Stockholders' Equity"],
+    label: "Total Equity Including Noncontrolling Interests",
+    aliases: ["Total Equity"],
     concepts: ["StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest", "StockholdersEquity", "PartnersCapital"],
     required: true
   },
@@ -336,15 +349,20 @@ async function readCaseOverrides() {
 }
 
 function selectedBasketCases(overrides) {
-  const enabled = new Set(
-    (process.env.REGRESSION_BASKET_CASES || basket.map((item) => item.ticker).join(","))
-      .split(",")
-      .map((item) => item.trim().toUpperCase())
-      .filter(Boolean)
-  );
-  return basket
-    .filter((testCase) => enabled.has(testCase.ticker))
-    .map((testCase) => ({ ...testCase, ...(overrides[testCase.ticker] || {}) }));
+  const basketByTicker = new Map(basket.map((item) => [item.ticker, item]));
+  const selectedTickers = (process.env.REGRESSION_BASKET_CASES || [...basketByTicker.keys(), ...Object.keys(overrides)].join(","))
+    .split(",")
+    .map((item) => item.trim().toUpperCase())
+    .filter(Boolean);
+  return Array.from(new Set(selectedTickers)).map((ticker) => {
+    const testCase = { ...(basketByTicker.get(ticker) || {}), ...(overrides[ticker] || {}), ticker };
+    if (!testCase.cik || !testCase.companyName || !testCase.companyType) {
+      throw new Error(
+        `${ticker}: arbitrary regression cases require cik, companyName, and companyType in the regression basket config.`
+      );
+    }
+    return testCase;
+  });
 }
 
 async function runCase(testCase, context) {
@@ -367,7 +385,10 @@ async function runCase(testCase, context) {
 
   try {
     logProgress(`${testCase.ticker}: loading SEC companyfacts`);
-    const facts = await fetchCompanyFacts(testCase.cik);
+    const [facts, submissions] = await Promise.all([
+      fetchCompanyFacts(testCase.cik),
+      fetchCompanySubmissions(testCase.cik)
+    ]);
     logProgress(`${testCase.ticker}: resolving gold model and input workbook`);
     const goldModel = context.library.findVerifiedGoldModelForCompany(context.goldScan, {
       ticker: testCase.ticker,
@@ -396,7 +417,7 @@ async function runCase(testCase, context) {
     }
 
     logProgress(`${testCase.ticker}: validating model-type routing`);
-    await validateRouting(testCase, facts, inputWorkbook, goldModel, context.library, result);
+    await validateRouting(testCase, facts, submissions, inputWorkbook, goldModel, context.library, result);
     if (result.errors.length) throw new Error(result.errors[0]);
     if (routingOnly) {
       result.status = "passed";
@@ -405,8 +426,12 @@ async function runCase(testCase, context) {
     }
 
     const outputWorkbook = path.join(outputDir, `${testCase.ticker}_regression_output.xlsx`);
-    logProgress(`${testCase.ticker}: generating workbook through ${apiUrl}`);
-    await postWorkbook({ apiUrl, ticker: testCase.ticker, inputWorkbook, outputWorkbook });
+    if (reuseExistingOutputs && fsSync.existsSync(outputWorkbook)) {
+      logProgress(`${testCase.ticker}: reusing existing generated workbook ${outputWorkbook}`);
+    } else {
+      logProgress(`${testCase.ticker}: generating workbook through ${apiUrl}`);
+      await postWorkbook({ apiUrl, ticker: testCase.ticker, inputWorkbook, outputWorkbook });
+    }
     result.outputWorkbook = outputWorkbook;
 
     logProgress(`${testCase.ticker}: validating returned workbook ${outputWorkbook}`);
@@ -450,8 +475,8 @@ function resolveInputWorkbook(testCase, goldModel) {
   return fsSync.existsSync(standard) ? standard : "";
 }
 
-async function validateRouting(testCase, facts, inputWorkbook, goldModel, library, result) {
-  const signals = companySignals(testCase, facts);
+async function validateRouting(testCase, facts, submissions, inputWorkbook, goldModel, library, result) {
+  const signals = companySignals(testCase, facts, submissions);
   const companyType = goldModel ? library.classifyModelTypeFromGoldReference(goldModel) : library.classifyCompanyModelTypeFromSecSignals(signals);
   const templateWorkbook = new ExcelJS.Workbook();
   await templateWorkbook.xlsx.readFile(inputWorkbook);
@@ -482,7 +507,7 @@ async function validateRouting(testCase, facts, inputWorkbook, goldModel, librar
   }
 }
 
-function companySignals(testCase, facts) {
+function companySignals(testCase, facts, submissions) {
   const conceptNames = [];
   const labels = [];
   for (const taxonomy of Object.keys(facts.facts || {})) {
@@ -493,11 +518,11 @@ function companySignals(testCase, facts) {
     }
   }
   return {
-    companyName: facts.entityName || testCase.companyName,
+    companyName: facts.entityName || submissions?.name || testCase.companyName,
     ticker: testCase.ticker,
     cik: testCase.cik,
-    sic: facts.sic || testCase.sic,
-    sicDescription: facts.sicDescription || testCase.sicDescription,
+    sic: submissions?.sic || facts.sic || testCase.sic,
+    sicDescription: submissions?.sicDescription || facts.sicDescription || testCase.sicDescription,
     conceptNames,
     labels
   };
@@ -518,7 +543,7 @@ async function validateReturnedWorkbook(testCase, options) {
     return;
   }
 
-  const periods = detectPeriodColumns(model).filter((item) => !item.isEstimate);
+  const periods = reportedPeriodColumnsFromFilingMap(workbook, model);
   if (!periods.length) errors.push("Returned workbook has no detected historical period columns.");
 
   if (testCase.companyType === "financial_services_broker_dealer") {
@@ -526,10 +551,12 @@ async function validateReturnedWorkbook(testCase, options) {
   } else {
     await validateIncomeStatementAnchors(testCase, model, periods, options.facts, result);
     await validateBalanceSheetAnchors(testCase, model, periods, options.facts, result);
+    await validateCashFlowAnchors(testCase, model, periods, options.facts, result);
   }
   validateBalanceSheetCheck(model, periods, result);
   validateSegmentAnalysis(workbook, model, periods, result);
   validateFormulaSafety(workbook, input, result);
+  validateCompanyMetadataFormulaCaches(workbook, input, testCase, result);
   validateSourceLedger(workbook, model, periods, testCase, result);
   validateClassificationLedgers(workbook, testCase, result);
   if (gold && options.goldModel) compareGoldStructure(workbook, gold, options.goldModel, result);
@@ -560,12 +587,14 @@ async function validateIncomeStatementAnchors(testCase, sheet, periods, facts, r
       else warnings.push(`${testCase.ticker}: optional income-statement row not found for ${check.label}.`);
       continue;
     }
-    if (check.incomeStatementOnly && !rowHasIncomeStatementLedgerSupport(sheet, row)) {
-      warnings.push(`${testCase.ticker}: skipped ${check.label} EDGAR comparison because the output did not show standalone income-statement source support.`);
-      continue;
-    }
     for (const period of periods) {
-      const source = expectedDurationValue(facts, period.period, check.concepts);
+      if (check.incomeStatementOnly && !rowHasIncomeStatementLedgerSupport(sheet, row, period.period)) {
+        warnings.push(
+          `${testCase.ticker} ${period.period}: skipped ${check.label} EDGAR comparison because the Source Ledger did not show standalone income-statement source support.`
+        );
+        continue;
+      }
+      const source = expectedGroupedIncomeStatementLedgerValue(sheet, row, period.period, check) ?? expectedIncomeStatementCheckValue(facts, period.period, check);
       if (!source) {
         if (check.required && !check.optionalIfNoSource) warnings.push(`${testCase.ticker} ${period.period}: no EDGAR source fact found for ${check.label}.`);
         continue;
@@ -603,6 +632,113 @@ async function validateBalanceSheetAnchors(testCase, sheet, periods, facts, resu
         errors.push(`${testCase.ticker} ${period.period} ${check.label} ${sheet.getCell(row, period.col).address}: expected ${round(expected)} from EDGAR ${source.concept}, got ${actual ?? "[blank]"}.`);
       } else {
         increment(result, "balanceSheetEdgarChecks");
+      }
+    }
+  }
+}
+
+async function validateCashFlowAnchors(testCase, sheet, periods, facts, result) {
+  const checks = [
+    {
+      label: "Net Cash From Operating Activities",
+      aliases: ["Net Cash From Operating Activities", "Net Cash Provided by Operating Activities"],
+      concepts: ["NetCashProvidedByUsedInOperatingActivities", "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"]
+    },
+    {
+      label: "Net Cash From Investment Activities",
+      aliases: ["Net Cash From Investment Activities", "Net Cash From Investing Activities"],
+      concepts: ["NetCashProvidedByUsedInInvestingActivities", "NetCashProvidedByUsedInInvestingActivitiesContinuingOperations"]
+    },
+    {
+      label: "Net Cash From Financing Activities",
+      aliases: ["Net Cash From Financing Activities"],
+      concepts: ["NetCashProvidedByUsedInFinancingActivities", "NetCashProvidedByUsedInFinancingActivitiesContinuingOperations"]
+    },
+    {
+      label: "Net Change in Cash",
+      aliases: ["Net Change in Cash"],
+      concepts: [
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecreaseIncludingExchangeRateEffect",
+        "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalentsPeriodIncreaseDecrease",
+        "CashAndCashEquivalentsPeriodIncreaseDecrease"
+      ]
+    }
+  ];
+
+  for (const check of checks) {
+    const row = findRowInSection(sheet, check.aliases, "cash_flow");
+    if (!row) {
+      result.errors.push(`${testCase.ticker}: missing cash-flow row for ${check.label}.`);
+      continue;
+    }
+    for (const period of periods) {
+      const source = expectedDurationValue(facts, period.period, check.concepts);
+      if (!source) {
+        result.warnings.push(`${testCase.ticker} ${period.period}: no EDGAR source fact found for ${check.label}.`);
+        continue;
+      }
+      const expected = source.value / 1_000_000;
+      const actual = numericCellValue(sheet.getCell(row, period.col));
+      if (!valuesMatch(actual, expected)) {
+        result.errors.push(
+          `${testCase.ticker} ${period.period} ${check.label} ${sheet.getCell(row, period.col).address}: expected ${round(expected)} from EDGAR ${source.concept}, got ${actual ?? "[blank]"}.`
+        );
+      } else {
+        increment(result, "cashFlowEdgarChecks");
+      }
+    }
+  }
+
+  const detailChecks = [
+    {
+      label: "Stock-Based Compensation",
+      aliases: ["Stock-Based Compensation", "Stock-Based Comp Expense"],
+      concepts: ["ShareBasedCompensation"],
+      sign: "inflow"
+    },
+    {
+      label: "Capital Expenditures",
+      aliases: ["Capital Expenditures", "Capex"],
+      concepts: ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"],
+      sign: "outflow"
+    },
+    {
+      label: "Share Repurchases",
+      aliases: ["(Repurchase) of Equity", "Repurchase of Equity"],
+      concepts: ["PaymentsForRepurchaseOfCommonStock"],
+      sign: "outflow"
+    },
+    {
+      label: "Dividends",
+      aliases: ["Dividends", "Dividends Issued"],
+      concepts: ["PaymentsOfDividends", "PaymentsOfDividendsCommonStock"],
+      sign: "outflow"
+    },
+    {
+      label: "Effect of FX Rate Changes on Cash",
+      aliases: ["Effect of FX Rate Changes on Cash"],
+      concepts: [
+        "EffectOfExchangeRateOnCashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents",
+        "EffectOfExchangeRateOnCashAndCashEquivalents"
+      ],
+      sign: "reported"
+    }
+  ];
+  for (const check of detailChecks) {
+    const row = findRowInSection(sheet, check.aliases, "cash_flow");
+    if (!row) continue;
+    for (const period of periods) {
+      const source = expectedDurationValue(facts, period.period, check.concepts);
+      if (!source) continue;
+      const raw = source.value / 1_000_000;
+      const expected = check.sign === "outflow" ? -Math.abs(raw) : check.sign === "inflow" ? Math.abs(raw) : raw;
+      const actual = numericCellValue(sheet.getCell(row, period.col));
+      if (!valuesMatch(actual, expected)) {
+        result.errors.push(
+          `${testCase.ticker} ${period.period} ${check.label} ${sheet.getCell(row, period.col).address}: expected ${round(expected)} from EDGAR ${source.concept}, got ${actual ?? "[blank]"}.`
+        );
+      } else {
+        increment(result, "cashFlowDetailEdgarChecks");
       }
     }
   }
@@ -663,16 +799,28 @@ function validateSegmentAnalysis(workbook, model, periods, result) {
 }
 
 function segmentRevenueDetailRows(sheet, totalRow) {
-  const rows = [];
-  const start = Math.max(1, totalRow - 20);
-  for (let row = start; row < totalRow; row += 1) {
+  const rowsBelow = [];
+  for (let row = totalRow + 1; row <= Math.min(sheet.rowCount, totalRow + 20); row += 1) {
+    const label = rowLabel(sheet, row);
+    const normalized = normalize(label);
+    if (!label) {
+      if (rowsBelow.length) break;
+      continue;
+    }
+    if (/^(revenuemix|totalcompanyrevenue|reportedrevenue|segmentanalysis|check)$/.test(normalized)) break;
+    if (rowHasAnyNumber(sheet, row)) rowsBelow.push(row);
+  }
+  if (rowsBelow.length) return rowsBelow;
+
+  const rowsAbove = [];
+  for (let row = Math.max(1, totalRow - 20); row < totalRow; row += 1) {
     const label = rowLabel(sheet, row);
     const normalized = normalize(label);
     if (!label) continue;
-    if (/segmentanalysis|revenue|totalcompanyrevenue|reportedrevenue|check/.test(normalized)) continue;
-    if (rowHasAnyNumber(sheet, row)) rows.push(row);
+    if (/^(revenuemix|totalcompanyrevenue|reportedrevenue|segmentanalysis|check)$/.test(normalized)) continue;
+    if (rowHasAnyNumber(sheet, row)) rowsAbove.push(row);
   }
-  return rows;
+  return rowsAbove;
 }
 
 function validateFormulaSafety(workbook, input, result) {
@@ -696,6 +844,49 @@ function validateFormulaSafety(workbook, input, result) {
 
     const inputSheet = input.getWorksheet(sheetName);
     if (inputSheet) validateForecastFormulaProtection(sheetName, sheet, inputSheet, result);
+  }
+}
+
+function validateCompanyMetadataFormulaCaches(workbook, input, testCase, result) {
+  const inputCover = input.getWorksheet("Cover");
+  const outputCover = workbook.getWorksheet("Cover");
+  if (!inputCover || !outputCover) return;
+  const inputCompanyRow = findRow(inputCover, ["Company Name"]);
+  const inputTickerRow = findRow(inputCover, ["Ticker"]);
+  const outputCompanyRow = findRow(outputCover, ["Company Name"]);
+  const outputTickerRow = findRow(outputCover, ["Ticker"]);
+  const priorCompany = inputCompanyRow ? String(cellValue(inputCover.getCell(inputCompanyRow, 6)) || "").trim() : "";
+  const priorTicker = inputTickerRow ? String(cellValue(inputCover.getCell(inputTickerRow, 6)) || "").trim() : "";
+  const outputCompany = outputCompanyRow ? String(cellValue(outputCover.getCell(outputCompanyRow, 6)) || "").trim() : "";
+  const outputTicker = outputTickerRow ? String(cellValue(outputCover.getCell(outputTickerRow, 6)) || "").trim() : "";
+  if (normalize(outputTicker) !== normalize(testCase.ticker)) {
+    result.errors.push(`${testCase.ticker}: Cover ticker metadata is ${outputTicker || "[blank]"}.`);
+  }
+  if (!outputCompany) result.errors.push(`${testCase.ticker}: Cover company-name metadata is blank.`);
+
+  const stale = [];
+  const priorTickerPattern = priorTicker
+    ? new RegExp(`(^|[^A-Za-z0-9])${priorTicker.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?=$|[^A-Za-z0-9])`)
+    : null;
+  for (const sheet of workbook.worksheets) {
+    sheet.eachRow({ includeEmpty: false }, (row) => {
+      row.eachCell({ includeEmpty: false }, (cell) => {
+        if (!cellFormula(cell)) return;
+        const display = String(cellValue(cell) ?? "");
+        if (priorCompany && normalize(priorCompany) !== normalize(outputCompany) && display.includes(priorCompany)) {
+          stale.push(`${sheet.name}!${cell.address}`);
+        } else if (priorTickerPattern && priorTicker !== outputTicker && priorTickerPattern.test(display)) {
+          stale.push(`${sheet.name}!${cell.address}`);
+        }
+      });
+    });
+  }
+  if (stale.length) {
+    result.errors.push(
+      `${testCase.ticker}: ${stale.length} formula display cache(s) still show prior-company metadata (${stale.slice(0, 12).join(", ")}).`
+    );
+  } else {
+    increment(result, "companyMetadataFormulaCacheChecks");
   }
 }
 
@@ -738,6 +929,7 @@ function validateSourceLedger(workbook, model, periods, testCase, result) {
       const cell = model.getCell(row, period.col);
       if (cellFormula(cell) || !isNumericCell(cell)) continue;
       const label = rowLabel(model, row);
+      if (isHistoricalPresentationMetadataLabel(label)) continue;
       if (/check|margin|growth|ratio|percent|%|multiple/i.test(label)) continue;
       const entries = byCellPeriod.get(`Model!${cell.address}!${period.period}`) || [];
       if (!entries.length) {
@@ -749,6 +941,30 @@ function validateSourceLedger(workbook, model, periods, testCase, result) {
       }
     }
   }
+}
+
+function isHistoricalPresentationMetadataLabel(label) {
+  const normalized = normalize(label);
+  if (
+    [
+      "incomestatement",
+      "incomestatementanalysis",
+      "cashflowstatement",
+      "cashflowanalysis",
+      "balancesheet",
+      "daysinperiod",
+      "fiscalyear",
+      "calendaryear",
+      "historicalperiod",
+      "modelperiod",
+      "period",
+      "quarter",
+      "year"
+    ].includes(normalized)
+  ) {
+    return true;
+  }
+  return /(?:analysis|schedule|drivers?|assumptions?)$/i.test(String(label).trim());
 }
 
 function validateLedgerRow(row, testCase, result) {
@@ -767,12 +983,6 @@ function validateLedgerRow(row, testCase, result) {
   }
   if (/explicit_current_sec_source/i.test(status)) {
     if (!normalizedAccessions.length) result.errors.push(`Source Ledger ${row.cell || "[unknown]"}: current SEC source entry has no normalized accession.`);
-    for (const accession of normalizedAccessions) {
-      const accessionCikValue = accessionCik(accession);
-      if (accessionCikValue && accessionCikValue !== normalizeCik(testCase.cik)) {
-        result.errors.push(`Source Ledger ${row.cell || "[unknown]"}: accession ${accession} belongs to ${accessionCikValue}, not ${normalizeCik(testCase.cik)}.`);
-      }
-    }
     if (!row["source XBRL tag"] && !row["source line item label"]) {
       result.errors.push(`Source Ledger ${row.cell || "[unknown]"}: current SEC source entry lacks source tag/label support.`);
     }
@@ -947,6 +1157,13 @@ async function fetchCompanyFacts(cik) {
   );
 }
 
+async function fetchCompanySubmissions(cik) {
+  return fetchJsonWithTimeout(
+    `https://data.sec.gov/submissions/CIK${normalizeCik(cik)}.json`,
+    `SEC submissions for CIK ${normalizeCik(cik)}`
+  );
+}
+
 async function fetchJsonWithTimeout(url, description) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), secFetchTimeoutMs);
@@ -962,11 +1179,66 @@ async function fetchJsonWithTimeout(url, description) {
   }
 }
 
+function expectedIncomeStatementCheckValue(facts, period, check) {
+  if (!Array.isArray(check.componentConceptGroups) || !check.componentConceptGroups.length) {
+    return expectedDurationValue(facts, period, check.concepts);
+  }
+
+  const aggregate = expectedDurationValue(facts, period, check.aggregateConcepts || []);
+  if (aggregate) return aggregate;
+  const components = check.componentConceptGroups.map((concepts) => expectedDurationValue(facts, period, concepts));
+  if (components.some((component) => !component)) return null;
+  return {
+    concept: components.map((component) => component.concept).join(" + "),
+    value: components.reduce((total, component) => total + component.value, 0),
+    fact: components[0].fact,
+    derived: "sum_of_nonoverlapping_reported_components"
+  };
+}
+
+function expectedGroupedIncomeStatementLedgerValue(sheet, row, period, check) {
+  if (!check.allowGroupedLedger) return null;
+  const ledger = sheet.workbook.getWorksheet("Source Ledger");
+  if (!ledger) return null;
+  const entry = ledgerObjects(ledger).find((candidate) => {
+    if (String(candidate["model row"] || "") !== String(row)) return false;
+    if (normalizePeriodLabel(candidate["fiscal period"]) !== normalizePeriodLabel(period)) return false;
+    if (!/income/i.test(String(candidate["source statement"] || ""))) return false;
+    return /explicit_current_sec_source|validated_current_company_derived_value|formula_preserved/i.test(
+      String(candidate["mapping status"] || "")
+    );
+  });
+  if (!entry) return null;
+  const provenance = parsedSourceProvenance(entry);
+  const derivedOutputs = provenance.filter(
+    (source) => source?.role === "derived_output" && typeof source?.value === "number" && Number.isFinite(source.value)
+  );
+  if (derivedOutputs.length === 1) {
+    return {
+      concept: derivedOutputs[0].concept,
+      value: derivedOutputs[0].value * 1_000_000,
+      derived: "source_ledger_final_derived_output"
+    };
+  }
+  const sources = provenance.filter(
+    (source) => source?.role === "sec_source" && typeof source?.value === "number" && Number.isFinite(source.value)
+  );
+  if (sources.length < 2) return null;
+  const expectedConcepts = new Set(check.concepts || []);
+  if (expectedConcepts.size && !sources.some((source) => expectedConcepts.has(source.concept))) return null;
+  return {
+    concept: sources.map((source) => source.concept).join(" + "),
+    value: sources.reduce((total, source) => total + source.value, 0) * 1_000_000,
+    derived: "sum_of_primary_statement_ledger_sources"
+  };
+}
+
 function expectedDurationValue(facts, period, concepts) {
   const parsed = parsePeriod(period);
   if (!parsed) return null;
   for (const concept of concepts) {
-    const factList = usdFacts(facts, concept).filter((fact) => factMatchesFiscalPeriod(fact, parsed));
+    const allConceptFacts = usdFacts(facts, concept);
+    const factList = allConceptFacts.filter((fact) => factMatchesFiscalPeriod(fact, parsed));
     if (!factList.length) continue;
     if (parsed.kind === "fy") {
       const fact = bestFact(factList.filter((fact) => fact.fp === "FY" && durationDays(fact) >= 250));
@@ -979,10 +1251,29 @@ function expectedDurationValue(facts, period, concepts) {
     const ytd = bestFact(factList.filter((fact) => fact.fp === `Q${parsed.quarter}` && durationDays(fact) > 120));
     if (ytd && parsed.quarter === 1) return { concept, value: ytd.val, fact: ytd };
     if (ytd && parsed.quarter > 1) {
-      const prior = expectedDurationValue(facts, `${parsed.quarter - 1}Q${String(parsed.year).slice(-2)}`, [concept]);
-      const priorYtd = bestFact(factList.filter((fact) => fact.fp === `Q${parsed.quarter - 1}` && durationDays(fact) > 120));
-      if (priorYtd) return { concept, value: ytd.val - priorYtd.val, fact: ytd, derived: "quarter_from_ytd" };
-      if (prior) return { concept, value: ytd.val - prior.value, fact: ytd, derived: "quarter_from_ytd_less_prior_quarter" };
+      const priorCumulative = bestFact(
+        allConceptFacts.filter(
+          (fact) =>
+            Number(fact.fy) === parsed.year &&
+            fact.fp === `Q${parsed.quarter - 1}` &&
+            fact.start === ytd.start &&
+            fact.end < ytd.end
+        )
+      );
+      if (priorCumulative) {
+        return { concept, value: ytd.val - priorCumulative.val, fact: ytd, derived: "quarter_from_ytd" };
+      }
+      const priorQuarters = Array.from({ length: parsed.quarter - 1 }, (_unused, index) =>
+        expectedDurationValue(facts, `${index + 1}Q${String(parsed.year).slice(-2)}`, [concept])
+      );
+      if (priorQuarters.every(Boolean)) {
+        return {
+          concept,
+          value: ytd.val - priorQuarters.reduce((total, prior) => total + prior.value, 0),
+          fact: ytd,
+          derived: "quarter_from_ytd_less_prior_quarters"
+        };
+      }
     }
     if (parsed.quarter === 4) {
       const annual = expectedDurationValue(facts, `FY${String(parsed.year).slice(-2)}`, [concept]);
@@ -1052,6 +1343,7 @@ function durationDays(fact) {
 }
 
 function applyModelSign(value, sign) {
+  if (sign === "invert_reported") return -value;
   if (sign === "expense") return value === 0 ? 0 : -Math.abs(value);
   return value;
 }
@@ -1067,6 +1359,23 @@ function detectPeriodColumns(sheet) {
     periods.push({ period, col, raw, isEstimate: isEstimatePeriodLabel(raw) });
   }
   return periods;
+}
+
+function reportedPeriodColumnsFromFilingMap(workbook, sheet) {
+  const detected = detectPeriodColumns(sheet);
+  const filingMap = workbook.getWorksheet("Filing Period Map");
+  if (!filingMap) return detected.filter((item) => !item.isEstimate);
+  const mapped = new Set(
+    ledgerObjects(filingMap)
+      .map((row) => {
+        const period = normalizePeriodLabel(row["model period"]);
+        const column = String(row["model column"] || "").trim().toUpperCase();
+        return period && column ? `${period}|${column}` : "";
+      })
+      .filter(Boolean)
+  );
+  if (!mapped.size) return detected.filter((item) => !item.isEstimate);
+  return detected.filter((item) => mapped.has(`${item.period}|${sheet.getColumn(item.col).letter.toUpperCase()}`));
 }
 
 function bestPeriodHeaderRow(sheet) {
@@ -1167,14 +1476,38 @@ function rowHasAnyNumber(sheet, row) {
   return false;
 }
 
-function rowHasIncomeStatementLedgerSupport(sheet, row) {
+function rowHasIncomeStatementLedgerSupport(sheet, row, period) {
   const workbook = sheet.workbook;
   const ledger = workbook.getWorksheet("Source Ledger");
   if (!ledger) return false;
   const rowNumber = String(row);
   return ledgerObjects(ledger).some((entry) => {
-    return String(entry["model row"] || "") === rowNumber && /income/i.test(String(entry["source statement"] || ""));
+    if (String(entry["model row"] || "") !== rowNumber) return false;
+    if (normalizePeriodLabel(entry["fiscal period"]) !== normalizePeriodLabel(period)) return false;
+    if (!/income/i.test(String(entry["source statement"] || ""))) return false;
+    if (/explicit_zero_no_source_disclosed|stale_or_unsupported/i.test(String(entry["mapping status"] || ""))) return false;
+    const rawSupport = `${entry["source XBRL tag"] || ""} ${entry["raw SEC value(s)"] || ""}`;
+    if (/PresentationAbsence|FourthQuarterPresentationBridge/i.test(rawSupport)) return false;
+    const provenance = parsedSourceProvenance(entry);
+    return provenance.some(
+      (source) =>
+        source?.role === "sec_source" &&
+        !/PresentationAbsence/i.test(String(source?.concept || "")) &&
+        !/cash.?flow|operating activities/i.test(`${source?.label || ""} ${source?.concept || ""}`)
+    );
   });
+}
+
+function parsedSourceProvenance(entry) {
+  const value = entry["structured source provenance"];
+  if (Array.isArray(value)) return value;
+  if (value && typeof value === "object") return [value];
+  try {
+    const parsed = JSON.parse(String(value || "[]"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function candidateHardcodedHistoricalRows(sheet) {
@@ -1275,11 +1608,6 @@ function normalizeAccessionList(value) {
       if (digits.length === 18) return `${digits.slice(0, 10)}-${digits.slice(10, 12)}-${digits.slice(12)}`;
       return item;
     });
-}
-
-function accessionCik(accession) {
-  const digits = String(accession || "").replace(/\D/g, "");
-  return digits.length >= 10 ? digits.slice(0, 10) : "";
 }
 
 function round(value) {

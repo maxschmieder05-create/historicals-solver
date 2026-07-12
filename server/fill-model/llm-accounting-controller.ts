@@ -78,8 +78,11 @@ export type AccountingLlmRequest<T> = {
   jsonSchema: unknown;
   maxTokens: number;
   maxAttemptsPerModel?: number;
+  maxTotalAttempts?: number;
   reasoningEffort?: "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
   timeoutMs: number;
+  deadlineAt?: number;
+  signal?: AbortSignal;
   enabled?: boolean;
   sessionId?: string;
   fetchImpl?: typeof fetch;
@@ -124,7 +127,18 @@ type OpenRouterRequestShape = {
 };
 
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
-const modelCapabilitiesCache = new Map<string, Promise<OpenRouterModelCapabilities>>();
+const DEFAULT_MODEL_CAPABILITY_CACHE_TTL_MS = 15 * 60_000;
+const DEFAULT_MODEL_CAPABILITY_FAILURE_CACHE_TTL_MS = 10_000;
+const MAX_MODEL_CAPABILITY_CACHE_TTL_MS = 24 * 60 * 60_000;
+
+type ModelCapabilitiesCacheEntry = {
+  promise: Promise<OpenRouterModelCapabilities>;
+  // An in-flight probe never expires so concurrent workbook requests share it.
+  // Once it settles, router results and fallback results receive separate TTLs.
+  expiresAt: number;
+};
+
+const modelCapabilitiesCache = new Map<string, ModelCapabilitiesCacheEntry>();
 
 export function emptyAccountingLlmTelemetry(input: {
   purpose: AccountingLlmPurpose;
@@ -149,33 +163,126 @@ export function emptyAccountingLlmTelemetry(input: {
 }
 
 export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>): Promise<AccountingLlmResult<T>> {
+  if (request.signal?.aborted) return accountingLlmCancelledResult(request);
   const modelCandidates = uniqueModels([request.model, ...(request.fallbackModels ?? [])]);
   const attemptTelemetry: AccountingLlmTelemetry[] = [];
   let lastResult: AccountingLlmResult<T> | null = null;
-  let lastCompletedFailure: AccountingLlmResult<T> | null = null;
   const maxAttemptsPerModel = Math.max(1, Math.min(4, Math.floor(request.maxAttemptsPerModel ?? 1)));
+  const maxTotalAttempts = Number.isFinite(request.maxTotalAttempts)
+    ? Math.max(0, Math.floor(request.maxTotalAttempts!))
+    : Number.POSITIVE_INFINITY;
+  const configuredTimeoutMs = Number.isFinite(request.timeoutMs) && request.timeoutMs > 0 ? request.timeoutMs : 1_000;
+  const requestDeadlineAt = Math.min(
+    Number.isFinite(request.deadlineAt) && (request.deadlineAt ?? 0) > 0 ? request.deadlineAt! : Number.POSITIVE_INFINITY,
+    Date.now() + configuredTimeoutMs
+  );
 
   for (const model of modelCandidates) {
     for (let attempt = 0; attempt < maxAttemptsPerModel; attempt += 1) {
-      const result = await requestAccountingJsonForModel({ ...request, model });
+      const remainingAttempts = maxTotalAttempts - attemptedTelemetryCount(attemptTelemetry);
+      if (remainingAttempts <= 0) return lastResult ?? accountingLlmAttemptBudgetResult(request, attemptTelemetry);
+      if (attempt > 0) await retryBackoff(attempt, configuredTimeoutMs, requestDeadlineAt, request.signal);
+      if (request.signal?.aborted) {
+        const cancelled = accountingLlmCancelledResult(request);
+        return { ...cancelled, attemptTelemetry: attemptTelemetry.length ? attemptTelemetry : [cancelled.telemetry] };
+      }
+      const remainingMs = requestDeadlineAt - Date.now();
+      if (remainingMs <= 0) return lastResult ? { ...lastResult, attemptTelemetry } : accountingLlmDeadlineResult(request, attemptTelemetry);
+      const result = await requestAccountingJsonForModel({
+        ...request,
+        model,
+        maxTotalAttempts: remainingAttempts,
+        deadlineAt: requestDeadlineAt,
+        timeoutMs: Math.max(1, Math.min(configuredTimeoutMs, remainingMs))
+      });
       attemptTelemetry.push(...(result.attemptTelemetry ?? [result.telemetry]));
-      if (result.value) return { ...result, attemptTelemetry };
+      if (accountingLlmResultHasValue(result)) return { ...result, attemptTelemetry };
       lastResult = result;
-      if (result.rawText) lastCompletedFailure = result;
+      if (request.signal?.aborted) return { ...result, attemptTelemetry };
+      if (attemptedTelemetryCount(attemptTelemetry) >= maxTotalAttempts) return { ...result, attemptTelemetry };
       if (!llmResultEligibleForFallback(result)) break;
     }
     if (lastResult && !llmResultEligibleForFallback(lastResult)) break;
   }
 
-  if (lastResult) {
-    const resultToReturn = llmResultEligibleForFallback(lastResult) && lastCompletedFailure ? lastCompletedFailure : lastResult;
-    return { ...resultToReturn, attemptTelemetry };
-  }
+  if (lastResult) return { ...lastResult, attemptTelemetry };
+  if (maxTotalAttempts <= 0) return accountingLlmAttemptBudgetResult(request, attemptTelemetry);
   return requestAccountingJsonForModel(request);
+}
+
+function attemptedTelemetryCount(items: AccountingLlmTelemetry[]) {
+  return items.filter((item) => item.attempted).length;
+}
+
+function accountingLlmResultHasValue<T>(result: AccountingLlmResult<T>) {
+  return Object.prototype.hasOwnProperty.call(result, "value");
+}
+
+async function retryBackoff(attempt: number, timeoutMs: number, deadlineAt: number, signal?: AbortSignal) {
+  const boundedTimeout = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 1_000;
+  const exponentialMs = 50 * 2 ** Math.max(0, attempt - 1);
+  const jitter = 0.75 + Math.random() * 0.5;
+  const remainingMs = Math.max(0, deadlineAt - Date.now());
+  const delayMs = Math.max(0, Math.min(1_000, Math.floor(boundedTimeout / 4), Math.round(exponentialMs * jitter), remainingMs));
+  if (!delayMs) return;
+  await new Promise<void>((resolve) => {
+    const timeout = setTimeout(finish, delayMs);
+    const onAbort = () => finish();
+    function finish() {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }
+    if (signal?.aborted) finish();
+    else signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function accountingLlmDeadlineResult<T>(
+  request: AccountingLlmRequest<T>,
+  attemptTelemetry: AccountingLlmTelemetry[] = []
+): AccountingLlmResult<T> {
+  const error = `LLM ${request.purpose} exceeded its total ${request.timeoutMs}ms request budget`;
+  const telemetry = emptyAccountingLlmTelemetry({
+    purpose: request.purpose,
+    model: request.model,
+    endpoint: request.endpoint,
+    status: "attempted_failed",
+    errorMessage: error
+  });
+  return { status: "attempted_failed", error, telemetry, attemptTelemetry: attemptTelemetry.length ? attemptTelemetry : [telemetry] };
+}
+
+function accountingLlmAttemptBudgetResult<T>(
+  request: AccountingLlmRequest<T>,
+  attemptTelemetry: AccountingLlmTelemetry[] = []
+): AccountingLlmResult<T> {
+  const error = `LLM ${request.purpose} exhausted its bounded request-attempt budget`;
+  const telemetry = emptyAccountingLlmTelemetry({
+    purpose: request.purpose,
+    model: request.model,
+    endpoint: request.endpoint,
+    status: "attempted_failed",
+    errorMessage: error
+  });
+  return { status: "attempted_failed", error, telemetry, attemptTelemetry: attemptTelemetry.length ? attemptTelemetry : [telemetry] };
+}
+
+function accountingLlmCancelledResult<T>(request: AccountingLlmRequest<T>): AccountingLlmResult<T> {
+  const error = `LLM ${request.purpose} cancelled because the workbook fill request was cancelled`;
+  const telemetry = emptyAccountingLlmTelemetry({
+    purpose: request.purpose,
+    model: request.model,
+    endpoint: request.endpoint,
+    status: "attempted_failed",
+    errorMessage: error
+  });
+  return { status: "attempted_failed", error, telemetry, attemptTelemetry: [telemetry] };
 }
 
 async function requestAccountingJsonForModel<T>(request: AccountingLlmRequest<T>): Promise<AccountingLlmResult<T>> {
   const startedAt = Date.now();
+  if (request.signal?.aborted) return accountingLlmCancelledResult(request);
   if (request.enabled === false) {
     const telemetry = emptyAccountingLlmTelemetry({
       purpose: request.purpose,
@@ -198,9 +305,20 @@ async function requestAccountingJsonForModel<T>(request: AccountingLlmRequest<T>
   }
 
   const fetchImpl = request.fetchImpl ?? fetch;
-  const capabilities = await capabilitiesForModel(request.model, fetchImpl, !request.fetchImpl);
+  const capabilityTimeoutMs = accountingLlmRemainingMs(request);
+  if (capabilityTimeoutMs <= 0) return accountingLlmDeadlineResult(request);
+  const capabilities = await capabilitiesForModel(
+    request.model,
+    fetchImpl,
+    !request.fetchImpl && isOpenRouterUrl(request.endpoint),
+    request.apiKey,
+    capabilityTimeoutMs
+  );
+  if (request.signal?.aborted) return accountingLlmCancelledResult(request);
   const shape = buildOpenRouterRequestShape(request, capabilities);
-  const primary = await postOpenRouterJson(request, shape, fetchImpl, startedAt, false, capabilities);
+  const primaryTimeoutMs = accountingLlmRemainingMs(request);
+  if (primaryTimeoutMs <= 0) return accountingLlmDeadlineResult(request);
+  const primary = await postOpenRouterJson({ ...request, timeoutMs: primaryTimeoutMs }, shape, fetchImpl, startedAt, false, capabilities);
   if (!primary.ok) return primary.result;
 
   const parsed = parseAndValidateResponse(primary.text, request.validate);
@@ -220,67 +338,93 @@ async function requestAccountingJsonForModel<T>(request: AccountingLlmRequest<T>
     };
   }
 
-  if (request.repair?.enabled) {
-    const repairShape = buildRepairRequestShape(request, capabilities, shape, parsed.error);
-    const repair = await postOpenRouterJson(request, repairShape, fetchImpl, startedAt, true, capabilities);
+  const primaryFailureStatus: AccountingLlmStatus = parsed.needsHumanReview ? "needs_human_review" : "attempted_failed";
+  const primaryFailureTelemetry: AccountingLlmTelemetry = {
+    ...primary.telemetry,
+    status: primaryFailureStatus,
+    completed: true,
+    validated: false,
+    affectedOutput: false,
+    errorMessage: parsed.error
+  };
+
+  const repairFitsAttemptBudget =
+    !Number.isFinite(request.maxTotalAttempts) || Math.max(0, Math.floor(request.maxTotalAttempts!)) >= 2;
+  if (request.repair?.enabled && repairFitsAttemptBudget) {
+    const repairShape = buildRepairRequestShape(request, shape, primary.text, parsed.error);
+    const repairTimeoutMs = accountingLlmRemainingMs(request);
+    if (repairTimeoutMs <= 0) {
+      return {
+        status: primaryFailureStatus,
+        rawText: primary.text,
+        error: parsed.error,
+        telemetry: primaryFailureTelemetry,
+        attemptTelemetry: [primaryFailureTelemetry]
+      };
+    }
+    const repair = await postOpenRouterJson({ ...request, timeoutMs: repairTimeoutMs }, repairShape, fetchImpl, Date.now(), true, capabilities);
     if (!repair.ok) {
+      const repairTelemetry = {
+        ...repair.result.telemetry,
+        repairAttempted: true,
+        errorMessage: repair.result.telemetry.errorMessage || parsed.error
+      };
       return {
         ...repair.result,
-        telemetry: {
-          ...repair.result.telemetry,
-          repairAttempted: true,
-          errorMessage: repair.result.telemetry.errorMessage || parsed.error
-        }
+        telemetry: repairTelemetry,
+        attemptTelemetry: [primaryFailureTelemetry, repairTelemetry]
       };
     }
     const repaired = parseAndValidateResponse(repair.text, request.validate);
     if (repaired.ok) {
       const status: AccountingLlmStatus = repaired.validation.validated ? "repaired" : "completed_unvalidated";
+      const repairTelemetry: AccountingLlmTelemetry = {
+        ...repair.telemetry,
+        status,
+        completed: true,
+        validated: repaired.validation.validated,
+        affectedOutput: repaired.validation.affectedOutput ?? repaired.validation.validated,
+        repairAttempted: true
+      };
       return {
         status,
         value: repaired.validation.value,
         rawText: repair.text,
-        telemetry: {
-          ...repair.telemetry,
-          status,
-          completed: true,
-          validated: repaired.validation.validated,
-          affectedOutput: repaired.validation.affectedOutput ?? repaired.validation.validated,
-          repairAttempted: true
-        }
+        telemetry: repairTelemetry,
+        attemptTelemetry: [primaryFailureTelemetry, repairTelemetry]
       };
     }
     const status: AccountingLlmStatus = repaired.needsHumanReview ? "needs_human_review" : "attempted_failed";
-    return {
-      status,
-      rawText: repair.text,
-      error: repaired.error,
-      telemetry: {
-        ...repair.telemetry,
-        status,
-        completed: true,
-        validated: false,
-        affectedOutput: false,
-        repairAttempted: true,
-        errorMessage: repaired.error
-      }
-    };
-  }
-
-  const status: AccountingLlmStatus = parsed.needsHumanReview ? "needs_human_review" : "attempted_failed";
-  return {
-    status,
-    rawText: primary.text,
-    error: parsed.error,
-    telemetry: {
-      ...primary.telemetry,
+    const repairTelemetry: AccountingLlmTelemetry = {
+      ...repair.telemetry,
       status,
       completed: true,
       validated: false,
       affectedOutput: false,
-      errorMessage: parsed.error
-    }
+      repairAttempted: true,
+      errorMessage: repaired.error
+    };
+    return {
+      status,
+      rawText: repair.text,
+      error: repaired.error,
+      telemetry: repairTelemetry,
+      attemptTelemetry: [primaryFailureTelemetry, repairTelemetry]
+    };
+  }
+
+  return {
+    status: primaryFailureStatus,
+    rawText: primary.text,
+    error: parsed.error,
+    telemetry: primaryFailureTelemetry
   };
+}
+
+function accountingLlmRemainingMs(request: { timeoutMs: number; deadlineAt?: number }) {
+  const timeoutMs = Number.isFinite(request.timeoutMs) && request.timeoutMs > 0 ? request.timeoutMs : 1_000;
+  if (!request.deadlineAt || !Number.isFinite(request.deadlineAt)) return timeoutMs;
+  return Math.max(0, Math.min(timeoutMs, request.deadlineAt - Date.now()));
 }
 
 function uniqueModels(models: string[]) {
@@ -302,9 +446,10 @@ function llmResultEligibleForFallback<T>(result: AccountingLlmResult<T>) {
   const httpStatus = result.telemetry.httpStatus;
   if ((!httpStatus || [401, 403].includes(httpStatus)) && /key limit|quota|billing|credits?|auth|api key|forbidden/i.test(error)) return false;
   if (httpStatus && [408, 409, 425, 429, 500, 502, 503, 504].includes(httpStatus)) return true;
+  if (httpStatus && httpStatus >= 400 && httpStatus < 500) return false;
   return Boolean(
     !error ||
-      /no endpoints|routing|provider|timed out|key limit|quota|rate limit|billing|credits?|capacity|temporarily unavailable|overloaded|did not include text output|json|schema|parse|validation|omitted target|unexpected source_row_key|duplicate source_row_key/i.test(
+      /no endpoints|routing|provider|timed out|fetch failed|network error|socket(?: hang up)?|econnreset|econnrefused|enotfound|eai_again|connection (?:reset|closed|terminated)|other side closed|capacity|temporarily unavailable|overloaded|did not include text output|json|schema|parse|validation|omitted target|unexpected source_row_key|duplicate source_row_key/i.test(
         error
       )
   );
@@ -334,7 +479,7 @@ export function aggregateAccountingTelemetry(items: AccountingLlmTelemetry[]) {
     attempts: items.filter((item) => item.attempted).length,
     successfulCompletions: items.filter((item) => item.completed).length,
     validatedCompletions: items.filter((item) => item.validated).length,
-    failedAttempts: items.filter((item) => item.attempted && !item.completed).length,
+    failedAttempts: items.filter((item) => item.attempted && (!item.completed || !item.validated)).length,
     affectedOutputDecisions: items.filter((item) => item.affectedOutput).length,
     statuses: statusCounts,
     models: Array.from(new Set(items.map((item) => item.responseModel || item.model).filter(Boolean))),
@@ -387,9 +532,9 @@ function buildOpenRouterRequestShape<T>(
     reasoning: request.reasoningEffort ? { effort: request.reasoningEffort, exclude: true } : undefined
   };
 
-  if (capabilities.supportsMaxCompletionTokens && !capabilities.supportsMaxTokens) {
+  if (capabilities.supportsMaxCompletionTokens) {
     shape.max_completion_tokens = request.maxTokens;
-  } else {
+  } else if (capabilities.supportsMaxTokens) {
     shape.max_tokens = request.maxTokens;
   }
   if (capabilities.supportsTemperature) shape.temperature = 0;
@@ -398,8 +543,8 @@ function buildOpenRouterRequestShape<T>(
 
 function buildRepairRequestShape<T>(
   request: AccountingLlmRequest<T>,
-  capabilities: OpenRouterModelCapabilities,
   originalShape: OpenRouterRequestShape,
+  originalResponse: string,
   validationError: string
 ): OpenRouterRequestShape {
   const repairInstruction =
@@ -410,12 +555,14 @@ function buildRepairRequestShape<T>(
     messages: [
       ...request.messages,
       {
+        role: "assistant",
+        content: originalResponse
+      },
+      {
         role: "user",
         content: `${repairInstruction}\n\nValidation error: ${validationError}`
       }
-    ],
-    response_format: capabilities.supportsResponseFormat ? { type: "json_object" } : originalShape.response_format,
-    provider: capabilities.supportsResponseFormat ? { require_parameters: true, sort: "throughput" } : originalShape.provider
+    ]
   };
 }
 
@@ -432,6 +579,7 @@ async function postOpenRouterJson<T>(
 > {
   const controller = new AbortController();
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  let onExternalAbort: (() => void) | undefined;
   try {
     const { response, body } = await Promise.race([
       (async () => {
@@ -457,6 +605,15 @@ async function postOpenRouterJson<T>(
           controller.abort();
           reject(new Error(`OpenRouter ${request.purpose} timed out after ${request.timeoutMs}ms`));
         }, request.timeoutMs);
+      }),
+      new Promise<never>((_, reject) => {
+        if (!request.signal) return;
+        onExternalAbort = () => {
+          controller.abort();
+          reject(new Error(`LLM ${request.purpose} cancelled because the workbook fill request was cancelled`));
+        };
+        if (request.signal.aborted) onExternalAbort();
+        else request.signal.addEventListener("abort", onExternalAbort, { once: true });
       })
     ]);
     const telemetry = telemetryFromOpenRouterResponse(
@@ -509,7 +666,11 @@ async function postOpenRouterJson<T>(
     }
     return { ok: true, text, telemetry };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
+    const message = request.signal?.aborted
+      ? `LLM ${request.purpose} cancelled because the workbook fill request was cancelled`
+      : error instanceof Error
+        ? error.message
+        : String(error);
     return {
       ok: false,
       result: {
@@ -535,6 +696,7 @@ async function postOpenRouterJson<T>(
     };
   } finally {
     if (timeout) clearTimeout(timeout);
+    if (onExternalAbort) request.signal?.removeEventListener("abort", onExternalAbort);
   }
 }
 
@@ -619,33 +781,116 @@ function telemetryFromOpenRouterResponse<T>(
   };
 }
 
-async function capabilitiesForModel(model: string, fetchImpl: typeof fetch, allowProbe: boolean): Promise<OpenRouterModelCapabilities> {
+async function capabilitiesForModel(
+  model: string,
+  fetchImpl: typeof fetch,
+  allowProbe: boolean,
+  apiKey: string,
+  timeoutMs: number
+): Promise<OpenRouterModelCapabilities> {
   const fromStatic = staticCapabilitiesForModel(model);
   if (!allowProbe || fromStatic.source === "static" || process.env.OPENROUTER_MODEL_CAPABILITY_PROBE === "0") return fromStatic;
-  if (!/^https:\/\/openrouter\.ai\//i.test(OPENROUTER_MODELS_URL)) return fromStatic;
+  if (!isOpenRouterUrl(OPENROUTER_MODELS_URL)) return fromStatic;
+  const now = Date.now();
   const cached = modelCapabilitiesCache.get(model);
-  if (cached) return cached;
-  const promise = fetchImpl(`${OPENROUTER_MODELS_URL}?supported_parameters=response_format`, {
-    headers: { Accept: "application/json" }
-  })
-    .then(async (response) => {
-      if (!response.ok) return fromStatic;
-      const body = await response.json().catch(() => null);
-      const found = Array.isArray(body?.data) ? body.data.find((item: any) => item?.id === model) : null;
-      if (!found || !Array.isArray(found.supported_parameters)) return fromStatic;
-      const params = new Set(found.supported_parameters.filter((item: unknown): item is string => typeof item === "string"));
-      return {
-        supportsResponseFormat: params.has("response_format"),
-        supportsStructuredOutputs: params.has("structured_outputs"),
-        supportsTemperature: params.has("temperature"),
-        supportsMaxCompletionTokens: params.has("max_completion_tokens"),
-        supportsMaxTokens: params.has("max_tokens"),
-        source: "router" as const
-      };
-    })
-    .catch(() => fromStatic);
-  modelCapabilitiesCache.set(model, promise);
+  if (cached && cached.expiresAt > now) return cached.promise;
+  if (cached) modelCapabilitiesCache.delete(model);
+
+  const promise = probeModelCapabilities(model, fetchImpl, apiKey, timeoutMs, fromStatic);
+  const entry: ModelCapabilitiesCacheEntry = {
+    promise,
+    expiresAt: Number.POSITIVE_INFINITY
+  };
+  modelCapabilitiesCache.set(model, entry);
+  void promise.then(
+    (capabilities) => {
+      // Do not mutate a newer entry if this probe was evicted/replaced while it
+      // was settling. A router result is safe to reuse longer; a timeout,
+      // malformed response, missing model, or other fallback is retried soon.
+      if (modelCapabilitiesCache.get(model) !== entry) return;
+      entry.expiresAt =
+        Date.now() +
+        modelCapabilityCacheTtlMs(
+          capabilities.source === "router"
+            ? "OPENROUTER_MODEL_CAPABILITY_CACHE_TTL_MS"
+            : "OPENROUTER_MODEL_CAPABILITY_FAILURE_CACHE_TTL_MS",
+          capabilities.source === "router"
+            ? DEFAULT_MODEL_CAPABILITY_CACHE_TTL_MS
+            : DEFAULT_MODEL_CAPABILITY_FAILURE_CACHE_TTL_MS
+        );
+    },
+    () => {
+      // probeModelCapabilities currently resolves to its fallback on failure,
+      // but keep unexpected rejections retryable rather than poisoning cache.
+      if (modelCapabilitiesCache.get(model) === entry) modelCapabilitiesCache.delete(model);
+    }
+  );
   return promise;
+}
+
+function modelCapabilityCacheTtlMs(environmentKey: string, fallbackMs: number) {
+  const configured = Number(process.env[environmentKey]);
+  if (!Number.isFinite(configured) || configured < 0) return fallbackMs;
+  return Math.min(MAX_MODEL_CAPABILITY_CACHE_TTL_MS, Math.floor(configured));
+}
+
+async function probeModelCapabilities(
+  model: string,
+  fetchImpl: typeof fetch,
+  apiKey: string,
+  timeoutMs: number,
+  fallback: OpenRouterModelCapabilities
+): Promise<OpenRouterModelCapabilities> {
+  if (!isOpenRouterUrl(OPENROUTER_MODELS_URL)) return fallback;
+  const controller = new AbortController();
+  const boundedRequestMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 2_000;
+  const probeTimeoutMs = Math.max(1, Math.min(1_500, Math.floor(boundedRequestMs / 4) || boundedRequestMs));
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const body = await Promise.race([
+      (async () => {
+        const response = await fetchImpl(`${OPENROUTER_MODELS_URL}?supported_parameters=response_format`, {
+          signal: controller.signal,
+          headers: {
+            Accept: "application/json",
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
+          }
+        });
+        if (!response.ok) return null;
+        return response.json().catch(() => null);
+      })(),
+      new Promise<null>((resolve) => {
+        timeout = setTimeout(() => {
+          controller.abort();
+          resolve(null);
+        }, probeTimeoutMs);
+      })
+    ]);
+    const found = Array.isArray(body?.data) ? body.data.find((item: any) => item?.id === model) : null;
+    if (!found || !Array.isArray(found.supported_parameters)) return fallback;
+    const params = new Set(found.supported_parameters.filter((item: unknown): item is string => typeof item === "string"));
+    return {
+      supportsResponseFormat: params.has("response_format"),
+      supportsStructuredOutputs: params.has("structured_outputs"),
+      supportsTemperature: params.has("temperature"),
+      supportsMaxCompletionTokens: params.has("max_completion_tokens"),
+      supportsMaxTokens: params.has("max_tokens"),
+      source: "router"
+    };
+  } catch {
+    return fallback;
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
+function isOpenRouterUrl(value: string) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && (url.hostname === "openrouter.ai" || url.hostname.endsWith(".openrouter.ai"));
+  } catch {
+    return false;
+  }
 }
 
 function staticCapabilitiesForModel(model: string): OpenRouterModelCapabilities {
@@ -656,7 +901,7 @@ function staticCapabilitiesForModel(model: string): OpenRouterModelCapabilities 
       supportsStructuredOutputs: true,
       supportsTemperature: false,
       supportsMaxCompletionTokens: true,
-      supportsMaxTokens: true,
+      supportsMaxTokens: false,
       source: "static"
     };
   }
@@ -666,7 +911,7 @@ function staticCapabilitiesForModel(model: string): OpenRouterModelCapabilities 
       supportsStructuredOutputs: true,
       supportsTemperature: !/^openai\/o[34]/.test(normalized),
       supportsMaxCompletionTokens: /^openai\/o[34]/.test(normalized),
-      supportsMaxTokens: true,
+      supportsMaxTokens: !/^openai\/o[34]/.test(normalized),
       source: "static"
     };
   }
@@ -792,3 +1037,15 @@ function stripUndefined<T extends Record<string, any>>(value: T): T {
   }
   return value;
 }
+
+export const __llmAccountingControllerTestHooks = {
+  capabilitiesForModel,
+  clearModelCapabilitiesCache: () => modelCapabilitiesCache.clear(),
+  modelCapabilitiesCacheState: () =>
+    Array.from(modelCapabilitiesCache.entries()).map(([model, entry]) => ({
+      model,
+      expiresAt: entry.expiresAt
+    })),
+  probeModelCapabilities,
+  staticCapabilitiesForModel
+};

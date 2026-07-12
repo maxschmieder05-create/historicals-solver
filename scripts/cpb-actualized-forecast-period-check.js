@@ -1,6 +1,7 @@
 const path = require("node:path");
 const ExcelJS = require("exceljs");
 const { postWorkbook } = require("./fill-workbook-api");
+const { requireSecRegressionHeaders } = require("./sec-regression-identity");
 
 const repoRoot = path.resolve(__dirname, "..");
 const ticker = process.env.CPB_TICKER || "CPB";
@@ -10,9 +11,7 @@ const outputWorkbook =
   process.env.CPB_OUTPUT_WORKBOOK || path.join(repoRoot, "tmp", "cpb-actualized-forecast-period-output.xlsx");
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
-const secHeaders = {
-  "User-Agent": process.env.SEC_USER_AGENT || "HistoricalsSolver CPB regression contact@example.com"
-};
+const secHeaders = requireSecRegressionHeaders();
 
 const actualizedFormulaRows = [
   "Cash & Cash Equivalents",

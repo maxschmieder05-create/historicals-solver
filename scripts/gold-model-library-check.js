@@ -65,6 +65,18 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function instantiatedCellCount(workbook) {
+  return workbook.worksheets.reduce(
+    (workbookTotal, sheet) =>
+      workbookTotal +
+      (sheet._rows || []).reduce(
+        (sheetTotal, row) => sheetTotal + (row?._cells || []).filter(Boolean).length,
+        0
+      ),
+    0
+  );
+}
+
 async function main() {
   const library = loadTypescriptModule(sourcePath);
   const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "gold-model-library-"));
@@ -115,6 +127,22 @@ async function main() {
   assert(jef.modelType === "financial_services_broker_dealer", `JEF model type should be financial_services_broker_dealer, got ${jef.modelType}.`);
   assert(jef.companyName === "Jefferies Financial Group Inc.", "Manifest company name should override filename guessing.");
   assert(jef.historicalPeriodsCovered.includes("1Q23") && jef.historicalPeriodsCovered.includes("FY23"), "Historical periods were not detected.");
+  assert(
+    library.findVerifiedGoldModelForCompany(scan, {
+      cik: "0001084580",
+      ticker: "JEF",
+      title: "Jefferies Financial Group Inc."
+    })?.filePath === jefPath,
+    "An exact SEC CIK identity should match the verified company gold model."
+  );
+  assert(
+    library.findVerifiedGoldModelForCompany(scan, {
+      cik: "0000000002",
+      ticker: "JEF",
+      title: "Jefferies Financial Group Inc."
+    }) === null,
+    "A verified gold model with an explicit conflicting CIK must not match by ticker or company name."
+  );
 
   const filled = scan.excluded.find((model) => model.filePath === filledPath);
   assert(filled, "Workbook with filled in filename should be excluded.");
@@ -155,6 +183,37 @@ async function main() {
   assert(
     workbookType.modelType === "financial_services_broker_dealer",
     `JEF-style workbook labels should classify as financial_services_broker_dealer, got ${workbookType.modelType}.`
+  );
+
+  const sparseWorkbook = new ExcelJS.Workbook();
+  for (let index = 0; index < 24; index += 1) {
+    const sheet = sparseWorkbook.addWorksheet(`Sparse ${index + 1}`);
+    sheet.getCell("A1").value = index === 0 ? "Income Statement Cost of Revenue Gross Profit" : "Reference Schedule";
+    sheet.getCell("L500").value = index === 0 ? "Balance Sheet Inventory Accounts Receivable" : "Supporting Assumptions";
+  }
+  const sparseCellsBefore = instantiatedCellCount(sparseWorkbook);
+  const sparseScanStartedAt = Date.now();
+  const sparseSignals = library.scanWorkbookModelTypeSignals(sparseWorkbook);
+  const sparseScanDurationMs = Date.now() - sparseScanStartedAt;
+  const sparseCellsAfter = instantiatedCellCount(sparseWorkbook);
+  assert(
+    sparseCellsAfter === sparseCellsBefore,
+    `Workbook model-type scanning must not materialize empty Excel cells (${sparseCellsBefore} before, ${sparseCellsAfter} after).`
+  );
+  assert(sparseScanDurationMs < 1_500, `Sparse workbook model-type scan took ${sparseScanDurationMs}ms; expected a bounded sparse scan.`);
+  const originalEachRows = sparseWorkbook.worksheets.map((sheet) => sheet.eachRow);
+  sparseWorkbook.worksheets.forEach((sheet) => {
+    sheet.eachRow = () => {
+      throw new Error("Precomputed workbook model-type signals were not reused.");
+    };
+  });
+  const sparseWorkbookType = library.classifyWorkbookModelType(sparseWorkbook, sparseSignals);
+  sparseWorkbook.worksheets.forEach((sheet, index) => {
+    sheet.eachRow = originalEachRows[index];
+  });
+  assert(
+    sparseWorkbookType.modelType === "standard_operating_company",
+    `Sparse standard workbook should classify from the precomputed scan, got ${sparseWorkbookType.modelType}.`
   );
 
   const standardWithInterestIncome = library.classifyCompanyModelTypeFromSecSignals({
@@ -211,7 +270,75 @@ async function main() {
     `Strong JEF-like signals should classify as financial_services_broker_dealer, got ${jefCompanySignals.modelType}.`
   );
 
-  console.log("Gold model library guard passed.");
+  const genericWorkbook = new ExcelJS.Workbook();
+  genericWorkbook.addWorksheet("Inputs").getCell("A1").value = "Assumptions";
+  const genericTemplateBeforeCompanyClassification = library.classifyWorkbookModelType(genericWorkbook);
+  const genericBrokerCompany = library.classifyCompanyModelTypeFromSecSignals({
+    companyName: "Example Capital Markets Holdings",
+    ticker: "ECM",
+    cik: "0000000003",
+    sic: "6211",
+    sicDescription: "Security brokers, dealers, and flotation companies",
+    conceptNames: ["InvestmentBankingRevenue", "PrincipalTransactionsRevenue", "FinancialInstrumentsOwned"],
+    labels: ["Investment banking", "Principal transactions", "Financial instruments owned"]
+  });
+  const genericTemplateAfterCompanyClassification = library.classifyWorkbookModelType(genericWorkbook);
+  assert(genericBrokerCompany.modelType === "financial_services_broker_dealer", "Broker SEC signals should classify the company, not the workbook.");
+  assert(
+    genericTemplateBeforeCompanyClassification.modelType === "unknown" && genericTemplateAfterCompanyClassification.modelType === "unknown",
+    "A generic/unlabeled workbook must remain unknown before and after classifying broker SEC concepts."
+  );
+
+  for (const specializedModelType of ["financial_services_broker_dealer", "bank", "insurance", "reit_real_estate", "utility"]) {
+    const specializedUnknownCompatibility = library.checkModelTemplateCompatibility(
+      { modelType: specializedModelType, confidence: "high", source: "sec_filing_signals", rationale: [] },
+      genericTemplateAfterCompanyClassification
+    );
+    assert(
+      !specializedUnknownCompatibility.compatible,
+      `High-confidence ${specializedModelType} companies must not pass an unknown/generic workbook template.`
+    );
+  }
+
+  const sicCases = [
+    { companyName: "NextEra Energy, Inc.", ticker: "NEE", sic: "4911", sicDescription: "Electric Services", expected: "utility" },
+    { companyName: "Equinix, Inc.", ticker: "EQIX", sic: "6798", sicDescription: "Real Estate Investment Trusts", expected: "reit_real_estate" },
+    { companyName: "JPMorgan Chase & Co.", ticker: "JPM", sic: "6021", sicDescription: "National Commercial Banks", expected: "bank" },
+    { companyName: "The Progressive Corporation", ticker: "PGR", sic: "6331", sicDescription: "Fire, Marine, and Casualty Insurance", expected: "insurance" }
+  ];
+  for (const testCase of sicCases) {
+    const classification = library.classifyCompanyModelTypeFromSecSignals({
+      ...testCase,
+      conceptNames: ["RevenueFromContractWithCustomerExcludingAssessedTax", "GrossProfit", "InventoryNet", "CapitalMarketsRevenue"],
+      labels: ["Revenue", "Gross profit", "Inventory", "Capital markets"]
+    });
+    assert(
+      classification.modelType === testCase.expected,
+      `${testCase.ticker} SIC ${testCase.sic} should take precedence over noisy concept/label signals and classify as ${testCase.expected}, got ${classification.modelType}.`
+    );
+    assert(classification.confidence === "high", `${testCase.ticker} SIC classification should be high confidence.`);
+  }
+
+  const bankTemplateCompatibility = library.checkModelTemplateCompatibility(
+    { modelType: "bank", confidence: "high", source: "sec_filing_signals", rationale: [] },
+    { modelType: "financial_services_broker_dealer", confidence: "high", source: "workbook", rationale: [] }
+  );
+  assert(!bankTemplateCompatibility.compatible, "A bank must not be silently routed into a broker-dealer template.");
+
+  const wasteServicesSignals = library.classifyCompanyModelTypeFromSecSignals({
+    companyName: "Example Waste Services, Inc.",
+    ticker: "WST",
+    sic: "4953",
+    sicDescription: "Refuse Systems",
+    conceptNames: ["RevenueFromContractWithCustomerExcludingAssessedTax", "CostOfRevenue", "PropertyPlantAndEquipmentNet"],
+    labels: ["Revenue", "Cost of operations", "Property and equipment"]
+  });
+  assert(
+    wasteServicesSignals.modelType === "standard_operating_company",
+    `Non-utility SIC 4953 must not be swept into the utility class, got ${wasteServicesSignals.modelType}.`
+  );
+
+  console.log(`Gold model library guard passed (24-sheet sparse scan: ${sparseScanDurationMs}ms, ${sparseCellsAfter} cells retained).`);
 }
 
 main().catch((error) => {

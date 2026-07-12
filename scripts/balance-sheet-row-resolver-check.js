@@ -180,7 +180,37 @@ const explicitZero = classifyBalanceSheetResolution({
   sources: [{ concept: "NoCurrentSecSource", label: "No current SEC source disclosed", value: 0, sourceLayer: "model" }],
   note: "Explicitly zero because the current SEC filing did not disclose this current-liability line item."
 });
-assert.equal(explicitZero.state, "explicit_zero_not_applicable");
+assert.equal(
+  explicitZero.state,
+  "unresolved_failure",
+  "absence of a disclosed source must not be self-certified as an explicit zero"
+);
+
+const reportedZero = classifyBalanceSheetResolution({
+  modelRow: "Other Current Liabilities",
+  value: 0,
+  classification: "direct",
+  sources: [{ concept: "OtherCurrentLiabilities", label: "Other current liabilities", value: 0, sourceLayer: "sec_filing_package" }],
+  note: "The current SEC primary balance sheet reported a zero value."
+});
+assert.equal(reportedZero.state, "explicit_zero_not_applicable");
+
+const missingSourceAmountIsNotZero = classifyBalanceSheetResolution({
+  modelRow: "Inventory",
+  value: 0,
+  classification: "direct",
+  sources: [{ concept: "InventoryNet", label: "Inventory", value: null, sourceLayer: "sec_ledger" }],
+  note: "The source concept was listed without a parseable amount."
+});
+assert.equal(
+  missingSourceAmountIsNotZero.state,
+  "unresolved_failure"
+);
+assert.notEqual(
+  missingSourceAmountIsNotZero.state,
+  "explicit_zero_not_applicable",
+  "a missing source amount must never be coerced into an explicit reported zero"
+);
 
 const componentDebt = classifyBalanceSheetResolution({
   modelRow: "Revolver",

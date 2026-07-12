@@ -11,7 +11,7 @@ import {
   useRef,
   useState
 } from "react";
-import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, Loader2, Search, ShieldCheck, UploadCloud } from "lucide-react";
+import { ArrowDownToLine, CheckCircle2, FileCheck2, FileSpreadsheet, KeyRound, Loader2, Search, ShieldCheck, UploadCloud, X } from "lucide-react";
 
 type FillSummary = {
   companyName: string;
@@ -28,12 +28,10 @@ type FillError = {
   debugLogPath?: string;
 };
 
-const SUPPORTED_WORKBOOK_EXTENSIONS = [".xlsx", ".xlsm"] as const;
+const SUPPORTED_WORKBOOK_EXTENSIONS = [".xlsx"] as const;
 const SUPPORTED_WORKBOOK_ACCEPT = [
   ".xlsx",
-  ".xlsm",
-  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-  "application/vnd.ms-excel.sheet.macroEnabled.12"
+  "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 ].join(",");
 
 function isSupportedWorkbookFile(file: File) {
@@ -76,6 +74,7 @@ function markWorkbookDropEffect(dataTransfer: DataTransfer | null) {
 
 export default function Home() {
   const [ticker, setTicker] = useState("");
+  const [accessKey, setAccessKey] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -86,6 +85,7 @@ export default function Home() {
   const dragDepthRef = useRef(0);
   const inputSyncFrameRef = useRef<number | null>(null);
   const inputSyncTimersRef = useRef<number[]>([]);
+  const activeRequestRef = useRef<AbortController | null>(null);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
@@ -110,7 +110,7 @@ export default function Home() {
       selectedFileRef.current = null;
       setFile(null);
       clearFileInput();
-      setError({ message: `${nextFile.name} is not a supported .xlsx or .xlsm workbook.` });
+      setError({ message: `${nextFile.name} is not a supported .xlsx workbook.` });
       return;
     }
     selectedFileRef.current = nextFile;
@@ -120,7 +120,7 @@ export default function Home() {
   const handleDroppedWorkbook = useCallback((dataTransfer: DataTransfer | null) => {
     const droppedFile = workbookFileFromTransfer(dataTransfer);
     if (!droppedFile) {
-      setError({ message: "Drop an .xlsx or .xlsm workbook file." });
+      setError({ message: "Drop an .xlsx workbook file." });
       return;
     }
     handleWorkbookSelected(droppedFile);
@@ -224,6 +224,8 @@ export default function Home() {
     };
   }, [syncInputSelection]);
 
+  useEffect(() => () => activeRequestRef.current?.abort(), []);
+
   function handleDrag(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     event.stopPropagation();
@@ -270,6 +272,11 @@ export default function Home() {
     syncInputSelectionSoon(event.currentTarget);
   }
 
+  function cancelFill() {
+    if (!activeRequestRef.current) return;
+    activeRequestRef.current.abort();
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -287,11 +294,11 @@ export default function Home() {
       return;
     }
     if (!selectedFile) {
-      setError({ message: "Choose an .xlsx or .xlsm workbook before filling." });
+      setError({ message: "Choose an .xlsx workbook before filling." });
       return;
     }
     if (!isSupportedWorkbookFile(selectedFile)) {
-      setError({ message: `${selectedFile.name} is not a supported .xlsx or .xlsm workbook.` });
+      setError({ message: `${selectedFile.name} is not a supported .xlsx workbook.` });
       return;
     }
 
@@ -302,11 +309,16 @@ export default function Home() {
     const formData = new FormData();
     formData.append("ticker", query);
     formData.append("file", selectedFile);
+    const controller = new AbortController();
+    activeRequestRef.current = controller;
+    const normalizedAccessKey = accessKey.trim();
 
     try {
       const response = await fetch("/api/fill-model", {
         method: "POST",
-        body: formData
+        body: formData,
+        signal: controller.signal,
+        headers: normalizedAccessKey ? { Authorization: `Bearer ${normalizedAccessKey}` } : undefined
       });
 
       if (!response.ok) {
@@ -335,8 +347,15 @@ export default function Home() {
       a.remove();
       URL.revokeObjectURL(downloadUrl);
     } catch (caught) {
-      setError({ message: caught instanceof Error ? caught.message : "Something went wrong." });
+      setError({
+        message: controller.signal.aborted
+          ? "Workbook fill cancelled. No output was downloaded."
+          : caught instanceof Error
+            ? caught.message
+            : "Something went wrong."
+      });
     } finally {
+      if (activeRequestRef.current === controller) activeRequestRef.current = null;
       setIsSubmitting(false);
     }
   }
@@ -357,7 +376,7 @@ export default function Home() {
           <h1>Historicals Solver</h1>
           <p>
             Drop a valuation template, enter a ticker or company name, and download a workbook with historical income
-            statement and balance sheet cells populated from SEC company facts.
+            statement and balance sheet cells populated from SEC company facts for domestic 10-K/10-Q filers.
           </p>
           <div className="assurance">
             <span>
@@ -391,8 +410,30 @@ export default function Home() {
                 onChange={(event) => setTicker(event.target.value)}
                 placeholder="AAPL, Microsoft, Costco..."
                 autoComplete="off"
+                disabled={isSubmitting}
               />
             </div>
+          </div>
+
+          <div className="field">
+            <label htmlFor="deployment-access-key">Deployment access key <span className="optionalLabel">(if required)</span></label>
+            <div className="searchBox">
+              <KeyRound aria-hidden="true" size={20} />
+              <input
+                id="deployment-access-key"
+                type="password"
+                value={accessKey}
+                onChange={(event) => setAccessKey(event.target.value)}
+                placeholder="Enter the key provided by your administrator"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={isSubmitting}
+              />
+            </div>
+            <small className="fieldHint">
+              Leave blank unless this deployment is protected. The key is kept only in this page&apos;s memory, sent in the
+              authorization header for this fill, and never added to the workbook.
+            </small>
           </div>
 
           <div
@@ -432,15 +473,23 @@ export default function Home() {
                 <small>{formatFileSize(file.size)}</small>
               </span>
             ) : (
-              <small>Click to browse or drag in an .xlsx or .xlsm file</small>
+              <small>Click to browse or drag in an .xlsx file</small>
             )}
             <span className="browseCue">{file ? "Choose different workbook" : "Choose workbook"}</span>
           </div>
 
-          <button className="primary" type="submit" disabled={!canSubmit}>
-            {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
-            {isSubmitting ? "Filling workbook" : "Fill and download"}
-          </button>
+          <div className="formActions">
+            <button className="primary" type="submit" disabled={!canSubmit}>
+              {isSubmitting ? <Loader2 className="spin" size={20} /> : <ArrowDownToLine size={20} />}
+              {isSubmitting ? "Filling workbook" : "Fill and download"}
+            </button>
+            {isSubmitting ? (
+              <button className="cancel" type="button" onClick={cancelFill}>
+                <X aria-hidden="true" size={19} />
+                Cancel fill
+              </button>
+            ) : null}
+          </div>
 
           {error ? (
             <div className="errorPanel" role="alert">
@@ -464,7 +513,7 @@ export default function Home() {
                 </strong>
                 <span>
                   {summary.filledCells} cells filled across {summary.periods.length} periods. {summary.commentsAdded} comments
-                  added for mapped or plugged rows.
+                  added for mapped or derived rows.
                 </span>
               </div>
             </div>
