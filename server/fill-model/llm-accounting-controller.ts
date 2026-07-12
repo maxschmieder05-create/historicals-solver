@@ -114,7 +114,11 @@ type OpenRouterModelCapabilities = {
 type OpenRouterRequestShape = {
   model: string;
   messages: AccountingLlmMessage[];
-  provider?: { require_parameters?: boolean; sort?: string };
+  provider?: {
+    require_parameters?: boolean;
+    sort?: string;
+    max_price?: { prompt: number; completion: number };
+  };
   response_format?: unknown;
   max_tokens?: number;
   max_completion_tokens?: number;
@@ -127,6 +131,14 @@ type OpenRouterRequestShape = {
 };
 
 const OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models";
+const OPENROUTER_MAX_PROMPT_PRICE_PER_MILLION = boundedPositivePrice(
+  process.env.OPENROUTER_MAX_PROMPT_PRICE_PER_MILLION,
+  0.5
+);
+const OPENROUTER_MAX_COMPLETION_PRICE_PER_MILLION = boundedPositivePrice(
+  process.env.OPENROUTER_MAX_COMPLETION_PRICE_PER_MILLION,
+  1
+);
 const DEFAULT_MODEL_CAPABILITY_CACHE_TTL_MS = 15 * 60_000;
 const DEFAULT_MODEL_CAPABILITY_FAILURE_CACHE_TTL_MS = 10_000;
 const MAX_MODEL_CAPABILITY_CACHE_TTL_MS = 24 * 60 * 60_000;
@@ -534,7 +546,14 @@ function buildOpenRouterRequestShape<T>(
     model: request.model,
     messages: request.messages,
     session_id: request.sessionId,
-    provider: responseFormat ? { require_parameters: true, sort: "throughput" } : { sort: "throughput" },
+    provider: {
+      ...(responseFormat ? { require_parameters: true } : {}),
+      sort: "price",
+      max_price: {
+        prompt: OPENROUTER_MAX_PROMPT_PRICE_PER_MILLION,
+        completion: OPENROUTER_MAX_COMPLETION_PRICE_PER_MILLION
+      }
+    },
     response_format: responseFormat,
     reasoning: request.reasoningEffort ? { effort: request.reasoningEffort, exclude: true } : undefined
   };
@@ -1036,6 +1055,11 @@ function numericOrNull(value: unknown) {
 function sumOptional(a: number | undefined, b: number | undefined) {
   if (a === undefined && b === undefined) return undefined;
   return (a ?? 0) + (b ?? 0);
+}
+
+function boundedPositivePrice(value: string | undefined, fallback: number) {
+  const parsed = Number(value ?? fallback);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function stripUndefined<T extends Record<string, any>>(value: T): T {

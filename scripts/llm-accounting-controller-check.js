@@ -122,6 +122,7 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
     const analystState = __fillModelServiceTestHooks.createLlmMappingState();
     assert.equal(analystState.analystMode, true, "LLM analyst mode must own the workflow when mapping and review are available");
     assert.equal(__fillModelServiceTestHooks.llmAnalystControlsValidation(analystState), true);
+    assert.equal(analystState.maxCostUsd, 0.1, "each workbook must have a small default LLM spend ceiling");
     assert.ok(analystState.reservedReviewCalls > 0, "classification must reserve calls for validation recovery");
     const reviewToolbox = (blockingFailures) => ({ verificationGate: { blockingFailures } });
     assert.ok(
@@ -136,6 +137,40 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
       __fillModelServiceTestHooks.llmMappingCanUse(analystState, 1),
       false,
       "pre-fill classification must stop before consuming the review/recovery reserve"
+    );
+
+    const costGuardState = __fillModelServiceTestHooks.createLlmMappingState();
+    const costTelemetry = (cost) => ({
+      purpose: "statement_line_item_classification",
+      status: "completed_validated",
+      attempted: true,
+      completed: true,
+      validated: true,
+      affectedOutput: true,
+      repairAttempted: false,
+      model: "deepseek/deepseek-v4-flash",
+      endpoint: "https://openrouter.ai/api/v1/chat/completions",
+      usage: { cost },
+      durationMs: 1
+    });
+    __fillModelServiceTestHooks.recordLlmTelemetry(costGuardState, costTelemetry(0.06));
+    assert.equal(costGuardState.enabled, true);
+    __fillModelServiceTestHooks.recordLlmTelemetry(costGuardState, costTelemetry(0.05));
+    assert.equal(costGuardState.enabled, false, "the per-workbook cost guard must stop additional LLM calls");
+    assert.equal(costGuardState.costWarningAdded, true);
+    assert.match(costGuardState.warnings.at(-1), /cost guard reached/i);
+
+    assert.equal(
+      __fillModelServiceTestHooks.isLlmMappableRow({
+        row: 209,
+        label: "Write-offs of Intangibles",
+        statement: "income",
+        kind: "duration",
+        classification: "unused",
+        modelContext: { hasHardcodedInput: true }
+      }),
+      false,
+      "unused schedule rows must not trigger large speculative LLM prompts by default"
     );
 
     const exhaustedState = __fillModelServiceTestHooks.createLlmMappingState();
@@ -231,6 +266,8 @@ async function main() {
   });
   assert.equal(repairedResult.status, "repaired");
   assert.equal(repairCalls, 2);
+  assert.equal(repairBodies[0].provider.sort, "price");
+  assert.deepEqual(repairBodies[0].provider.max_price, { prompt: 0.5, completion: 1 });
   assert.equal(repairBodies[1].messages.at(-2).role, "assistant");
   assert.equal(repairBodies[1].messages.at(-2).content, '{"ok":false}');
   assert.match(repairBodies[1].messages.at(-1).content, /validation rejected payload/);

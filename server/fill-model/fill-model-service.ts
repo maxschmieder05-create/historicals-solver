@@ -497,6 +497,9 @@ type LlmMappingState = {
   maxCalls: number;
   reservedReviewCalls: number;
   reservedReviewMs: number;
+  maxCostUsd: number;
+  spentCostUsd: number;
+  costWarningAdded: boolean;
   startedAt: number;
   deadlineAt: number;
   budgetWarningAdded: boolean;
@@ -973,10 +976,12 @@ const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost
 // The LLM is the responsible analyst, so use an accounting-capable frontier
 // model for both primary statement work and recovery. A capable paid fallback
 // prevents provider latency from silently downgrading the workbook to rules.
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "openai/gpt-5.6-sol-pro";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-5.6-sol-pro";
-const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "openai/gpt-5.6-sol-pro";
-const DEFAULT_LLM_MAPPING_FALLBACK_MODELS = ["anthropic/claude-sonnet-5"];
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "deepseek/deepseek-v4-pro";
+const DEFAULT_LLM_MAPPING_FAST_FALLBACK_MODELS = ["deepseek/deepseek-v3.2"];
+const DEFAULT_LLM_MAPPING_COMPLEX_FALLBACK_MODELS = ["deepseek/deepseek-v3.2"];
+const DEFAULT_LLM_MAPPING_REVIEW_FALLBACK_MODELS = ["deepseek/deepseek-v4-flash"];
 const LLM_MAPPING_FAST_MODEL = normalizeConfiguredLlmModel(
   process.env.LLM_MAPPING_FAST_MODEL || process.env.LLM_MAPPING_MODEL || DEFAULT_LLM_MAPPING_FAST_MODEL,
   DEFAULT_LLM_MAPPING_FAST_MODEL
@@ -991,17 +996,17 @@ const LLM_MAPPING_REVIEW_MODEL = normalizeConfiguredLlmModel(
 );
 const LLM_MAPPING_FAST_FALLBACK_MODELS = llmFallbackModels(
   process.env.LLM_MAPPING_FAST_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
-  DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
+  DEFAULT_LLM_MAPPING_FAST_FALLBACK_MODELS,
   LLM_MAPPING_FAST_MODEL
 );
 const LLM_MAPPING_COMPLEX_FALLBACK_MODELS = llmFallbackModels(
   process.env.LLM_MAPPING_COMPLEX_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
-  DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
+  DEFAULT_LLM_MAPPING_COMPLEX_FALLBACK_MODELS,
   LLM_MAPPING_COMPLEX_MODEL
 );
 const LLM_MAPPING_REVIEW_FALLBACK_MODELS = llmFallbackModels(
   process.env.LLM_MAPPING_REVIEW_FALLBACK_MODELS || process.env.LLM_MAPPING_FALLBACK_MODELS,
-  DEFAULT_LLM_MAPPING_FALLBACK_MODELS,
+  DEFAULT_LLM_MAPPING_REVIEW_FALLBACK_MODELS,
   LLM_MAPPING_REVIEW_MODEL
 );
 // In analyst mode the LLM owns primary-statement classification and recovery.
@@ -1020,6 +1025,8 @@ const LLM_MAPPING_RECOVERY_MAX_ITEMS = boundedPositiveNumber(process.env.LLM_MAP
 // this pass, especially when the provider queues a large structured response.
 const LLM_MAPPING_REVIEW_TIMEOUT_MS = Number(process.env.LLM_MAPPING_REVIEW_TIMEOUT_MS || 240_000);
 const LLM_MAPPING_REVIEW_AUTOCORRECT = booleanEnv(process.env.LLM_MAPPING_REVIEW_AUTOCORRECT, LLM_ANALYST_MODE);
+const LLM_MAX_COST_PER_WORKBOOK_USD = nonNegativeNumber(process.env.LLM_MAX_COST_PER_WORKBOOK_USD, 0.1);
+const LLM_UNUSED_ROW_MAPPING_ENABLED = booleanEnv(process.env.LLM_UNUSED_ROW_MAPPING_ENABLED, false);
 const LLM_MAPPING_MIN_CANDIDATE_SCORE = Number(process.env.LLM_MAPPING_MIN_CANDIDATE_SCORE || 2);
 const LLM_MAPPING_CANDIDATE_LIMIT = Number(process.env.LLM_MAPPING_CANDIDATE_LIMIT || 80);
 const LLM_MAPPING_COMPLEX_SCORE = Number(process.env.LLM_MAPPING_COMPLEX_SCORE || 4);
@@ -19075,6 +19082,9 @@ function createLlmMappingState(signal?: AbortSignal): LlmMappingState {
       Number.isFinite(LLM_MAPPING_MAX_CALLS) ? LLM_MAPPING_MAX_CALLS : 24
     ),
     reservedReviewMs: Number.isFinite(LLM_MAPPING_REVIEW_RESERVED_MS) ? LLM_MAPPING_REVIEW_RESERVED_MS : 180_000,
+    maxCostUsd: Number.isFinite(LLM_MAX_COST_PER_WORKBOOK_USD) ? LLM_MAX_COST_PER_WORKBOOK_USD : 0.1,
+    spentCostUsd: 0,
+    costWarningAdded: false,
     startedAt,
     deadlineAt: startedAt + maxDurationMs,
     budgetWarningAdded: false,
@@ -19108,6 +19118,20 @@ function recordLlmTelemetry(state: LlmMappingState, telemetry: AccountingLlmTele
   if (telemetry.attempted && (!telemetry.completed || !telemetry.validated)) state.failedAttempts += 1;
   if (telemetry.affectedOutput) state.affectedOutputDecisions += 1;
   if (telemetry.completed) state.calls += 1;
+  const requestCost = telemetry.usage?.cost;
+  if (typeof requestCost === "number" && Number.isFinite(requestCost) && requestCost > 0) {
+    state.spentCostUsd += requestCost;
+  }
+  if (state.maxCostUsd > 0 && state.spentCostUsd >= state.maxCostUsd) {
+    state.enabled = false;
+    state.deadlineAt = Date.now();
+    if (!state.costWarningAdded) {
+      state.costWarningAdded = true;
+      state.warnings.push(
+        `LLM workbook cost guard reached $${state.spentCostUsd.toFixed(4)} against the configured $${state.maxCostUsd.toFixed(2)} limit; no additional model calls were allowed.`
+      );
+    }
+  }
   if (llmTelemetryIndicatesAccountBudgetExhausted(telemetry)) {
     state.enabled = false;
     state.deadlineAt = Date.now();
@@ -19171,6 +19195,8 @@ function llmMappingStateSummary(state: LlmMappingState) {
     mappingAttemptsRemaining: llmMappingAttemptsRemaining(state),
     reservedReviewCalls: state.reservedReviewCalls,
     reservedReviewMs: state.reservedReviewMs,
+    maxCostUsd: state.maxCostUsd,
+    spentCostUsd: state.spentCostUsd,
     remainingMs: llmTimeRemainingMs(state),
     decisionCount: state.decisions.size,
     models: aggregate.models,
@@ -20522,6 +20548,7 @@ async function llmAssistedFillRow(
 }
 
 function isLlmMappableRow(fillRow: FillRow) {
+  if (!LLM_UNUSED_ROW_MAPPING_ENABLED) return false;
   if (fillRow.statement !== "income" && fillRow.statement !== "balance") return false;
   if (fillRow.classification !== "unused") return false;
   const context = fillRow.modelContext;
@@ -32650,6 +32677,8 @@ export const __fillModelServiceTestHooks = {
   refreshDividendCachedResults,
   llmApiKeyForEndpoint,
   createLlmMappingState,
+  recordLlmTelemetry,
+  isLlmMappableRow,
   llmMappingCanUse,
   llmMappingAttemptsRemaining,
   llmAnalystControlsValidation,
