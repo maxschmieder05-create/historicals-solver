@@ -85,6 +85,68 @@ assert.equal(
   "an equity roll-forward whose extracted table text contains net income must not be misclassified as an income statement"
 );
 
+const mrkSalesRow = {
+  rowLabel: "Sales",
+  xbrlConcept: "Revenues",
+  value: 16_286_000_000,
+  period: { start: "2025-10-01", end: "2025-12-31", periodType: "duration" },
+  consolidated: true,
+  dimensions: [],
+  rowOrder: 500000
+};
+assert.equal(
+  hooks.statementSectionForRow(
+    { statementName: "Consolidated Statement of Income", sourceTableType: "primary_statement", rows: [mrkSalesRow] },
+    mrkSalesRow,
+    "income_statement"
+  ),
+  "revenue",
+  "a Revenues-tagged Sales row must not inherit an operating-expense section from fragile presentation ordering"
+);
+assert.equal(
+  hooks.statementRowIsSubtotal({ rowLabel: "Stockholders' Equity before Treasury Stock", xbrlConcept: "StockholdersEquityBeforeTreasuryStock" }),
+  true,
+  "apostrophized stockholders' equity subtotals must not consume LLM statement-coverage calls"
+);
+assert.notEqual(
+  hooks.statementClassificationSemanticKey({
+    statement: "balance_sheet",
+    sourceTableType: "primary_statement",
+    section: "current liabilities",
+    periodType: "instant",
+    xbrlTag: "OtherLiabilitiesCurrent",
+    cleanLabel: "Accrued and other current liabilities"
+  }),
+  hooks.statementClassificationSemanticKey({
+    statement: "balance_sheet",
+    sourceTableType: "primary_statement",
+    section: "current liabilities",
+    periodType: "instant",
+    xbrlTag: "OtherLiabilitiesCurrent",
+    cleanLabel: "Other current liabilities"
+  }),
+  "the same XBRL tag with materially different filing labels must receive separate LLM decisions"
+);
+assert.equal(
+  hooks.statementClassificationSemanticKey({
+    statement: "balance_sheet",
+    sourceTableType: "primary_statement",
+    section: "current assets",
+    periodType: "instant",
+    xbrlTag: "AccountsReceivableNetCurrent",
+    cleanLabel: "Accounts receivable net of allowance of $103 in 2026 and $97 in 2025"
+  }),
+  hooks.statementClassificationSemanticKey({
+    statement: "balance_sheet",
+    sourceTableType: "primary_statement",
+    section: "current assets",
+    periodType: "instant",
+    xbrlTag: "AccountsReceivableNetCurrent",
+    cleanLabel: "Accounts receivable net of allowance of $93 in 2025 and $89 in 2024"
+  }),
+  "period-specific amounts and years in otherwise identical filing labels must share one LLM decision"
+);
+
 function statementRow(rowOrder, rowLabel, xbrlConcept, value) {
   return {
     statementName: "Consolidated Balance Sheet",
@@ -468,6 +530,58 @@ assert.deepEqual(hooks.duplicateIncomeStatementAssignmentKeys(duplicateRows), ["
 assert.equal(hooks.validationRepairStrategy([], model, "same", null), "targeted");
 assert.equal(hooks.shouldStopRepeatedUnrepairableValidationFailure("same", "same", 1), true);
 assert.equal(hooks.shouldStopRepeatedUnrepairableValidationFailure("same", "different", 0), true);
+
+const q4Absence = hooks.fourthQuarterPresentationAbsenceResolved(
+  "4Q25",
+  {
+    fiscalPeriods: {
+      entries: [{
+        accessionNumber: "0000000000-26-000010",
+        accessionKey: "000000000026000010",
+        form: "10-K",
+        filingDate: "2026-02-15",
+        reportDate: "2025-12-31",
+        fiscalYear: 2025,
+        fiscalQuarter: 4,
+        quarterPeriod: "4Q25",
+        annualPeriod: "FY25"
+      }],
+      reportedPeriods: new Set(["4Q25"])
+    }
+  },
+  {
+    value: null,
+    sources: [
+      { concept: "InterestExpensePresentationAbsence", value: 0, accn: "q1", start: "2025-01-01", end: "2025-03-31" },
+      { concept: "InterestExpensePresentationAbsence", value: 0, accn: "q2", start: "2025-04-01", end: "2025-06-30" },
+      { concept: "InterestExpensePresentationAbsence", value: 0, accn: "q3", start: "2025-07-01", end: "2025-09-30" }
+    ]
+  },
+  "Interest (Expense)"
+);
+assert.equal(q4Absence.value, 0);
+assert.equal(q4Absence.sources[0].start, "2025-10-01", "Q4 presentation absence must start after the Q3 SEC duration");
+assert.equal(q4Absence.sources[0].end, "2025-12-31", "Q4 presentation absence must end on the annual filing report date");
+
+const segmentLedgerWorkbook = new ExcelJS.Workbook();
+const segmentLedgerSheet = segmentLedgerWorkbook.addWorksheet("Segment Analysis");
+segmentLedgerSheet.getCell("C5").value = "Pharmaceutical segment Operating Income";
+segmentLedgerSheet.getCell("C6").value = "Animal Health segment Operating Income";
+segmentLedgerSheet.getCell("C7").value = "Corporate / Reconciliation Operating Income";
+const segmentLedgerAssignments = hooks.assignSegmentsToMetricRowsForLedger(
+  segmentLedgerSheet,
+  [5, 6, 7],
+  [
+    { label: "Corporate / Reconciliation", operatingIncome: new Map([["1Q26", -100]]) },
+    { label: "Pharmaceutical segment", operatingIncome: new Map([["1Q26", 80]]) },
+    { label: "Animal Health segment", operatingIncome: new Map([["1Q26", 20]]) }
+  ],
+  "Operating Income",
+  ["1Q26"]
+);
+assert.equal(segmentLedgerAssignments.get(5), 1);
+assert.equal(segmentLedgerAssignments.get(6), 2);
+assert.equal(segmentLedgerAssignments.get(7), 0, "segment ledger must retain Corporate / Reconciliation on its dedicated labeled row");
 
 assert.equal(
   hooks.llmApiKeyForEndpoint("https://openrouter.ai/api/v1/chat/completions", {

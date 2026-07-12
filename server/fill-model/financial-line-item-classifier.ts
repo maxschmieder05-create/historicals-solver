@@ -294,6 +294,7 @@ const GENERAL_ACCOUNTING_ROUTING_INSTRUCTIONS = [
   "This is a general side-by-side mapping task, not a keyword lookup and not a rule limited to the examples.",
   "For every target row, compare the SEC source row against all available model rows and definitions, then choose the row whose accounting substance best fits.",
   "Use statement placement, current/non-current section, parent subtotal, nearby rows, XBRL concept semantics, and prior-period labels to infer meaning when filing labels and model labels differ.",
+  "Inventory explicitly reported as non-current or classified in Other assets belongs in Other Non-Current Assets, not the current Inventory row.",
   "Prefer a specific model row when the template exposes one; otherwise group into the appropriate Other bucket with a reusable accounting reason.",
   "Exclude subtotals, totals, component detail, and duplicate rows when mapping them would double-count a model row.",
   "Preserve EDGAR tie-outs: major model totals should reconcile to the SEC filing through assigned components, formulas, or explicit exclusion reasons."
@@ -675,6 +676,14 @@ export function fullStatementLineItemNeedsAnalystPass(request: FinancialLineItem
   if (aggregateOperatingExpenseSourceHasReportedComponents(request)) return false;
   const text = `${request.cleanLabel || request.reportedLineItemLabel} ${request.xbrlTag ?? ""}`.toLowerCase();
   const tagCompact = (request.xbrlTag ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const currentStatementLines = (request.currentPeriodSourceLines ?? []).join(" ").toLowerCase();
+  const isGrossPpeSupportDetail =
+    request.statement === "balance_sheet" &&
+    /^(?:land|buildingsandimprovementsgross|machineryandequipmentgross|constructioninprogressgross|propertyplantandequipmentgross)$/.test(
+      tagCompact
+    ) &&
+    /property,? plant and equipment.*net|property and equipment.*net|net property,? plant and equipment/.test(currentStatementLines);
+  if (isGrossPpeSupportDetail) return false;
   if (
     /\bper (?:common )?share\b|\bearnings per share\b|\beps\b|\bweighted average (?:number of )?shares?\b|\bshares? (?:outstanding|used|weighted)\b|\bnumber of shares?\b/.test(
       text
@@ -692,7 +701,8 @@ export function fullStatementLineItemNeedsAnalystPass(request: FinancialLineItem
     ) ||
       /^(?:grossprofit|operatingincomeloss|incomelossfromcontinuingoperationsbeforeincometaxes|incomelossfromcontinuingoperations|profitloss|netincomeloss)$/.test(
         tagCompact
-      ))
+      ) ||
+      /incomelossfromcontinuingoperationsbeforeincometaxes|netincomelossattributableto(?:noncontrollinginterest|parent)/.test(tagCompact))
   ) {
     return false;
   }
@@ -1005,6 +1015,24 @@ function deterministicFinancialLineItemClassification(
       should_exclude_from_other_bucket: true,
       confidence: "medium",
       reason: "Short-term debt generally maps to the short-term borrowing/Revolver row unless the filing identifies it as current long-term debt."
+    };
+  }
+
+  if (
+    section === "non-current assets" &&
+    /\baircraft fuel\b|\bspare parts?\b|\bparts and supplies\b|\bmerchandise inventory\b|\braw materials?\b|\bwork[-\s]?in[-\s]?process\b|\bfinished goods?\b|\binventor(?:y|ies)\b/.test(
+      text
+    )
+  ) {
+    return {
+      ...base,
+      recommended_model_row: preferred("Other Non-Current Assets"),
+      classification_type: "non-current inventory reported in other assets",
+      is_current: false,
+      is_operating: true,
+      should_exclude_from_other_bucket: false,
+      confidence: "high",
+      reason: "Inventory reported as non-current or explicitly classified in Other assets belongs in Other Non-Current Assets, not the current Inventory row."
     };
   }
 
@@ -1689,7 +1717,11 @@ function trustedBalanceSheetRouteTarget(request: FinancialLineItemClassification
   }
   if (semantics.cash) return preferred("Cash & Cash Equivalents");
   if (semantics.receivable) return preferred("Accounts Receivable", "Prepaid & Other Current Assets");
-  if (semantics.inventory) return preferred("Inventory", "Prepaid & Other Current Assets");
+  if (semantics.inventory) {
+    return section === "non-current assets"
+      ? preferred("Other Non-Current Assets")
+      : preferred("Inventory", "Prepaid & Other Current Assets");
+  }
   if (semantics.propertyPlantEquipment) return preferred("PP&E, Net", "Other Non-Current Assets");
   if (semantics.intangible) return preferred("Intangible Assets, Net", "Other Non-Current Assets");
   if (semantics.goodwill && !semantics.goodwillImpairment) return preferred("Goodwill", "Other Non-Current Assets");
@@ -1911,14 +1943,20 @@ async function requestStatementLlmClassification(
     apiKey: options.apiKey,
     endpoint: options.endpoint,
     model: options.model,
-    fallbackModels: options.fallbackModels?.filter((model) => !/^openrouter\/free$/i.test(model.trim())),
+    // OpenRouter already retries healthy providers for this model. A second
+    // model divides the same short statement-batch deadline and left too little
+    // time for either model to finish structured output.
+    fallbackModels: [],
     siteUrl: options.siteUrl,
     appTitle: options.appTitle,
     timeoutMs: options.timeoutMs ?? 15_000,
     deadlineAt: options.deadlineAt,
     signal: options.signal,
     maxTokens: Math.max(3_000, Math.min(12_000, 1_200 + targets.length * 400)),
-    maxAttemptsPerModel: /(?:deepseek-v4-flash|^openrouter\/free|:free$)/i.test(options.model.trim()) ? 2 : 1,
+    // Provider/model fallbacks are more useful than retrying the same slow
+    // endpoint inside one statement batch. Recursive focused repair remains
+    // available within the caller's bounded batch attempt budget.
+    maxAttemptsPerModel: 1,
     maxTotalAttempts,
     reasoningEffort: "low",
     fetchImpl: options.fetchImpl,

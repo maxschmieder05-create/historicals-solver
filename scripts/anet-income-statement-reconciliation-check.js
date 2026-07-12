@@ -28,6 +28,9 @@ function loadTypeScriptModule(file) {
 const { __fillModelServiceTestHooks: hooks } = loadTypeScriptModule(sourcePath);
 assert.equal(hooks.statementMetricTies(2, 5), false, "a $3mm error on a small line item must never pass accounting validation");
 assert.equal(hooks.statementMetricTies(2, 2.1), true, "one-decimal model display rounding remains acceptable");
+assert.equal(hooks.incomeStatementOperatingBridgeTies("FY25", 100, 99), true, "a $1mm annual SEC display-rounding difference is acceptable");
+assert.equal(hooks.incomeStatementOperatingBridgeTies("FY25", 100.1, 99), false, "an annual bridge difference above $1mm remains blocking");
+assert.equal(hooks.incomeStatementOperatingBridgeTies("4Q25", 100, 99), false, "quarterly operating bridges remain strict");
 assert.equal(hooks.segmentMetric("us-gaap:Depreciation"), "depreciationAmortization", "an exact SEC Depreciation segment tag must map to segment D&A");
 
 function statementRow({ rowOrder, label, concept, value, accession, start, end }) {

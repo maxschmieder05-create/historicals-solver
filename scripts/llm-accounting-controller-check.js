@@ -130,7 +130,35 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
         __fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox(["failed accounting equation"])),
       "validation recovery must use a smaller, context-safe evidence workbench than final review"
     );
-    assert.equal(__fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox(["failed accounting equation"])), 220);
+    assert.equal(__fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox([])), 180);
+    assert.equal(__fillModelServiceTestHooks.llmMappingReviewItemLimit(reviewToolbox(["failed accounting equation"])), 140);
+    const diagnosticIssue = {
+      severity: "error",
+      issueType: "missing_source_line",
+      period: "1Q26",
+      sourceLineItemLabel: "Sales",
+      sourceXbrlTag: "Revenues",
+      currentModelRow: "",
+      recommendedModelRow: "Revenue",
+      reason: "Concept normalization reports net_revenue missing and an optional liabilities tie-out was skipped."
+    };
+    assert.equal(
+      __fillModelServiceTestHooks.isActionableLlmMappingBlockingIssue(diagnosticIssue),
+      false,
+      "missing normalization aliases and skipped optional tie-outs must not become stochastic release blockers"
+    );
+    assert.equal(
+      __fillModelServiceTestHooks.isActionableLlmMappingBlockingIssue({
+        ...diagnosticIssue,
+        issueType: "wrong_model_row",
+        sourceLineItemLabel: "Corporate / Reconciliation",
+        currentModelRow: "Animal Health Operating Income",
+        recommendedModelRow: "Other / Reconciliation",
+        reason: "The reconciliation source was attached to a reportable segment row."
+      }),
+      true,
+      "a concrete source-row misplacement must remain blocking"
+    );
     analystState.attempts = analystState.maxCalls - analystState.reservedReviewCalls;
     assert.equal(__fillModelServiceTestHooks.llmMappingAttemptsRemaining(analystState), 0);
     assert.equal(
@@ -266,8 +294,9 @@ async function main() {
   });
   assert.equal(repairedResult.status, "repaired");
   assert.equal(repairCalls, 2);
-  assert.equal(repairBodies[0].provider.sort, "price");
-  assert.deepEqual(repairBodies[0].provider.max_price, { prompt: 0.5, completion: 1 });
+  assert.equal(repairBodies[0].provider.sort, undefined);
+  assert.equal(repairBodies[0].provider.order, undefined);
+  assert.deepEqual(repairBodies[0].provider.max_price, { prompt: 0.5, completion: 2.1 });
   assert.equal(repairBodies[1].messages.at(-2).role, "assistant");
   assert.equal(repairBodies[1].messages.at(-2).content, '{"ok":false}');
   assert.match(repairBodies[1].messages.at(-1).content, /validation rejected payload/);

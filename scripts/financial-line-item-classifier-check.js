@@ -377,6 +377,26 @@ async function classify(overrides) {
       expected: true
     },
     {
+      name: "non-current inventory cannot map to the current Inventory row",
+      request: request({
+        label: "Inventories classified in Other assets",
+        xbrlTag: "InventoryNoncurrent",
+        section: "non-current assets"
+      }),
+      row: "Inventory",
+      expected: false
+    },
+    {
+      name: "non-current inventory maps to Other Non-Current Assets",
+      request: request({
+        label: "Inventories classified in Other assets",
+        xbrlTag: "InventoryNoncurrent",
+        section: "non-current assets"
+      }),
+      row: "Other Non-Current Assets",
+      expected: true
+    },
+    {
       name: "equity securities without a readily determinable fair value remain investment assets",
       request: request({
         label: "Equity Securities without Readily Determinable Fair Value, Amount",
@@ -2296,6 +2316,57 @@ async function classify(overrides) {
     ),
     false
   );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Income (Loss) Before Taxes",
+        xbrlTag: "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        section: "below operating income"
+      })
+    ),
+    false,
+    "extended pre-tax subtotal concepts must not be paid LLM mapping targets"
+  );
+  assert.equal(
+    fullStatementLineItemNeedsAnalystPass(
+      request({
+        statement: "income_statement",
+        periodType: "duration",
+        label: "Less: Net Income Attributable to Noncontrolling Interests",
+        xbrlTag: "NetIncomeLossAttributableToNoncontrollingInterest",
+        section: "net income"
+      })
+    ),
+    false,
+    "post-net-income attribution lines must remain structural reconciliation rows"
+  );
+  for (const [label, xbrlTag] of [
+    ["Land", "Land"],
+    ["Buildings and Improvements, Gross", "BuildingsAndImprovementsGross"],
+    ["Machinery and Equipment, Gross", "MachineryAndEquipmentGross"],
+    ["Construction in Progress, Gross", "ConstructionInProgressGross"],
+    ["Property, Plant and Equipment, Gross", "PropertyPlantAndEquipmentGross"]
+  ]) {
+    assert.equal(
+      fullStatementLineItemNeedsAnalystPass(
+        request({
+          statement: "balance_sheet",
+          periodType: "instant",
+          label,
+          xbrlTag,
+          section: "non-current assets",
+          currentPeriodSourceLines: [
+            "Property, Plant and Equipment, at cost, net of accumulated depreciation",
+            label
+          ]
+        })
+      ),
+      false,
+      `${label} must remain PP&E support detail when net PP&E is already reported`
+    );
+  }
   assert.equal(
     fullStatementLineItemNeedsAnalystPass(
       request({

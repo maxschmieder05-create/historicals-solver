@@ -117,6 +117,7 @@ type OpenRouterRequestShape = {
   provider?: {
     require_parameters?: boolean;
     sort?: string;
+    order?: string[];
     max_price?: { prompt: number; completion: number };
   };
   response_format?: unknown;
@@ -137,8 +138,12 @@ const OPENROUTER_MAX_PROMPT_PRICE_PER_MILLION = boundedPositivePrice(
 );
 const OPENROUTER_MAX_COMPLETION_PRICE_PER_MILLION = boundedPositivePrice(
   process.env.OPENROUTER_MAX_COMPLETION_PRICE_PER_MILLION,
-  1
+  2.1
 );
+const OPENROUTER_PROVIDER_ORDER = (process.env.OPENROUTER_PROVIDER_ORDER || "")
+  .split(",")
+  .map((provider) => provider.trim())
+  .filter(Boolean);
 const DEFAULT_MODEL_CAPABILITY_CACHE_TTL_MS = 15 * 60_000;
 const DEFAULT_MODEL_CAPABILITY_FAILURE_CACHE_TTL_MS = 10_000;
 const MAX_MODEL_CAPABILITY_CACHE_TTL_MS = 24 * 60 * 60_000;
@@ -206,7 +211,7 @@ export async function requestAccountingJson<T>(request: AccountingLlmRequest<T>)
       // first model can consume the entire deadline and the fallback is only
       // nominally configured.
       const hasLaterFallback = modelIndex < modelCandidates.length - 1;
-      const modelAttemptMs = hasLaterFallback ? Math.max(1, Math.floor(remainingMs * 0.75)) : remainingMs;
+      const modelAttemptMs = hasLaterFallback ? Math.max(1, Math.floor((remainingMs * 2) / 3)) : remainingMs;
       const result = await requestAccountingJsonForModel({
         ...request,
         model,
@@ -548,7 +553,9 @@ function buildOpenRouterRequestShape<T>(
     session_id: request.sessionId,
     provider: {
       ...(responseFormat ? { require_parameters: true } : {}),
-      sort: "price",
+      ...(OPENROUTER_PROVIDER_ORDER.length ? { order: OPENROUTER_PROVIDER_ORDER } : {}),
+      // Avoid `sort`, which disables OpenRouter's health-aware provider load
+      // balancing. An explicit order remains available as an opt-in override.
       max_price: {
         prompt: OPENROUTER_MAX_PROMPT_PRICE_PER_MILLION,
         completion: OPENROUTER_MAX_COMPLETION_PRICE_PER_MILLION
