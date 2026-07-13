@@ -4,7 +4,6 @@ import {
   ChangeEvent,
   DragEvent,
   FormEvent,
-  SyntheticEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -83,8 +82,6 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedFileRef = useRef<File | null>(null);
   const dragDepthRef = useRef(0);
-  const inputSyncFrameRef = useRef<number | null>(null);
-  const inputSyncTimersRef = useRef<number[]>([]);
   const activeRequestRef = useRef<AbortController | null>(null);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
@@ -126,31 +123,6 @@ export default function Home() {
     handleWorkbookSelected(droppedFile);
   }, [handleWorkbookSelected]);
 
-  const clearPendingInputSync = useCallback(() => {
-    if (inputSyncFrameRef.current !== null) {
-      window.cancelAnimationFrame(inputSyncFrameRef.current);
-      inputSyncFrameRef.current = null;
-    }
-    for (const timer of inputSyncTimersRef.current) window.clearTimeout(timer);
-    inputSyncTimersRef.current = [];
-  }, []);
-
-  const syncInputSelection = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
-    const nextFile = input?.files?.item(0) ?? undefined;
-    if (!nextFile) return;
-    handleWorkbookSelected(nextFile);
-  }, [handleWorkbookSelected]);
-
-  const syncInputSelectionSoon = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
-    clearPendingInputSync();
-    syncInputSelection(input);
-    inputSyncFrameRef.current = window.requestAnimationFrame(() => {
-      syncInputSelection(input);
-      inputSyncFrameRef.current = null;
-    });
-    inputSyncTimersRef.current = [100, 300, 1000].map((delay) => window.setTimeout(() => syncInputSelection(input), delay));
-  }, [clearPendingInputSync, syncInputSelection]);
-
   useEffect(() => {
     function handleWindowDragOver(event: globalThis.DragEvent) {
       if (!markWorkbookDropEffect(event.dataTransfer)) return;
@@ -174,55 +146,15 @@ export default function Home() {
       handleDroppedWorkbook(transfer);
     }
 
-    function handleWindowFocus() {
-      syncInputSelectionSoon();
-    }
-
-    function handleVisibilityChange() {
-      if (document.visibilityState === "visible") syncInputSelectionSoon();
-    }
-
-    function handlePageShow() {
-      syncInputSelectionSoon();
-    }
-
-    syncInputSelectionSoon();
-
     window.addEventListener("dragover", handleWindowDragOver);
     window.addEventListener("dragleave", handleWindowDragLeave);
     window.addEventListener("drop", handleWindowDrop);
-    window.addEventListener("focus", handleWindowFocus);
-    window.addEventListener("pageshow", handlePageShow);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
     return () => {
       window.removeEventListener("dragover", handleWindowDragOver);
       window.removeEventListener("dragleave", handleWindowDragLeave);
       window.removeEventListener("drop", handleWindowDrop);
-      window.removeEventListener("focus", handleWindowFocus);
-      window.removeEventListener("pageshow", handlePageShow);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      clearPendingInputSync();
     };
-  }, [clearPendingInputSync, handleDroppedWorkbook, syncInputSelectionSoon]);
-
-  useEffect(() => {
-    const input = fileInputRef.current;
-    if (!input) return;
-
-    const handleNativeFileSelection = () => {
-      syncInputSelection(input);
-    };
-
-    input.addEventListener("change", handleNativeFileSelection);
-    input.addEventListener("input", handleNativeFileSelection);
-    input.addEventListener("cancel", handleNativeFileSelection);
-    syncInputSelection(input);
-    return () => {
-      input.removeEventListener("change", handleNativeFileSelection);
-      input.removeEventListener("input", handleNativeFileSelection);
-      input.removeEventListener("cancel", handleNativeFileSelection);
-    };
-  }, [syncInputSelection]);
+  }, [handleDroppedWorkbook]);
 
   useEffect(() => () => activeRequestRef.current?.abort(), []);
 
@@ -256,20 +188,13 @@ export default function Home() {
     handleDroppedWorkbook(event.dataTransfer);
   }
 
-  function pickInputFile(input: HTMLInputElement) {
-    handleWorkbookSelected(input.files?.item(0) ?? undefined);
-  }
-
   function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
-    pickInputFile(event.currentTarget);
+    handleWorkbookSelected(event.currentTarget.files?.item(0) ?? undefined);
   }
 
-  function handleFileInput(event: FormEvent<HTMLInputElement>) {
-    pickInputFile(event.currentTarget);
-  }
-
-  function handleFilePickerActivation(event: SyntheticEvent<HTMLInputElement>) {
-    syncInputSelectionSoon(event.currentTarget);
+  function openWorkbookPicker() {
+    if (isSubmitting) return;
+    fileInputRef.current?.click();
   }
 
   function cancelFill() {
@@ -440,10 +365,10 @@ export default function Home() {
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
             aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
             aria-disabled={isSubmitting}
-            onDragEnterCapture={handleDrag}
-            onDragOverCapture={handleDrag}
-            onDragLeaveCapture={handleDrag}
-            onDropCapture={handleDrop}
+            onDragEnter={handleDrag}
+            onDragOver={handleDrag}
+            onDragLeave={handleDrag}
+            onDrop={handleDrop}
           >
             <input
               id="model-template-file"
@@ -454,13 +379,7 @@ export default function Home() {
               accept={SUPPORTED_WORKBOOK_ACCEPT}
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               disabled={isSubmitting}
-              onClickCapture={handleFilePickerActivation}
-              onFocusCapture={handleFilePickerActivation}
-              onBlurCapture={handleFilePickerActivation}
-              onChangeCapture={handleFileSelect}
-              onInputCapture={handleFileInput}
               onChange={handleFileSelect}
-              onInput={handleFileInput}
             />
             <span className="dropIcon">
               {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
@@ -475,7 +394,9 @@ export default function Home() {
             ) : (
               <small>Click to browse or drag in an .xlsx file</small>
             )}
-            <span className="browseCue">{file ? "Choose different workbook" : "Choose workbook"}</span>
+            <button className="browseCue" type="button" onClick={openWorkbookPicker} disabled={isSubmitting}>
+              {file ? "Choose different workbook" : "Choose workbook"}
+            </button>
           </div>
 
           <div className="formActions">

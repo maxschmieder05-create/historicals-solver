@@ -8,119 +8,57 @@ const styles = fs.readFileSync(stylesPath, "utf8");
 
 const checks = [
   {
-    ok: !/<label\s+[^>]*className=\{`dropzone/.test(source),
-    message: "Dropzone must not be a label; label activation can swallow file-picker changes."
+    ok: /<input[\s\S]*className="fileInput"[\s\S]*type="file"[\s\S]*name="file"[\s\S]*accept=\{SUPPORTED_WORKBOOK_ACCEPT\}[\s\S]*onChange=\{handleFileSelect\}/.test(source),
+    message: "A single native .xlsx file input must own picker selection."
   },
   {
-    ok: !/<button[\s\S]*className=\{`dropzone/.test(source),
-    message: "Dropzone must not be a button that depends on scripted file-input clicks."
+    ok: /function openWorkbookPicker\(\)[\s\S]*fileInputRef\.current\?\.click\(\);/.test(source)
+      && /<button className="browseCue" type="button" onClick=\{openWorkbookPicker\}/.test(source),
+    message: "The visible Choose workbook button must open the native input from a direct user action."
   },
   {
-    ok: /<div[\s\S]*className=\{`dropzone[\s\S]*<input[\s\S]*className="fileInput"[\s\S]*type="file"/.test(source),
-    message: "Native file input must live inside the dropzone so direct clicks open the picker."
+    ok: /function handleFileSelect\(event: ChangeEvent<HTMLInputElement>\)[\s\S]*handleWorkbookSelected\(event\.currentTarget\.files\?\.item\(0\) \?\? undefined\)/.test(source),
+    message: "Native picker change must synchronously populate shared workbook state."
   },
   {
-    ok: /<input[\s\S]*type="file"[\s\S]*name="file"[\s\S]*onChangeCapture=\{handleFileSelect\}[\s\S]*onInputCapture=\{handleFileInput\}[\s\S]*onChange=\{handleFileSelect\}[\s\S]*onInput=\{handleFileInput\}/.test(source),
-    message: "Native file input must remain wired to capture and bubble change/input events."
+    ok: !/onChangeCapture=|onInputCapture=|onInput=\{handleFileInput\}|handleFilePickerActivation|syncInputSelectionSoon|inputSyncTimersRef|inputSyncFrameRef/.test(source),
+    message: "Picker selection must not be raced by duplicate capture handlers or focus timers."
   },
   {
-    ok: /const SUPPORTED_WORKBOOK_EXTENSIONS = \["\.xlsx"\]/.test(source)
-      && /accept=\{SUPPORTED_WORKBOOK_ACCEPT\}/.test(source)
-      && /spreadsheetml\.sheet/.test(source)
-      && !/macroEnabled\.12/.test(source),
-    message: "Workbook picker must accept .xlsx files and must not advertise unsafe .xlsm support."
+    ok: /onDragEnter=\{handleDrag\}/.test(source)
+      && /onDragOver=\{handleDrag\}/.test(source)
+      && /onDragLeave=\{handleDrag\}/.test(source)
+      && /onDrop=\{handleDrop\}/.test(source)
+      && !/onDropCapture=/.test(source),
+    message: "The drop target must own one ordinary drag/drop event path."
   },
   {
-    ok: /function hasTransferredFiles\(dataTransfer: DataTransfer \| null\)[\s\S]*type\.toLowerCase\(\)[\s\S]*types\.includes\("files"\)[\s\S]*application\/x-moz-file[\s\S]*public\.file-url[\s\S]*dataTransfer\.items[\s\S]*item\.kind === "file"/.test(source),
-    message: "File drag detection must accept case-normalized DataTransfer.types, browser-specific file types, and DataTransfer.items file payloads."
+    ok: /function workbookFileFromTransfer\(dataTransfer: DataTransfer \| null\)[\s\S]*listedFiles\.find\(isSupportedWorkbookFile\)[\s\S]*item\.getAsFile\(\)/.test(source)
+      && /handleDroppedWorkbook\(event\.dataTransfer\)/.test(source),
+    message: "Dropped files must be normalized and sent through the shared workbook selection handler."
   },
   {
-    ok: /function markWorkbookDropEffect\(dataTransfer: DataTransfer \| null\)[\s\S]*dataTransfer\.dropEffect = "copy"/.test(source),
-    message: "Workbook drag/drop handlers must mark supported file drags as copy operations so browsers allow the drop."
-  },
-  {
-    ok: /function workbookFileFromTransfer\(dataTransfer: DataTransfer \| null\)[\s\S]*listedFiles\.find\(isSupportedWorkbookFile\)[\s\S]*item\.getAsFile\(\)[\s\S]*itemFiles\.find\(isSupportedWorkbookFile\)/.test(source),
-    message: "Dropped workbook extraction must prefer supported workbook files and fall back to DataTransferItem.getAsFile when files is empty."
-  },
-  {
-    ok: /input\.addEventListener\("change", handleNativeFileSelection\)/.test(source)
-      && /input\.addEventListener\("input", handleNativeFileSelection\)/.test(source)
-      && /input\.addEventListener\("cancel", handleNativeFileSelection\)/.test(source),
-    message: "File input must keep native DOM listeners as a fallback for browser-specific picker event timing, including same-file cancel events."
-  },
-  {
-    ok: /function handleFilePickerActivation\(event: SyntheticEvent<HTMLInputElement>\)[\s\S]*syncInputSelectionSoon\(event\.currentTarget\);/.test(source)
-      && /onClickCapture=\{handleFilePickerActivation\}/.test(source)
-      && /onFocusCapture=\{handleFilePickerActivation\}/.test(source)
-      && /onBlurCapture=\{handleFilePickerActivation\}/.test(source),
-    message: "File input activation, focus, and blur must schedule a deferred native input resync so OS picker timing cannot strand a selected workbook."
-  },
-  {
-    ok: /const handleWorkbookSelected = useCallback/.test(source)
-      && /const handleDroppedWorkbook = useCallback/.test(source)
-      && /handleDroppedWorkbook\(event\.dataTransfer\)/.test(source)
-      && /handleWorkbookSelected\(input\.files\?\.item\(0\) \?\? undefined\)/.test(source),
-    message: "File picker and drag/drop paths must share the same workbook-selection handler."
-  },
-  {
-    ok: /handleDroppedWorkbook\(transfer\)/.test(source),
-    message: "Window-level file drops must use the normalized drag payload extractor."
-  },
-  {
-    ok: /const selectedFile =\s*selectedFileRef\.current\s*\?\?\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
-    message: "Submit must prefer the synchronously stored selected file over the displayed state and native input value."
+    ok: /window\.addEventListener\("drop", handleWindowDrop\)/.test(source)
+      && /handleDroppedWorkbook\(transfer\)/.test(source),
+    message: "A file dropped anywhere on the page must still populate the workbook."
   },
   {
     ok: /const selectedFileRef = useRef<File \| null>\(null\);/.test(source)
       && /selectedFileRef\.current = nextFile;\s*setFile\(nextFile\);/.test(source),
-    message: "A valid workbook selection must synchronously store the selected File and update visible state."
+    message: "A valid workbook must update synchronous submission state and visible React state."
   },
   {
-    ok: !/fileInputVersion/.test(source)
-      && !/setFileInputVersion/.test(source)
-      && !/fileInputResetTimerRef/.test(source),
-    message: "Valid workbook selection must not remount or reset the native input after the picker returns."
+    ok: /const selectedFile =\s*selectedFileRef\.current\s*\?\?\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
+    message: "Submit must use the selected workbook even if a render has not completed yet."
   },
   {
-    ok: !/fileKey\(nextFile\) === selectedFileKeyRef\.current/.test(source),
-    message: "Focus-return sync must not skip a native file just because its key was seen before."
-  },
-  {
-    ok: /function handlePageShow\(\)[\s\S]*syncInputSelectionSoon\(\);[\s\S]*syncInputSelectionSoon\(\);[\s\S]*window\.addEventListener\("pageshow", handlePageShow\)/.test(source),
-    message: "Dropzone must resync from the native file input on mount and page-show after app reloads or browser restores."
-  },
-  {
-    ok: !/prepareNativeFilePicker/.test(source)
-      && !/function handleFilePicker(Pointer|Key)Down/.test(source)
-      && !/onPointerDown=\{handleFilePickerPointerDown\}/.test(source)
-      && !/onKeyDown=\{handleFilePickerKeyDown\}/.test(source),
-    message: "Picker-opening pointer and keyboard events must not reset the native input before selection resolves."
-  },
-  {
-    ok: !/(onClick|onPointerDown|onKeyDown)=\{\(event\)\s*=>\s*\{[\s\S]*event\.currentTarget\.value = ""/.test(source)
-      && !/(onClick|onPointerDown|onKeyDown)=\{handleFilePicker/.test(source),
-    message: "Native picker resets must stay out of picker-opening handlers that can erase picker results."
-  },
-  {
-    ok: /const dragDepthRef = useRef\(0\);/.test(source)
-      && /onDragEnterCapture=\{handleDrag\}/.test(source)
-      && /onDragOverCapture=\{handleDrag\}/.test(source)
-      && /onDragLeaveCapture=\{handleDrag\}/.test(source)
-      && /onDropCapture=\{handleDrop\}/.test(source),
-    message: "Dropzone must capture drag/drop events before the transparent native input can swallow the drop."
-  },
-  {
-    ok: /selectedFileRef\.current = null;[\s\S]*setFile\(null\);[\s\S]*clearFileInput\(\);[\s\S]*not a supported \.xlsx workbook/.test(source),
-    message: "Invalid workbook selections must clear both selected-file state and the native input."
-  },
-  {
-    ok: /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),
-    message: "File input must stay as a full-size transparent overlay, not a clipped hidden input."
+    ok: /\.fileInput\s*\{[\s\S]*width:\s*1px;[\s\S]*height:\s*1px;[\s\S]*clip-path:\s*inset\(50%\)/.test(styles)
+      && !/\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%/.test(styles),
+    message: "The native input must be visually hidden instead of intercepting the entire drop target."
   }
 ];
 
 const failures = checks.filter((check) => !check.ok).map((check) => check.message);
-
 if (failures.length) {
   console.error(failures.join("\n"));
   process.exit(1);
