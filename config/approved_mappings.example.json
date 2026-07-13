@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "mappings": [
+    {
+      "scope": "approved_exact",
+      "statement": "balance_sheet",
+      "sourceTableType": "primary_statement",
+      "section": "current assets",
+      "xbrlTag": "ExampleApprovedTaxonomyConcept",
+      "reportedLabel": "Example approved filing label",
+      "modelRow": "Prepaid & Other Current Assets",
+      "action": "merge_into_other",
+      "explanation": "Example only. Replace with a human-approved reusable accounting mapping.",
+      "approvedBy": "analyst@example.com",
+      "approvedAt": "2026-01-01T00:00:00.000Z"
+    }
+  ]
+}

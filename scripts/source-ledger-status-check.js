@@ -2101,11 +2101,13 @@ assert.equal(wrongFinalPeriodValidation.status, "blocked", "the final derived ou
   const savedLlmEnv = {
     OPENROUTER_API_KEY: process.env.OPENROUTER_API_KEY,
     LLM_MAPPING_ENABLED: process.env.LLM_MAPPING_ENABLED,
-    LLM_MAPPING_REVIEW_ENABLED: process.env.LLM_MAPPING_REVIEW_ENABLED
+    LLM_MAPPING_REVIEW_ENABLED: process.env.LLM_MAPPING_REVIEW_ENABLED,
+    ALLOW_LEGACY_LLM_WORKBOOK_REVIEW: process.env.ALLOW_LEGACY_LLM_WORKBOOK_REVIEW
   };
   process.env.OPENROUTER_API_KEY = "focused-test-key";
   process.env.LLM_MAPPING_ENABLED = "false";
   process.env.LLM_MAPPING_REVIEW_ENABLED = "true";
+  process.env.ALLOW_LEGACY_LLM_WORKBOOK_REVIEW = "true";
   const reviewOnlyState = __fillModelServiceTestHooks.createLlmMappingState();
   const reviewOnlySummary = __fillModelServiceTestHooks.llmMappingStateSummary(reviewOnlyState);
   assert.equal(reviewOnlySummary.enabled, true);

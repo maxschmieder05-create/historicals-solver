@@ -14,6 +14,7 @@ import {
   AccountingLlmValidationResult,
   requestAccountingJson
 } from "./llm-accounting-controller";
+import { findApprovedMapping, type ApprovedMappingCache } from "./approved-mapping-cache";
 
 export type FinancialStatementName = "income_statement" | "balance_sheet" | "cash_flow" | "segment_analysis";
 
@@ -122,6 +123,7 @@ type LlmClassificationOptions = {
 
 type ClassifierOptions = {
   llm?: LlmClassificationOptions;
+  approvedMappings?: ApprovedMappingCache;
   statementAnalystPass?: {
     enabled: boolean;
     materialityThreshold?: number;
@@ -336,6 +338,13 @@ export function lineItemNeedsClassification(request: FinancialLineItemClassifica
   if (request.isSubtotal) return false;
   if (request.sourceTableType !== "primary_statement" && request.sourceTableType !== "cash_flow_reconciliation") return false;
   if (aggregateOperatingExpenseSourceHasReportedComponents(request)) return false;
+  if (
+    request.sourceTableType === "primary_statement" &&
+    (request.statement === "income_statement" || request.statement === "balance_sheet") &&
+    !fullStatementLineItemNeedsAnalystPass(request)
+  ) {
+    return false;
+  }
   const text = requestSearchText(request);
   if (AMBIGUOUS_LINE_ITEM_TERMS.some((term) => text.includes(term))) return true;
   if (/short[-\s]?term|current investments?|marketable securities|available[-\s]?for[-\s]?sale securities|current maturit|current portion|senior notes?|convertible|contract liabilit|deferred revenue|deferred income|spare parts?|supplies|in[-\s]?process research|special items?|other/.test(text)) return true;
@@ -344,7 +353,7 @@ export function lineItemNeedsClassification(request: FinancialLineItemClassifica
     /\badvertising\b|\bmarketing\b|\bpromotion(?:al)?\b|\bsales and marketing\b|\bselling and marketing\b|\bsales expense\b|\bselling expense\b|\bgeneral and administrative\b|\badministrative expense\b|\bcorporate overhead\b/.test(text)
   ) return true;
   if (request.deterministicCandidate && /other|accrued|revolver|deferred|d&a|depreciation|amortization/i.test(request.deterministicCandidate)) return true;
-  return Boolean(request.uncertaintyReason);
+  return Boolean(request.uncertaintyReason && !request.deterministicCandidate);
 }
 
 export function materialStatementLineItemNeedsAnalystPass(
@@ -370,7 +379,8 @@ export async function classifyFinancialLineItem(
   request: FinancialLineItemClassificationRequest,
   options: ClassifierOptions = {}
 ): Promise<FinancialLineItemClassification> {
-  const deterministic = deterministicFinancialLineItemClassification(request);
+  const approved = approvedFinancialLineItemClassification(request, options.approvedMappings);
+  const deterministic = approved ?? deterministicFinancialLineItemClassification(request);
   const fallback = deterministic ?? conservativeFallbackClassification(request);
   const deterministicIsValidated =
     deterministic?.confidence === "high" &&
@@ -383,7 +393,7 @@ export async function classifyFinancialLineItem(
       options.llm.apiKey &&
       options.llm.model &&
       lineItemNeedsClassification(request) &&
-      (!deterministicIsValidated || primaryBalanceSheetLineItemNeedsLlmReview(request))
+      !deterministicIsValidated
   );
 
   if (!shouldCallLlm) return finalizeClassification(request, fallback);
@@ -405,6 +415,7 @@ export async function classifyFinancialLineItem(
       llm_status: result.status
     });
   }
+  if (deterministicIsValidated) return finalizeClassification(request, fallback);
   return failedLlmClassification(request, fallback, result.status, result.error || result.telemetry.errorMessage || "unknown classifier LLM error");
 }
 
@@ -539,7 +550,9 @@ async function classifyFinancialStatementLineItemsWithinBudget(
   const failed = classificationTargets.map((item) => ({
     request: item.request,
     classification: item.needsLlm
-      ? failedLlmClassification(item.request, item.fallback, result.status, message)
+      ? item.deterministicIsValidated
+        ? item.initialClassification
+        : failedLlmClassification(item.request, item.fallback, result.status, message)
       : item.initialClassification
   }));
   const warnings = targets.map(
@@ -568,7 +581,9 @@ function statementLlmBudgetExhaustedResult(
     classifications: classificationTargets.map((item) => ({
       request: item.request,
       classification: item.needsLlm
-        ? failedLlmClassification(item.request, item.fallback, "attempted_failed", message)
+        ? item.deterministicIsValidated
+          ? item.initialClassification
+          : failedLlmClassification(item.request, item.fallback, "attempted_failed", message)
         : item.initialClassification
     })),
     warnings: targets.map(
@@ -618,7 +633,8 @@ function prepareLineItemClassification(
   index: number,
   options: ClassifierOptions
 ): PreparedLineItemClassification {
-  const deterministic = deterministicFinancialLineItemClassification(request);
+  const approved = approvedFinancialLineItemClassification(request, options.approvedMappings);
+  const deterministic = approved ?? deterministicFinancialLineItemClassification(request);
   const fallback = deterministic ?? conservativeFallbackClassification(request);
   const deterministicIsValidated =
     deterministic?.confidence === "high" &&
@@ -645,7 +661,11 @@ function prepareLineItemClassification(
       options.llm.apiKey &&
       options.llm.model &&
       needsClassification &&
-      (fullStatementTarget || materialAnalystTarget || !deterministicIsValidated || primaryBalanceSheetLineItemNeedsLlmReview(request))
+      !approved &&
+      (fullStatementTarget ||
+        materialAnalystTarget ||
+        !deterministicIsValidated ||
+        primaryBalanceSheetLineItemNeedsLlmReview(request))
   );
 
   return {
@@ -743,6 +763,37 @@ export function modelRowsMatch(a: string, b: string) {
 
 export function modelRowAvailable(row: string, availableRows: string[]) {
   return availableRows.some((available) => modelRowsMatch(row, available));
+}
+
+function approvedFinancialLineItemClassification(
+  request: FinancialLineItemClassificationRequest,
+  cache?: ApprovedMappingCache
+): FinancialLineItemClassification | null {
+  const mapping = findApprovedMapping(cache, {
+    company: request.company,
+    statement: request.statement,
+    sourceTableType: request.sourceTableType,
+    section: request.section,
+    xbrlTag: request.xbrlTag,
+    reportedLabel: request.cleanLabel || request.reportedLineItemLabel,
+    availableModelRows: request.availableModelRows
+  });
+  if (!mapping) return null;
+  const classification: FinancialLineItemClassification = {
+    ...baseClassification(request),
+    recommended_action: mapping.action ?? (/other/i.test(mapping.modelRow) ? "merge_into_other" : "map"),
+    recommended_model_row: mapping.modelRow,
+    classification_type:
+      mapping.scope === "approved_exact" ? "approved exact mapping" : "approved company historical mapping",
+    confidence: "high",
+    reason: `${mapping.explanation} Approved by ${mapping.approvedBy} on ${mapping.approvedAt}.`,
+    requires_validation: true,
+    requires_revalidation: true,
+    llm_used: false,
+    mapping_passed_validation: false
+  };
+  classification.mapping_passed_validation = classificationPassesValidation(request, classification);
+  return classification.mapping_passed_validation ? classification : null;
 }
 
 export function classificationModelRowAssignmentForPrimaryStatement(

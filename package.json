@@ -65,6 +65,8 @@
     "test:gold-model-library": "node scripts/gold-model-library-check.js",
     "test:balance-sheet-row-resolver": "node scripts/balance-sheet-row-resolver-check.js",
     "test:source-ledger-status": "node scripts/source-ledger-status-check.js",
+    "test:normalized-architecture": "node scripts/normalized-architecture-check.js",
+    "test:segment-filing-package-fallback": "node scripts/segment-filing-package-fallback-check.js",
     "test:regression-basket": "node scripts/regression-basket-check.js",
     "test:regression-preflight": "REGRESSION_ROUTING_ONLY=1 node scripts/regression-basket-check.js",
     "test:balance-sheet-instant-regression": "node scripts/balance-sheet-instant-regression-check.js",

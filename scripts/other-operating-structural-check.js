@@ -350,6 +350,11 @@ assert.equal(
   3_600_000
 );
 assert.equal(hooks.otherOperatingLineValue({ concept: "AssetDispositionLoss", label: "Loss on disposition of assets", value: 2_000_000 }), -2_000_000);
+assert.equal(
+  hooks.otherOperatingLineValue({ concept: "RestructuringCharges", label: "Restructuring and other charges", value: -62_000_000 }),
+  62_000_000,
+  "A negative reported charge is an operating credit/reversal and must not be forced back to an expense."
+);
 
 assert.equal(hooks.isNumericConstantFormula("-24.1-5.5"), true);
 assert.equal(hooks.isNumericConstantFormula("=(-24.1)+(1.5)-6.3"), true);

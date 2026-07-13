@@ -50,6 +50,7 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
     "LLM_MAPPING_ENABLED",
     "LLM_MAPPING_REVIEW_ENABLED",
     "LLM_MAPPING_REVIEW_BLOCKING",
+    "ALLOW_LEGACY_LLM_WORKBOOK_REVIEW",
     "OPENROUTER_API_KEY",
     "OPENAI_API_KEY",
     "ACCOUNTING_LLM_API_KEY"
@@ -77,6 +78,7 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
     );
 
   try {
+    process.env.ALLOW_LEGACY_LLM_WORKBOOK_REVIEW = "true";
     process.env.LLM_MAPPING_ENABLED = "false";
     process.env.LLM_MAPPING_REVIEW_ENABLED = "true";
     for (const keyName of ["OPENROUTER_API_KEY", "OPENAI_API_KEY", "ACCOUNTING_LLM_API_KEY"]) {
@@ -120,8 +122,8 @@ async function checkLlmMappingReviewAvailabilityPolicy() {
     process.env.OPENAI_API_KEY = "test-key";
     process.env.ACCOUNTING_LLM_API_KEY = "test-key";
     const analystState = __fillModelServiceTestHooks.createLlmMappingState();
-    assert.equal(analystState.analystMode, true, "LLM analyst mode must own the workflow when mapping and review are available");
-    assert.equal(__fillModelServiceTestHooks.llmAnalystControlsValidation(analystState), true);
+    assert.equal(analystState.analystMode, false, "deterministic validation must remain authoritative by default");
+    assert.equal(__fillModelServiceTestHooks.llmAnalystControlsValidation(analystState), false);
     assert.equal(analystState.maxCostUsd, 0.1, "each workbook must have a small default LLM spend ceiling");
     assert.ok(analystState.reservedReviewCalls > 0, "classification must reserve calls for validation recovery");
     const reviewToolbox = (blockingFailures) => ({ verificationGate: { blockingFailures } });
