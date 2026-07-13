@@ -4,6 +4,8 @@ import {
   ChangeEvent,
   DragEvent,
   FormEvent,
+  KeyboardEvent,
+  MouseEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -197,6 +199,18 @@ export default function Home() {
     fileInputRef.current?.click();
   }
 
+  function handleDropzoneClick(event: MouseEvent<HTMLElement>) {
+    const target = event.target;
+    if (target instanceof Element && target.closest("button, input")) return;
+    openWorkbookPicker();
+  }
+
+  function handleDropzoneKeyDown(event: KeyboardEvent<HTMLElement>) {
+    if (event.target !== event.currentTarget || (event.key !== "Enter" && event.key !== " ")) return;
+    event.preventDefault();
+    openWorkbookPicker();
+  }
+
   function cancelFill() {
     if (!activeRequestRef.current) return;
     activeRequestRef.current.abort();
@@ -363,8 +377,13 @@ export default function Home() {
 
           <div
             className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
+            data-testid="workbook-dropzone"
+            role="button"
+            tabIndex={isSubmitting ? -1 : 0}
             aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
             aria-disabled={isSubmitting}
+            onClick={handleDropzoneClick}
+            onKeyDown={handleDropzoneKeyDown}
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}

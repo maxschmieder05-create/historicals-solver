@@ -17,6 +17,12 @@ const checks = [
     message: "The visible Choose workbook button must open the native input from a direct user action."
   },
   {
+    ok: /function handleDropzoneClick\(event: MouseEvent<HTMLElement>\)[\s\S]*target\.closest\("button, input"\)[\s\S]*openWorkbookPicker\(\)/.test(source)
+      && /function handleDropzoneKeyDown\(event: KeyboardEvent<HTMLElement>\)[\s\S]*event\.key !== "Enter"[\s\S]*event\.key !== " "[\s\S]*openWorkbookPicker\(\)/.test(source)
+      && /data-testid="workbook-dropzone"[\s\S]*role="button"[\s\S]*onClick=\{handleDropzoneClick\}[\s\S]*onKeyDown=\{handleDropzoneKeyDown\}/.test(source),
+    message: "The entire dropbox must open the picker by mouse or keyboard without double-opening from its nested controls."
+  },
+  {
     ok: /function handleFileSelect\(event: ChangeEvent<HTMLInputElement>\)[\s\S]*handleWorkbookSelected\(event\.currentTarget\.files\?\.item\(0\) \?\? undefined\)/.test(source),
     message: "Native picker change must synchronously populate shared workbook state."
   },
