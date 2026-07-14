@@ -84,6 +84,20 @@ assert.equal(
   false,
   "an equity roll-forward whose extracted table text contains net income must not be misclassified as an income statement"
 );
+assert.equal(
+  hooks.isPrimaryIncomeStatementStructure(
+    statementStructure("Leases Lease Amounts Included in Consolidated Income Statement Details")
+  ),
+  false,
+  "lease-note income-statement details must not be selected as the primary income statement"
+);
+assert.equal(
+  hooks.isPrimaryIncomeStatementStructure(
+    statementStructure("Consolidated Income Statement Related to Lessor Activity")
+  ),
+  false,
+  "a lessor-activity note table must not be selected as the primary income statement"
+);
 
 const mrkSalesRow = {
   rowLabel: "Sales",

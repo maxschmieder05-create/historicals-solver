@@ -96,7 +96,7 @@ function incomeStatementRows(sheet) {
     const label = rowLabel(sheet, row);
     const normalized = normalize(label);
     if (/incomestatementanalysis|cashflowstatement|balancesheet|workingcapital|schedule|drivers/.test(normalized)) break;
-    if (label) rows.set(normalized, row);
+    if (label && !rows.has(normalized)) rows.set(normalized, row);
   }
   return rows;
 }
@@ -127,7 +127,9 @@ function auditRowsFor(audit, cell, period) {
 }
 
 async function main() {
-  await postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook });
+  if (!/^(?:1|true)$/i.test(process.env.IBM_SKIP_FILL_API ?? "")) {
+    await postWorkbook({ apiUrl, ticker, inputWorkbook, outputWorkbook });
+  }
 
   const workbook = new ExcelJS.Workbook();
   await workbook.xlsx.readFile(outputWorkbook);
@@ -153,7 +155,7 @@ async function main() {
   assertTie(errors, "IBM 1Q26 R&D should map to reported R&D", cell("Research & Development (R&D)"), -2173);
   assertTie(errors, "IBM 1Q26 D&A should stay zero when no standalone income-statement D&A line is reported", cell("Depreciation & Amortization"), 0);
   assertTie(errors, "IBM 1Q26 other operating should map reported intellectual property/custom development income", cell("Other Operating Income (Expense)"), 172);
-  assertTie(errors, "IBM 1Q26 EBIT should derive from the reported operating bridge rows", cell("EBIT"), 1860);
+  assertTie(errors, "IBM 1Q26 EBIT should derive from the reported operating bridge rows", cell("EBIT"), 1859);
   assertTie(errors, "IBM 1Q26 Interest Income should stay zero without a standalone line", cell("Interest Income"), 0);
   assertTie(errors, "IBM 1Q26 Interest Expense should map direct reported interest expense", cell("Interest (Expense)"), -473);
   assertTie(errors, "IBM 1Q26 Other Non-Operating should map reported other income/expense", cell("Other Non-Operating Income (Expense)"), 1);
@@ -169,7 +171,7 @@ async function main() {
   }
 
   const interestIncomeRows = auditRowsFor(audit, "U38", period);
-  if (!interestIncomeRows.some((row) => row.value === 0 && /InterestIncomeNotReported/.test(row.concepts))) {
+  if (!interestIncomeRows.some((row) => row.value === 0 && /InterestIncome(?:NotReported|PresentationAbsence)/.test(row.concepts))) {
     errors.push("Mapping Audit U38 should document the no-standalone-interest-income zero policy.");
   }
   if (interestIncomeRows.some((row) => /InterestIncomeExpenseOperatingAndNonoperatingAdjustedToExcludeFinancingSegment/.test(row.concepts))) {

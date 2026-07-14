@@ -127,6 +127,338 @@ const ctx = {
   }
 };
 
+assert.equal(
+  hooks.otherNonOperatingValue({
+    concept: "OtherIncomeAndExpense",
+    label: "Other (income) and expense",
+    value: -233_000_000,
+    unit: "USD",
+    sourceLayer: "sec_filing_package"
+  }),
+  233_000_000,
+  "a broad OtherIncomeAndExpense filing concept uses the filing's expense-sign convention and must be inverted for the model"
+);
+
+const priorDiscontinuedSource = {
+  concept: "IncomeLossFromDiscontinuedOperationsNetOfTax",
+  label: "Income (loss) from discontinued operations, net of tax",
+  value: -7_000_000,
+  unit: "USD",
+  taxonomy: "us-gaap",
+  sourceLayer: "sec_filing_package",
+  accn: "000005114323000001",
+  periodKey: "1Q23",
+  periodType: "quarterly",
+  start: "2023-01-01",
+  end: "2023-03-31"
+};
+const priorPeriodCtx = {
+  ...ctx,
+  duration: new Map([...ctx.duration, ["1Q23", new Map([[priorDiscontinuedSource.concept, priorDiscontinuedSource]])]])
+};
+const priorDiscontinued = hooks.resolveDiscontinuedOperationsBridge("1Q23", priorPeriodCtx);
+assert.equal(priorDiscontinued.value, -7_000_000, "direct prior-year discontinued operations must not be replaced by a model-only zero");
+assert.equal(priorDiscontinued.sources[0], priorDiscontinuedSource);
+
+function ibm2023Row(rowOrder, rowLabel, xbrlConcept, value) {
+  return {
+    ...statementRow(rowOrder, rowLabel, xbrlConcept, value),
+    accession: "000155837023006656",
+    reportingPeriod: "2023-03-31",
+    period: { start: "2023-01-01", end: "2023-03-31", periodType: "duration" }
+  };
+}
+
+const ibm2023PrimaryRows = [
+  ibm2023Row(1, "Revenue", "Revenues", 14_252_000_000),
+  ibm2023Row(2, "Cost", "CostOfRevenue", 6_743_000_000),
+  ibm2023Row(3, "Gross profit", "GrossProfit", 7_509_000_000),
+  ibm2023Row(4, "SG&A expense", "SellingGeneralAndAdministrativeExpense", 4_853_000_000),
+  // The SEC statement parser can omit R&D even though the same-period filing
+  // fact is available. The full pre-tax equation must still anchor EBIT.
+  ibm2023Row(5, "Intellectual property and custom development income", "IntellectualPropertyAndCustomDevelopmentIncome", 180_000_000),
+  ibm2023Row(6, "Total other (income) and expense", "OtherIncomeAndExpense", -245_000_000),
+  ibm2023Row(7, "Interest expense", "InterestExpense", 367_000_000),
+  ibm2023Row(8, "Income from continuing operations before income taxes", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", 1_058_000_000),
+  ibm2023Row(9, "Provision for income taxes", "IncomeTaxExpenseBenefit", 124_000_000),
+  ibm2023Row(10, "Income from continuing operations", "IncomeLossFromContinuingOperations", 934_000_000),
+  ibm2023Row(11, "Income from discontinued operations, net of tax", "IncomeLossFromDiscontinuedOperationsNetOfTaxAttributableToReportingEntity", -7_000_000),
+  ibm2023Row(12, "Net income", "NetIncomeLoss", 927_000_000)
+];
+const ibm2023FactRows = [
+  ...ibm2023PrimaryRows,
+  ibm2023Row(5, "Research and development", "ResearchAndDevelopmentExpense", 1_655_000_000)
+];
+const ibm2023Facts = new Map(
+  ibm2023FactRows.map((row) => [
+    row.xbrlConcept,
+    {
+      concept: row.xbrlConcept,
+      label: row.rowLabel,
+      value: row.value,
+      unit: "USD",
+      taxonomy: "us-gaap",
+      sourceLayer: "sec_filing_package",
+      accn: row.accession,
+      start: row.period.start,
+      end: row.period.end,
+      periodKey: "1Q23",
+      periodType: "quarterly",
+      reportDate: row.reportingPeriod
+    }
+  ])
+);
+const ibm2023Entry = {
+  accessionNumber: "000155837023006656",
+  accessionKey: "000155837023006656",
+  form: "10-Q",
+  filingDate: "2023-05-10",
+  reportDate: "2023-03-31",
+  fiscalYear: 2023,
+  fiscalQuarter: 1,
+  quarterPeriod: "1Q23"
+};
+const ibm2023Ctx = {
+  ...ctx,
+  duration: new Map([["1Q23", ibm2023Facts]]),
+  filingPackageStatements: [
+    {
+      statementName: "Statement Consolidated Income Statement",
+      sourceTableType: "primary_statement",
+      accession: ibm2023Entry.accessionNumber,
+      reportingPeriod: ibm2023Entry.reportDate,
+      form: ibm2023Entry.form,
+      filingDate: ibm2023Entry.filingDate,
+      rows: ibm2023PrimaryRows
+    }
+  ],
+  fiscalPeriods: {
+    ...ctx.fiscalPeriods,
+    entries: [ibm2023Entry],
+    byAccession: new Map([[ibm2023Entry.accessionKey, ibm2023Entry]]),
+    byReportDate: new Map([[ibm2023Entry.reportDate, ibm2023Entry]]),
+    reportedPeriods: new Set(["1Q23"])
+  }
+};
+const operatingResolverStartedAt = Date.now();
+const ibm2023OperatingIncome = hooks.resolveOperatingIncome("1Q23", ibm2023Ctx);
+assert.ok(Date.now() - operatingResolverStartedAt < 2_000, "the missing-subtotal operating-income equation must resolve without runaway recursion");
+assert.equal(ibm2023OperatingIncome.value, 1_181_000_000, "IBM-shaped operating components must reconcile through the SEC pre-tax equation");
+assert.ok(
+  ibm2023OperatingIncome.sources[0].derivationCalculation?.terms.length,
+  "the source-backed operating-income equation must retain replayable calculation provenance"
+);
+assert.ok(
+  !ibm2023OperatingIncome.sources[0].derivationCalculation.terms.some((term) => /BeforeIncomeTaxes/.test(term.concept)),
+  "operating-income amount provenance must replay from operating components while pre-tax remains a reconciliation check"
+);
+assert.equal(hooks.resolveOtherNonOperatingIncomeExpense("1Q23", ibm2023Ctx).value, 245_000_000);
+
+function scaledIbmPeriod(period, start, end, accession, multiplier, periodType, form) {
+  const rows = ibm2023PrimaryRows.map((row) => ({
+    ...row,
+    value: row.value * multiplier,
+    accession,
+    reportingPeriod: end,
+    period: { start, end, periodType: "duration" }
+  }));
+  const rdRow = {
+    ...ibm2023FactRows.find((row) => row.xbrlConcept === "ResearchAndDevelopmentExpense"),
+    value: 1_655_000_000 * multiplier,
+    accession,
+    reportingPeriod: end,
+    period: { start, end, periodType: "duration" }
+  };
+  const facts = new Map(
+    [...rows, rdRow].map((row) => [
+      row.xbrlConcept,
+      {
+        concept: row.xbrlConcept,
+        label: row.rowLabel,
+        value: row.value,
+        unit: "USD",
+        taxonomy: "us-gaap",
+        sourceLayer: "sec_filing_package",
+        accn: accession,
+        start,
+        end,
+        periodKey: period,
+        periodType,
+        reportDate: end
+      }
+    ])
+  );
+  return {
+    period,
+    rows,
+    facts,
+    statement: {
+      statementName: "Statement Consolidated Income Statement",
+      sourceTableType: "primary_statement",
+      accession,
+      reportingPeriod: end,
+      form,
+      filingDate: end,
+      rows
+    },
+    entry: {
+      accessionNumber: accession,
+      accessionKey: accession,
+      form,
+      filingDate: end,
+      reportDate: end,
+      fiscalYear: 2023,
+      fiscalQuarter: period.startsWith("FY") ? 4 : Number(period[0]),
+      quarterPeriod: period.startsWith("FY") ? "4Q23" : period,
+      annualPeriod: "FY23"
+    }
+  };
+}
+
+const ibmMultiPeriods = [
+  scaledIbmPeriod("1Q23", "2023-01-01", "2023-03-31", "000000000023000001", 1, "quarterly", "10-Q"),
+  scaledIbmPeriod("2Q23", "2023-04-01", "2023-06-30", "000000000023000002", 1, "quarterly", "10-Q"),
+  scaledIbmPeriod("3Q23", "2023-07-01", "2023-09-30", "000000000023000003", 1, "quarterly", "10-Q"),
+  scaledIbmPeriod("FY23", "2023-01-01", "2023-12-31", "000000000023000004", 4, "annual", "10-K")
+];
+const ibmMultiPeriodCtx = {
+  ...ctx,
+  duration: new Map(ibmMultiPeriods.map((item) => [item.period, item.facts])),
+  filingPackageStatements: ibmMultiPeriods.map((item) => item.statement),
+  fiscalPeriods: {
+    ...ctx.fiscalPeriods,
+    entries: ibmMultiPeriods.map((item) => item.entry),
+    byAccession: new Map(ibmMultiPeriods.map((item) => [item.entry.accessionKey, item.entry])),
+    byReportDate: new Map(ibmMultiPeriods.map((item) => [item.entry.reportDate, item.entry])),
+    reportedPeriods: new Set(["1Q23", "2Q23", "3Q23", "4Q23"])
+  }
+};
+const fourthQuarterResolverStartedAt = Date.now();
+const ibm2023FourthQuarterOperatingIncome = hooks.resolveOperatingIncome("4Q23", ibmMultiPeriodCtx);
+assert.ok(Date.now() - fourthQuarterResolverStartedAt < 2_000, "annual-to-fourth-quarter operating bridges must use bounded resolver work");
+assert.ok(
+  Math.abs((ibm2023FourthQuarterOperatingIncome.value ?? 0) - 1_181_000_000) <= 5_000_000,
+  "the synthetic fourth-quarter bridge must stay within accumulated whole-million SEC rounding"
+);
+
+const aggregateAnnualFacts = new Map(ibmMultiPeriods.find((item) => item.period === "FY23").facts);
+aggregateAnnualFacts.delete("OtherIncomeAndExpense");
+aggregateAnnualFacts.set("OtherNonoperatingIncomeExpense", {
+  concept: "OtherNonoperatingIncomeExpense",
+  label: "Other Nonoperating Income (Expense)",
+  value: 266_000_000,
+  unit: "USD",
+  taxonomy: "us-gaap",
+  sourceLayer: "sec_live_companyfacts",
+  accn: "000000000023000004",
+  start: "2023-01-01",
+  end: "2023-12-31",
+  periodKey: "FY23",
+  periodType: "annual",
+  reportDate: "2023-12-31"
+});
+aggregateAnnualFacts.set("InterestExpense", {
+  ...aggregateAnnualFacts.get("InterestExpense"),
+  value: 1_607_000_000
+});
+const aggregatePreTaxConcept = "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest";
+aggregateAnnualFacts.set(aggregatePreTaxConcept, {
+  ...aggregateAnnualFacts.get(aggregatePreTaxConcept),
+  value: 8_690_000_000
+});
+aggregateAnnualFacts.set("OperatingIncomeLoss", {
+  ...aggregateAnnualFacts.get(aggregatePreTaxConcept),
+  concept: "OperatingIncomeLoss",
+  label: "Operating income",
+  value: 8_424_000_000
+});
+const aggregateAnnualCtx = {
+  ...ibmMultiPeriodCtx,
+  duration: new Map([...ibmMultiPeriodCtx.duration, ["FY23", aggregateAnnualFacts]]),
+  filingPackageStatements: ibmMultiPeriodCtx.filingPackageStatements.map((statement) =>
+    statement.reportingPeriod === "2023-12-31"
+      ? {
+          ...statement,
+          rows: [
+            ...statement.rows
+              .filter((row) => !["OtherIncomeAndExpense", "InterestExpense"].includes(row.xbrlConcept))
+              .map((row) => row.xbrlConcept === aggregatePreTaxConcept ? { ...row, value: 8_690_000_000 } : row),
+            {
+              ...statement.rows.find((row) => row.xbrlConcept === aggregatePreTaxConcept),
+              rowOrder: 7,
+              rowLabel: "Operating income",
+              xbrlConcept: "OperatingIncomeLoss",
+              value: 8_424_000_000
+            }
+          ]
+        }
+      : statement
+  )
+};
+assert.equal(
+  hooks.resolveOperatingIncome("FY23", aggregateAnnualCtx).value,
+  8_424_000_000,
+  "the reported annual operating-income subtotal must remain authoritative in the aggregate split"
+);
+assert.equal(
+  hooks.resolveInterestExpense("FY23", aggregateAnnualCtx).value,
+  -1_607_000_000,
+  "a same-period SEC interest fact must be usable when the reported nonoperating aggregate bridges operating income to pre-tax income"
+);
+assert.equal(
+  hooks.resolveOtherNonOperatingIncomeExpense("FY23", aggregateAnnualCtx).value,
+  1_873_000_000,
+  "a non-primary nonoperating aggregate must exclude separately modeled annual interest expense"
+);
+
+const derivedOtherOperatingValidation = hooks.validateResolvedValueForWrite(
+  { cik: "0000051143", ticker: "IBM", title: "International Business Machines Corporation" },
+  {
+    row: 35,
+    label: "Other Operating Income (Expense)",
+    classification: "grouped",
+    statement: "income",
+    kind: "duration",
+    concepts: []
+  },
+  "4Q23",
+  {
+    value: -716_000_000,
+    classification: "grouped",
+    sources: [
+      {
+        concept: "OtherOperatingIncomeExpenseFromPreTaxEquation",
+        label: "Other operating income/expense derived from the complete SEC pre-tax equation",
+        value: -716_000_000,
+        sourceLayer: "derived",
+        periodKey: "4Q23",
+        periodType: "quarterly"
+      },
+      {
+        concept: "Revenues",
+        label: "Fourth-quarter revenue bridge",
+        value: 17_381_000_000,
+        sourceLayer: "derived",
+        periodKey: "4Q23",
+        periodType: "quarterly"
+      },
+      {
+        concept: "Revenues",
+        label: "Annual revenue",
+        value: 61_860_000_000,
+        sourceLayer: "sec_live_companyfacts",
+        periodKey: "FY23",
+        periodType: "annual"
+      }
+    ]
+  }
+);
+assert.notEqual(
+  derivedOtherOperatingValidation.status,
+  "blocked",
+  "a compatible final derived output must treat nested component bridges as traced inputs rather than competing row classifications"
+);
+
 const revenueFillRowWithBadStatementInference = {
   row: 28,
   label: "Revenue",
@@ -273,6 +605,27 @@ assert.equal(revenueSheet.getCell("U11").value, 15_917);
 assert.equal(revenueAuditRows[0].formulaPreserved, false);
 assert.match(revenueAuditRows[0].formulaStatus, /formula replaced/i);
 
+revenueSheet.getCell("U12").value = 15_912;
+revenueSheet.getCell("U11").value = { formula: "U12+5", result: 15_917 };
+const tiedRevenueAuditRows = [];
+const tiedRevenueReconciliation = hooks.reconcileIncomeStatementFormulaMetricToEdgar(
+  revenueSheet,
+  ["1Q26"],
+  [21],
+  ctx,
+  tiedRevenueAuditRows,
+  ["Revenue"],
+  () => ({
+    value: 15_917_000_000,
+    sources: [{ concept: "Revenues", label: "Total revenue", value: 15_917_000_000, unit: "USD", sourceLayer: "sec_filing_package" }],
+    classification: "direct"
+  }),
+  "revenue"
+);
+assert.equal(tiedRevenueReconciliation.filledCells, 0, "an already-current formula cache does not require a workbook write");
+assert.equal(tiedRevenueAuditRows.length, 1, "an already-correct reported formula still needs current SEC provenance in the source ledger");
+assert.equal(tiedRevenueAuditRows[0].formulaPreserved, true);
+
 const balanceWorkbook = new ExcelJS.Workbook();
 const balanceSheet = balanceWorkbook.addWorksheet("Model");
 balanceSheet.getCell("C10").value = "Balance Sheet";
@@ -295,6 +648,40 @@ assert.equal(annualCopy.filledCells, 1);
 assert.equal(balanceSheet.getCell("V11").value, 100);
 assert.equal(balanceAuditRows[0].formulaPreserved, false);
 assert.match(balanceAuditRows[0].formulaStatus, /formula replaced/i);
+
+const exactAnnualBalanceWorkbook = new ExcelJS.Workbook();
+const exactAnnualBalanceSheet = exactAnnualBalanceWorkbook.addWorksheet("Model");
+exactAnnualBalanceSheet.getCell("C10").value = "Balance Sheet";
+exactAnnualBalanceSheet.getCell("C11").value = "Total Assets";
+exactAnnualBalanceSheet.getCell("U11").value = 100;
+exactAnnualBalanceSheet.getCell("V11").value = 100;
+hooks.markReportedPeriodColumns(exactAnnualBalanceSheet, [
+  { period: "4Q26", col: 21 },
+  { period: "FY26", col: 22 }
+]);
+const exactAnnualSource = {
+  concept: "Assets",
+  label: "Total assets",
+  value: 100_000_000,
+  unit: "USD",
+  sourceLayer: "sec_filing_package",
+  accn: "000000000026000001",
+  end: "2026-12-31",
+  periodKey: "4Q26",
+  periodType: "instant"
+};
+const exactAnnualAuditRows = [];
+const exactAnnualCopy = hooks.copyBalanceSheetFourthQuarterToAnnualColumns(
+  exactAnnualBalanceSheet,
+  ["4Q26", "FY26"],
+  [21, 22],
+  { duration: new Map(), instant: new Map([["4Q26", new Map([["Assets", exactAnnualSource]])]]) },
+  exactAnnualAuditRows
+);
+assert.equal(exactAnnualCopy.filledCells, 0, "an already-correct annual balance-sheet hardcode does not require a workbook write");
+assert.equal(exactAnnualAuditRows.length, 1, "an already-correct annual balance-sheet hardcode still needs refreshed SEC provenance");
+assert.equal(exactAnnualAuditRows[0].sourceProvenance[0].role, "sec_source");
+assert.equal(exactAnnualAuditRows[0].sourceProvenance[0].value, 100, "annual SEC audit provenance must use the workbook's millions scale");
 
 const annualFormulaWorkbook = new ExcelJS.Workbook();
 const annualFormulaSheet = annualFormulaWorkbook.addWorksheet("Model");
