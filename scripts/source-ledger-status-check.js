@@ -1490,6 +1490,48 @@ assert.equal(wrongFinalPeriodValidation.status, "blocked", "the final derived ou
     "a nested derivation accepts same-concept, same-period positive SEC expense magnitude as support for its explicitly negative calculation term"
   );
 
+  const largeGroupedNestedRows = [
+    ledgerRow({
+      value: 100,
+      mappingStatus: "validated_current_company_derived_value",
+      sourceMappingType: "derived",
+      rawSecValue: "DerivedOutput:OuterGroupedBridge=100mm; DerivedInput:NestedGroupedInput=100mm; ProductRevenue=60mm; ServiceRevenue=40mm",
+      sourceProvenance: [
+        provenance({
+          role: "derived_output",
+          concept: "OuterGroupedBridge",
+          value: 100,
+          sourceLayer: "derived",
+          accession: "",
+          derivationCalculation: linearDerivationCalculation([
+            { concept: "NestedGroupedInput", value: 100, coefficient: 1 }
+          ])
+        }),
+        provenance({
+          role: "derived_input",
+          concept: "NestedGroupedInput",
+          value: 100,
+          sourceLayer: "derived",
+          accession: "",
+          derivationCalculation: linearDerivationCalculation([
+            { concept: "ProductRevenue", value: 100, coefficient: 1 }
+          ])
+        }),
+        provenance({ concept: "ProductRevenue", value: 60 }),
+        provenance({ concept: "ServiceRevenue", value: 40 }),
+        ...Array.from({ length: 17 }, (_unused, index) =>
+          provenance({ concept: `UnrelatedGroupedFact${index + 1}`, value: index + 1 })
+        )
+      ],
+      classificationReason: "A grouped nested derivation uses a representative concept for two same-period SEC facts."
+    })
+  ];
+  assert.deepEqual(
+    await validateHistoricalSourceLedger(largeGroupedNestedRows, periodEntries, company, new Map()),
+    [],
+    "a same-period two-source grouped derivation remains valid when the ledger row contains more than 16 provenance candidates"
+  );
+
   const signNormalizedDerivedRows = [
     ledgerRow({
       value: -100,

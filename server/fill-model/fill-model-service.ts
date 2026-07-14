@@ -13426,16 +13426,22 @@ function removeUnreconciledRevenueDisclosureGroups(
     if (totalRevenue === undefined) return;
     removeDuplicateRevenueRowsThatPreventReconciliation(periodValues, totalRevenue);
 
-    const totalsByFamily = new Map<string, number>();
+    const totalsByFamily = new Map<string, { value: number; positiveDetailRows: number }>();
     periodValues.forEach((metrics) => {
       if (metrics.revenue === undefined || metrics.aggregate) return;
       const family = metrics.tableFamily ?? metrics.family ?? "other";
-      totalsByFamily.set(family, (totalsByFamily.get(family) ?? 0) + metrics.revenue);
+      const existing = totalsByFamily.get(family) ?? { value: 0, positiveDetailRows: 0 };
+      existing.value += metrics.revenue;
+      if (Math.abs(metrics.revenue) > 0.0001) existing.positiveDetailRows += 1;
+      totalsByFamily.set(family, existing);
     });
 
     const reconciledFamilies = new Set(
       Array.from(totalsByFamily.entries())
-        .filter(([, value]) => revenueDisclosureCanReconcile(value, totalRevenue))
+        .filter(([, { value, positiveDetailRows }]) => {
+          const coverage = Math.abs(totalRevenue) > 0.0001 ? Math.abs(value / totalRevenue) : 0;
+          return revenueDisclosureCanReconcile(value, totalRevenue) && (coverage >= 0.25 || positiveDetailRows >= 2);
+        })
         .map(([family]) => family)
     );
     if (!reconciledFamilies.size) return;
@@ -13582,9 +13588,35 @@ function revenueDisclosureKind(
   if (members.some(isNonRevenueComponentMember)) return null;
 
   const joinedMembers = members.join(" ");
-  const text = `${tableInfo.text} ${rowLabel ?? ""} ${joinedMembers}`;
-  if (members.some(isReportableSegmentMember)) {
-    return "segment";
+  const memberAndRowText = `${rowLabel ?? ""} ${joinedMembers}`;
+  const text = `${tableInfo.text} ${memberAndRowText}`;
+  const hasProductOrServiceDimension = members.some((member) =>
+    /ProductOrServiceAxis|Products?Axis|ServiceLineAxis|ProductAndService|ProductMember|ServiceMember/i.test(member)
+  );
+  const hasBusinessLineDimension = members.some((member) =>
+    /BusinessLineAxis|LineOfBusinessAxis|DivisionAxis|BrandAxis|ChannelAxis|SolutionAxis/i.test(member)
+  );
+  const hasGeographicDimension = members.some((member) => /Geograph|RegionAxis|CountryAxis|country:/i.test(member));
+  const hasReportableSegmentDimension = members.some(isReportableSegmentMember);
+
+  // Classify by the most specific XBRL dimension before looking at broad table
+  // prose. A product/service fact can also carry a geography member (for
+  // example, product revenue split between U.S. and non-U.S. customers); it is
+  // still part of the product/service revenue family, not a geographic family.
+  if (hasProductOrServiceDimension) return "product_service";
+  if (hasBusinessLineDimension) return "business_line";
+  if (hasGeographicDimension) return "geographic";
+  if (hasReportableSegmentDimension) {
+    return /\b(geographic|geographical|region|country|domestic|international|foreign|americas|europe|asia pacific)\b/i.test(text)
+      ? "geographic"
+      : "segment";
+  }
+
+  if (/\b(product|service|products and services|goods and services|subscription|license|advertising|online stores|physical stores)\b/i.test(memberAndRowText)) {
+    return "product_service";
+  }
+  if (/\b(business line|line of business|service line|category|market|division|brand|channel|solution)\b/i.test(memberAndRowText)) {
+    return "business_line";
   }
   if (/\b(geographic|geographical|region|country|domestic|international|foreign|americas|europe|asia pacific)\b/i.test(text)) {
     return "geographic";
@@ -16063,7 +16095,10 @@ function assignSegmentsToMetricRowsForLedger(
 
   if (options.matchExistingLabelsOnly) return assignments;
 
-  segmentRowsForUnmatchedDisclosureAssignment(sheet, rows, suffix, assignments).forEach((rowNumber) => {
+  const unmatchedRows = options.forceOrderedAssignment
+    ? rows.filter((rowNumber) => !assignments.has(rowNumber))
+    : segmentRowsForUnmatchedDisclosureAssignment(sheet, rows, suffix, assignments);
+  unmatchedRows.forEach((rowNumber) => {
     if (assignments.has(rowNumber)) return;
     const segmentIndex = nextUnusedSegmentIndex(segments, usedSegments);
     if (segmentIndex === null) return;
@@ -16543,6 +16578,7 @@ function rankedRevenueSegmentFamilyCandidates(
 ) {
   if (!segments.length) return [];
   return segmentFamilyCandidates(segments, maxRows)
+    .filter(({ family, segments: candidateSegments }) => isEligibleRevenueMixCandidate(family, candidateSegments))
     .map((candidate) => ({ candidate, score: scoreSegmentFamilyCandidate(candidate.segments, periods, ctx, candidate.family) }))
     .filter(({ score }) => score.tieCount > 0 || score.repairableCount > 0)
     .sort((a, b) => {
@@ -16556,6 +16592,12 @@ function rankedRevenueSegmentFamilyCandidates(
       if (b.score.detailRows !== a.score.detailRows) return b.score.detailRows - a.score.detailRows;
       return a.score.totalError - b.score.totalError;
     });
+}
+
+function isEligibleRevenueMixCandidate(family: string, segments: SegmentRevenue[]) {
+  const baseFamily = family.split(":")[0];
+  if (baseFamily === "geographic") return false;
+  return segments.every((segment) => segment.disclosureKind !== "geographic");
 }
 
 function selectReconciledRevenueSegmentFamilyForTemplate(
@@ -17740,7 +17782,10 @@ function assignSegmentsToMetricRows(
 
   if (options.matchExistingLabelsOnly) return assignments;
 
-  segmentRowsForUnmatchedDisclosureAssignment(sheet, rows, suffix, assignments).forEach((rowNumber) => {
+  const unmatchedRows = options.forceOrderedAssignment
+    ? rows.filter((rowNumber) => !assignments.has(rowNumber))
+    : segmentRowsForUnmatchedDisclosureAssignment(sheet, rows, suffix, assignments);
+  unmatchedRows.forEach((rowNumber) => {
     if (assignments.has(rowNumber)) return;
     const segmentIndex = nextUnusedSegmentIndex(segments, usedSegments);
     if (segmentIndex === null) return;
@@ -17876,7 +17921,7 @@ function segmentLinkedTextFormulaResult(
     }
     const referencedAddress = snapshotAddress(referenced.worksheet, Number(referenced.row), Number(referenced.col));
     const linkedValue = baseAddresses.has(referencedAddress)
-      ? cellDisplay(referenced)
+      ? cellDisplay(referenced).trim() || null
       : hasFormula(referenced)
         ? segmentLinkedTextFormulaResult(referenced, baseAddresses, cache, visiting)
         : null;
@@ -33040,6 +33085,35 @@ function sourceLedgerDerivationTermHasProvenanceSupport(
       Math.abs(Math.abs(source.value!) - Math.abs(term.value)) <= tolerance
   );
   if (magnitudeExactSecSources.some((source) => sourceLedgerDerivationEvidenceIsValid(row, source, active))) return true;
+
+  // A grouped resolver can record one representative concept for a value that
+  // is the sum or difference of two same-period SEC facts. Validate that
+  // common bridge directly before the general subset search: a large ledger
+  // row may contain more than the bounded subset solver's 16 candidates even
+  // though the relevant grouped support is an unambiguous two-source pair.
+  const matchingConceptSources = candidates.filter(conceptMatches);
+  for (const matchingSource of matchingConceptSources) {
+    const samePeriodCompanions = candidates.filter(
+      (source) =>
+        source !== matchingSource &&
+        source.periodKey === matchingSource.periodKey &&
+        source.periodType === matchingSource.periodType
+    );
+    for (const companion of samePeriodCompanions) {
+      for (const matchingCoefficient of [1, -1] as const) {
+        for (const companionCoefficient of [1, -1] as const) {
+          const combined = matchingCoefficient * matchingSource.value! + companionCoefficient * companion.value!;
+          if (Math.abs(combined - term.value) > tolerance) continue;
+          if (
+            sourceLedgerDerivationEvidenceIsValid(row, matchingSource, active) &&
+            sourceLedgerDerivationEvidenceIsValid(row, companion, active)
+          ) {
+            return true;
+          }
+        }
+      }
+    }
+  }
 
   // Some higher-level resolvers pass a grouped ResolvedValue as one bridge
   // input. In that case the term carries the representative source concept

@@ -1,4 +1,3 @@
-const fs = require("node:fs/promises");
 const path = require("node:path");
 const ExcelJS = require("exceljs");
 const { postWorkbook } = require("./fill-workbook-api");
@@ -10,24 +9,8 @@ const outputWorkbook = process.env.MCD_SEGMENT_OUTPUT_WORKBOOK || path.join(repo
 const apiUrl = process.env.FILL_API_URL || "http://localhost:3000/api/fill-model";
 
 const expectedLabels = [
-  ["C8", "U.S. Market Revenue"],
-  ["C9", "International Operated Markets Revenue"],
-  ["C10", "International Developmental Licensed Markets and Corporate Revenue"],
-  ["C16", "U.S. Market"],
-  ["C17", "International Operated Markets"],
-  ["C18", "International Developmental Licensed Markets and Corporate"]
-];
-
-const expectedRevenueCells = [
-  ["F8", 2487.6, "1Q23 U.S. Market revenue"],
-  ["F9", 2794.8, "1Q23 International Operated Markets revenue"],
-  ["F10", 615.6, "1Q23 IDL Markets and Corporate revenue"],
-  ["I8", 2675.6, "4Q23 U.S. Market revenue"],
-  ["I9", 3131.1, "4Q23 International Operated Markets revenue"],
-  ["I10", 599.3, "4Q23 IDL Markets and Corporate revenue"],
-  ["S8", 2778, "4Q25 U.S. Market revenue"],
-  ["S9", 3597, "4Q25 International Operated Markets revenue"],
-  ["S10", 634, "4Q25 IDL Markets and Corporate revenue"]
+  ["C8", "Reported Revenue"],
+  ["C16", "Reported"]
 ];
 
 const revenueColumns = ["F", "G", "H", "I", "K", "L", "M", "N", "P", "Q", "R", "S", "U"];
@@ -75,10 +58,10 @@ async function main() {
     }
   }
 
-  for (const [address, expected, label] of expectedRevenueCells) {
-    const actual = numericCell(segmentSheet.getCell(address));
-    if (!valuesMatch(actual, expected)) {
-      errors.push(`${label} Segment Analysis!${address}: expected ${expected}, got ${actual ?? "[blank]"}.`);
+  for (let row = 8; row <= 13; row += 1) {
+    const label = String(cellValue(segmentSheet.getCell(`C${row}`)) ?? "");
+    if (/U\.S\. Market|International Operated Markets|International Developmental Licensed Markets/i.test(label)) {
+      errors.push(`Segment Analysis!C${row} should not include geographic revenue label "${label}".`);
     }
   }
 
@@ -92,11 +75,10 @@ async function main() {
     if (!valuesMatch(segmentRevenue, modelRevenue ?? NaN)) {
       errors.push(`Segment Analysis ${col}: segment rows sum to ${segmentRevenue}, but Model!${col}28 revenue is ${modelRevenue ?? "[blank]"}.`);
     }
-  }
-
-  const fourthQuarterUs = segmentSheet.getCell("I8").value;
-  if (!fourthQuarterUs || typeof fourthQuarterUs !== "object" || !String(fourthQuarterUs.formula ?? "").startsWith("10568.4-SUM(F8:H8)")) {
-    errors.push("Segment Analysis!I8 should preserve a 4Q segment bridge formula based on U.S. Market annual revenue, not consolidated company revenue.");
+    const reportedRevenue = numericCell(segmentSheet.getCell(`${col}8`));
+    if (!valuesMatch(reportedRevenue, modelRevenue ?? NaN)) {
+      errors.push(`Segment Analysis!${col}8 Reported Revenue is ${reportedRevenue ?? "[blank]"}, but Model!${col}28 revenue is ${modelRevenue ?? "[blank]"}.`);
+    }
   }
 
   if (errors.length) {

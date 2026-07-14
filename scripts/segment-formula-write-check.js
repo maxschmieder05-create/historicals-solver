@@ -57,6 +57,7 @@ const {
   segmentAnalysisAssignmentStatus,
   segmentAnalysisAssignmentReason,
   segmentAnalysisAssignmentSourceStatement,
+  assignSegmentsToMetricRowsForLedger,
   validateFinancialSegmentAssignmentCoverage,
   validateWorkbookBeforeReturn,
   snapshotWorkbook,
@@ -112,6 +113,65 @@ const linkedFill = fillSegmentMetricRows(
 assert.equal(linkedFill.filledCells, 1, "a formula-linked fallback row must remain assigned after its base label changes");
 assert.equal(linkedLabelSheet.getCell("F8").value, 2709);
 assert.equal(linkedFillAuditRows.length, 1);
+
+const orderedRevenueWorkbook = new ExcelJS.Workbook();
+const orderedRevenueSheet = orderedRevenueWorkbook.addWorksheet("Segment Analysis");
+for (const [row, baseRow, baseLabel] of [
+  [8, 16, "Prior Company"],
+  [9, 17, "Segment 2"],
+  [10, 18, "Segment 3"]
+]) {
+  orderedRevenueSheet.getCell(`C${row}`).value = {
+    formula: `C${baseRow}&" Revenue"`,
+    result: `${baseLabel} Revenue`
+  };
+  orderedRevenueSheet.getCell(`C${baseRow}`).value = baseLabel;
+  orderedRevenueSheet.getCell(`F${row}`).value = 0;
+}
+const orderedRevenueSegments = [
+  {
+    label: "Concentrate Operations",
+    family: "product_service",
+    values: new Map([["1Q26", 60_000_000]]),
+    operatingIncome: new Map(),
+    depreciationAmortization: new Map()
+  },
+  {
+    label: "Finished Product Operations",
+    family: "product_service",
+    values: new Map([["1Q26", 40_000_000]]),
+    operatingIncome: new Map(),
+    depreciationAmortization: new Map()
+  }
+];
+fillSegmentMetricRows(
+  orderedRevenueSheet,
+  ["1Q26"],
+  [6],
+  [8, 9, 10],
+  orderedRevenueSegments,
+  "values",
+  "Revenue",
+  [],
+  { forceOrderedAssignment: true, clearUnmatchedLabels: true, clearUnmatchedFormulas: true }
+);
+refreshSegmentLinkedLabelFormulaResults(orderedRevenueSheet, [8, 9, 10]);
+assert.equal(orderedRevenueSheet.getCell("C8").text, "Concentrate Operations Revenue");
+assert.equal(orderedRevenueSheet.getCell("C9").text, "Finished Product Operations Revenue");
+assert.equal(orderedRevenueSheet.getCell("C10").text, "", "an unused linked revenue row must remain visually blank");
+assert.equal(orderedRevenueSheet.getCell("C16").text, "Concentrate Operations");
+assert.equal(orderedRevenueSheet.getCell("C17").text, "Finished Product Operations");
+assert.equal(orderedRevenueSheet.getCell("C18").text, "");
+const orderedRevenueLedgerAssignments = assignSegmentsToMetricRowsForLedger(
+  orderedRevenueSheet,
+  [8, 9, 10],
+  orderedRevenueSegments,
+  "Revenue",
+  ["1Q26"],
+  { forceOrderedAssignment: true }
+);
+assert.equal(orderedRevenueLedgerAssignments.get(8), 0);
+assert.equal(orderedRevenueLedgerAssignments.get(9), 1);
 
 const missingPeriodWorkbook = new ExcelJS.Workbook();
 const missingPeriodSheet = missingPeriodWorkbook.addWorksheet("Segment Analysis");
@@ -756,6 +816,104 @@ assert.deepEqual(
     7
   )?.segments.map((item) => item.label),
   ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf"]
+);
+
+const geographicOnlyRevenue = sevenDisclosedSegments.map((segment) => ({
+  ...segment,
+  family: "geographic",
+  disclosureKind: "geographic",
+  disclosurePriority: 5
+}));
+assert.equal(
+  selectReconciledRevenueSegmentFamilyForTemplate(
+    geographicOnlyRevenue,
+    ["1Q26"],
+    capacityContext,
+    Number.MAX_SAFE_INTEGER
+  ),
+  null,
+  "geographic revenue must not be selected for the Segment Analysis revenue-mix block"
+);
+assert.equal(
+  segmentRevenueTemplateCapacityIssue(
+    segmentCapacitySheet(6),
+    ["1Q26"],
+    [6],
+    geographicOnlyRevenue,
+    capacityContext
+  ),
+  null,
+  "an oversized geographic disclosure must fall back to reported revenue instead of blocking the workbook"
+);
+
+const productServiceWithGeographyHtml = `
+  <ix:nonNumeric name="dei:DocumentFiscalYearFocus">2025</ix:nonNumeric>
+  <ix:nonNumeric name="dei:DocumentFiscalPeriodFocus">FY</ix:nonNumeric>
+  <ix:nonNumeric name="dei:DocumentPeriodEndDate">2025-12-31</ix:nonNumeric>
+  <xbrli:context id="total"><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="concentrate-us"><xbrli:entity><xbrli:segment><xbrldi:explicitMember dimension="srt:ProductOrServiceAxis">test:ConcentrateOperationsMember</xbrldi:explicitMember><xbrldi:explicitMember dimension="srt:StatementGeographicalAxis">country:US</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="concentrate-nonus"><xbrli:entity><xbrli:segment><xbrldi:explicitMember dimension="srt:ProductOrServiceAxis">test:ConcentrateOperationsMember</xbrldi:explicitMember><xbrldi:explicitMember dimension="srt:StatementGeographicalAxis">us-gaap:NonUsMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="concentrate"><xbrli:entity><xbrli:segment><xbrldi:explicitMember dimension="srt:ProductOrServiceAxis">test:ConcentrateOperationsMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="finished"><xbrli:entity><xbrli:segment><xbrldi:explicitMember dimension="srt:ProductOrServiceAxis">test:FinishedProductOperationsMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="emea"><xbrli:entity><xbrli:segment><xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis">test:EuropeMiddleEastAfricaMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="north-america"><xbrli:entity><xbrli:segment><xbrldi:explicitMember dimension="us-gaap:StatementBusinessSegmentsAxis">test:NorthAmericaMember</xbrldi:explicitMember></xbrli:segment></xbrli:entity><xbrli:period><xbrli:startDate>2025-01-01</xbrli:startDate><xbrli:endDate>2025-12-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <table>
+    <caption>Revenue by product and service category and geographic operating segment</caption>
+    <tr><td>Total revenue</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="total" scale="6">100</ix:nonFraction></td></tr>
+    <tr><td>Concentrate operations - U.S.</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="concentrate-us" scale="6">20</ix:nonFraction></td></tr>
+    <tr><td>Concentrate operations - non-U.S.</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="concentrate-nonus" scale="6">40</ix:nonFraction></td></tr>
+    <tr><td>Concentrate operations</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="concentrate" scale="6">60</ix:nonFraction></td></tr>
+    <tr><td>Finished product operations</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="finished" scale="6">40</ix:nonFraction></td></tr>
+    <tr><td>Europe, Middle East and Africa</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="emea" scale="6">55</ix:nonFraction></td></tr>
+    <tr><td>North America</td><td><ix:nonFraction name="us-gaap:Revenues" contextRef="north-america" scale="6">45</ix:nonFraction></td></tr>
+  </table>`;
+const productServiceWithGeographyParsed = parseInlineSegmentRevenue(productServiceWithGeographyHtml, "10-K");
+const productServiceWithGeographyRows = productServiceWithGeographyParsed.annual.get("4Q25");
+assert.ok(productServiceWithGeographyRows, "product/service and geographic SEC fixture should parse annual revenue disclosures");
+const productServiceWithGeographySegments = Array.from(productServiceWithGeographyRows.values()).map((item) => ({
+  label: item.label,
+  family: item.family,
+  disclosureKind: item.disclosureKind,
+  disclosurePriority: item.disclosurePriority,
+  sourceOrder: item.sourceOrder,
+  aggregate: item.aggregate,
+  aggregateParent: item.aggregateParent,
+  values: new Map([["FY25", item.revenue || 0]]),
+  annualValues: new Map([["FY25", item.revenue || 0]]),
+  operatingIncome: new Map(),
+  depreciationAmortization: new Map()
+}));
+const productServiceContext = {
+  duration: new Map([
+    [
+      "FY25",
+      new Map([
+        [
+          "Revenues",
+          {
+            concept: "Revenues",
+            label: "Revenue",
+            value: 100_000_000,
+            accn: "product-service-annual-revenue-FY25",
+            periodType: "annual"
+          }
+        ]
+      ])
+    ]
+  ]),
+  instant: new Map()
+};
+const selectedProductServiceFamily = selectReconciledRevenueSegmentFamilyForTemplate(
+  productServiceWithGeographySegments,
+  ["FY25"],
+  productServiceContext,
+  6
+);
+assert.equal(selectedProductServiceFamily?.family, "product_service");
+assert.deepEqual(
+  selectedProductServiceFamily?.segments.map((item) => item.label),
+  ["Concentrate Operations", "Finished Product Operations"],
+  "product/service revenue must outrank and exclude the geographic operating-segment breakout"
 );
 
 const nestedHealthcareDisclosureHtml = `
