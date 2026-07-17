@@ -12,15 +12,9 @@ const checks = [
     message: "A single native .xlsx file input must own picker selection."
   },
   {
-    ok: /function openWorkbookPicker\(\)[\s\S]*fileInputRef\.current\?\.click\(\);/.test(source)
-      && /<button className="browseCue" type="button" onClick=\{openWorkbookPicker\}/.test(source),
-    message: "The visible Choose workbook button must open the native input from a direct user action."
-  },
-  {
-    ok: /function handleDropzoneClick\(event: MouseEvent<HTMLElement>\)[\s\S]*target\.closest\("button, input"\)[\s\S]*openWorkbookPicker\(\)/.test(source)
-      && /function handleDropzoneKeyDown\(event: KeyboardEvent<HTMLElement>\)[\s\S]*event\.key !== "Enter"[\s\S]*event\.key !== " "[\s\S]*openWorkbookPicker\(\)/.test(source)
-      && /data-testid="workbook-dropzone"[\s\S]*role="button"[\s\S]*onClick=\{handleDropzoneClick\}[\s\S]*onKeyDown=\{handleDropzoneKeyDown\}/.test(source),
-    message: "The entire dropbox must open the picker by mouse or keyboard without double-opening from its nested controls."
+    ok: /data-testid="workbook-dropzone"[\s\S]*<input[\s\S]*className="fileInput"[\s\S]*type="file"/.test(source)
+      && /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*z-index:\s*2;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),
+    message: "One native file input must cover the entire drop target so clicks, keyboard focus, and OS file drops use the browser upload control."
   },
   {
     ok: /function handleFileSelect\(event: ChangeEvent<HTMLInputElement>\)[\s\S]*handleWorkbookSelected\(event\.currentTarget\.files\?\.item\(0\) \?\? undefined\)/.test(source),
@@ -58,9 +52,10 @@ const checks = [
     message: "Submit must use the selected workbook even if a render has not completed yet."
   },
   {
-    ok: /\.fileInput\s*\{[\s\S]*width:\s*1px;[\s\S]*height:\s*1px;[\s\S]*clip-path:\s*inset\(50%\)/.test(styles)
-      && !/\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%/.test(styles),
-    message: "The native input must be visually hidden instead of intercepting the entire drop target."
+    ok: /\.dropzone\s*>\s*:not\(\.fileInput\)\s*\{[\s\S]*pointer-events:\s*none;/.test(styles)
+      && /<span className="browseCue" aria-hidden="true">/.test(source)
+      && !/openWorkbookPicker|handleDropzoneClick|handleDropzoneKeyDown/.test(source),
+    message: "Decorative dropzone content must not intercept the native upload control or depend on scripted picker activation."
   }
 ];
 
