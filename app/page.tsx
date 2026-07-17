@@ -4,7 +4,6 @@ import {
   ChangeEvent,
   DragEvent,
   FormEvent,
-  MouseEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -83,7 +82,6 @@ export default function Home() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const selectedFileRef = useRef<File | null>(null);
   const dragDepthRef = useRef(0);
-  const pickerSyncTimersRef = useRef<number[]>([]);
   const activeRequestRef = useRef<AbortController | null>(null);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
@@ -125,23 +123,6 @@ export default function Home() {
     handleWorkbookSelected(droppedFile);
   }, [handleWorkbookSelected]);
 
-  const clearPickerSyncTimers = useCallback(() => {
-    pickerSyncTimersRef.current.forEach((timer) => window.clearTimeout(timer));
-    pickerSyncTimersRef.current = [];
-  }, []);
-
-  const syncFileInputSelection = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
-    const selected = input?.files?.item(0);
-    if (selected) handleWorkbookSelected(selected);
-  }, [handleWorkbookSelected]);
-
-  const scheduleFileInputSelectionSync = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
-    clearPickerSyncTimers();
-    pickerSyncTimersRef.current = [0, 100, 400].map((delay) =>
-      window.setTimeout(() => syncFileInputSelection(input), delay)
-    );
-  }, [clearPickerSyncTimers, syncFileInputSelection]);
-
   useEffect(() => {
     function handleWindowDragOver(event: globalThis.DragEvent) {
       if (!markWorkbookDropEffect(event.dataTransfer)) return;
@@ -174,28 +155,6 @@ export default function Home() {
       window.removeEventListener("drop", handleWindowDrop);
     };
   }, [handleDroppedWorkbook]);
-
-  useEffect(() => {
-    const input = fileInputRef.current;
-    if (!input) return;
-    const handleNativeSelection = () => scheduleFileInputSelectionSync(input);
-    const handlePickerReturn = () => scheduleFileInputSelectionSync(input);
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible") handlePickerReturn();
-    };
-
-    input.addEventListener("change", handleNativeSelection);
-    input.addEventListener("input", handleNativeSelection);
-    window.addEventListener("focus", handlePickerReturn);
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    return () => {
-      input.removeEventListener("change", handleNativeSelection);
-      input.removeEventListener("input", handleNativeSelection);
-      window.removeEventListener("focus", handlePickerReturn);
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-      clearPickerSyncTimers();
-    };
-  }, [clearPickerSyncTimers, scheduleFileInputSelectionSync]);
 
   useEffect(() => () => activeRequestRef.current?.abort(), []);
 
@@ -230,10 +189,10 @@ export default function Home() {
   }
 
   function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
-    handleWorkbookSelected(event.currentTarget.files?.item(0) ?? undefined);
-  }
-
-  function prepareFilePicker(event: MouseEvent<HTMLInputElement>) {
+    const selected = event.currentTarget.files?.item(0);
+    handleWorkbookSelected(selected);
+    // Keep the File object in React state/ref, then reset the native control so
+    // selecting the same workbook again still emits a change event.
     event.currentTarget.value = "";
   }
 
@@ -418,25 +377,26 @@ export default function Home() {
               accept={SUPPORTED_WORKBOOK_ACCEPT}
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               disabled={isSubmitting}
-              onClick={prepareFilePicker}
               onChange={handleFileSelect}
             />
-            <span className="dropIcon">
-              {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
-            </span>
-            <span className="dropTitle">{file ? "Workbook selected" : "Drop Excel model here"}</span>
-            {file ? (
-              <span className="selectedFile" aria-live="polite">
-                <FileSpreadsheet aria-hidden="true" size={18} />
-                <span>{file.name}</span>
-                <small>{formatFileSize(file.size)}</small>
+            <label className="dropzonePicker" htmlFor="model-template-file">
+              <span className="dropIcon">
+                {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
               </span>
-            ) : (
-              <small>Click to browse or drag in an .xlsx file</small>
-            )}
-            <span className="browseCue" aria-hidden="true">
-              {file ? "Choose different workbook" : "Choose workbook"}
-            </span>
+              <span className="dropTitle">{file ? "Workbook selected" : "Drop Excel model here"}</span>
+              {file ? (
+                <span className="selectedFile" aria-live="polite">
+                  <FileSpreadsheet aria-hidden="true" size={18} />
+                  <span>{file.name}</span>
+                  <small>{formatFileSize(file.size)}</small>
+                </span>
+              ) : (
+                <small>Click to browse or drag in an .xlsx file</small>
+              )}
+              <span className="browseCue" aria-hidden="true">
+                {file ? "Choose different workbook" : "Choose workbook"}
+              </span>
+            </label>
           </div>
 
           <div className="formActions">

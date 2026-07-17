@@ -13,25 +13,18 @@ const checks = [
   },
   {
     ok: /data-testid="workbook-dropzone"[\s\S]*<input[\s\S]*className="fileInput"[\s\S]*type="file"/.test(source)
-      && /\.fileInput\s*\{[\s\S]*inset:\s*0;[\s\S]*z-index:\s*2;[\s\S]*width:\s*100%;[\s\S]*height:\s*100%;[\s\S]*opacity:\s*0;/.test(styles),
-    message: "One native file input must cover the entire drop target so clicks, keyboard focus, and OS file drops use the browser upload control."
+      && /<label className="dropzonePicker" htmlFor="model-template-file">/.test(source)
+      && /\.fileInput\s*\{[\s\S]*width:\s*1px;[\s\S]*clip:\s*rect\(0, 0, 0, 0\);/.test(styles),
+    message: "The visible picker must be an explicit label for one visually hidden native file input."
   },
   {
-    ok: /function handleFileSelect\(event: ChangeEvent<HTMLInputElement>\)[\s\S]*handleWorkbookSelected\(event\.currentTarget\.files\?\.item\(0\) \?\? undefined\)/.test(source),
+    ok: /function handleFileSelect\(event: ChangeEvent<HTMLInputElement>\)[\s\S]*const selected = event\.currentTarget\.files\?\.item\(0\);[\s\S]*handleWorkbookSelected\(selected\)/.test(source),
     message: "Native picker change must synchronously populate shared workbook state."
   },
   {
-    ok: /function prepareFilePicker\(event: MouseEvent<HTMLInputElement>\)[\s\S]*event\.currentTarget\.value = "";/.test(source)
-      && /onClick=\{prepareFilePicker\}[\s\S]*onChange=\{handleFileSelect\}/.test(source),
-    message: "Native picker activation must clear only the input value so selecting the same workbook again still emits a change."
-  },
-  {
-    ok: /input\.addEventListener\("change", handleNativeSelection\)/.test(source)
-      && /input\.addEventListener\("input", handleNativeSelection\)/.test(source)
-      && /window\.addEventListener\("focus", handlePickerReturn\)/.test(source)
-      && /document\.addEventListener\("visibilitychange", handleVisibilityChange\)/.test(source)
-      && /const scheduleFileInputSelectionSync = useCallback[\s\S]*\[0, 100, 400\]/.test(source),
-    message: "Picker selection must resync from the native input after change/input events and after the OS picker returns focus."
+    ok: /handleWorkbookSelected\(selected\);[\s\S]*event\.currentTarget\.value = "";/.test(source)
+      && !/prepareFilePicker|pickerSyncTimersRef|handlePickerReturn/.test(source),
+    message: "The selected File must be retained before the native input resets for same-file reselection."
   },
   {
     ok: /onDragEnter=\{handleDrag\}/.test(source)
@@ -61,10 +54,9 @@ const checks = [
     message: "Submit must use the selected workbook even if a render has not completed yet."
   },
   {
-    ok: /\.dropzone\s*>\s*:not\(\.fileInput\)\s*\{[\s\S]*pointer-events:\s*none;/.test(styles)
-      && /<span className="browseCue" aria-hidden="true">/.test(source)
+    ok: /<label className="dropzonePicker" htmlFor="model-template-file">[\s\S]*<span className="browseCue" aria-hidden="true">/.test(source)
       && !/openWorkbookPicker|handleDropzoneClick|handleDropzoneKeyDown/.test(source),
-    message: "Decorative dropzone content must not intercept the native upload control or depend on scripted picker activation."
+    message: "The full visible dropzone must activate its associated native input without scripted picker activation."
   }
 ];
 
