@@ -1044,9 +1044,9 @@ const OPENROUTER_SITE_URL = process.env.OPENROUTER_SITE_URL || "http://localhost
 // The LLM is the responsible analyst, so use an accounting-capable frontier
 // model for both primary statement work and recovery. A capable paid fallback
 // prevents provider latency from silently downgrading the workbook to rules.
-const DEFAULT_LLM_MAPPING_FAST_MODEL = "openai/gpt-5-mini";
-const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "openai/gpt-5-mini";
-const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "openai/gpt-5-mini";
+const DEFAULT_LLM_MAPPING_FAST_MODEL = "qwen/qwen3.7-plus";
+const DEFAULT_LLM_MAPPING_COMPLEX_MODEL = "qwen/qwen3.7-plus";
+const DEFAULT_LLM_MAPPING_REVIEW_MODEL = "qwen/qwen3.7-plus";
 const DEFAULT_LLM_MAPPING_FAST_FALLBACK_MODELS = ["deepseek/deepseek-v4-flash"];
 const DEFAULT_LLM_MAPPING_COMPLEX_FALLBACK_MODELS = ["deepseek/deepseek-v4-flash"];
 const DEFAULT_LLM_MAPPING_REVIEW_FALLBACK_MODELS: string[] = [];

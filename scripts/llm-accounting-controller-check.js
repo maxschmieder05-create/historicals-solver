@@ -366,6 +366,13 @@ async function main() {
   assert.equal(gptRequestBody.max_completion_tokens, 77);
   assert.equal("max_tokens" in gptRequestBody, false);
 
+  const qwenCapabilities = __llmAccountingControllerTestHooks.staticCapabilitiesForModel("qwen/qwen3.7-plus");
+  assert.equal(qwenCapabilities.supportsResponseFormat, true);
+  assert.equal(qwenCapabilities.supportsStructuredOutputs, true);
+  assert.equal(qwenCapabilities.supportsTemperature, true);
+  assert.equal(qwenCapabilities.supportsMaxTokens, true);
+  assert.equal(qwenCapabilities.supportsMaxCompletionTokens, false);
+
   const fallbackCapabilities = __llmAccountingControllerTestHooks.staticCapabilitiesForModel("unlisted/provider-model");
   let probeAborted = false;
   let probeUrl = "";
