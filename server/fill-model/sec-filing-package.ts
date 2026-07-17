@@ -12,7 +12,9 @@ export type SecFilingPackageRequest = {
 
 export type SecFilingPackageArtifactKind =
   | "filing_index"
+  | "filing_summary"
   | "primary_html"
+  | "schema"
   | "instance"
   | "calculation"
   | "presentation"
@@ -30,6 +32,8 @@ export type SecFilingPackageArtifact = {
 export type SecFilingContextDimension = {
   dimension: string;
   member: string;
+  dimensionLabel?: string;
+  memberLabel?: string;
   typedValue?: string;
 };
 
@@ -87,6 +91,9 @@ export type SecFilingStatementStructure = {
   statementName: string;
   sourceTableType: SecFilingStatementSourceTableType;
   roleUri?: string;
+  roleDefinition?: string;
+  reportCategory?: string;
+  reportPosition?: number;
   sourceUrl?: string;
   accession: string;
   reportingPeriod?: string;
@@ -185,9 +192,26 @@ type PresentationNode = {
 type PresentationStatement = {
   statementName: string;
   roleUri?: string;
+  roleDefinition?: string;
+  reportCategory?: string;
+  reportPosition?: number;
+  sourceUrl?: string;
   sourceTableType: SecFilingStatementSourceTableType;
   nodes: PresentationNode[];
 };
+
+type FilingRoleMetadata = {
+  roleUri: string;
+  definition?: string;
+  shortName?: string;
+  reportCategory?: string;
+  reportPosition?: number;
+  reportHtmlFileName?: string;
+  reportHtmlUrl?: string;
+  parentRoleUri?: string;
+};
+
+type FilingRoleMetadataMap = Map<string, FilingRoleMetadata>;
 
 type CalculationParent = {
   parentConcept: string;
@@ -390,8 +414,10 @@ async function fetchSecFilingPackageUncached(
   if (!indexItems.length) return null;
 
   const artifacts = discoverFilingArtifacts(indexItems, filing, baseUrl);
-  const [primaryHtml, instanceXml, presentationXml, calculationXml, labelXml, definitionXml] = await Promise.all([
+  const [primaryHtml, schemaXml, filingSummaryXml, instanceXml, presentationXml, calculationXml, labelXml, definitionXml] = await Promise.all([
     artifacts.primary_html ? fetchSecText(artifacts.primary_html.url, headers, "text/html", signal) : Promise.resolve(null),
+    artifacts.schema ? fetchSecText(artifacts.schema.url, headers, "application/xml", signal) : Promise.resolve(null),
+    artifacts.filing_summary ? fetchSecText(artifacts.filing_summary.url, headers, "application/xml", signal) : Promise.resolve(null),
     artifacts.instance ? fetchSecText(artifacts.instance.url, headers, "application/xml", signal) : Promise.resolve(null),
     artifacts.presentation ? fetchSecText(artifacts.presentation.url, headers, "application/xml", signal) : Promise.resolve(null),
     artifacts.calculation ? fetchSecText(artifacts.calculation.url, headers, "application/xml", signal) : Promise.resolve(null),
@@ -410,7 +436,8 @@ async function fetchSecFilingPackageUncached(
   const labels = parseLabelLinkbase(labelXml ?? "");
   const calculations = parseCalculationLinkbase(calculationXml ?? "");
   const definitions = parseDefinitionLinkbase(definitionXml ?? "");
-  const presentation = parsePresentationLinkbase(presentationXml ?? "", labels);
+  const roleMetadata = parseFilingRoleMetadata(schemaXml ?? "", filingSummaryXml ?? "", baseUrl);
+  const presentation = parsePresentationLinkbase(presentationXml ?? "", labels, roleMetadata);
   const metadata = {
     cik: filing.cik,
     accessionNumber: filing.accessionNumber,
@@ -455,7 +482,7 @@ function discoverFilingArtifacts(
   const artifact = (kind: SecFilingPackageArtifactKind, item: SecArchiveIndexItem): SecFilingPackageArtifact => ({
     kind,
     name: item.name,
-    url: `${baseUrl}/${encodeURIComponent(item.name)}`,
+    url: secArchiveArtifactUrl(baseUrl, item.name),
     type: item.type,
     size: item.size
   });
@@ -472,6 +499,13 @@ function discoverFilingArtifacts(
     (filing.primaryDocument ? byName.get(filing.primaryDocument) : undefined) ??
     items.find((item) => isHtmlFile(item.name) && !isGeneratedFilingSupportFile(item.name));
   if (primary) artifacts.primary_html = artifact("primary_html", primary);
+
+  const expectedSchemaName = primary?.name.replace(/\.(?:htm|html)$/i, ".xsd");
+  const schema = (expectedSchemaName ? byName.get(expectedSchemaName) : undefined) ?? items.find((item) => /\.xsd$/i.test(item.name));
+  if (schema) artifacts.schema = artifact("schema", schema);
+
+  const filingSummary = items.find((item) => /^FilingSummary\.xml$/i.test(item.name));
+  if (filingSummary) artifacts.filing_summary = artifact("filing_summary", filingSummary);
 
   const xmlItems = items.filter((item) => /\.xml$/i.test(item.name));
   const pickXml = (kind: SecFilingPackageArtifactKind, pattern: RegExp) => {
@@ -633,27 +667,81 @@ function parseLabelLinkbase(xml: string): LabelMap {
   for (const linkMatch of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?labelLink\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?labelLink>/g)) {
     const body = linkMatch[1];
     const locators = parseLocators(body);
-    const labelResources = new Map<string, ConceptLabel>();
+    const labelResources = new Map<string, ConceptLabel[]>();
     for (const labelMatch of body.matchAll(/<(?:[A-Za-z_][\w.-]*:)?label\b([^>]*)>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?label>/g)) {
       const attrs = labelMatch[1];
       const label = attr(attrs, "xlink:label") ?? attr(attrs, "label");
       const text = decodeXml(stripTags(labelMatch[2]).trim()).replace(/\s+/g, " ");
       if (!label || !text) continue;
-      labelResources.set(label, { text, role: attr(attrs, "xlink:role") ?? attr(attrs, "role") ?? undefined });
+      const resources = labelResources.get(label) ?? [];
+      resources.push({ text, role: attr(attrs, "xlink:role") ?? attr(attrs, "role") ?? undefined });
+      labelResources.set(label, resources);
     }
     for (const arc of parseArcs(body, "labelArc")) {
       const concept = locators.get(arc.from)?.concept;
-      const resource = labelResources.get(arc.to);
-      if (!concept || !resource) continue;
+      const resources = labelResources.get(arc.to) ?? [];
+      if (!concept || !resources.length) continue;
       const existing = labels.get(concept) ?? [];
-      existing.push(resource);
+      for (const resource of resources) {
+        if (!existing.some((candidate) => candidate.text === resource.text && candidate.role === resource.role)) {
+          existing.push(resource);
+        }
+      }
       labels.set(concept, existing);
     }
   }
   return labels;
 }
 
-function parsePresentationLinkbase(xml: string, labels: LabelMap): PresentationStatement[] {
+function parseFilingRoleMetadata(schemaXml: string, filingSummaryXml: string, baseUrl = ""): FilingRoleMetadataMap {
+  const metadata = parseSchemaRoleMetadata(schemaXml);
+  for (const [roleUri, report] of parseFilingSummaryRoleMetadata(filingSummaryXml, baseUrl)) {
+    metadata.set(roleUri, { ...metadata.get(roleUri), ...report, roleUri });
+  }
+  return metadata;
+}
+
+function parseSchemaRoleMetadata(xml: string): FilingRoleMetadataMap {
+  const metadata: FilingRoleMetadataMap = new Map();
+  for (const match of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?roleType\b([^>]*)>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?roleType>/g)) {
+    const roleUri = attr(match[1], "roleURI");
+    if (!roleUri) continue;
+    metadata.set(roleUri, {
+      roleUri,
+      definition: textContent(match[2], "definition") ?? undefined
+    });
+  }
+  return metadata;
+}
+
+function parseFilingSummaryRoleMetadata(xml: string, baseUrl = ""): FilingRoleMetadataMap {
+  const metadata: FilingRoleMetadataMap = new Map();
+  for (const match of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?Report\b[^>]*>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?Report>/g)) {
+    const body = match[1];
+    const roleUri = textContent(body, "Role");
+    if (!roleUri) continue;
+    const reportHtmlFileName = textContent(body, "HtmlFileName") ?? undefined;
+    const positionText = textContent(body, "Position");
+    const position = positionText ? Number(positionText) : Number.NaN;
+    metadata.set(roleUri, {
+      roleUri,
+      definition: textContent(body, "LongName") ?? undefined,
+      shortName: textContent(body, "ShortName") ?? undefined,
+      reportCategory: textContent(body, "MenuCategory") ?? undefined,
+      reportPosition: Number.isFinite(position) ? position : undefined,
+      reportHtmlFileName,
+      reportHtmlUrl: reportHtmlFileName && baseUrl ? secArchiveArtifactUrl(baseUrl, reportHtmlFileName) : undefined,
+      parentRoleUri: textContent(body, "ParentRole") ?? undefined
+    });
+  }
+  return metadata;
+}
+
+function parsePresentationLinkbase(
+  xml: string,
+  labels: LabelMap,
+  roleMetadata: FilingRoleMetadataMap = new Map()
+): PresentationStatement[] {
   const statements: PresentationStatement[] = [];
   for (const linkMatch of xml.matchAll(/<(?:[A-Za-z_][\w.-]*:)?presentationLink\b([^>]*)>([\s\S]*?)<\/(?:[A-Za-z_][\w.-]*:)?presentationLink>/g)) {
     const linkAttrs = linkMatch[1];
@@ -691,11 +779,18 @@ function parsePresentationLinkbase(xml: string, labels: LabelMap): PresentationS
       .map(([, node]) => node)
       .sort((a, b) => a.order - b.order || labelForConcept(a.concept, labels).localeCompare(labelForConcept(b.concept, labels)));
     const fallbackRoots = roots.length ? roots : Array.from(nodesByLabel.values()).filter((node) => !node.parentConcept);
-    const statementName = statementNameFromRole(roleUri, fallbackRoots[0]?.concept ? labelForConcept(fallbackRoots[0].concept, labels) : undefined);
+    const metadata = roleUri ? roleMetadata.get(roleUri) : undefined;
+    const fallbackName = fallbackRoots[0]?.concept ? labelForConcept(fallbackRoots[0].concept, labels) : undefined;
+    const statementName = statementNameFromRoleMetadata(metadata, roleUri, fallbackName);
+    const classificationText = [statementName, metadata?.definition, metadata?.reportCategory].filter(Boolean).join(" ");
     statements.push({
       statementName,
       roleUri,
-      sourceTableType: classifySourceTableType(statementName, roleUri),
+      roleDefinition: metadata?.definition,
+      reportCategory: metadata?.reportCategory,
+      reportPosition: metadata?.reportPosition,
+      sourceUrl: metadata?.reportHtmlUrl,
+      sourceTableType: classifySourceTableType(classificationText, roleUri),
       nodes: flattenPresentationNodes(fallbackRoots)
     });
   }
@@ -885,6 +980,7 @@ function buildPresentationStatementStructures(
 ): SecFilingStatementStructure[] {
   return presentationStatements.map((statement) => {
     const rows: SecFilingStatementRow[] = [];
+    const statementSourceUrl = statement.sourceUrl ?? metadata.primaryDocumentUrl;
     statement.nodes.forEach((node, index) => {
       const facts = instance.factsByConcept.get(node.concept) ?? [];
       const label = labelForConcept(node.concept, labels, node.preferredLabelRole);
@@ -904,7 +1000,7 @@ function buildPresentationStatementStructures(
           parentSubtotal: presentationParentSubtotal(node, labels),
           accession: metadata.accessionNumber,
           reportingPeriod: metadata.reportingPeriod,
-          sourceUrl: metadata.primaryDocumentUrl
+          sourceUrl: statementSourceUrl
         });
         return;
       }
@@ -919,7 +1015,7 @@ function buildPresentationStatementStructures(
             calculations,
             metadata,
             roleUri: statement.roleUri,
-            sourceUrl: metadata.primaryDocumentUrl,
+            sourceUrl: statementSourceUrl,
             rowOrder: index + factIndex / 1000,
             presentationParent: presentationParentSubtotal(node, labels)
           })
@@ -930,7 +1026,10 @@ function buildPresentationStatementStructures(
       statementName: statement.statementName,
       sourceTableType: statement.sourceTableType,
       roleUri: statement.roleUri,
-      sourceUrl: metadata.primaryDocumentUrl,
+      roleDefinition: statement.roleDefinition,
+      reportCategory: statement.reportCategory,
+      reportPosition: statement.reportPosition,
+      sourceUrl: statementSourceUrl,
       accession: metadata.accessionNumber,
       reportingPeriod: metadata.reportingPeriod,
       form: metadata.form,
@@ -957,7 +1056,11 @@ function statementRowFromFact(input: {
   presentationParent?: SecFilingParentSubtotal;
 }): SecFilingStatementRow {
   const context = input.fact.context;
-  const dimensions = context?.dimensions ?? [];
+  const dimensions = (context?.dimensions ?? []).map((dimension) => ({
+    ...dimension,
+    dimensionLabel: labelForQualifiedConcept(dimension.dimension, input.labels),
+    memberLabel: dimension.typedValue ? undefined : labelForDimensionMember(dimension.member, input.labels)
+  }));
   const parentSubtotal = calculationParentSubtotal(input.fact.concept, input.calculations, input.labels, input.roleUri) ?? input.presentationParent;
   return {
     statementName: input.statementName,
@@ -1034,6 +1137,20 @@ function labelForConcept(concept: string, labels: LabelMap, preferredRole?: stri
   return preferred?.text ?? sorted[0]?.text ?? humanizeConcept(concept);
 }
 
+function labelForQualifiedConcept(value: string, labels: LabelMap, preferredRole?: string) {
+  const concept = conceptFromQualifiedName(value).concept;
+  return labelForConcept(concept, labels, preferredRole);
+}
+
+function labelForDimensionMember(value: string, labels: LabelMap) {
+  const concept = conceptFromQualifiedName(value).concept;
+  const candidates = labels.get(concept) ?? [];
+  const descriptiveNetLabel = candidates.find(
+    (candidate) => /netLabel$/i.test(candidate.role ?? "") && /\(.+\)/.test(candidate.text)
+  );
+  return descriptiveNetLabel?.text ?? labelForConcept(concept, labels);
+}
+
 function labelRoleScore(role?: string) {
   if (!role) return 0;
   if (/terseLabel$/i.test(role)) return 7;
@@ -1050,6 +1167,17 @@ function statementNameFromRole(roleUri?: string, fallback?: string) {
   const last = decodeURIComponent(roleUri.split(/[/#]/).filter(Boolean).at(-1) ?? roleUri);
   const withoutPrefix = last.replace(/^\d+\s*[-_]\s*/, "");
   return humanizeConcept(withoutPrefix.replace(/[_-]/g, " ")) || fallback || "SEC Filing Statement";
+}
+
+function statementNameFromRoleMetadata(metadata?: FilingRoleMetadata, roleUri?: string, fallback?: string) {
+  const shortName = cleanStatementLabel(metadata?.shortName ?? "");
+  if (shortName) return shortName;
+  const definition = cleanStatementLabel(metadata?.definition ?? "").replace(
+    /^\d+\s*-\s*(?:document|statement|disclosure)\s*-\s*/i,
+    ""
+  );
+  if (definition) return definition;
+  return statementNameFromRole(roleUri, fallback);
 }
 
 function statementNameFromHtmlContext(html: string, tableHtml: string, tableIndex: number) {
@@ -1370,6 +1498,10 @@ function isHtmlFile(name: string) {
   return /\.(?:htm|html)$/i.test(name);
 }
 
+function secArchiveArtifactUrl(baseUrl: string, name: string) {
+  return `${baseUrl}/${name.split("/").map(encodeURIComponent).join("/")}`;
+}
+
 function isGeneratedFilingSupportFile(name: string) {
   return /^(?:FilingSummary|MetaLinks|Financial_Report)\.xml$/i.test(name) || /\.(?:xsd|jpg|jpeg|png|gif|css|js)$/i.test(name);
 }
@@ -1399,6 +1531,12 @@ function boundedEnvironmentInteger(value: string | undefined, fallback: number, 
 export const __secFilingPackageTestHooks = {
   parseInstanceXml,
   preferMostPreciseDuplicateFacts,
+  parseLabelLinkbase,
+  labelForConcept,
+  parseFilingRoleMetadata,
+  parsePresentationLinkbase,
+  buildPresentationStatementStructures,
+  discoverFilingArtifacts,
   createBoundedTtlLruCache: (maxEntries: number, ttlMs: number, now?: () => number) =>
     new BoundedTtlLruCache<unknown, unknown>(maxEntries, ttlMs, now),
   fetchSecText,

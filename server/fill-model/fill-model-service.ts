@@ -12358,8 +12358,12 @@ function segmentRevenueFromFilingPackageStatements(
   const wanted = new Set(periods);
   const segments = new Map<string, SegmentRevenue>();
   const annualMetrics = new Map<string, Map<SegmentMetricKey, Map<string, { value: number; sources: FactSource[] }>>>();
+  const selectedMetricPriorities = new Map<string, number>();
+  const segmentStatements = statements.filter((item) => item.sourceTableType === "segment_table");
+  const detailStatements = segmentStatements.filter(isFilingPackageSegmentDetailStatement);
+  const candidateStatements = detailStatements.length ? detailStatements : segmentStatements;
 
-  for (const statement of statements.filter((item) => item.sourceTableType === "segment_table")) {
+  for (const statement of candidateStatements) {
     for (const row of statement.rows) {
       if (typeof row.value !== "number" || !Number.isFinite(row.value) || row.period.periodType === "instant") continue;
       if (row.unit && !/usd/i.test(row.unit)) continue;
@@ -12367,8 +12371,9 @@ function segmentRevenueFromFilingPackageStatements(
       if (!metric) continue;
       const segmentDimension = filingPackageSegmentDimension(row.dimensions, statement.statementName);
       if (!segmentDimension) continue;
-      const label = cleanSegmentMember(segmentDimension.member.replace(/(?:Segment)?Member$/i, ""));
-      if (!label || !isUsefulRevenueBreakoutLabel(label)) continue;
+      const memberLabel = segmentDimension.memberLabel ?? segmentDimension.member;
+      const label = cleanSegmentMember(memberLabel.replace(/\s*\[Member\]\s*$/i, "").replace(/(?:Segment)?Member$/i, ""), true);
+      if (!label || (!isUsefulRevenueBreakoutLabel(label) && !isAuthoritativeNumberedSegmentLabel(label))) continue;
       const end = row.period.end;
       const start = row.period.start;
       if (!start || !end) continue;
@@ -12378,6 +12383,11 @@ function segmentRevenueFromFilingPackageStatements(
       const annual = days >= 330;
       if (!annual && days > 115) continue;
       const period = annual ? `FY${periodYearSuffix(quarterPeriod)}` : quarterPeriod;
+      const key = filingPackageSegmentIdentity(segmentDimension, label);
+      const selectionKey = `${key}|${metric}|${period}|${annual ? "annual" : "quarterly"}`;
+      const priority = filingPackageSegmentMetricPriority(row, metric);
+      const selectedPriority = selectedMetricPriorities.get(selectionKey);
+      if (selectedPriority !== undefined && priority < selectedPriority) continue;
       const source: FactSource = {
         concept: row.xbrlConcept ?? row.rowLabel,
         label: `${label} ${segmentMetricDisplayLabel(metric === "revenue" ? "values" : metric)}`,
@@ -12395,8 +12405,10 @@ function segmentRevenueFromFilingPackageStatements(
         periodType: annual ? "annual" : "quarterly",
         reportDate: statement.reportingPeriod
       };
-      const key = normalize(label);
       const segment = segments.get(key) ?? emptyFilingPackageSegment(label);
+      segment.aggregate = Boolean(
+        segment.aggregate || isAggregateFilingPackageSegmentMember(segmentDimension.member, memberLabel)
+      );
       if (annual) {
         const byMetric = annualMetrics.get(key) ?? new Map();
         const byPeriod = byMetric.get(metric) ?? new Map();
@@ -12404,9 +12416,11 @@ function segmentRevenueFromFilingPackageStatements(
         byMetric.set(metric, byPeriod);
         annualMetrics.set(key, byMetric);
         if (metric === "revenue") segment.annualValues?.set(period, row.value);
+        if (wanted.has(period)) setSegmentRevenueMetric(segment, metric, period, row.value, [source]);
       } else if (wanted.has(period)) {
         setSegmentRevenueMetric(segment, metric, period, row.value, [source]);
       }
+      selectedMetricPriorities.set(selectionKey, priority);
       segments.set(key, segment);
     }
   }
@@ -12448,18 +12462,72 @@ function segmentRevenueFromFilingPackageStatements(
     .sort((left, right) => segmentSort(left.label, right.label));
 }
 
+function filingPackageSegmentIdentity(
+  dimension: SecFilingStatementStructure["rows"][number]["dimensions"][number],
+  label: string
+) {
+  const memberConcept = dimension.member
+    .split(":")
+    .pop()
+    ?.replace(/(?:Segment)?Member$/i, "")
+    .trim();
+  return normalize(memberConcept || label);
+}
+
+function filingPackageSegmentMetricPriority(
+  row: SecFilingStatementStructure["rows"][number],
+  metric: SegmentMetricKey
+) {
+  if (metric !== "revenue") return row.xbrlConcept ? 10 : 0;
+  const concept = row.xbrlConcept?.split(":").pop() ?? "";
+  const dimensionText = row.dimensions
+    .map((dimension) => `${dimension.dimensionLabel ?? dimension.dimension}=${dimension.memberLabel ?? dimension.member}`)
+    .join(" ");
+  let priority = 0;
+  if (/^(RevenueFromContractWithCustomerExcludingAssessedTax|SalesRevenueNet)$/i.test(concept)) priority += 100;
+  else if (/^Revenues$/i.test(concept)) priority += 50;
+  if (/\b(?:net )?revenue\b|\bnet sales\b|\bsales to external customers\b/i.test(row.rowLabel)) priority += 30;
+  if (/\bgross revenue\b/i.test(row.rowLabel)) priority -= 20;
+  if (/\bintercompany|\bintersegment|\belimination/i.test(`${row.rowLabel} ${dimensionText}`)) priority -= 100;
+  return priority;
+}
+
+function isAggregateFilingPackageSegmentMember(member: string, label: string) {
+  const text = `${member} ${label}`;
+  return (
+    /\bsubtotal\b|\bsub\s+total\b/i.test(text) ||
+    /\b(?:total|consolidated)\s+(?:reportable\s+|operating\s+)?segments?\b/i.test(text)
+  );
+}
+
+function isFilingPackageSegmentDetailStatement(statement: SecFilingStatementStructure) {
+  const text = [statement.roleDefinition, statement.statementName, statement.roleUri, statement.reportCategory]
+    .filter(Boolean)
+    .join(" ");
+  return /segment/i.test(text) && /detail/i.test(text);
+}
+
 function filingPackageSegmentDimension(
   dimensions: SecFilingStatementStructure["rows"][number]["dimensions"],
   statementName: string
 ) {
   const explicit = dimensions.find(
-    (dimension) =>
-      /StatementBusinessSegments|BusinessSegment|OperatingSegment|SegmentAxis/i.test(dimension.dimension) &&
-      !isNonSegmentMetricMember(`${dimension.dimension}=${dimension.member}`)
+    (dimension) => {
+      const dimensionText = `${dimension.dimension} ${dimension.dimensionLabel ?? ""}`;
+      const memberText = `${dimension.member} ${dimension.memberLabel ?? ""}`;
+      return (
+        /StatementBusinessSegments|BusinessSegment|OperatingSegment|Segment(?:s)?\s*(?:\[)?Axis/i.test(dimensionText) &&
+        !isNonSegmentMetricMember(`${dimensionText}=${memberText}`)
+      );
+    }
   );
   if (explicit) return explicit;
   if (!/reportable segment|operating segment|segment information/i.test(statementName) || dimensions.length !== 1) return null;
-  return isNonSegmentMetricMember(`${dimensions[0].dimension}=${dimensions[0].member}`) ? null : dimensions[0];
+  const onlyDimension = dimensions[0];
+  const dimensionText = `${onlyDimension.dimension} ${onlyDimension.dimensionLabel ?? ""}`;
+  const memberText = `${onlyDimension.member} ${onlyDimension.memberLabel ?? ""}`;
+  if (/geograph|country|region/i.test(`${dimensionText} ${memberText}`)) return null;
+  return isNonSegmentMetricMember(`${dimensionText}=${memberText}`) ? null : onlyDimension;
 }
 
 function filingPackageSegmentMetricFromLabel(label: string): SegmentMetricKey | null {
@@ -13704,7 +13772,8 @@ function isNumericOrCurrencyHeavySegmentLabel(label: string) {
 function isAggregateRevenueBreakoutLabel(label: string) {
   return (
     /^(total|consolidated|company|net sales|sales|revenue|revenues|net revenue|gross revenue|intercompany revenue|intersegment revenue|total revenue|total revenues|total net sales)$/i.test(label.trim()) ||
-    /\btotal$/i.test(label.trim())
+    /\btotal$/i.test(label.trim()) ||
+    /\bsubtotal\b|\bsub\s+total\b/i.test(label.trim())
   );
 }
 
@@ -13930,7 +13999,7 @@ function isNonSegmentMetricMember(member: string) {
   return /RelatedParty|Reclassification|AccumulatedOtherComprehensiveIncome|Aoci|MinimumMember|MaximumMember/i.test(member);
 }
 
-function cleanSegmentMember(member: string) {
+function cleanSegmentMember(member: string, allowNumberedGroup = false) {
   const local = member
     .split(":")
     .pop()
@@ -13941,13 +14010,17 @@ function cleanSegmentMember(member: string) {
     .replace(/\bAnd\b/g, "and")
     .replace(/\s+/g, " ")
     .trim();
-  if (!local || isGenericInlineSegmentMemberLabel(local) || /^Group\s*\d+$/i.test(local)) return null;
+  if (!local || isGenericInlineSegmentMemberLabel(local) || (!allowNumberedGroup && /^Group\s*\d+$/i.test(local))) return null;
   if (isNumericOrCurrencyHeavySegmentLabel(local)) return null;
   if (/^IPhone$/i.test(local)) return "iPhone";
   if (/^IPad$/i.test(local)) return "iPad";
   if (/^Service$/i.test(local)) return "Services";
   if (/^Wearables Homeand Accessories$/i.test(local)) return "Wearables, Home and Accessories";
   return local;
+}
+
+function isAuthoritativeNumberedSegmentLabel(label: string) {
+  return /^(?:group|segment)\s*\d+(?:\s*\([^)]+\))?$/i.test(label.trim());
 }
 
 function isGenericInlineSegmentMemberLabel(label: string) {
@@ -15752,7 +15825,7 @@ function fillSegmentAnalysis(
   const warnings: string[] = [];
   let filledCells = 0;
   let commentsAdded = 0;
-  const preserveExistingLabels = options.preserveExistingLabels === true;
+  const preserveRequestedExistingLabels = options.preserveExistingLabels === true;
   const revenueConcepts = C.revenue;
   const rows = segmentMetricRows(sheet, "Total Company Revenue", "Revenue Mix", columns);
   const operatingIncomeRows = segmentMetricRows(sheet, "Total Company Operating Income", "Operating Income Check", columns);
@@ -15761,6 +15834,9 @@ function fillSegmentAnalysis(
     selectReconciledRevenueSegmentFamilyForTemplate(segments, periods, ctx, Math.max(rows.length, 1))?.segments ?? [];
   const fallbackSegment = reconciledSegments.length ? null : reportedRevenueFallbackSegment(periods, ctx);
   const usableSegments = reconciledSegments.length ? reconciledSegments : fallbackSegment ? [fallbackSegment] : [];
+  const preserveExistingLabels =
+    preserveRequestedExistingLabels &&
+    shouldPreserveExistingSegmentLabels(sheet, periods, columns, usableSegments);
   const usesReportedRevenueFallback = usableSegments.some((segment) => isReportedConsolidatedFallbackSegment(segment, "values"));
 
   if (!usableSegments.length) {
