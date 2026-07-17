@@ -21,8 +21,17 @@ const checks = [
     message: "Native picker change must synchronously populate shared workbook state."
   },
   {
-    ok: !/onChangeCapture=|onInputCapture=|onInput=\{handleFileInput\}|handleFilePickerActivation|syncInputSelectionSoon|inputSyncTimersRef|inputSyncFrameRef/.test(source),
-    message: "Picker selection must not be raced by duplicate capture handlers or focus timers."
+    ok: /function prepareFilePicker\(event: MouseEvent<HTMLInputElement>\)[\s\S]*event\.currentTarget\.value = "";/.test(source)
+      && /onClick=\{prepareFilePicker\}[\s\S]*onChange=\{handleFileSelect\}/.test(source),
+    message: "Native picker activation must clear only the input value so selecting the same workbook again still emits a change."
+  },
+  {
+    ok: /input\.addEventListener\("change", handleNativeSelection\)/.test(source)
+      && /input\.addEventListener\("input", handleNativeSelection\)/.test(source)
+      && /window\.addEventListener\("focus", handlePickerReturn\)/.test(source)
+      && /document\.addEventListener\("visibilitychange", handleVisibilityChange\)/.test(source)
+      && /const scheduleFileInputSelectionSync = useCallback[\s\S]*\[0, 100, 400\]/.test(source),
+    message: "Picker selection must resync from the native input after change/input events and after the OS picker returns focus."
   },
   {
     ok: /onDragEnter=\{handleDrag\}/.test(source)
