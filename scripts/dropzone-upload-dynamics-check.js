@@ -12,10 +12,10 @@ const checks = [
     message: "A single native .xlsx file input must own picker selection."
   },
   {
-    ok: /data-testid="workbook-dropzone"[\s\S]*<input[\s\S]*className="fileInput"[\s\S]*type="file"/.test(source)
-      && /<label className="dropzonePicker" htmlFor="model-template-file">/.test(source)
-      && /\.fileInput\s*\{[\s\S]*width:\s*1px;[\s\S]*clip:\s*rect\(0, 0, 0, 0\);/.test(styles),
-    message: "The visible picker must be an explicit label for one visually hidden native file input."
+    ok: /data-testid="workbook-dropzone"[\s\S]*<label className="dropzonePicker">[\s\S]*<input[\s\S]*className="fileInput"[\s\S]*type="file"/.test(source)
+      && /\.fileInput\s*\{[\s\S]*width:\s*min\(100%, 520px\);[\s\S]*border:\s*1px solid var\(--line\);/.test(styles)
+      && !/\.fileInput\s*\{[\s\S]*clip:\s*rect\(/.test(styles),
+    message: "The browser-managed file control must remain visible so its native filename is always shown."
   },
   {
     ok: /function handleFileSelect\(event: SyntheticEvent<HTMLInputElement>\)[\s\S]*syncFileInputSelection\(event\.currentTarget\)/.test(source),
@@ -53,13 +53,20 @@ const checks = [
     message: "A valid workbook must update synchronous submission state and visible React state."
   },
   {
+    ok: /function workbookNameFromInputValue\(value: string\)/.test(source)
+      && /const selectedName = selected\?\.name \?\? workbookNameFromInputValue\(input\?\.value \?\? ""\);/.test(source)
+      && /if \(selectedName\) setNativeFileName\(selectedName\);/.test(source)
+      && /const selectedWorkbookName = file\?\.name \?\? nativeFileName;/.test(source),
+    message: "The dropzone must display the native selected filename even while the browser is still exposing the File object."
+  },
+  {
     ok: /const selectedFile =\s*selectedFileRef\.current\s*\?\?\s*file\s*\?\?\s*\(nativeFile instanceof File && nativeFile\.size > 0 \? nativeFile : null\)/.test(source),
     message: "Submit must use the selected workbook even if a render has not completed yet."
   },
   {
-    ok: /<label className="dropzonePicker" htmlFor="model-template-file">[\s\S]*<span className="browseCue" aria-hidden="true">/.test(source)
+    ok: /<label className="dropzonePicker">[\s\S]*<input[\s\S]*id="model-template-file"[\s\S]*type="file"/.test(source)
       && !/openWorkbookPicker|handleDropzoneClick|handleDropzoneKeyDown/.test(source),
-    message: "The full visible dropzone must activate its associated native input without scripted picker activation."
+    message: "The full visible dropzone must contain and activate the native picker without scripted activation."
   }
 ];
 

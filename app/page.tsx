@@ -38,6 +38,10 @@ function isSupportedWorkbookFile(file: File) {
   return SUPPORTED_WORKBOOK_EXTENSIONS.some((extension) => fileName.endsWith(extension));
 }
 
+function workbookNameFromInputValue(value: string) {
+  return value.split(/[/\\]/).pop()?.trim() ?? "";
+}
+
 function sameWorkbookFile(left: File | null, right: File | null) {
   if (!left || !right) return false;
   return left.name === right.name && left.size === right.size && left.lastModified === right.lastModified;
@@ -75,6 +79,7 @@ export default function Home() {
   const [ticker, setTicker] = useState("");
   const [accessKey, setAccessKey] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [nativeFileName, setNativeFileName] = useState("");
   const [isDragging, setIsDragging] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [summary, setSummary] = useState<FillSummary | null>(null);
@@ -86,6 +91,7 @@ export default function Home() {
   const fileInputSyncTimersRef = useRef<number[]>([]);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
+  const selectedWorkbookName = file?.name ?? nativeFileName;
 
   const clearFileInput = useCallback(() => {
     if (!fileInputRef.current) return;
@@ -107,12 +113,14 @@ export default function Home() {
     if (!isSupportedWorkbookFile(nextFile)) {
       selectedFileRef.current = null;
       setFile(null);
+      setNativeFileName("");
       clearFileInput();
       setError({ message: `${nextFile.name} is not a supported .xlsx workbook.` });
       return;
     }
     selectedFileRef.current = nextFile;
     setFile(nextFile);
+    setNativeFileName(nextFile.name);
   }, [clearFileInput]);
 
   const handleDroppedWorkbook = useCallback((dataTransfer: DataTransfer | null) => {
@@ -125,7 +133,9 @@ export default function Home() {
   }, [handleWorkbookSelected]);
 
   const syncFileInputSelection = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
-    const selected = input?.files?.item(0);
+    const selected = input?.files?.item(0) ?? null;
+    const selectedName = selected?.name ?? workbookNameFromInputValue(input?.value ?? "");
+    if (selectedName) setNativeFileName(selectedName);
     if (selected) handleWorkbookSelected(selected);
   }, [handleWorkbookSelected]);
 
@@ -399,43 +409,40 @@ export default function Home() {
           </div>
 
           <div
-            className={`dropzone${isDragging ? " dragging" : ""}${file ? " hasFile" : ""}`}
+            className={`dropzone${isDragging ? " dragging" : ""}${selectedWorkbookName ? " hasFile" : ""}`}
             data-testid="workbook-dropzone"
             onDragEnter={handleDrag}
             onDragOver={handleDrag}
             onDragLeave={handleDrag}
             onDrop={handleDrop}
           >
-            <input
-              id="model-template-file"
-              ref={fileInputRef}
-              className="fileInput"
-              type="file"
-              name="file"
-              accept={SUPPORTED_WORKBOOK_ACCEPT}
-              aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
-              disabled={isSubmitting}
-              onClick={handleFilePickerOpen}
-              onInput={handleFileSelect}
-              onChange={handleFileSelect}
-            />
-            <label className="dropzonePicker" htmlFor="model-template-file">
+            <label className="dropzonePicker">
               <span className="dropIcon">
-                {file ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
+                {selectedWorkbookName ? <FileCheck2 aria-hidden="true" size={30} /> : <UploadCloud aria-hidden="true" size={30} />}
               </span>
-              <span className="dropTitle">{file ? "Workbook selected" : "Drop Excel model here"}</span>
-              {file ? (
+              <span className="dropTitle">{selectedWorkbookName ? "Workbook selected" : "Drop Excel model here"}</span>
+              {selectedWorkbookName ? (
                 <span className="selectedFile" aria-live="polite">
                   <FileSpreadsheet aria-hidden="true" size={18} />
-                  <span>{file.name}</span>
-                  <small>{formatFileSize(file.size)}</small>
+                  <span>{selectedWorkbookName}</span>
+                  {file ? <small>{formatFileSize(file.size)}</small> : null}
                 </span>
               ) : (
                 <small>Click to browse or drag in an .xlsx file</small>
               )}
-              <span className="browseCue" aria-hidden="true">
-                {file ? "Choose different workbook" : "Choose workbook"}
-              </span>
+              <input
+                id="model-template-file"
+                ref={fileInputRef}
+                className="fileInput"
+                type="file"
+                name="file"
+                accept={SUPPORTED_WORKBOOK_ACCEPT}
+                aria-label={selectedWorkbookName ? `Selected workbook ${selectedWorkbookName}. Choose a different workbook.` : "Choose Excel workbook"}
+                disabled={isSubmitting}
+                onClick={handleFilePickerOpen}
+                onInput={handleFileSelect}
+                onChange={handleFileSelect}
+              />
             </label>
           </div>
 
