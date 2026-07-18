@@ -5013,7 +5013,14 @@ function isOperatingSpecialChargeSource(source: FactSource) {
   if (isComprehensiveIncomeSource(source)) return false;
   if (OPERATING_SPECIAL_CHARGE_CONCEPTS.includes(source.concept)) return true;
   const text = sourceSearchText(source);
-  return /\b(restructuring|impairment|special items?|special charges?|integration costs?|business realignment|acquisition[-\s]?related charges?|litigation|settlement|accretion|business divestitures?)\b/.test(text);
+  const explicitSettlementCharge =
+    /\bsettlements?\b/.test(text) &&
+    /\b(expenses?|charges?|gains?|loss(?:es)?|income|litigation|legal|lawsuits?|claims?|restructuring|pension|withdrawal)\b/.test(text);
+  return (
+    /\b(restructuring|impairment|special items?|special charges?|integration costs?|business realignment|acquisition[-\s]?related charges?|litigation|accretion|business divestitures?)\b/.test(
+      text
+    ) || explicitSettlementCharge
+  );
 }
 
 function otherOperatingLineValue(source: FactSource) {
@@ -6961,12 +6968,12 @@ function resolvePreTaxAdjustments(period: string, ctx: ResolveContext): Resolved
     };
   }
 
-  return {
-    value: 0,
-    sources: [zeroSource("PreTaxAdjustmentsNotReported")],
-    note: "No EDGAR-supported pre-tax adjustment item was reported for this period, so the adjusted net income bridge uses zero instead of preserving stale model hardcodes.",
-    classification: "grouped"
-  };
+  return primaryIncomeStatementPresentationZeroResolved(
+    period,
+    ctx,
+    "PreTaxAdjustmentsNotReported",
+    "No pre-tax adjustment item was separately reported on the complete EDGAR primary income statement, so the adjusted net income bridge uses zero instead of preserving stale model hardcodes."
+  );
 }
 
 function resolvePostTaxAdjustments(period: string, ctx: ResolveContext): ResolvedValue {
@@ -6993,12 +7000,12 @@ function resolvePostTaxAdjustments(period: string, ctx: ResolveContext): Resolve
   const taxEffect = taxEffectForPreTaxAdjustment(period, ctx, preTaxAdjustment);
   if (taxEffect.value !== null) return taxEffect;
 
-  return {
-    value: 0,
-    sources: [zeroSource("PostTaxAdjustmentsNotReported")],
-    note: "No EDGAR-supported post-tax adjustment item was reported for this period, so the adjusted net income bridge uses zero instead of preserving stale model hardcodes.",
-    classification: "grouped"
-  };
+  return primaryIncomeStatementPresentationZeroResolved(
+    period,
+    ctx,
+    "PostTaxAdjustmentsNotReported",
+    "No post-tax adjustment item was separately reported on the complete EDGAR primary income statement, so the adjusted net income bridge uses zero instead of preserving stale model hardcodes."
+  );
 }
 
 function equityMethodIncomeBelongsInPostTaxBridge(period: string, ctx: ResolveContext, source: FactSource | null = first(period, ctx.duration, EQUITY_METHOD_INCOME_CONCEPTS)) {
@@ -11229,7 +11236,7 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
           if (refreshedFormula) {
             preservedReportedFormula = true;
             updatedReportedIncomeFormula = refreshedFormula.formulaUpdated;
-          } else if (!isNumericConstantFormula(formulaForCell(cell))) {
+          } else if (!isNumericConstantFormula(formulaForCell(cell)) && !isOptionalIncomeAdjustmentRowLabel(effectiveFillRow.label)) {
             // A fourth-quarter/annual formula can depend on earlier cells that
             // are populated later in this pass. Preserve it for the dedicated
             // post-fill reconciliation instead of destroying template logic.
@@ -19435,17 +19442,23 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
   const noncontrollingIncomeRow = findIncomeStatementMetricRow(sheet, ["Income (Loss) due to Non-Controlling Interest", "Income (Loss) due to Noncontrolling Interest"]);
   const adjustedNetIncomeRow = findIncomeStatementMetricRow(sheet, ["Adj. Net Income (Loss)", "Adjusted Net Income", "Adj. Net Income"]);
 
-  if (revenueRow) refreshFormulaRowCachedResults(sheet, revenueRow, columns);
-  if (grossProfitRow) refreshFormulaRowCachedResults(sheet, grossProfitRow, columns);
-  if (ebitRow) refreshFormulaRowCachedResults(sheet, ebitRow, columns);
-  if (pretaxRow) refreshFormulaRowCachedResults(sheet, pretaxRow, columns);
-  if (taxRow) refreshFormulaRowCachedResults(sheet, taxRow, columns);
-  if (netIncomeRow) refreshFormulaRowCachedResults(sheet, netIncomeRow, columns);
-  if (preTaxAdjustmentsRow) refreshFormulaRowCachedResults(sheet, preTaxAdjustmentsRow, columns);
-  if (postTaxAdjustmentsRow) refreshFormulaRowCachedResults(sheet, postTaxAdjustmentsRow, columns);
-  if (discontinuedOperationsRow) refreshFormulaRowCachedResults(sheet, discontinuedOperationsRow, columns);
-  if (noncontrollingIncomeRow) refreshFormulaRowCachedResults(sheet, noncontrollingIncomeRow, columns);
-  if (adjustedNetIncomeRow) refreshFormulaRowCachedResults(sheet, adjustedNetIncomeRow, columns);
+  const refreshKeyMetricFormula = (rowNumber: number | null) => {
+    if (rowNumber) refreshFormulaRowCachedResults(sheet, rowNumber, columns, false, () => false, { allowFormulaResultRefresh: true });
+  };
+  refreshKeyMetricFormula(revenueRow);
+  refreshKeyMetricFormula(grossProfitRow);
+  refreshKeyMetricFormula(ebitRow);
+  refreshKeyMetricFormula(pretaxRow);
+  refreshKeyMetricFormula(taxRow);
+  refreshKeyMetricFormula(netIncomeRow);
+  refreshKeyMetricFormula(preTaxAdjustmentsRow);
+  refreshKeyMetricFormula(postTaxAdjustmentsRow);
+  refreshKeyMetricFormula(discontinuedOperationsRow);
+  refreshKeyMetricFormula(noncontrollingIncomeRow);
+  refreshKeyMetricFormula(adjustedNetIncomeRow);
+  if (netIncomeRow && adjustedNetIncomeRow) {
+    refreshAdjustedNetIncomeFormulaCacheFromRowRange(sheet, netIncomeRow, adjustedNetIncomeRow, columns);
+  }
 
   const nonAnnualColumns = columns.filter((_col, index) => !isAnnualPeriod(periods[index]));
   refreshAnnualIncomeStatementFormulaCaches(sheet, nonAnnualColumns.length ? nonAnnualColumns : columns, [otherOperatingRow, otherNonOperatingRow, pretaxRow, netIncomeRow]);
@@ -19542,6 +19555,42 @@ function refreshFinalIncomeStatementKeyMetrics(sheet: ExcelJS.Worksheet, periods
     resolveNetIncome,
     "net income"
   );
+}
+
+function refreshAdjustedNetIncomeFormulaCacheFromRowRange(
+  sheet: ExcelJS.Worksheet,
+  netIncomeRow: number,
+  adjustedNetIncomeRow: number,
+  columns: number[]
+) {
+  let refreshedCells = 0;
+  if (adjustedNetIncomeRow <= netIncomeRow) return refreshedCells;
+
+  for (const col of uniqueNumbers(columns)) {
+    const cell = sheet.getCell(adjustedNetIncomeRow, col);
+    const formula = formulaForCell(cell);
+    const colLetter = columnLetter(col);
+    const expectedFormula = `SUM(${colLetter}${netIncomeRow}:${colLetter}${adjustedNetIncomeRow - 1})`;
+    if (!formula || normalizeFormula(formula) !== normalizeFormula(expectedFormula)) continue;
+
+    let total = 0;
+    let complete = true;
+    for (let rowNumber = netIncomeRow; rowNumber < adjustedNetIncomeRow; rowNumber += 1) {
+      const componentCell = sheet.getCell(rowNumber, col);
+      if (componentCell.value === null) continue;
+      const value = numericCellValue(componentCell);
+      if (value === null) {
+        complete = false;
+        break;
+      }
+      total += value;
+    }
+    if (!complete) continue;
+    setFormulaResult(cell, total);
+    refreshedCells += 1;
+  }
+
+  return refreshedCells;
 }
 
 function refreshAnnualIncomeStatementFormulaCaches(sheet: ExcelJS.Worksheet, periodColumns: number[], rows: Array<number | null>) {
@@ -34367,6 +34416,8 @@ export const __fillModelServiceTestHooks = {
   resolveOtherNonOperatingIncomeExpense,
   otherNonOperatingValue,
   resolveOtherOperatingIncomeExpense,
+  resolvePreTaxAdjustments,
+  resolvePostTaxAdjustments,
   resolveDiscontinuedOperationsBridge,
   fourthQuarterPresentationAbsenceResolved,
   deriveFourthQuarterPrimaryIncomeStatementAssignmentLedgerRows,
@@ -34375,9 +34426,11 @@ export const __fillModelServiceTestHooks = {
   incomeStatementOperatingBridgeTies,
   sourceBackedSupportFormulaTies,
   primaryIncomeStatementOtherOperatingLineSources,
+  isOperatingSpecialChargeSource,
   otherOperatingLineValue,
   isNumericConstantFormula,
   incomeStatementClassificationCellTiesResolvedValue,
+  refreshAdjustedNetIncomeFormulaCacheFromRowRange,
   sourceLooksLikeCurrentInvestment,
   sourceLooksLikeCashLikeShortTermInvestment,
   sourceLooksLikeNonCurrentCashBalance,

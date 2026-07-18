@@ -25,6 +25,20 @@ const expected1Q26 = {
   "Adj. Net Income (Loss)": 3924
 };
 
+const expectedOtherOperatingHistory = {
+  "4Q24": -176,
+  FY24: -4163,
+  "4Q25": -1059,
+  FY25: -1261
+};
+
+const expectedEbitHistory = {
+  "4Q24": 2709,
+  FY24: 9992,
+  "4Q25": 1841,
+  FY25: 13762
+};
+
 function cellValue(cell) {
   const value = cell.value;
   if (typeof value === "number" || typeof value === "string") return value;
@@ -166,6 +180,30 @@ async function main() {
     }
     const actual = cellValue(model.getCell(rowNumber, col));
     if (!valuesMatch(actual, expected)) errors.push(`${period} ${label}: expected ${expected}, got ${actual ?? "[blank]"}.`);
+  }
+
+  for (const [historicalPeriod, expected] of Object.entries(expectedOtherOperatingHistory)) {
+    const historicalCol = findPeriodColumn(model, historicalPeriod);
+    const rowNumber = row("Other Operating Income (Expense)");
+    if (!historicalCol || !rowNumber) {
+      errors.push(`Could not find ${historicalPeriod} Other Operating Income (Expense) cell.`);
+      continue;
+    }
+    const actual = cellValue(model.getCell(rowNumber, historicalCol));
+    if (!valuesMatch(actual, expected)) {
+      errors.push(`${historicalPeriod} Other Operating Income (Expense): expected ${expected}, got ${actual ?? "[blank]"}.`);
+    }
+  }
+
+  for (const [historicalPeriod, expected] of Object.entries(expectedEbitHistory)) {
+    const historicalCol = findPeriodColumn(model, historicalPeriod);
+    const rowNumber = row("EBIT");
+    if (!historicalCol || !rowNumber) {
+      errors.push(`Could not find ${historicalPeriod} EBIT cell.`);
+      continue;
+    }
+    const actual = cellValue(model.getCell(rowNumber, historicalCol));
+    if (!valuesMatch(actual, expected)) errors.push(`${historicalPeriod} EBIT: expected ${expected}, got ${actual ?? "[blank]"}.`);
   }
 
   const ebitFormula = formula(model.getCell(row("EBIT"), col));

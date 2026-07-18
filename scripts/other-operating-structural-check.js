@@ -3,6 +3,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const Module = require("node:module");
 const ts = require("typescript");
+const ExcelJS = require("exceljs");
 
 const repoRoot = path.resolve(__dirname, "..");
 const sourcePath = path.join(repoRoot, "server", "fill-model", "fill-model-service.ts");
@@ -73,7 +74,9 @@ const rows = [
   statementRow(8, "Restructuring charges", "RestructuringCharges", 33_200_000),
   statementRow(9, "Operating income", "OperatingIncomeLoss", 2_780_200_000),
   statementRow(10, "Interest expense", "InterestExpense", 508_200_000),
-  statementRow(11, "Income before income taxes", "IncomeLossFromContinuingOperationsBeforeIncomeTaxes", 2_191_500_000)
+  statementRow(11, "Income before income taxes", "IncomeLossFromContinuingOperationsBeforeIncomeTaxes", 2_191_500_000),
+  statementRow(12, "Income tax expense", "IncomeTaxExpenseBenefit", 400_000_000),
+  statementRow(13, "Net income", "NetIncomeLoss", 1_791_500_000)
 ];
 
 const leaseRows = [
@@ -291,6 +294,21 @@ assert.equal(otherOperating.value, -132_000_000);
 assert.equal(otherOperating.sources.some((source) => source.concept === "PensionAndOtherPostretirementBenefitExpense"), true);
 assert.equal(otherOperating.sources.some((source) => source.concept === "GainLossOnDispositionOfAssetsAndImpairmentsNet"), true);
 
+const absentPreTaxAdjustments = hooks.resolvePreTaxAdjustments("FY23", ctx);
+assert.equal(absentPreTaxAdjustments.value, 0);
+assert.equal(
+  absentPreTaxAdjustments.sources.some((source) => source.sourceLayer === "derived" && source.accn === accession),
+  true,
+  "A zero for an absent optional pre-tax adjustment must be derived from the complete EDGAR primary statement, not invented as a model-only zero."
+);
+const absentPostTaxAdjustments = hooks.resolvePostTaxAdjustments("FY23", ctx);
+assert.equal(absentPostTaxAdjustments.value, 0);
+assert.equal(
+  absentPostTaxAdjustments.sources.some((source) => source.sourceLayer === "derived" && source.accn === accession),
+  true,
+  "A zero for an absent optional post-tax adjustment must be derived from the complete EDGAR primary statement, not invented as a model-only zero."
+);
+
 const divergentPretaxRows = rows.map((row) =>
   row.xbrlConcept === "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
     ? { ...row, value: row.value + 65_000_000 }
@@ -399,6 +417,20 @@ assert.equal(
   62_000_000,
   "A negative reported charge is an operating credit/reversal and must not be forced back to an expense."
 );
+assert.equal(
+  hooks.isOperatingSpecialChargeSource({
+    concept: "SupplierFinanceProgramObligationDecreaseSettlement",
+    label: "Supplier Finance Program Obligation Decrease Settlement",
+    value: 4_974_000_000
+  }),
+  false,
+  "A supplier-finance obligation settlement is a financing-program disclosure, not an income-statement operating charge."
+);
+assert.equal(
+  hooks.isOperatingSpecialChargeSource({ concept: "LegalSettlementExpense", label: "Legal settlement expense", value: 24_000_000 }),
+  true,
+  "A settlement fact with explicit income-statement charge semantics should remain eligible for other operating expense."
+);
 
 assert.equal(hooks.isNumericConstantFormula("-24.1-5.5"), true);
 assert.equal(hooks.isNumericConstantFormula("=(-24.1)+(1.5)-6.3"), true);
@@ -410,6 +442,21 @@ assert.equal(
   "A cached SEC value must not hide a numeric formula whose recalculated result is wrong."
 );
 assert.equal(hooks.incomeStatementClassificationCellTiesResolvedValue(-90.2, -90.2, -90.2), true);
+
+const formulaWorkbook = new ExcelJS.Workbook();
+const formulaSheet = formulaWorkbook.addWorksheet("Model");
+formulaSheet.getCell("U45").value = { formula: "U42+U44", result: 3966 };
+formulaSheet.getCell("U47").value = 0;
+formulaSheet.getCell("U48").value = 0;
+formulaSheet.getCell("U49").value = 0;
+formulaSheet.getCell("U50").value = -42;
+formulaSheet.getCell("U51").value = { formula: "SUM(U45:U50)", result: 2321 };
+assert.equal(hooks.refreshAdjustedNetIncomeFormulaCacheFromRowRange(formulaSheet, 45, 51, [21]), 1);
+assert.equal(
+  formulaSheet.getCell("U51").value.result,
+  3924,
+  "The adjusted-net-income formula cache must be recomputed from the current EDGAR-backed bridge rows instead of retaining a prior-company result."
+);
 
 const noncurrentRestrictedCash = {
   concept: "RestrictedCashAndInvestmentsNoncurrent",
