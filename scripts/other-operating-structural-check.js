@@ -290,6 +290,50 @@ const otherOperating = hooks.resolveOtherOperatingIncomeExpense("FY23", ctx);
 assert.equal(otherOperating.value, -132_000_000);
 assert.equal(otherOperating.sources.some((source) => source.concept === "PensionAndOtherPostretirementBenefitExpense"), true);
 assert.equal(otherOperating.sources.some((source) => source.concept === "GainLossOnDispositionOfAssetsAndImpairmentsNet"), true);
+
+const divergentPretaxRows = rows.map((row) =>
+  row.xbrlConcept === "IncomeLossFromContinuingOperationsBeforeIncomeTaxes"
+    ? { ...row, value: row.value + 65_000_000 }
+    : row
+);
+const divergentPretaxCtx = {
+  ...ctx,
+  duration: new Map([
+    ...Array.from(ctx.duration.entries()).filter(([period]) => period !== "FY23"),
+    [
+      "FY23",
+      new Map(
+        divergentPretaxRows.map((row) => [
+          row.xbrlConcept,
+          {
+            concept: row.xbrlConcept,
+            label: row.rowLabel,
+            value: row.value,
+            unit: "USD",
+            taxonomy: row.taxonomy,
+            sourceLayer: "sec_filing_package",
+            accn: accession,
+            start: row.period.start,
+            end: reportDate,
+            periodKey: "FY23",
+            periodType: "annual",
+            reportDate
+          }
+        ])
+      )
+    ]
+  ]),
+  filingPackageStatements: ctx.filingPackageStatements.map((statement) =>
+    statement.accession === accession && statement.statementName === "Consolidated Statements of Income"
+      ? { ...statement, rows: divergentPretaxRows }
+      : statement
+  )
+};
+assert.equal(
+  hooks.resolveOtherOperatingIncomeExpense("FY23", divergentPretaxCtx).value,
+  -132_000_000,
+  "an explicit primary-statement other-operating presentation must remain authoritative when a broader pre-tax residual disagrees"
+);
 assert.equal(hooks.resolveOtherOperatingIncomeExpense("1Q23", ctx).value, -29_600_000);
 assert.equal(hooks.resolveOtherOperatingIncomeExpense("2Q23", ctx).value, -40_000_000);
 assert.equal(hooks.resolveOtherOperatingIncomeExpense("3Q23", ctx).value, -29_400_000);

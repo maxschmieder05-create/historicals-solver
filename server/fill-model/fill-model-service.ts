@@ -6398,12 +6398,14 @@ function resolveOtherOperatingIncomeExpenseUncached(period: string, ctx: Resolve
   }
 
   const explicitItems = resolveExplicitOtherOperatingItems(period, ctx);
-  if (explicitItems.value !== null && otherOperatingValueTiesPreTaxEquation(period, ctx, explicitItems)) return explicitItems;
+  // A standalone primary-statement line is the authoritative presentation for
+  // this model row. A residual bridge can absorb classification differences in
+  // SG&A, D&A, or below-operating rows and must not replace an explicitly
+  // reported other-operating amount.
+  if (explicitItems.value !== null) return explicitItems;
 
   const preTaxBridge = resolveOtherOperatingFromPreTaxEquation(period, ctx);
   if (preTaxBridge.value !== null) return preTaxBridge;
-
-  if (explicitItems.value !== null) return explicitItems;
 
   const reportedOperatingBridge = resolveOtherOperatingFromReportedOperatingIncomeBridge(period, ctx);
   if (reportedOperatingBridge.value !== null && !statementMetricTies(reportedOperatingBridge.value / 1_000_000, 0)) {
@@ -6444,12 +6446,6 @@ function resolveOtherOperatingIncomeExpenseUncached(period: string, ctx: Resolve
     "OtherOperatingIncomeExpenseNotReported",
     "Set to zero because no standalone other operating income/expense line was reported. Operating income tie-outs do not create this row by residual."
   );
-}
-
-function otherOperatingValueTiesPreTaxEquation(period: string, ctx: ResolveContext, resolved: ResolvedValue) {
-  if (resolved.value === null) return false;
-  const bridge = resolveOtherOperatingFromPreTaxEquation(period, ctx);
-  return bridge.value !== null && incomeStatementOperatingBridgeTies(period, resolved.value / 1_000_000, bridge.value / 1_000_000);
 }
 
 function resolveOtherOperatingFromPreTaxEquation(period: string, ctx: ResolveContext): ResolvedValue {
@@ -24182,6 +24178,12 @@ function preferredIncomeStatementResolverOverNarrowerAssignment(
   if (resolved.value === null || !Number.isFinite(resolved.value) || !resolvedHasCurrentSourceSupport(resolved)) return null;
   const assignedValue = assigned.reduce((total, row) => total + row.modelAmount, 0);
   if (statementMetricTies(resolved.value / 1_000_000, assignedValue / 1_000_000)) return null;
+
+  // Derived bridge inputs describe how a residual was calculated; they are not
+  // additional source lines assigned to this model row. Letting them count as
+  // broader row coverage makes a targeted retry preserve the exact residual
+  // that the primary-statement ledger is trying to repair.
+  if (resolved.sources.some((source) => source.sourceLayer === "derived")) return null;
 
   const secSources = resolved.sources.filter(
     (source) => source.sourceLayer !== "model" && source.sourceLayer !== "derived" && Number.isFinite(source.value)
