@@ -1,9 +1,9 @@
 "use client";
 
 import {
-  ChangeEvent,
   DragEvent,
   FormEvent,
+  SyntheticEvent,
   useCallback,
   useEffect,
   useMemo,
@@ -83,6 +83,7 @@ export default function Home() {
   const selectedFileRef = useRef<File | null>(null);
   const dragDepthRef = useRef(0);
   const activeRequestRef = useRef<AbortController | null>(null);
+  const fileInputSyncTimersRef = useRef<number[]>([]);
 
   const canSubmit = useMemo(() => !isSubmitting, [isSubmitting]);
 
@@ -123,6 +124,23 @@ export default function Home() {
     handleWorkbookSelected(droppedFile);
   }, [handleWorkbookSelected]);
 
+  const syncFileInputSelection = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
+    const selected = input?.files?.item(0);
+    if (selected) handleWorkbookSelected(selected);
+  }, [handleWorkbookSelected]);
+
+  const clearFileInputSyncTimers = useCallback(() => {
+    for (const timer of fileInputSyncTimersRef.current) window.clearTimeout(timer);
+    fileInputSyncTimersRef.current = [];
+  }, []);
+
+  const syncFileInputSelectionSoon = useCallback((input: HTMLInputElement | null = fileInputRef.current) => {
+    clearFileInputSyncTimers();
+    fileInputSyncTimersRef.current = [0, 50, 200, 500, 1000].map((delay) =>
+      window.setTimeout(() => syncFileInputSelection(input), delay)
+    );
+  }, [clearFileInputSyncTimers, syncFileInputSelection]);
+
   useEffect(() => {
     function handleWindowDragOver(event: globalThis.DragEvent) {
       if (!markWorkbookDropEffect(event.dataTransfer)) return;
@@ -158,6 +176,23 @@ export default function Home() {
 
   useEffect(() => () => activeRequestRef.current?.abort(), []);
 
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) return;
+
+    const handleNativeSelection = () => syncFileInputSelection(input);
+    const handleWindowFocus = () => syncFileInputSelectionSoon(input);
+    input.addEventListener("input", handleNativeSelection);
+    input.addEventListener("change", handleNativeSelection);
+    window.addEventListener("focus", handleWindowFocus);
+    return () => {
+      input.removeEventListener("input", handleNativeSelection);
+      input.removeEventListener("change", handleNativeSelection);
+      window.removeEventListener("focus", handleWindowFocus);
+      clearFileInputSyncTimers();
+    };
+  }, [clearFileInputSyncTimers, syncFileInputSelection, syncFileInputSelectionSoon]);
+
   function handleDrag(event: DragEvent<HTMLElement>) {
     event.preventDefault();
     event.stopPropagation();
@@ -188,12 +223,15 @@ export default function Home() {
     handleDroppedWorkbook(event.dataTransfer);
   }
 
-  function handleFileSelect(event: ChangeEvent<HTMLInputElement>) {
-    const selected = event.currentTarget.files?.item(0);
-    handleWorkbookSelected(selected);
-    // Keep the File object in React state/ref, then reset the native control so
-    // selecting the same workbook again still emits a change event.
+  function handleFileSelect(event: SyntheticEvent<HTMLInputElement>) {
+    syncFileInputSelection(event.currentTarget);
+  }
+
+  function handleFilePickerOpen(event: SyntheticEvent<HTMLInputElement>) {
+    // Clear before opening so choosing the same file again emits a selection
+    // event, while retaining the previous File in React state if the user cancels.
     event.currentTarget.value = "";
+    syncFileInputSelectionSoon(event.currentTarget);
   }
 
   function cancelFill() {
@@ -377,6 +415,8 @@ export default function Home() {
               accept={SUPPORTED_WORKBOOK_ACCEPT}
               aria-label={file ? `Selected workbook ${file.name}. Choose a different workbook.` : "Choose Excel workbook"}
               disabled={isSubmitting}
+              onClick={handleFilePickerOpen}
+              onInput={handleFileSelect}
               onChange={handleFileSelect}
             />
             <label className="dropzonePicker" htmlFor="model-template-file">

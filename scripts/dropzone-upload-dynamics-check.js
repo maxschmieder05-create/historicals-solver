@@ -8,7 +8,7 @@ const styles = fs.readFileSync(stylesPath, "utf8");
 
 const checks = [
   {
-    ok: /<input[\s\S]*className="fileInput"[\s\S]*type="file"[\s\S]*name="file"[\s\S]*accept=\{SUPPORTED_WORKBOOK_ACCEPT\}[\s\S]*onChange=\{handleFileSelect\}/.test(source),
+    ok: /<input[\s\S]*className="fileInput"[\s\S]*type="file"[\s\S]*name="file"[\s\S]*accept=\{SUPPORTED_WORKBOOK_ACCEPT\}[\s\S]*onClick=\{handleFilePickerOpen\}[\s\S]*onInput=\{handleFileSelect\}[\s\S]*onChange=\{handleFileSelect\}/.test(source),
     message: "A single native .xlsx file input must own picker selection."
   },
   {
@@ -18,13 +18,16 @@ const checks = [
     message: "The visible picker must be an explicit label for one visually hidden native file input."
   },
   {
-    ok: /function handleFileSelect\(event: ChangeEvent<HTMLInputElement>\)[\s\S]*const selected = event\.currentTarget\.files\?\.item\(0\);[\s\S]*handleWorkbookSelected\(selected\)/.test(source),
-    message: "Native picker change must synchronously populate shared workbook state."
+    ok: /function handleFileSelect\(event: SyntheticEvent<HTMLInputElement>\)[\s\S]*syncFileInputSelection\(event\.currentTarget\)/.test(source),
+    message: "Native picker input/change events must synchronously populate shared workbook state."
   },
   {
-    ok: /handleWorkbookSelected\(selected\);[\s\S]*event\.currentTarget\.value = "";/.test(source)
-      && !/prepareFilePicker|pickerSyncTimersRef|handlePickerReturn/.test(source),
-    message: "The selected File must be retained before the native input resets for same-file reselection."
+    ok: /function handleFilePickerOpen\(event: SyntheticEvent<HTMLInputElement>\)[\s\S]*event\.currentTarget\.value = "";[\s\S]*syncFileInputSelectionSoon\(event\.currentTarget\)/.test(source),
+    message: "The native input must reset before opening and resync after the file picker returns."
+  },
+  {
+    ok: /input\.addEventListener\("input", handleNativeSelection\);[\s\S]*input\.addEventListener\("change", handleNativeSelection\);[\s\S]*window\.addEventListener\("focus", handleWindowFocus\);/.test(source),
+    message: "Native file events and picker-return focus must provide fallbacks when synthetic change events are missed."
   },
   {
     ok: /onDragEnter=\{handleDrag\}/.test(source)
