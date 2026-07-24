@@ -27,4 +27,4 @@
 
 ## Local Server
 
-- After source changes, make sure the dev server is running and verify `http://localhost:3000` responds successfully.
+- After source changes, run `npm run dev:ensure` so the supervised dev server remains alive after the launching shell exits, and verify `http://localhost:3000` responds successfully.

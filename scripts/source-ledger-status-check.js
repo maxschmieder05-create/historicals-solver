@@ -1206,6 +1206,73 @@ assert.equal(wrongFinalPeriodValidation.status, "blocked", "the final derived ou
     "a non-core optional formula with no strict current value stays outside financial provenance instead of surfacing stale cached data"
   );
 
+  const unsupportedScheduleWorkbook = new ExcelJS.Workbook();
+  const unsupportedScheduleSheet = unsupportedScheduleWorkbook.addWorksheet("Model");
+  unsupportedScheduleSheet.getCell("C28").value = "Revenue";
+  unsupportedScheduleSheet.getCell("F28").value = 100;
+  unsupportedScheduleSheet.getCell("C194").value = "Depreciation Expense";
+  unsupportedScheduleSheet.getCell("F194").value = { formula: "-409+207", result: -202 };
+  unsupportedScheduleSheet.getCell("C202").value = "Depreciation as a % of Sales";
+  unsupportedScheduleSheet.getCell("F202").value = { formula: "-F194/F28", result: 2.02 };
+  unsupportedScheduleSheet.getCell("C208").value = "Amortization Expense";
+  unsupportedScheduleSheet.getCell("F208").value = { formula: "F28-F194", result: 302 };
+  const unsupportedScheduleAudit = [
+    auditRow({
+      cell: "F28",
+      modelRowLabel: "Revenue",
+      valueWritten: 100,
+      conceptsUsed: "RevenueFromContractWithCustomerExcludingAssessedTax=100mm",
+      sourceStatement: "income",
+      accession: "0000000000-23-000001",
+      sourceProvenance: [provenance({ value: 100 })]
+    })
+  ];
+  const unsupportedScheduleRows = __fillModelServiceTestHooks.buildHistoricalSourceLedgerRows(
+    company,
+    periodEntries,
+    unsupportedScheduleSheet,
+    [
+      { row: 28, label: "Revenue", classification: "direct", statement: "income", kind: "duration" },
+      { row: 194, label: "Depreciation Expense", classification: "partial", statement: "support", kind: "duration" },
+      { row: 202, label: "Depreciation as a % of Sales", classification: "formula", statement: "support", kind: "duration" },
+      { row: 208, label: "Amortization Expense", classification: "formula", statement: "support", kind: "duration" }
+    ],
+    [{ period: "1Q23", col: 6 }],
+    unsupportedScheduleAudit
+  );
+  const unsupportedScheduleResult = __fillModelServiceTestHooks.clearUnsupportedOptionalHistoricalFormulas(
+    unsupportedScheduleWorkbook,
+    unsupportedScheduleRows,
+    unsupportedScheduleAudit
+  );
+  assert.equal(unsupportedScheduleResult.clearedCells, 3);
+  assert.equal(unsupportedScheduleSheet.getCell("F194").value, null);
+  assert.equal(unsupportedScheduleSheet.getCell("F202").value, null);
+  assert.equal(unsupportedScheduleSheet.getCell("F208").value, null);
+  assert.equal(
+    unsupportedScheduleAudit.filter((row) => row.formulaStatus === "unsupported optional historical formula cleared").length,
+    3,
+    "unsupported literal formulas and every optional historical formula that depends on them must be cleared and audited"
+  );
+  const cleanedUnsupportedScheduleRows = __fillModelServiceTestHooks.buildHistoricalSourceLedgerRows(
+    company,
+    periodEntries,
+    unsupportedScheduleSheet,
+    [
+      { row: 28, label: "Revenue", classification: "direct", statement: "income", kind: "duration" },
+      { row: 194, label: "Depreciation Expense", classification: "partial", statement: "support", kind: "duration" },
+      { row: 202, label: "Depreciation as a % of Sales", classification: "formula", statement: "support", kind: "duration" },
+      { row: 208, label: "Amortization Expense", classification: "formula", statement: "support", kind: "duration" }
+    ],
+    [{ period: "1Q23", col: 6 }],
+    unsupportedScheduleAudit
+  );
+  assert.deepEqual(
+    await validateHistoricalSourceLedger(cleanedUnsupportedScheduleRows, periodEntries, company, new Map()),
+    [],
+    "cleared optional schedule formulas must no longer fail source-backed validation"
+  );
+
   presentationSheet.getCell("C30").value = "Revenue";
   presentationSheet.getCell("F30").value = 100;
   presentationSheet.getCell("C36").value = "Calendar-adjusted support formula";

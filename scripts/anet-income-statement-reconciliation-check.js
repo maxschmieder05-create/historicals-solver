@@ -292,6 +292,59 @@ const preferred = hooks.preferredIncomeStatementResolverOverNarrowerAssignment(p
 ]);
 assert.equal(preferred.value, -118_521_000, "a narrower assignment ledger must not overwrite a broader SEC-backed SG&A grouping");
 
+const combinedNonOperatingRows = [
+  [1, "Revenue", "RevenueFromContractWithCustomerExcludingAssessedTax", 10_000_000_000],
+  [2, "Cost of revenue", "CostOfGoodsAndServicesSold", 6_000_000_000],
+  [3, "Operating income", "OperatingIncomeLoss", 4_000_000_000],
+  [4, "Other income/(expense), net", "NonoperatingIncomeExpense", -393_000_000],
+  [5, "Income before taxes", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", 3_607_000_000],
+  [6, "Income tax expense", "IncomeTaxExpenseBenefit", 600_000_000],
+  [7, "Net income", "NetIncomeLoss", 3_007_000_000]
+].map(([rowOrder, label, concept, value]) => statementRow({ rowOrder, label, concept, value, accession, start, end }));
+const combinedNonOperatingCtx = contextForStatements([
+  { period, accession, start, end, form: "10-Q", filingDate: end, rows: combinedNonOperatingRows }
+]);
+combinedNonOperatingCtx.duration.get(period).set("InterestExpense", {
+  concept: "InterestExpense",
+  label: "Interest expense disclosed outside the primary statement",
+  value: 1_003_000_000,
+  unit: "USD",
+  accn: accession,
+  start,
+  end,
+  periodKey: period,
+  periodType: "quarterly",
+  sourceLayer: "sec_live_companyfacts"
+});
+const splitReportedLinePreferred = hooks.preferredIncomeStatementResolverOverNarrowerAssignment(
+  period,
+  combinedNonOperatingCtx,
+  "Other Non-Operating Income (Expense)",
+  [
+    {
+      fiscalPeriod: period,
+      sourceFilingAccession: accession,
+      sourceStatement: "Consolidated Statements of Operations",
+      sourceLineItemLabel: "Other income/(expense), net",
+      sourceAmount: -393_000_000,
+      modelAmount: -393_000_000,
+      sourceXbrlTag: "NonoperatingIncomeExpense",
+      assignedModelRow: "Other Non-Operating Income (Expense)",
+      assignmentStatus: "mapped_to_model_row",
+      classificationReason: "primary combined non-operating line",
+      llmUsed: false,
+      validationStatus: "OK!",
+      sourceSection: "below operating income",
+      sourceRowKey: "combined-other"
+    }
+  ]
+);
+assert.equal(
+  splitReportedLinePreferred.value,
+  610_000_000,
+  "a combined primary non-operating line must be split after separately sourced interest expense instead of double-counting interest"
+);
+
 function annualRows(period, accession, start, end, values) {
   return [
     [1, "Revenue", "RevenueFromContractWithCustomerExcludingAssessedTax", values.revenue],

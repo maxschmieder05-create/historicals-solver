@@ -47,6 +47,17 @@ function sameWorkbookFile(left: File | null, right: File | null) {
   return left.name === right.name && left.size === right.size && left.lastModified === right.lastModified;
 }
 
+function fillRequestErrorMessage(caught: unknown, wasCancelled: boolean) {
+  if (wasCancelled) return "Workbook fill cancelled. No output was downloaded.";
+  if (
+    caught instanceof TypeError
+    && /failed to fetch|load failed|network\s*error|networkerror/i.test(caught.message)
+  ) {
+    return "The app server connection was lost. Your workbook is still selected; wait a moment and try again. If you are running locally, restart it with npm run dev:ensure.";
+  }
+  return caught instanceof Error ? caught.message : "Something went wrong.";
+}
+
 function hasTransferredFiles(dataTransfer: DataTransfer | null) {
   if (!dataTransfer) return false;
   const types = Array.from(dataTransfer.types ?? []).map((type) => type.toLowerCase());
@@ -320,11 +331,7 @@ export default function Home() {
       URL.revokeObjectURL(downloadUrl);
     } catch (caught) {
       setError({
-        message: controller.signal.aborted
-          ? "Workbook fill cancelled. No output was downloaded."
-          : caught instanceof Error
-            ? caught.message
-            : "Something went wrong."
+        message: fillRequestErrorMessage(caught, controller.signal.aborted)
       });
     } finally {
       if (activeRequestRef.current === controller) activeRequestRef.current = null;

@@ -4676,6 +4676,15 @@ function primaryIntangibleAssetSources(period: string, ctx: ResolveContext) {
   return withAcceptedModelRowClassifications(period, ctx, sources, "Intangible Assets, Net");
 }
 
+function primaryGoodwillSources(period: string, ctx: ResolveContext) {
+  const sources = primaryBalanceSheetComponentSources(period, ctx, (source, row) => {
+    if (isPrimaryBalanceSheetSubtotalSource(source) || !primaryRowInNonCurrentAssetSection(row, source)) return false;
+    if (sourceLooksLikeIntangiblesIncludingGoodwill(source)) return false;
+    return C.goodwill.includes(source.concept) || sourceTextMatches(source, /\bgoodwill\b/);
+  });
+  return withAcceptedModelRowClassifications(period, ctx, sources, "Goodwill");
+}
+
 function primaryCurrentLiabilitySectionWasInspected(period: string, ctx: ResolveContext) {
   return primaryBalanceSheetRowsForPeriod(period, ctx).some((row) => {
     const source = primaryBalanceSheetFactSource(row, period);
@@ -8833,9 +8842,17 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
   const currentDebt = excludeCurrentDebt ? resolveCurrentDebt(period, ctx) : zeroResolved(C.currentDebt[0]);
   if (currentLiabilities && accountsPayable.value !== null && otherCurrent.value !== null && currentDebt.value !== null) {
     const residualValue = currentLiabilities.value - accountsPayable.value - otherCurrent.value - currentDebt.value;
+    const residualInputs = [currentLiabilities, accountsPayable, otherCurrent, currentDebt];
+    const derivation = bridgeSource(
+      period,
+      "AccruedLiabilitiesDerivedFromCurrentLiabilities",
+      "Accrued liabilities derived from reported current liabilities less separately modeled current-liability components",
+      residualValue,
+      residualInputs
+    );
     return {
       value: residualValue,
-      sources: compactSources([currentLiabilities, accountsPayable, otherCurrent, currentDebt]),
+      sources: [derivation, ...compactSources(residualInputs)],
       note: excludeCurrentDebt
         ? "Derived from SEC current liabilities less separately modeled accounts payable, other current liabilities, and current debt."
         : "Derived from SEC current liabilities less separately modeled accounts payable and other current liabilities. Current debt remains in accrued liabilities when the template does not expose a separate current debt row.",
@@ -8857,13 +8874,28 @@ function resolveAccruedLiabilities(period: string, ctx: ResolveContext): Resolve
 }
 
 function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = first(period, ctx.instant, C.intangibles);
-  if (direct) return { value: direct.value, sources: [direct] };
   const primaryIntangibles = resolvedFromPrimarySources(
     primaryIntangibleAssetSources(period, ctx),
     "Mapped to reported intangible asset lines from the primary consolidated balance sheet."
   );
   if (primaryIntangibles.value !== null) return primaryIntangibles;
+  if (primaryBalanceSheetPeriodWasInspected(period, ctx)) {
+    const presentationZero = supplementalNonCurrentAssetPresentationZeroResolved(
+      period,
+      ctx,
+      "IntangibleAssetsPrimaryStatementPresentationAbsence",
+      "Intangible assets were set to a presentation zero because the inspected SEC primary balance sheet did not separately present them and retained the amount within a broad non-current asset line."
+    );
+    if (presentationZero) return presentationZero;
+    return {
+      value: null,
+      sources: [],
+      note:
+        "The SEC primary balance sheet was inspected and did not separately present intangible assets; note-table or companyfacts detail was not substituted for the primary-statement presentation."
+    };
+  }
+  const direct = first(period, ctx.instant, C.intangibles);
+  if (direct) return { value: direct.value, sources: [direct] };
   return {
     value: null,
     sources: [],
@@ -8872,10 +8904,9 @@ function resolveIntangibleAssets(period: string, ctx: ResolveContext): ResolvedV
 }
 
 function combinedIntangiblesIncludingGoodwillSource(period: string, ctx: ResolveContext) {
-  return (
-    primaryBalanceSheetConceptSource(period, ctx, INTANGIBLE_ASSETS_INCLUDING_GOODWILL_CONCEPTS) ??
-    first(period, ctx.instant, INTANGIBLE_ASSETS_INCLUDING_GOODWILL_CONCEPTS)
-  );
+  const primary = primaryBalanceSheetConceptSource(period, ctx, INTANGIBLE_ASSETS_INCLUDING_GOODWILL_CONCEPTS);
+  if (primary || primaryBalanceSheetPeriodWasInspected(period, ctx)) return primary;
+  return first(period, ctx.instant, INTANGIBLE_ASSETS_INCLUDING_GOODWILL_CONCEPTS);
 }
 
 function balanceSheetSourcesMatchCurrentFiling(period: string, ctx: ResolveContext, sources: FactSource[]) {
@@ -8886,8 +8917,11 @@ function balanceSheetSourcesMatchCurrentFiling(period: string, ctx: ResolveConte
 }
 
 function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
-  const direct = first(period, ctx.instant, C.goodwill);
-  if (direct) return { value: direct.value, sources: [direct] };
+  const primaryGoodwill = resolvedFromPrimarySources(
+    primaryGoodwillSources(period, ctx),
+    "Mapped to reported goodwill from the primary consolidated balance sheet."
+  );
+  if (primaryGoodwill.value !== null) return primaryGoodwill;
 
   const combinedIntangibles = combinedIntangiblesIncludingGoodwillSource(period, ctx);
   const separateIntangibles = resolveIntangibleAssets(period, ctx);
@@ -8918,6 +8952,23 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
   }
 
   const primaryInspected = primaryBalanceSheetPeriodWasInspected(period, ctx);
+  if (primaryInspected) {
+    const presentationZero = supplementalNonCurrentAssetPresentationZeroResolved(
+      period,
+      ctx,
+      "GoodwillPrimaryStatementPresentationAbsence",
+      "Goodwill was set to a presentation zero because the inspected SEC primary balance sheet did not separately present it and retained the amount within a broad non-current asset line."
+    );
+    if (presentationZero) return presentationZero;
+    return {
+      value: null,
+      sources: [],
+      note:
+        "The SEC primary balance sheet was inspected and did not separately present goodwill; note-table or companyfacts detail was not substituted for the primary-statement presentation."
+    };
+  }
+  const direct = first(period, ctx.instant, C.goodwill);
+  if (direct) return { value: direct.value, sources: [direct] };
   const carried = primaryInspected ? null : firstWithPriorInstant(period, ctx.instant, C.goodwill);
   if (carried && !primaryInspected) {
     return {
@@ -8936,6 +8987,33 @@ function resolveGoodwill(period: string, ctx: ResolveContext): ResolvedValue {
 
 function primaryBalanceSheetPeriodWasInspected(period: string, ctx: ResolveContext) {
   return primaryBalanceSheetRowsForPeriod(period, ctx).some((row) => Boolean(primaryBalanceSheetFactSource(row, period)));
+}
+
+function supplementalNonCurrentAssetPresentationZeroResolved(
+  period: string,
+  ctx: ResolveContext,
+  concept: string,
+  note: string
+): ResolvedValue | null {
+  const anchor = primaryOtherNonCurrentAssetSources(period, ctx)[0];
+  if (!anchor?.accn) return null;
+  const source: FactSource = {
+    ...anchor,
+    concept,
+    label: `${sourceDisplayLabel({ concept, label: concept, value: 0 })} not separately presented on the primary balance sheet`,
+    value: 0,
+    sourceLayer: "derived",
+    periodKey: period,
+    periodType: "instant",
+    note
+  };
+  return {
+    value: 0,
+    sources: [source],
+    note,
+    classification: "grouped",
+    includedLineItems: [source.label]
+  };
 }
 
 function resolveOtherNonCurrentAssets(period: string, ctx: ResolveContext): ResolvedValue {
@@ -11566,6 +11644,23 @@ export async function fillModelWorkbook(input: FillModelWorkbookInput): Promise<
     warnings.push(...optionalAdjustmentFinalizeResult.warnings);
     debug.step("unsupported optional income adjustments finalized", optionalAdjustmentFinalizeResult);
     refreshFinalIncomeStatementKeyMetrics(sheet, incomeStatementPeriods, incomeStatementColumns, ctx, auditRows);
+
+    const provisionalSourceLedgerRows = buildHistoricalSourceLedgerRows(
+      company,
+      modelPeriodMap.entries,
+      sheet,
+      fillRows,
+      reportedPeriodPairs,
+      auditRows
+    );
+    const optionalHistoricalFormulaFinalizeResult = clearUnsupportedOptionalHistoricalFormulas(
+      workbook,
+      provisionalSourceLedgerRows,
+      auditRows
+    );
+    filledCells += optionalHistoricalFormulaFinalizeResult.clearedCells;
+    warnings.push(...optionalHistoricalFormulaFinalizeResult.warnings);
+    debug.step("unsupported optional historical formulas finalized", optionalHistoricalFormulaFinalizeResult);
     timing("reconciliations complete");
 
     const segmentAnalysisAssignmentLedgerRows = segmentSheet
@@ -24228,11 +24323,19 @@ function preferredIncomeStatementResolverOverNarrowerAssignment(
   const assignedValue = assigned.reduce((total, row) => total + row.modelAmount, 0);
   if (statementMetricTies(resolved.value / 1_000_000, assignedValue / 1_000_000)) return null;
 
-  // Derived bridge inputs describe how a residual was calculated; they are not
-  // additional source lines assigned to this model row. Letting them count as
-  // broader row coverage makes a targeted retry preserve the exact residual
-  // that the primary-statement ledger is trying to repair.
-  if (resolved.sources.some((source) => source.sourceLayer === "derived")) return null;
+  const derivedSources = resolved.sources.filter((source) => source.sourceLayer === "derived");
+  const isReportedNonOperatingLineSplit =
+    derivedSources.some((source) => /OtherNonOperatingIncomeExpense(?:FromReportedLine|FourthQuarterBridge)/i.test(source.concept)) &&
+    derivedSources.every((source) =>
+      /OtherNonOperatingIncomeExpense(?:FromReportedLine|FourthQuarterBridge)|InterestIncomePresentationAbsence|GoodwillImpairmentPresentationAbsence/i.test(
+        source.concept
+      )
+    );
+  // Reconciliation bridges are not extra source lines. The narrow exception is
+  // a documented split of one primary non-operating line after a dedicated
+  // interest or impairment row was separately sourced; that split must be
+  // preserved or the model double-counts the dedicated component.
+  if (derivedSources.length && !isReportedNonOperatingLineSplit) return null;
 
   const secSources = resolved.sources.filter(
     (source) => source.sourceLayer !== "model" && source.sourceLayer !== "derived" && Number.isFinite(source.value)
@@ -29104,10 +29207,16 @@ function validateBalanceSheetClassificationCompleteness(
     labels: string[];
     metricName: string;
     resolver: (period: string, ctx: ResolveContext) => ResolvedValue;
+    allowBroadNonCurrentAssetPresentation?: boolean;
   }> = [
     { labels: ["Inventory"], metricName: "inventory", resolver: resolveInventory },
-    { labels: ["Intangible Assets, Net", "Intangibles, Net"], metricName: "intangible assets", resolver: resolveIntangibleAssets },
-    { labels: ["Goodwill"], metricName: "goodwill", resolver: resolveGoodwill },
+    {
+      labels: ["Intangible Assets, Net", "Intangibles, Net"],
+      metricName: "intangible assets",
+      resolver: resolveIntangibleAssets,
+      allowBroadNonCurrentAssetPresentation: true
+    },
+    { labels: ["Goodwill"], metricName: "goodwill", resolver: resolveGoodwill, allowBroadNonCurrentAssetPresentation: true },
     { labels: ["Accounts Payable", "Accounts Payable and Accrued Liabilities", "Accounts Payable & Accrued Liabilities", "Pharmacy Costs Payable"], metricName: "accounts payable", resolver: resolveAccountsPayable },
     { labels: ["Accrued Liabilities", "Accrued Expenses", "Accrued Expenses and Other", "Accrued Expenses and Other Current Liabilities"], metricName: "accrued liabilities", resolver: resolveAccruedLiabilities },
     { labels: ["Other Current Liabilities", "Other Current Liabs"], metricName: "other current liabilities", resolver: resolveOtherCurrentLiabilities },
@@ -29138,6 +29247,23 @@ function validateBalanceSheetClassificationCompleteness(
       const protectedFormula = isProtectedFormulaOrCheckCell(cell);
       const modelValue = evaluatedCellNumber(cell, evaluator);
       if (resolved.value === null) {
+        const broadNonCurrentAssetRow = findBalanceSheetRow(sheet, [
+          "Other Non-Current Assets",
+          "Other Long-Term Assets",
+          "Other LT Assets",
+          "Other Assets and Loans"
+        ]);
+        if (
+          check.allowBroadNonCurrentAssetPresentation &&
+          broadNonCurrentAssetRow &&
+          (modelValue === null || Math.abs(modelValue) <= 0.5) &&
+          supplementalNonCurrentAssetPresentationAbsenceIsCovered(lookupPeriod, ctx)
+        ) {
+          warnings.unshift(
+            `Balance Sheet ${period}: ${check.metricName} was not separately presented on the inspected SEC primary balance sheet; the amount remains within the reported broad non-current asset line instead of being invented from note-table detail.`
+          );
+          return;
+        }
         const sourceSupport = currentSourceLedgerSupportForCell(auditRows, sheet, rowNumber, col, period, modelValue);
         if (sourceSupport) {
           warnings.unshift(
@@ -29181,6 +29307,10 @@ function validateBalanceSheetClassificationCompleteness(
   }
 
   return unique(errors);
+}
+
+function supplementalNonCurrentAssetPresentationAbsenceIsCovered(period: string, ctx: ResolveContext) {
+  return primaryBalanceSheetPeriodWasInspected(period, ctx) && primaryOtherNonCurrentAssetSources(period, ctx).length > 0;
 }
 
 function currentSourceLedgerSupportForCell(
@@ -32501,7 +32631,12 @@ export function sourceLedgerStatusForAuditRow(row: MappingAuditRow): SourceLedge
     }
     if (presentationAbsences.length === 1) {
       const presentation = presentationAbsences[0];
-      return /income/i.test(row.sourceStatement) &&
+      const acceptedStatementPresentation =
+        /income/i.test(row.sourceStatement) ||
+        (/balance/i.test(row.sourceStatement) &&
+          /^(?:IntangibleAssets|Goodwill)PrimaryStatementPresentationAbsence$/i.test(presentation.concept) &&
+          /broad non-current asset line/i.test(text));
+      return acceptedStatementPresentation &&
         Math.abs(row.valueWritten) <= 0.0001 &&
         presentation.value !== null &&
         Math.abs(presentation.value) <= 0.0001 &&
@@ -32747,6 +32882,85 @@ function sourceLedgerFormulaRequiresDependencyAudit(row: HistoricalSourceLedgerR
   // when they are not a required primary-statement input. Forecast columns and
   // text-only navigation/label formulas remain outside this dependency gate.
   return true;
+}
+
+function unsupportedOptionalHistoricalFormulaFailure(
+  row: HistoricalSourceLedgerRow,
+  rowsByCell: Map<string, HistoricalSourceLedgerRow>,
+  dependencyMemo: Map<string, string | null>
+) {
+  if (row.mappingStatus !== "formula_preserved" || row.requiredCoreHistoricalInput || !row.workbookFormula) return null;
+  if (!sourceLedgerFormulaRequiresDependencyAudit(row) || sourceLedgerRowHasAuditableSecAmount(row)) return null;
+
+  const externalReferences = String(row.workbookFormulaExternalReferences ?? "").trim();
+  if (externalReferences) return `formula depends on an external workbook (${externalReferences}).`;
+  const unresolvedDefinedNames = String(row.workbookFormulaUnresolvedDefinedNames ?? "").trim();
+  if (unresolvedDefinedNames) return `formula uses an unresolved defined name (${unresolvedDefinedNames}).`;
+  const unsupportedReferences = String(row.workbookFormulaUnsupportedReferences ?? "").trim();
+  if (unsupportedReferences) return `formula contains dependency syntax that cannot be audited (${unsupportedReferences}).`;
+
+  return (
+    unsupportedHistoricalFormulaLiteralFailure(row) ??
+    sourceLedgerFormulaDependencyFailure(row, rowsByCell, dependencyMemo, new Set())
+  );
+}
+
+function clearUnsupportedOptionalHistoricalFormulas(
+  workbook: ExcelJS.Workbook,
+  rows: HistoricalSourceLedgerRow[],
+  auditRows: MappingAuditRow[]
+) {
+  const rowsByCell = new Map(rows.map((row) => [sourceLedgerCellKey(row.sheetName, row.cell), row]));
+  const dependencyMemo = new Map<string, string | null>();
+  const unsupported = rows.flatMap((row) => {
+    const failure = unsupportedOptionalHistoricalFormulaFailure(row, rowsByCell, dependencyMemo);
+    return failure ? [{ row, failure }] : [];
+  });
+  let clearedCells = 0;
+
+  for (const { row, failure } of unsupported) {
+    const sheet = workbook.getWorksheet(row.sheetName);
+    if (!sheet) continue;
+    const cell = sheet.getCell(row.cell);
+    const formula = formulaForCell(cell);
+    if (!formula) continue;
+    cell.value = null;
+    clearEdgarMapperComment(cell);
+    clearedCells += 1;
+    auditRows.push({
+      sheetName: row.sheetName,
+      cell: row.cell,
+      modelRowLabel: row.modelRowLabel,
+      section: "Historical Support Schedule",
+      period: row.fiscalPeriod,
+      valueWritten: 0,
+      mappingType: "cleared",
+      conceptsUsed: "",
+      secLabels: "",
+      sourceStatement: row.sourceStatement,
+      accession: "",
+      sourceUrl: "",
+      filingForm: "",
+      filedDate: "",
+      startDate: "",
+      endDate: "",
+      cellWritable: true,
+      formulaPreserved: false,
+      formulaStatus: "unsupported optional historical formula cleared",
+      writeBlockedReason: failure,
+      signConvention: "not written",
+      confidence: "high",
+      validationStatus: "cleared",
+      notes: `Cleared unsupported prior formula ${formula.slice(0, 180)} because it could not be certified from current-company SEC-backed historical cells.`
+    });
+  }
+
+  return {
+    clearedCells,
+    warnings: clearedCells
+      ? [`Cleared ${clearedCells} unsupported optional historical formula(s) that lacked current-company SEC-backed lineage.`]
+      : []
+  };
 }
 
 function unsupportedHistoricalFormulaLiteralFailure(row: HistoricalSourceLedgerRow) {
@@ -34326,6 +34540,7 @@ export const __fillModelServiceTestHooks = {
   clearSegmentMetricRowLabel,
   markReportedPeriodColumns,
   buildHistoricalSourceLedgerRows,
+  clearUnsupportedOptionalHistoricalFormulas,
   formulaDependencyAnalysis,
   sourceProvenanceForResolved,
   resolvedAuditSource,
@@ -34390,6 +34605,7 @@ export const __fillModelServiceTestHooks = {
   reportedLineItemCategory,
   deterministicModelRowCandidateForSource,
   resolveInventory,
+  resolveIntangibleAssets,
   resolveAccruedLiabilities,
   resolveGoodwill,
   resolveCurrentDebt,
@@ -34444,6 +34660,7 @@ export const __fillModelServiceTestHooks = {
   completeQuarterlyAnnualValue,
   refreshReportedIncomeFormulaForTarget,
   preferredIncomeStatementResolverOverNarrowerAssignment,
+  supplementalNonCurrentAssetPresentationAbsenceIsCovered,
   isPostTaxEquityMethodBridgeFormulaUpdate,
   reconcilePostTaxEquityMethodNetIncomeBridge,
   mappingAuditSignConvention,

@@ -4,6 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:ensure": "node scripts/ensure-dev-server.js",
+    "dev:stop": "node scripts/ensure-dev-server.js --stop",
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
@@ -40,6 +42,7 @@
     "test:fill-model-api-guards": "node scripts/fill-model-api-guards-check.js",
     "test:fill-workbook-api-auth": "node scripts/fill-workbook-api-auth-check.js",
     "test:analyst-rollout-ui-guards": "node scripts/analyst-rollout-ui-guards-check.js",
+    "test:dev-server-reliability": "node scripts/dev-server-reliability-check.js",
     "test:nvda-income-statement": "node scripts/nvda-income-statement-regression-check.js",
     "test:de-source-ledger": "node scripts/de-source-ledger-regression-check.js",
     "test:sec-accession-normalization": "node scripts/sec-accession-normalization-check.js",

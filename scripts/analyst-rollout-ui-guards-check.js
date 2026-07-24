@@ -27,7 +27,13 @@ assert.match(pageSource, /never added to the workbook/i, "the page must explain 
 assert.match(pageSource, /const activeRequestRef = useRef<AbortController \| null>\(null\)/);
 assert.match(pageSource, /signal:\s*controller\.signal/, "the browser fetch must use an AbortController signal");
 assert.match(pageSource, /function cancelFill\(\)[\s\S]*activeRequestRef\.current\.abort\(\)/, "the cancel control must abort the active request");
-assert.match(pageSource, /controller\.signal\.aborted[\s\S]*Workbook fill cancelled/, "the page must show a clear cancellation outcome");
+assert.match(pageSource, /fillRequestErrorMessage\(caught, controller\.signal\.aborted\)/, "the page must classify cancellation from the active request signal");
+assert.match(pageSource, /if \(wasCancelled\) return "Workbook fill cancelled/, "the page must show a clear cancellation outcome");
 assert.match(pageSource, /type="button" onClick=\{cancelFill\}/, "cancel must be a non-submit button");
+assert.match(
+  pageSource,
+  /function fillRequestErrorMessage\([\s\S]*failed to fetch[\s\S]*app server connection was lost[\s\S]*npm run dev:ensure/i,
+  "browser network failures must be translated into an actionable local-server recovery message"
+);
 
 console.log("Analyst access-key and cancellation UI guards passed.");

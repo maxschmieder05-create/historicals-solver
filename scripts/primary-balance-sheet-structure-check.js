@@ -34,13 +34,17 @@ function loadTypeScriptModule(file) {
   return mod.exports;
 }
 
-const { isPrimaryBalanceSheetStructure, __fillModelServiceTestHooks } = loadTypeScriptModule(
+const { isPrimaryBalanceSheetStructure, sourceLedgerStatusForAuditRow, __fillModelServiceTestHooks } = loadTypeScriptModule(
   path.join(repoRoot, "server", "fill-model", "fill-model-service.ts")
 );
 const {
   primaryBalanceSheetRowsHaveStructuralAnchor,
   selectPrimaryBalanceSheetStatementCandidates,
-  buildPrimaryBalanceSheetAssignmentLedgerRows
+  buildPrimaryBalanceSheetAssignmentLedgerRows,
+  resolveIntangibleAssets,
+  resolveGoodwill,
+  resolveAccruedLiabilities,
+  supplementalNonCurrentAssetPresentationAbsenceIsCovered
 } = __fillModelServiceTestHooks;
 const { classifySourceTableType } = loadTypeScriptModule(path.join(repoRoot, "server", "fill-model", "sec-filing-package.ts"));
 
@@ -243,5 +247,135 @@ assert.equal(
   true,
   "equity explicitly attributable to noncontrolling interests is a component carrying amount, not an equity subtotal"
 );
+
+const broadNonCurrentAssetRows = [
+  ledgerRow({ rowOrder: 1, label: "Cash and cash equivalents", concept: "CashAndCashEquivalentsAtCarryingValue", value: 1_000, parentConcept: "AssetsCurrent", parentLabel: "Assets, Current", section: "current" }),
+  ledgerRow({ rowOrder: 2, label: "Assets, Current", concept: "AssetsCurrent", value: 1_000, parentConcept: "Assets", parentLabel: "Assets", section: "current" }),
+  ledgerRow({ rowOrder: 3, label: "Property, Plant and Equipment, Net", concept: "PropertyPlantAndEquipmentNet", value: 2_000, parentConcept: "Assets", parentLabel: "Assets", section: "non_current" }),
+  ledgerRow({ rowOrder: 4, label: "Other non-current assets", concept: "OtherAssetsNoncurrent", value: 7_000, parentConcept: "Assets", parentLabel: "Assets", section: "non_current" }),
+  ledgerRow({ rowOrder: 5, label: "Assets", concept: "Assets", value: 10_000, parentConcept: "AssetsAbstract", parentLabel: "Assets [Abstract]" })
+];
+const broadAssetContext = {
+  ...ledgerContext,
+  instant: new Map([
+    [
+      "1Q26",
+      new Map([
+        [
+          "IntangibleAssetsNetExcludingGoodwill",
+          {
+            concept: "IntangibleAssetsNetExcludingGoodwill",
+            label: "Intangible assets from acquisition note",
+            value: 777,
+            unit: "USD",
+            accn: accession,
+            periodKey: "1Q26",
+            periodType: "instant",
+            sourceLayer: "sec_live_companyfacts"
+          }
+        ],
+        [
+          "Goodwill",
+          {
+            concept: "Goodwill",
+            label: "Goodwill from acquisition note",
+            value: 888,
+            unit: "USD",
+            accn: accession,
+            periodKey: "1Q26",
+            periodType: "instant",
+            sourceLayer: "sec_live_companyfacts"
+          }
+        ]
+      ])
+    ]
+  ]),
+  filingPackageStatements: [{ ...ledgerStatement, rows: broadNonCurrentAssetRows }]
+};
+assert.equal(
+  resolveIntangibleAssets("1Q26", broadAssetContext).value,
+  0,
+  "note-table intangible facts must not override the presentation zero derived from an inspected primary balance sheet's broad non-current asset line"
+);
+assert.equal(
+  resolveGoodwill("1Q26", broadAssetContext).value,
+  0,
+  "note-table goodwill facts must not override the presentation zero derived from an inspected primary balance sheet's broad non-current asset line"
+);
+assert.match(resolveIntangibleAssets("1Q26", broadAssetContext).sources[0].concept, /PresentationAbsence$/);
+assert.equal(
+  sourceLedgerStatusForAuditRow({
+    mappingType: "derived",
+    validationStatus: "OK!",
+    formulaStatus: "historical input refreshed from SEC resolver value",
+    writeBlockedReason: "",
+    notes: "Not separately presented; retained within a broad non-current asset line.",
+    conceptsUsed: "IntangibleAssetsPrimaryStatementPresentationAbsence=0mm",
+    sourceStatement: "balance",
+    valueWritten: 0,
+    formulaPreserved: false,
+    accession,
+    sourceProvenance: [
+      {
+        role: "presentation_absence",
+        concept: "IntangibleAssetsPrimaryStatementPresentationAbsence",
+        label: "Intangible assets not separately presented on the primary balance sheet",
+        value: 0,
+        accession
+      }
+    ]
+  }),
+  "explicit_zero_no_source_disclosed",
+  "an SEC-anchored balance-sheet presentation zero must satisfy core historical provenance"
+);
+assert.equal(
+  supplementalNonCurrentAssetPresentationAbsenceIsCovered("1Q26", broadAssetContext),
+  true,
+  "a broad primary-statement non-current asset line must cover omitted supplemental goodwill and intangible breakdown rows"
+);
+
+const residualAccruedContext = {
+  duration: new Map(),
+  instant: new Map([
+    [
+      "1Q26",
+      new Map(
+        [
+          ["LiabilitiesCurrent", 100],
+          ["AccountsPayableCurrent", 30],
+          ["ContractWithCustomerLiabilityCurrent", 10],
+          ["LongTermDebtCurrent", 5],
+          ["CommercialPaper", 5]
+        ].map(([concept, value]) => [
+          concept,
+          {
+            concept,
+            label: concept,
+            value,
+            unit: "USD",
+            accn: accession,
+            periodKey: "1Q26",
+            periodType: "instant",
+            sourceLayer: "sec_live_companyfacts"
+          }
+        ])
+      )
+    ]
+  ]),
+  template: {
+    hasOtherCurrentLiabilityRow: true,
+    hasCurrentDebtRow: true,
+    hasShortTermBorrowingsRow: true,
+    hasCurrentLiabilitiesExcludingDebtRow: true
+  }
+};
+const residualAccrued = resolveAccruedLiabilities("1Q26", residualAccruedContext);
+assert.equal(residualAccrued.value, 50);
+assert.equal(
+  residualAccrued.sources[0].concept,
+  "AccruedLiabilitiesDerivedFromCurrentLiabilities",
+  "a residual accrued-liability value must record a derived output before its subtraction inputs"
+);
+assert.equal(residualAccrued.sources[0].derivationCalculation.operation, "signed_linear_combination");
 
 console.log("Primary balance-sheet structure regression passed.");
