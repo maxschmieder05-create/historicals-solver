@@ -1,5 +1,12 @@
 # Codex Collaboration Rules
 
+## Project Status
+
+- This project was archived as maintenance-only on July 26, 2026. Read
+  `PROJECT_CLOSEOUT.md` before making changes.
+- Do not resume an inferred backlog. Treat future work as a bounded reactivation
+  only when the user explicitly requests it.
+
 ## Git Sync
 
 - Use `codex/rsg-segment-historicals` as the shared working branch unless the user explicitly names another branch.

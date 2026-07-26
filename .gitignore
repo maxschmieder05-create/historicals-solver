@@ -2,7 +2,9 @@ node_modules
 .next
 out
 dist
-.env*.local
+.env*
+!.env.example
+api.txt
 *.log
 .DS_Store
 tmp/
